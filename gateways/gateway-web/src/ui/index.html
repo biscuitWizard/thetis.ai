@@ -14,11 +14,24 @@
   <aside class="sidebar">
     <header class="sidebar-head">
       <div class="brand">
-        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <!-- The agent's avatar. Exactly one of these two is shown, chosen at
+             serve time by serve_asset in lib.rs: the image when agent.avatar
+             names one, otherwise the built-in mark. Both are always in the
+             markup so the choice is a `hidden` attribute rather than string
+             surgery on HTML, and so a broken image URL can fall back to the
+             mark at runtime (see wireAvatar in app.js). -->
+        <!-- width/height match the CSS box so the brand does not reflow in the
+             moment between the image arriving and the stylesheet applying. -->
+        <img id="brand-avatar" class="brand-avatar" src="{agent_avatar}" alt=""
+             width="20" height="20" decoding="async" {agent_avatar_hidden}>
+        <svg id="brand-mark" class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" {agent_mark_hidden}>
           <circle cx="16" cy="16" r="9" fill="none" stroke="currentColor" stroke-width="2.5"/>
           <circle cx="16" cy="16" r="3" fill="currentColor"/>
         </svg>
-        <span>Thetis</span>
+        <!-- Substituted at serve time with the configured agent name; see
+             serve_asset in lib.rs. The harness is Thetis, the agent is
+             whatever agent.name says. -->
+        <span>{agent_name}</span>
       </div>
       <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat">
         <svg viewBox="0 0 20 20" aria-hidden="true">

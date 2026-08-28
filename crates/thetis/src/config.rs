@@ -382,6 +382,18 @@ pub struct Config {
     pub models: Vec<ModelSpec>,
 
     // --- agent loop --------------------------------------------------------
+    /// What the agent calls itself: in its system prompt, in the web UI's
+    /// brand, and as the Discord bot's username.
+    ///
+    /// Deliberately separate from the harness, which is always called Thetis.
+    /// The two were the same word for a long time and it made every sentence
+    /// about either one ambiguous.
+    pub agent_name: String,
+    /// An image to show as the agent's avatar in the web UI, beside the brand.
+    ///
+    /// A URL or a `data:` URI. Empty means the built-in mark, which is drawn as
+    /// an SVG and tints itself with the accent colour.
+    pub agent_avatar: String,
     pub system_prompt: String,
     pub max_iterations: u32,
     pub modes: Vec<ModeSpec>,
@@ -783,6 +795,11 @@ mod spec {
     pub struct Agent {
         pub max_iterations: u32,
         pub default_mode: String,
+        /// What the agent calls itself. Empty falls back to the default.
+        pub name: String,
+        /// Image URL or `data:` URI for the agent's avatar. Empty draws the
+        /// built-in mark instead.
+        pub avatar: String,
         /// Inline prompt. Ignored when `system_prompt_file` is set.
         pub system_prompt: String,
         /// Path to a prompt file, relative to the project root.
@@ -793,6 +810,8 @@ mod spec {
             Self {
                 max_iterations: 32,
                 default_mode: "agent".into(),
+                name: String::new(),
+                avatar: String::new(),
                 system_prompt: String::new(),
                 system_prompt_file: String::new(),
             }
@@ -1450,6 +1469,14 @@ impl Config {
             .parse()
             .with_context(|| format!("`{bind_raw}` is not a valid host:port"))?;
 
+        // What the agent calls itself, as distinct from the harness running it.
+        let agent_name = resolve_agent_name(env.string("THETIS_AGENT_NAME"), &file.agent.name);
+        let agent_avatar = env
+            .string("THETIS_AGENT_AVATAR")
+            .unwrap_or(file.agent.avatar)
+            .trim()
+            .to_string();
+
         // A prompt file wins over an inline prompt; neither means the built-in.
         let system_prompt = match env.string("THETIS_SYSTEM_PROMPT") {
             Some(p) => p,
@@ -1461,6 +1488,10 @@ impl Config {
             None if !file.agent.system_prompt.is_empty() => file.agent.system_prompt,
             None => default_system_prompt().to_string(),
         };
+        // `{agent_name}` is substituted wherever it appears, in a custom prompt
+        // as much as in the built-in one, so renaming the agent does not mean
+        // hand-editing a prompt file as well.
+        let system_prompt = system_prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name);
 
         let models = match env.string("THETIS_MODELS") {
             Some(raw) => parse_models_env(&raw),
@@ -1475,7 +1506,7 @@ impl Config {
             None => builtin_models(),
         };
 
-        let modes: Vec<ModeSpec> = if file.modes.is_empty() {
+        let mut modes: Vec<ModeSpec> = if file.modes.is_empty() {
             builtin_modes()
         } else {
             file.modes
@@ -1489,6 +1520,11 @@ impl Config {
                 })
                 .collect()
         };
+        // A mode prompt is appended to the system prompt, so it gets the same
+        // substitution — otherwise `{agent_name}` would reach the model raw.
+        for mode in &mut modes {
+            mode.prompt = mode.prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name);
+        }
 
         let default_mode = env.string("THETIS_DEFAULT_MODE").unwrap_or(file.agent.default_mode);
         if !modes.iter().any(|m| m.id == default_mode) {
@@ -1522,6 +1558,8 @@ impl Config {
             max_retries: env.parse("THETIS_MAX_RETRIES", file.llm.max_retries),
             models,
 
+            agent_name,
+            agent_avatar,
             system_prompt,
             max_iterations: env.parse("THETIS_MAX_ITERATIONS", file.agent.max_iterations),
             modes,
@@ -1831,8 +1869,34 @@ fn builtin_modes() -> Vec<ModeSpec> {
     ]
 }
 
+/// What the agent calls itself when nothing says otherwise.
+pub const DEFAULT_AGENT_NAME: &str = "Thetis";
+
+/// Picks the agent's name: the environment, then the file, then the default.
+///
+/// Split out as a pure function so the precedence can be tested without
+/// mutating the process environment, which is shared by every test in the
+/// binary and by the live conversations this process is serving.
+///
+/// Blank or whitespace at either layer means "not set" rather than "no name":
+/// an empty name would produce `You are , an agent...` and read as a bug in the
+/// harness rather than a mistake in the config.
+fn resolve_agent_name(from_env: Option<String>, from_file: &str) -> String {
+    from_env
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| Some(from_file.to_string()).filter(|n| !n.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string())
+        .trim()
+        .to_string()
+}
+
+/// Substituted for the configured agent name anywhere in a system or mode
+/// prompt. A custom prompt gets this too, so a rename reaches it without the
+/// author having to hardcode the name.
+pub const AGENT_NAME_PLACEHOLDER: &str = "{agent_name}";
+
 fn default_system_prompt() -> &'static str {
-    "You are Thetis, an agent running inside a self-modifying WebAssembly grip.
+    "You are {agent_name}, an agent running inside a self-modifying WebAssembly grip named Thetis.
 
 You are unusual: your own agentic loop, your tools, and the chat interface you \
 are speaking through are all WebAssembly components that you can rewrite while \
@@ -1879,6 +1943,130 @@ mod tests {
         assert_eq!(cfg.modes.len(), 2);
         assert!(cfg.mode("plan").unwrap().read_only);
         assert!(!cfg.mode("agent").unwrap().read_only);
+    }
+
+    /// The agent's name defaults to the harness's, which is what made the two
+    /// easy to conflate in the first place.
+    #[test]
+    fn the_agent_is_named_thetis_by_default() {
+        let cfg = from_toml("").unwrap();
+        assert_eq!(cfg.agent_name, "Thetis");
+        assert!(
+            cfg.system_prompt.starts_with("You are Thetis,"),
+            "the placeholder should have been substituted, got: {:?}",
+            &cfg.system_prompt[..40.min(cfg.system_prompt.len())]
+        );
+    }
+
+    #[test]
+    fn naming_the_agent_renames_it_in_the_built_in_prompt() {
+        let cfg = from_toml(
+            r#"
+            [agent]
+            name = "Ada"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_name, "Ada");
+        assert!(cfg.system_prompt.starts_with("You are Ada,"));
+        // The harness keeps its own name in the same sentence.
+        assert!(cfg.system_prompt.contains("grip named Thetis"));
+    }
+
+    /// The point of the placeholder: a custom prompt should not have to
+    /// hardcode the name to follow a rename.
+    #[test]
+    fn a_custom_prompt_gets_the_placeholder_substituted() {
+        let cfg = from_toml(
+            r#"
+            [agent]
+            name = "Ada"
+            system_prompt = "You are {agent_name}. Greet as {agent_name}."
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.system_prompt, "You are Ada. Greet as Ada.");
+        assert!(
+            !cfg.system_prompt.contains("{agent_name}"),
+            "no placeholder may reach the model raw"
+        );
+    }
+
+    #[test]
+    fn a_mode_prompt_gets_the_placeholder_too() {
+        let cfg = from_toml(
+            r#"
+            [agent]
+            name = "Ada"
+
+            [[modes]]
+            id = "agent"
+            label = "Agent"
+            prompt = "You are {agent_name} in agent mode."
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mode("agent").unwrap().prompt, "You are Ada in agent mode.");
+    }
+
+    #[test]
+    fn the_agent_has_no_avatar_unless_one_is_configured() {
+        // Empty is meaningful: it selects the built-in mark.
+        assert_eq!(from_toml("").unwrap().agent_avatar, "");
+    }
+
+    #[test]
+    fn an_avatar_can_be_a_url_or_a_data_uri() {
+        let cfg = from_toml(
+            r#"
+            [agent]
+            avatar = "  https://example.com/ada.png  "
+            "#,
+        )
+        .unwrap();
+        // Trimmed, because stray whitespace in an attribute value is a broken
+        // image rather than a helpful error.
+        assert_eq!(cfg.agent_avatar, "https://example.com/ada.png");
+
+        let cfg = from_toml(
+            r#"
+            [agent]
+            avatar = "data:image/png;base64,iVBORw0KGgo="
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_avatar, "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    /// An empty or whitespace name is a mistake, not a request for a nameless
+    /// agent: falling through to the default keeps the prompt grammatical.
+    #[test]
+    fn a_blank_name_falls_back_to_the_default() {
+        let cfg = from_toml(
+            r#"
+            [agent]
+            name = "   "
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.agent_name, "Thetis");
+    }
+
+    #[test]
+    fn the_environment_names_the_agent_over_the_file() {
+        // Tested through the pure resolver rather than by setting a process
+        // variable: this binary's tests share one environment, and so do the
+        // conversations this process is serving.
+        assert_eq!(resolve_agent_name(Some("Ada".into()), "Grace"), "Ada");
+        assert_eq!(resolve_agent_name(None, "Grace"), "Grace");
+        assert_eq!(resolve_agent_name(None, ""), "Thetis");
+
+        // Blank at either layer defers instead of yielding a nameless agent.
+        assert_eq!(resolve_agent_name(Some("  ".into()), "Grace"), "Grace");
+        assert_eq!(resolve_agent_name(Some("  ".into()), "  "), "Thetis");
+
+        // Whitespace from a copy-paste is trimmed, not carried into the prompt.
+        assert_eq!(resolve_agent_name(None, "  Ada  "), "Ada");
     }
 
     #[test]
