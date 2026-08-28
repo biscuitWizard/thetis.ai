@@ -27,6 +27,30 @@ pub(crate) fn has_drive_prefix(path: &str) -> bool {
         && first.as_bytes()[0].is_ascii_alphabetic()
 }
 
+/// Maps a guest-facing preopen path (`/workspace/...`) onto the real directory
+/// behind it.
+///
+/// A guest sees each WASI preopen under its own last path segment, so the
+/// shared workspace is `/workspace` no matter where it lives on this machine.
+/// Anything that is not such a path comes back untouched, and the result still
+/// goes through the ordinary root check afterwards — this only fixes the
+/// spelling, it grants nothing.
+fn rewrite_workspace_prefix(cfg: &Config, raw: &str) -> String {
+    for dir in &cfg.wasi.dirs {
+        let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let prefix = format!("/{name}");
+        if raw == prefix {
+            return dir.to_string_lossy().to_string();
+        }
+        if let Some(rest) = raw.strip_prefix(&format!("{prefix}/")) {
+            return dir.join(rest).to_string_lossy().to_string();
+        }
+    }
+    raw.to_string()
+}
+
 /// Resolves a guest-supplied path against the configured roots.
 ///
 /// Relative paths are taken against the first root, which is the project root
@@ -46,7 +70,14 @@ pub fn resolve(cfg: &Config, raw: &str) -> Result<PathBuf> {
         .first()
         .ok_or_else(|| anyhow!("no filesystem roots are configured"))?;
 
-    let candidate = Path::new(raw);
+    // `/workspace` is what every guest sees the shared preopen as, so it is the
+    // name an agent reaches for — and taken literally it names a directory at
+    // the filesystem root that does not exist. Rewrite it to the real workspace
+    // path before anything else looks at it, so the spelling the agent knows and
+    // the spelling on disk are the same place.
+    let raw = &rewrite_workspace_prefix(cfg, raw);
+
+    let candidate = Path::new(raw.as_str());
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
@@ -153,7 +184,28 @@ fn require_enabled(cfg: &Config) -> Result<()> {
 }
 
 /// Shows a path relative to its root, so messages stay readable.
+///
+/// A path inside a WASI preopen is rendered with its guest prefix — a workspace
+/// file reads as `/workspace/notes.md`, not `notes.md`. That is not cosmetic:
+/// relative paths resolve against the *first* root, so a bare `notes.md`
+/// handed back from the workspace would be read again from the project root and
+/// either miss or, worse, hit a different file of the same name. Preopens are
+/// checked before the plain roots for exactly that reason.
 fn display(cfg: &Config, path: &Path) -> String {
+    for dir in &cfg.wasi.dirs {
+        let Ok(relative) = path.strip_prefix(dir) else {
+            continue;
+        };
+        let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        return if relative.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("/{name}/{relative}")
+        };
+    }
     for root in &cfg.filesystem.roots {
         if let Ok(relative) = path.strip_prefix(root) {
             return relative.to_string_lossy().replace('\\', "/");
@@ -961,6 +1013,73 @@ mod tests {
                 "{bad} gave: {err:#}"
             );
         }
+    }
+
+    /// The shared workspace has to be reachable by the name the agent knows it
+    /// by. A guest sees the preopen as `/workspace`; on this machine it is some
+    /// other absolute path entirely, and taking the guest spelling literally
+    /// used to produce "outside the allowed roots" for the one directory every
+    /// agent is meant to share.
+    #[test]
+    fn the_workspace_is_reachable_by_its_guest_name() {
+        let (mut cfg, _d) = fixture();
+        let ws = cfg.filesystem.roots[0].join("shared-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("note.md"), "shared").unwrap();
+        cfg.wasi.dirs = vec![ws.clone()];
+        cfg.filesystem.roots.push(ws.clone());
+
+        assert_eq!(resolve(&cfg, "/shared-ws").unwrap(), ws);
+        assert_eq!(resolve(&cfg, "/shared-ws/note.md").unwrap(), ws.join("note.md"));
+        assert_eq!(read_file(&cfg, "/shared-ws/note.md").unwrap(), "shared");
+        assert!(list_dir(&cfg, "/shared-ws").unwrap().iter().any(|e| e.name == "note.md"));
+    }
+
+    /// Whatever a listing or a search result calls a file, feeding that name
+    /// straight back to another call has to reach the same file. Making the
+    /// workspace a root put that at risk: relative names resolve against the
+    /// *first* root, so a workspace file rendered as a bare `note.md` would be
+    /// read again from the project root.
+    #[test]
+    fn a_workspace_path_round_trips_through_display() {
+        let (mut cfg, _d) = fixture();
+        let project = cfg.filesystem.roots[0].clone();
+        let ws = project.join("shared-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("note.md"), "in the workspace").unwrap();
+        // Same file name in the project root: a bare `note.md` would find this
+        // one instead, which is the failure worth catching.
+        std::fs::write(project.join("note.md"), "in the project").unwrap();
+        cfg.wasi.dirs = vec![ws.clone()];
+        cfg.filesystem.roots.push(ws.clone());
+
+        let shown = display(&cfg, &ws.join("note.md"));
+        assert_eq!(shown, "/shared-ws/note.md");
+        assert_eq!(read_file(&cfg, &shown).unwrap(), "in the workspace");
+
+        // And the listing agrees with itself.
+        let entry = list_dir(&cfg, "/shared-ws")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "note.md")
+            .expect("note.md should be listed");
+        assert_eq!(read_file(&cfg, &entry.path).unwrap(), "in the workspace");
+    }
+
+    /// Rewriting the prefix is a spelling fix, not a grant: `..` out of the
+    /// workspace still has to land inside a root to be allowed.
+    #[test]
+    fn the_workspace_alias_still_cannot_escape() {
+        let (mut cfg, _d) = fixture();
+        let ws = cfg.filesystem.roots[0].join("shared-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        cfg.wasi.dirs = vec![ws];
+
+        let err = resolve(&cfg, "/shared-ws/../../../../etc/passwd").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("outside the allowed roots"),
+            "{err:#}"
+        );
     }
 
     #[test]
