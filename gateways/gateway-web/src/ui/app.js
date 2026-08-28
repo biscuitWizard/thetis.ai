@@ -622,7 +622,7 @@ const TOOL_GROUP_ORDER = [
 
 const TOOL_GROUP_NOTE = {
   Files: "Reading and writing files — the shared workspace and the sandbox filesystem.",
-  Shell: "Running commands and interactive terminal sessions in the sandbox.",
+  Shell: "Running commands and interactive terminal sessions, locally and on registered ssh hosts.",
   "Code & tools": "Editing its own source and tools, managing dependencies, and restarting the orchestrator.",
   "Version control": "The conversation's sandbox branch — status, history, updating from trunk and merging back.",
   Git: "Remote repositories on GitHub, as the app's own [bot] identity — reading files, commits, branches, PRs, and cloning a real working tree.",

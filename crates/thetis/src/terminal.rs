@@ -665,7 +665,7 @@ impl Terminals {
             if !pty {
                 return Err(anyhow!(
                     "session {id} runs on {remote} without a terminal, so there is no channel \
-                     for a signal. Set pty=true on that host (ssh_host action=set) to make \
+                     for a signal. Set pty=true on that host (ssh_host_set) to make \
                      interrupts possible, or run `pkill` on the far side."
                 ));
             }

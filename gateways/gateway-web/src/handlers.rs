@@ -516,7 +516,9 @@ fn tool_group(name: &str) -> &'static str {
         "update_from_trunk" | "reset_branch" | "complete_merge" | "abort_merge" => {
             "Version control"
         }
-        _ if name.starts_with("terminal_") => "Shell",
+        // The ssh host registry belongs with the terminal: its whole purpose is
+        // naming a machine `terminal_open` can open a session on.
+        _ if name.starts_with("terminal_") || name.starts_with("ssh_host") => "Shell",
         _ if name.starts_with("skill_") => "Skills",
         _ if name.starts_with("branch_") => "Version control",
         _ if name.starts_with("web-") || name.starts_with("web_") => "Web",

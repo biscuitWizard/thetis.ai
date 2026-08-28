@@ -1,7 +1,7 @@
 ---
 name = "Writing and maintaining tool components"
-brief = "Build, edit, configure and debug a tool component: the tool world, describe/invoke, capabilities, config, filesystem and network reach, budgets and failure modes."
-when_to_use = "Use when creating a new tool with new_tool, editing an existing tools/<name> crate, giving a tool an API key or other setting, adding a crate dependency to it, deciding what a tool is allowed to touch outside itself (files, HTTP, the KV store), deleting a tool, or debugging one that never appears in the tool list, returns truncated output, is withheld in a read-only mode, or crashes and gets rolled back. Not for adding a built-in tool to the agent's own loop beyond the two-edit summary here, and not for a user's own project code."
+brief = "Build, edit, configure and debug a tool: one tool per operation, the tool world, describe/invoke, capabilities, config, reach, budgets and failure modes."
+when_to_use = "Use when designing or shaping a tool surface — deciding whether one tool or several, or splitting a tool that bundles operations behind an action argument — when creating a new tool with new_tool, editing an existing tools/<name> crate, giving a tool an API key or other setting, adding a crate dependency to it, deciding what a tool is allowed to touch outside itself (files, HTTP, the KV store), deleting a tool, or debugging one that never appears in the tool list, returns truncated output, is withheld in a read-only mode, or crashes and gets rolled back. Not for adding a built-in tool to the agent's own loop beyond the two-edit summary here, and not for a user's own project code."
 universal = false
 tags = ["tools", "tool component", "new_tool", "describe", "invoke", "args schema", "capabilities", "read-only", "tool config", "api key", "wasm32-wasip2", "wit-bindgen", "hot reload", "filesystem", "workspace", "side effects"]
 version = 2
@@ -35,6 +35,54 @@ outside `workspace`.
 To add a **built-in** instead: one `ToolDef` in the right group function and one
 arm in `invoke`, both in `tools.rs`. Set `mutating` correctly — that is the only
 thing a read-only mode filters on.
+
+## Favour atomic tools over monolithic ones
+
+**House rule: one tool per operation.** Do not bundle several operations behind
+an `action`, `mode`, `command` or `op` string. Give each its own name and its
+own schema. `ssh_host_list` / `ssh_host_get` / `ssh_host_set` /
+`ssh_host_remove` / `ssh_host_rename`, not `ssh_host action=...` — that split is
+the worked example, in `ssh_host_tools` and its `invoke` arms.
+
+Why the split is worth the extra lines:
+
+- **`mutating` is per tool.** A mega-tool has to declare the union, so its
+  readers vanish in a read-only mode along with its writers. Split, `*_list` and
+  `*_get` stay available. Same for a component's `"read-only"` capability, which
+  is one flag for the whole component.
+- **The schema can be honest.** `required` applies to the whole object, so a
+  mega-tool cannot require `to` for a rename without requiring it for a list;
+  everything becomes optional and the checking moves to runtime. Each atomic
+  tool requires exactly its own fields, and a missing one is caught before the
+  call.
+- **The name is the documentation.** One description covering five operations is
+  read as a paragraph of prose; five descriptions are read as the right one. A
+  mistyped operation becomes an unknown tool name rather than
+  `unknown action "renmae"`.
+- **Retrieval and grouping work on names.** The UI's `tool_group` and any
+  prefix-matching classification key off the name, so operations that share a
+  prefix stay together for free.
+
+Legitimate exceptions, all narrow: one operation whose *parameters* vary
+(`terminal_run` with `background`); a passthrough where the sub-command belongs
+to a foreign system, not to you; a set so large that N tools would crowd out
+everything else in the tool list — and then prefer a component with pagination
+over an `action` enum.
+
+When splitting an existing mega-tool, sweep for the old name afterwards. Tool
+names are quoted in other tools' descriptions, in kernel error messages, in
+`thetis.toml` comments, and in the file headers a feature writes — a stale
+`ssh_host action=set` in an error message is advice the model cannot follow.
+
+### Where a built-in shows up in the UI
+
+`tool_group` in `gateways/gateway-web/src/handlers.rs` maps a name to a panel
+group, with prefix arms for families and `"Other"` as the fallback; the display
+order and the one-line note per group are `TOOL_GROUP_ORDER` and
+`TOOL_GROUP_NOTE` in `ui/app.js`. Terminal sessions and the ssh host registry
+are both **Shell** — anything whose subject is running commands or the machines
+they run on belongs there, not in a group of its own. A new family with no arm
+lands in "Other", which is a hint you forgot the arm rather than a design.
 
 ## The contract
 
