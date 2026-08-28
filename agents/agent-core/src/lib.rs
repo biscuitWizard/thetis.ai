@@ -89,6 +89,12 @@ struct Turn {
     cost_usd: f64,
     tools_used: Vec<String>,
     stopped_by: &'static str,
+    /// Nudge text seen at a checkpoint where a `user` message would not have
+    /// been legal yet, waiting to be added by `flush_pending`.
+    pending: Vec<String>,
+    /// Whether the user has stopped this turn. Sticky: a stop stays stopped
+    /// however many further checkpoints the loop passes through.
+    cancelled: bool,
 }
 
 impl Turn {
@@ -120,6 +126,8 @@ impl Turn {
             cost_usd: 0.0,
             tools_used: Vec::new(),
             stopped_by: "stop",
+            pending: Vec::new(),
+            cancelled: false,
         }
     }
 
@@ -165,10 +173,21 @@ impl Turn {
             self.record_usage(&reply.usage);
             self.push(assistant_message(&reply), seq);
 
+            // Mid-stream input, folded in now that the assistant turn it
+            // arrived during is on the list. Doing it here rather than at the
+            // moment it arrived is what keeps the message order legal: a user
+            // message may not be spliced in ahead of the assistant reply that
+            // was already being written.
+            let interrupted = self.flush_pending();
+
             if reply.tool_calls.is_empty() {
                 // The model is done talking. Only a nudge that landed while it
                 // was finishing justifies another round trip.
-                match self.drain_inbox() {
+                // Polled once more, and flushed: a nudge landing in the gap
+                // between the last check and here would otherwise wait in
+                // `pending` through the whole of the next completion, arriving
+                // an answer later than the user expects.
+                match interrupted.or(self.flush_pending()) {
                     Interrupt::None => {
                         self.stopped_by = "stop";
                         break;
@@ -181,14 +200,40 @@ impl Turn {
                 }
             }
 
-            for call in &reply.tool_calls {
+            // A stop that arrived while the model was still writing must not be
+            // paid for by running the tools it asked for.
+            if matches!(interrupted, Interrupt::Cancelled) {
+                self.cancel_remaining(&reply.tool_calls, 0);
+                self.stopped_by = "cancelled";
+                break;
+            }
+
+            // Checked between calls, not just after the batch. A model that
+            // asks for six terminal commands used to run all six after the stop
+            // button was pressed, because the only checkpoint was past the end
+            // of the loop — which is precisely the case the button is for.
+            let mut stopped_at = None;
+            for (i, call) in reply.tool_calls.iter().enumerate() {
+                if matches!(self.drain_inbox(), Interrupt::Cancelled) {
+                    stopped_at = Some(i);
+                    break;
+                }
                 self.dispatch(call);
+            }
+
+            if let Some(i) = stopped_at {
+                self.cancel_remaining(&reply.tool_calls, i);
+                self.stopped_by = "cancelled";
+                break;
             }
 
             if matches!(self.drain_inbox(), Interrupt::Cancelled) {
                 self.stopped_by = "cancelled";
                 break;
             }
+            // Nudges that arrived during the tools, now that every call has its
+            // result and a user message is legal again.
+            self.flush_pending();
         }
 
         Ok(TurnStats {
@@ -467,7 +512,28 @@ impl Turn {
         let stream = llm::stream_open(&request.to_string()).map_err(describe_llm_error)?;
 
         let mut reply = Reply::default();
+        // Deltas since the last inbox check. Polling on every token would be
+        // one host call per token; a short stride keeps a stop responsive
+        // without that cost.
+        const POLL_EVERY: u32 = 16;
+        let mut since_poll = 0;
+
         loop {
+            // Checked while the model is still talking, not only once it has
+            // finished. A long answer used to stream to the very end after the
+            // stop button was pressed, because the loop had no checkpoint in it
+            // at all. Whatever arrived so far is kept: the caller records it, so
+            // a stopped turn still shows what the model had said.
+            since_poll += 1;
+            if since_poll >= POLL_EVERY {
+                since_poll = 0;
+                if matches!(self.drain_inbox(), Interrupt::Cancelled) {
+                    llm::stream_close(stream);
+                    sys::log(LogLevel::Info, "stopped streaming: the user stopped the turn");
+                    return Ok(reply);
+                }
+            }
+
             match llm::stream_next(stream) {
                 Ok(StreamChunk::Delta(chunk)) => {
                     // Straight to the browser: the user sees tokens as they land.
@@ -482,6 +548,12 @@ impl Turn {
                 }
                 Err(e) => {
                     llm::stream_close(stream);
+                    // The host fails the stream when the turn is stopped, which
+                    // is not an error to report: it is the stop working. Keep
+                    // what arrived and let the loop's own checkpoint end things.
+                    if matches!(self.drain_inbox(), Interrupt::Cancelled) {
+                        return Ok(reply);
+                    }
                     return Err(describe_llm_error(e));
                 }
             }
@@ -518,9 +590,22 @@ impl Turn {
         );
     }
 
-    /// Folds any mid-turn input into the conversation and reports what it found.
+    /// Reads mid-turn input and reports what it found.
+    ///
+    /// Nudge text is queued rather than appended to the message list, because
+    /// this is called from places where a user message would be illegal —
+    /// mid-stream, before the assistant turn being written has been added.
+    /// [`Self::flush_pending`] puts them in once it is safe.
+    ///
+    /// Cancellation is sticky: once seen it stays set for the rest of the turn,
+    /// so a later checkpoint that happens to find an empty inbox cannot
+    /// resurrect a turn the user already stopped.
     fn drain_inbox(&mut self) -> Interrupt {
-        let mut interrupt = Interrupt::None;
+        let mut interrupt = if self.cancelled {
+            Interrupt::Cancelled
+        } else {
+            Interrupt::None
+        };
 
         for item in host::poll_inbox(&self.session_id) {
             match item {
@@ -529,13 +614,16 @@ impl Turn {
                     // The host logs the nudge itself; this is the same text
                     // reaching the model within the turn already running, so it
                     // has no sequence of its own to point at.
-                    self.push(json!({ "role": "user", "content": text }), 0);
+                    self.pending.push(text);
                     // Cancellation outranks a nudge; never downgrade it.
                     if !matches!(interrupt, Interrupt::Cancelled) {
                         interrupt = Interrupt::Nudged;
                     }
                 }
-                InboxItem::Cancel => interrupt = Interrupt::Cancelled,
+                InboxItem::Cancel => {
+                    self.cancelled = true;
+                    interrupt = Interrupt::Cancelled;
+                }
                 InboxItem::Control(cmd) => {
                     sys::log(LogLevel::Debug, &format!("ignoring control item: {cmd}"));
                 }
@@ -543,6 +631,46 @@ impl Turn {
         }
 
         interrupt
+    }
+
+    /// Adds any queued nudge text to the conversation.
+    ///
+    /// Safe to call only where a `user` message is legal: after the assistant
+    /// turn has been pushed, and with no tool call left unanswered.
+    fn flush_pending(&mut self) -> Interrupt {
+        let interrupt = self.drain_inbox();
+        for text in std::mem::take(&mut self.pending) {
+            self.push(json!({ "role": "user", "content": text }), 0);
+        }
+        interrupt
+    }
+
+    /// Answers the tool calls a stop meant we never ran.
+    ///
+    /// Not optional bookkeeping. Every tool call in an assistant message must
+    /// have a matching result or the next request is rejected outright by the
+    /// provider — so abandoning a batch half-way would leave the conversation
+    /// unable to continue at all. Recording why they did not run also means the
+    /// model can see, next turn, that the user stopped it rather than that the
+    /// tools mysteriously failed.
+    fn cancel_remaining(&mut self, calls: &[ToolCall], from: usize) {
+        for call in calls.iter().skip(from) {
+            let result = ToolOutcome {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                ok: false,
+                content: "Not run: you stopped this turn.".to_string(),
+            };
+            let seq = host::append(&self.session_id, &SessionEvent::ToolResult(result.clone()));
+            self.push(
+                json!({
+                    "role": "tool",
+                    "tool_call_id": result.call_id,
+                    "content": result.content,
+                }),
+                seq,
+            );
+        }
     }
 
     fn record_usage(&mut self, usage: &Option<TokenUsage>) {
@@ -564,6 +692,21 @@ enum Interrupt {
     None,
     Nudged,
     Cancelled,
+}
+
+impl Interrupt {
+    /// Combines two observations, keeping the more urgent.
+    ///
+    /// A stop outranks a nudge, and a nudge outranks nothing. Written once here
+    /// because getting it the wrong way round downgrades a cancellation into a
+    /// "carry on", which is the bug this ordering exists to prevent.
+    fn or(self, other: Interrupt) -> Interrupt {
+        match (self, other) {
+            (Interrupt::Cancelled, _) | (_, Interrupt::Cancelled) => Interrupt::Cancelled,
+            (Interrupt::Nudged, _) | (_, Interrupt::Nudged) => Interrupt::Nudged,
+            _ => Interrupt::None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -625,6 +768,77 @@ fn assistant_message(reply: &Reply) -> Value {
         );
     }
     msg
+}
+
+/// Tests for the interrupt precedence rules.
+///
+/// These run on the host (`cargo test` in this crate), not in wasm: they touch
+/// no imports, only the pure ordering logic that decides whether a turn keeps
+/// going. That is deliberate — the ordering is the part that silently breaks
+/// the stop button when it is wrong, and it is the part that can be checked
+/// without a running orchestrator.
+#[cfg(test)]
+mod interrupt_tests {
+    use super::Interrupt;
+
+    #[test]
+    fn nothing_observed_twice_is_still_nothing() {
+        assert_eq!(
+            Interrupt::None.or(Interrupt::None),
+            Interrupt::None,
+            "an idle turn must not think it was interrupted"
+        );
+    }
+
+    #[test]
+    fn a_stop_outranks_a_nudge_from_either_side() {
+        // The ordering bug this guards: if a nudge won, a stop would be
+        // downgraded to "carry on" and the turn would keep running tools —
+        // exactly the symptom the stop button is meant to cure.
+        assert_eq!(
+            Interrupt::Cancelled.or(Interrupt::Nudged),
+            Interrupt::Cancelled
+        );
+        assert_eq!(
+            Interrupt::Nudged.or(Interrupt::Cancelled),
+            Interrupt::Cancelled,
+            "a stop must win no matter which check saw it first"
+        );
+    }
+
+    #[test]
+    fn a_stop_survives_being_combined_with_nothing() {
+        assert_eq!(Interrupt::Cancelled.or(Interrupt::None), Interrupt::Cancelled);
+        assert_eq!(Interrupt::None.or(Interrupt::Cancelled), Interrupt::Cancelled);
+    }
+
+    #[test]
+    fn a_nudge_is_kept_when_there_is_no_stop() {
+        assert_eq!(Interrupt::Nudged.or(Interrupt::None), Interrupt::Nudged);
+        assert_eq!(Interrupt::None.or(Interrupt::Nudged), Interrupt::Nudged);
+    }
+
+    #[test]
+    fn combining_is_idempotent_so_repeated_polls_agree() {
+        // The loop calls `or` across several checkpoints in one iteration;
+        // seeing the same signal twice must not change the verdict.
+        for signal in [Interrupt::None, Interrupt::Nudged, Interrupt::Cancelled] {
+            assert_eq!(signal.or(signal), signal);
+        }
+    }
+
+    #[test]
+    fn a_stop_is_absorbing_across_any_sequence_of_polls() {
+        // Once a stop has been seen, no later observation may clear it.
+        let mut seen = Interrupt::None;
+        for later in [Interrupt::Nudged, Interrupt::Cancelled, Interrupt::None] {
+            seen = seen.or(later);
+        }
+        assert_eq!(
+            seen, Interrupt::Cancelled,
+            "a stop seen mid-sequence must stick to the end"
+        );
+    }
 }
 
 fn describe_llm_error(e: LlmError) -> String {
