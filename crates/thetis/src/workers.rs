@@ -465,7 +465,7 @@ async fn supervise(
                     ),
                 )
                 .await;
-            reconcile_and_resume(&grip).await;
+            reconcile_session(&grip, &session_id).await;
             return;
         }
 
@@ -488,9 +488,9 @@ async fn supervise(
     }
 
     tracing::info!(session = %session_id, "worker exited");
-    // Repair whatever the death interrupted; resuming re-materializes the
-    // worker on demand.
-    reconcile_and_resume(&grip).await;
+    // Repair whatever *this* death interrupted; resuming re-materializes the
+    // worker on demand. Deliberately scoped: see `reconcile_session`.
+    reconcile_session(&grip, &session_id).await;
 }
 
 /// Points a branch back at the trunk kernel. True when it was on its own.
@@ -651,6 +651,7 @@ impl ipc::Handler for GatewayHandler {
             // The worker's aspects are up and it is accepting turns.
             "ready" => {
                 let _ = self.ready.send(true);
+                let session_id = self.session_id.clone();
                 tokio::spawn(async move {
                     // A fresh deployment serves the fallback page until some
                     // worker's first build lands in the cache; a branch at
@@ -659,7 +660,7 @@ impl ipc::Handler for GatewayHandler {
                     if grip.loader.get(&ui).is_none() {
                         crate::roles::gateway::load_ui_gateway(&grip).await;
                     }
-                    reconcile_and_resume(&grip).await;
+                    reconcile_session(&grip, &session_id).await;
                 });
             }
             // The worker wants itself restarted — after a kernel rebuild in
@@ -749,10 +750,25 @@ pub fn reconcile_and_resume(
     grip: &Arc<Grip>,
 ) -> futures_util::future::BoxFuture<'static, ()> {
     let grip = grip.clone();
-    Box::pin(async move { reconcile_and_resume_inner(grip).await })
+    Box::pin(async move { reconcile_and_resume_inner(grip, None).await })
 }
 
-async fn reconcile_and_resume_inner(grip: Arc<Grip>) {
+/// Reconciles one conversation, for the common case: its own worker died.
+///
+/// A worker's death says nothing about anyone else, and the fleet-wide sweep
+/// used to drag in every session that merely had no worker at that instant —
+/// including agents part-way through a restart they asked for. With several
+/// self-modifying conversations running that fed back on itself.
+pub fn reconcile_session(
+    grip: &Arc<Grip>,
+    session_id: &str,
+) -> futures_util::future::BoxFuture<'static, ()> {
+    let grip = grip.clone();
+    let session_id = session_id.to_string();
+    Box::pin(async move { reconcile_and_resume_inner(grip, Some(session_id)).await })
+}
+
+async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
     // One at a time: readiness and death fire this from several places, and
     // two scans racing each other once synthesized duplicate tool results.
     static RECONCILING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -768,9 +784,10 @@ async fn reconcile_and_resume_inner(grip: Arc<Grip>) {
         Role::Worker(_) => Vec::new(),
     };
     let interrupted = match store.reconcile_interrupted_turns(
-        "This turn was interrupted when Thetis restarted. Carry on from where you \
-         left off; anything you were part-way through may need doing again.",
+        "This turn was interrupted and has been picked back up. Carry on from where \
+         you left off; anything you were part-way through may need doing again.",
         &live,
+        only.as_deref(),
     ) {
         Ok(found) => found,
         Err(e) => {

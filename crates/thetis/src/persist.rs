@@ -128,6 +128,16 @@ impl Persist {
         )
     }
 
+    /// Marks the next interruption of this session as one we asked for.
+    pub async fn expect_restart(&self, session_id: &str) -> Result<()> {
+        delegate!(
+            self,
+            "store.expect_restart",
+            |s| s.expect_restart(session_id),
+            json!({ "session": session_id })
+        )
+    }
+
     pub async fn set_no_resume(&self, session_id: &str, no_resume: bool) -> Result<()> {
         delegate!(
             self,
@@ -309,6 +319,9 @@ fn serve_store_call_inner(
         ),
         "store.clear_resume_attempts" => {
             to_value(store.clear_resume_attempts(own_session(&params, caller_session)?)?)
+        }
+        "store.expect_restart" => {
+            to_value(store.expect_restart(own_session(&params, caller_session)?)?)
         }
         "store.set_no_resume" => {
             let flag = params
