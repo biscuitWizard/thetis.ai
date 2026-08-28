@@ -68,6 +68,35 @@
   --fast: 110ms;
   --med: 180ms;
 
+  /* Terminal — the palette the drawer renders shell output with.
+   *
+   * Here rather than in the view because it is colour, and colour lives in one
+   * file. xterm needs the values as JavaScript strings, so the drawer reads
+   * these back with getComputedStyle; that is also why every one is a plain hex
+   * literal, since a color-mix() would come back unresolved and xterm's own
+   * parser would reject it. Muted against the near-black surfaces: raw ANSI red
+   * and green on this background is a fairground. */
+  --term-bg:        #0c0c12;
+  --term-fg:        #d7d7e3;
+  --term-cursor:    #7c9cff;
+  --term-selection: #2c3560;
+  --term-black:     #2b2b38;
+  --term-red:       #f2788f;
+  --term-green:     #7fd18f;
+  --term-yellow:    #e8b673;
+  --term-blue:      #7c9cff;
+  --term-magenta:   #c69bf0;
+  --term-cyan:      #74ccd4;
+  --term-white:     #c6c6d4;
+  --term-bright-black:   #4e4e62;
+  --term-bright-red:     #ff93a7;
+  --term-bright-green:   #9ce0a9;
+  --term-bright-yellow:  #f5cd93;
+  --term-bright-blue:    #9db4ff;
+  --term-bright-magenta: #d9b6ff;
+  --term-bright-cyan:    #96e2e9;
+  --term-bright-white:   #f0f0f6;
+
   /* Layout */
   --sidebar-w: 272px;
   --measure: 48rem;

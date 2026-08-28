@@ -23,7 +23,7 @@ const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
 
 /// True when this frame type belongs here.
 pub fn handles(frame_type: &str) -> bool {
-    frame_type == "debug-request" || frame_type == "turn-cancel"
+    frame_type == "debug-request" || frame_type == "turn-cancel" || frame_type == "terminals"
 }
 
 /// Handles one frame, returning the reply frames to send on this socket.
@@ -122,6 +122,34 @@ async fn dispatch(grip: &Arc<Grip>, frame_type: &str, session: &str) -> Result<S
                 "session": session,
                 "ok": true,
                 "stopped": stopped,
+            })
+            .to_string())
+        }
+
+        // The shells this conversation's sandbox is holding, each with its
+        // transcript, so a tab that has just connected can draw them without
+        // waiting for the next line of output.
+        //
+        // Never materializes a worker: a conversation with none has no shells
+        // by definition, and the honest answer is the empty list.
+        "terminals" => {
+            let Some(peer) = router.live_peer(session).await else {
+                return Ok(json!({
+                    "type": "terminals",
+                    "session": session,
+                    "ok": true,
+                    "terminals": [],
+                })
+                .to_string());
+            };
+            let reply = peer
+                .call("terminals.list", json!({ "session": session }))
+                .await?;
+            Ok(json!({
+                "type": "terminals",
+                "session": session,
+                "ok": true,
+                "terminals": reply.get("terminals").cloned().unwrap_or(json!([])),
             })
             .to_string())
         }

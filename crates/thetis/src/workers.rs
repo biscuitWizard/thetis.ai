@@ -658,6 +658,27 @@ impl ipc::Handler for GatewayHandler {
                     });
                 }
             }
+            // Shell activity in this worker's sandbox, broadcast as an ordinary
+            // frame so the browser's terminal drawer draws it live. Tagged with
+            // the session here rather than by the worker: the socket already
+            // identifies the conversation, and asking the far end to restate it
+            // would let the two disagree.
+            "terminal" => {
+                let mut frame = params;
+                if let Some(obj) = frame.as_object_mut() {
+                    obj.insert("type".into(), Value::String("terminal".into()));
+                    obj.insert(
+                        "session".into(),
+                        Value::String(self.session_id.clone()),
+                    );
+                }
+                if let Ok(text) = serde_json::to_string(&frame) {
+                    let _ = grip.frames_tx.send(RenderedFrame {
+                        session_id: self.session_id.clone(),
+                        frame: text,
+                    });
+                }
+            }
             // The worker's raw event stream, mirrored so connectors on this
             // side (Discord) can follow conversations exactly as before the
             // split. Browsers are fed by the rendered `frame` notes instead.
