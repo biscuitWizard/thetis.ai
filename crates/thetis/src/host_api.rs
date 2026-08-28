@@ -198,6 +198,17 @@ impl sys::Host for HostState {
             "max_iterations" => Some(cfg.max_iterations.to_string()),
             "max_tool_output_bytes" => Some(cfg.max_tool_output_bytes.to_string()),
             "sandbox_available" => Some(cfg.sandbox_available.to_string()),
+            // Where the shared workspace really is on this machine. A guest
+            // reaches it as the preopen `/workspace` and cannot learn the host
+            // path from the preopen itself, but it needs it to say anything
+            // useful in a terminal command — the filesystem tools are rooted at
+            // the conversation's own checkout, which the workspace sits outside
+            // of. Not a secret: it is printed in the UI's workspace explorer.
+            "workspace_dir" => cfg
+                .wasi
+                .dirs
+                .first()
+                .map(|d| d.display().to_string()),
             // The dev kit is wired up; the agent uses this to decide whether to
             // offer itself the self-modification tools.
             "devkit_available" => Some(cfg.devkit.enabled.to_string()),
