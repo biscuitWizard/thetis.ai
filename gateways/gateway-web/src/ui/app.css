@@ -1073,6 +1073,44 @@ body { display: flex; flex-direction: column; }
   line-height: 1.5;
 }
 
+/* A section that folds. Same heading as `.panel-section`, but the rows live
+   inside it and start hidden, so a panel of a dozen domains reads as a table of
+   contents rather than a wall of prose. The chevron sits in the gutter left of
+   the title, where the group heading's indent already leaves room. */
+.panel-group { margin: var(--gap-4) 0 0; }
+.panel-group:first-child { margin-top: 0; }
+.panel-group-summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  padding: var(--gap-1) 0 var(--gap-1) var(--gap-4);
+  position: relative;
+  border-radius: var(--r-sm);
+}
+.panel-group-summary::-webkit-details-marker { display: none; }
+.panel-group-summary::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: calc(var(--gap-1) + .42em);
+  width: 5px; height: 5px;
+  border-right: 1.4px solid var(--text-faint);
+  border-bottom: 1.4px solid var(--text-faint);
+  transform: rotate(-45deg);
+  transition: transform var(--med) var(--ease);
+}
+.panel-group[open] > .panel-group-summary::before { transform: rotate(45deg); }
+.panel-group-summary:hover .panel-section-title { color: var(--text); }
+.panel-group-summary:hover::before { border-color: var(--text-dim); }
+/* The note is the group's explanation and is worth reading while choosing a
+   group, so it stays visible when the group is folded. */
+.panel-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  margin-top: var(--gap-2);
+}
+
 /* The four disclosure levels. Collapsed by default: it explains the model
  * once, and is noise on every later visit. */
 .legend { border: 1px solid var(--hairline); border-radius: var(--r-md); padding: var(--gap-2) var(--gap-3); }
