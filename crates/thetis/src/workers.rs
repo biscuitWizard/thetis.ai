@@ -404,7 +404,29 @@ async fn supervise(
     // Whichever arm won, callers still parked on this peer must be woken now
     // rather than at CALL_TIMEOUT, and no new call may be admitted.
     peer.force_close();
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .ok()
+        .and_then(Result::ok);
+    // How it died, not merely that it did. A worker that ends silently is
+    // indistinguishable from one that was killed, and telling those apart is
+    // the whole difference between a bug in the turn and something outside
+    // reaching in.
+    match status {
+        Some(status) => {
+            use std::os::unix::process::ExitStatusExt;
+            tracing::info!(
+                session = %session_id,
+                code = ?status.code(),
+                signal = ?status.signal(),
+                "worker process ended"
+            );
+        }
+        None => tracing::warn!(
+            session = %session_id,
+            "worker process did not exit within 5s of its socket closing"
+        ),
+    }
     let _ = child.start_kill();
     let _ = child.wait().await;
     let requested = router
