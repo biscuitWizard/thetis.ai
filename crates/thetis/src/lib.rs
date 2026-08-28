@@ -10,6 +10,7 @@ pub mod bindings;
 pub mod branch_api;
 pub mod debug_api;
 pub mod branches;
+pub mod browser;
 pub mod branchops;
 pub mod buildcache;
 pub mod builder;

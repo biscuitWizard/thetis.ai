@@ -53,6 +53,13 @@ pub async fn run() -> Result<()> {
     }
     crate::offload::spawn_stall_detector();
     workers::spawn_reaper(router.clone());
+
+    // The headless browser behind the `web-browser-*` tools. Set up and
+    // supervised here because the gateway outlives every worker, so one browser
+    // serves all conversations and survives their restarts. Non-fatal by
+    // design: it checks node, installs the pinned Playwright if the vendored
+    // copy is missing, and reports through the tools rather than stopping boot.
+    crate::browser::spawn(cfg.clone());
     {
         let grip = grip.clone();
         tokio::spawn(async move {
