@@ -4,8 +4,9 @@
 //! own git worktree. Workers are children of the gateway, not systemd units:
 //! the control socket is inherited at spawn, a replacement can be a
 //! *different* binary (a branch that rebuilt its own kernel), and
-//! `PR_SET_PDEATHSIG` guarantees a dying gateway takes its workers with it —
-//! no orphan can ever squat on a worktree or wedge a terminal.
+//! and a worker that finds itself orphaned exits on its own, so a dying
+//! gateway still takes its workers with it — no orphan can squat on a
+//! worktree or wedge a terminal.
 //!
 //! Materialization is lazy: a conversation gets its branch, worktree, and
 //! worker at its first message. A worker that dies is respawned by the next
@@ -995,14 +996,23 @@ fn spawn_worker_process(
         cmd.env("THETIS_WORKSPACE_DIR", workspace);
     }
 
-    // After fork, before exec: pin the socket to the agreed fd and arrange to
-    // die with the gateway. Only async-signal-safe calls are allowed here.
+    // After fork, before exec: pin the socket to the agreed fd. Only
+    // async-signal-safe calls are allowed here.
+    //
+    // Deliberately *not* `PR_SET_PDEATHSIG`. The kernel delivers that when the
+    // thread that forked dies, not when the parent process does — and a tokio
+    // worker thread is not a stable thing to hang a process's life on. Threads
+    // move between the core and blocking pools (`offload::blocking` uses
+    // `block_in_place`, which does exactly that) and retired blocking threads
+    // exit, at which point every worker forked from one is SIGKILLed while the
+    // gateway is perfectly healthy. That is what was killing conversations
+    // mid-turn: `signal=9`, no shutdown request, nothing in the log. The
+    // guarantee it was there for — no orphan squatting on a worktree — is kept
+    // by the worker watching its own parent instead, which is a property of
+    // the process and cannot be undone by a thread going away.
     unsafe {
         cmd.pre_exec(move || {
             if libc::dup2(theirs_fd, WORKER_SOCKET_FD) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
