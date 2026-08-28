@@ -416,6 +416,63 @@ async fn admin_branch_action(
                 None => "nothing to export yet".to_string(),
             })
         }
+        // The other direction: take in what another checkout published, so
+        // that publishing from here adds to it rather than replacing it.
+        "pull-public" => {
+            let root = branches.root_git();
+            let before = root.head().await?;
+            match crate::publish::plan_pull(root).await? {
+                crate::publish::Pull::NothingPublished => Ok(format!(
+                    "nothing has been published to origin/{} yet, so there is nothing to pull",
+                    crate::publish::REMOTE_BRANCH
+                )),
+                crate::publish::Pull::UpToDate => Ok(format!(
+                    "already up to date with origin/{}",
+                    crate::publish::REMOTE_BRANCH
+                )),
+                crate::publish::Pull::Ready(plan) => {
+                    let count = plan.subjects.len();
+                    let pulled = crate::publish::apply_pull(root, plan).await?;
+                    let Some(commit) = pulled.trunk_commit else {
+                        return Ok(format!(
+                            "origin/{} held nothing this checkout was missing; its history is \
+                             now part of ours, so publishing from here no longer replaces it",
+                            crate::publish::REMOTE_BRANCH
+                        ));
+                    };
+                    // Everyone's page is served from trunk's build, and trunk
+                    // just moved.
+                    crate::roles::gateway::load_ui_gateway(grip).await;
+                    let mut msg = format!(
+                        "pulled {count} commit(s) from origin/{}; trunk is at {}",
+                        crate::publish::REMOTE_BRANCH,
+                        &commit[..12.min(commit.len())]
+                    );
+                    // The guest aspects hot-swap; the kernel does not, and
+                    // nothing here rebuilds it — say so rather than leave the
+                    // operator running a binary older than trunk unawares.
+                    if crate::control::kernel_source_moved(root, &before, "HEAD").await {
+                        msg.push_str(
+                            ". This moved the orchestrator's own source, so trunk's binary is \
+                             now older than trunk — rebuild and restart to run it",
+                        );
+                    }
+                    Ok(msg)
+                }
+            }
+        }
+        // A claim about the past only the operator can make: what is published
+        // now is where this checkout and the remote last agreed.
+        "adopt-remote" => {
+            let root = branches.root_git();
+            let remote = crate::publish::adopt_remote(root).await?;
+            Ok(format!(
+                "adopted origin/{} at {} as the base this checkout last agreed with; pull now \
+                 to join the two histories",
+                crate::publish::REMOTE_BRANCH,
+                &remote[..12.min(remote.len())]
+            ))
+        }
         "push-public" => {
             let root = branches.root_git();
             // Export first. Pushing meant "publish where trunk is now", but the
@@ -620,6 +677,16 @@ hook refuses everything else. Currently private: {private_list}.</p>
       onsubmit="return confirm('Publish to origin/main? This replaces the remote\'s main with the filtered export of trunk.')">
   <input type=hidden name=action value="push-public">
   <button>publish to origin/main</button></form>
+<p class=note>When another checkout publishes too, pull before publishing: it merges what
+they published into trunk here, so the next publish carries both instead of being refused
+for replacing their work. Only paths that leave this machine are touched.</p>
+<form method=post action="/admin/branch">
+  <input type=hidden name=action value="pull-public">
+  <button>pull from origin/main</button></form>
+<form method=post action="/admin/branch"
+      onsubmit="return confirm('Adopt origin/main as the base? Only if what is published there is work this checkout already has — anything on it that is new here would be treated as already-had and dropped from the next publish.')">
+  <input type=hidden name=action value="adopt-remote">
+  <button>adopt origin/main as base</button></form>
 <p class=note>{sessions} session(s) on record.</p>
 <p><a href="/">&larr; back to chat</a></p>"#,
         banner = banner,
