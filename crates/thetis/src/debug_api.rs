@@ -23,7 +23,10 @@ const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
 
 /// True when this frame type belongs here.
 pub fn handles(frame_type: &str) -> bool {
-    frame_type == "debug-request" || frame_type == "turn-cancel" || frame_type == "terminals"
+    frame_type == "debug-request"
+        || frame_type == "turn-cancel"
+        || frame_type == "terminals"
+        || frame_type == "terminal-close"
 }
 
 /// Handles one frame, returning the reply frames to send on this socket.
@@ -39,7 +42,15 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
         .unwrap_or_default()
         .to_string();
 
-    match dispatch(grip, &frame_type, &session).await {
+    // Which shell, for `terminal-close`. A separate field because `id` is
+    // already spoken for by the conversation.
+    let terminal = frame
+        .get("terminal")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    match dispatch(grip, &frame_type, &session, &terminal).await {
         Ok(reply) => vec![reply],
         Err(e) => vec![json!({
             "type": frame_type,
@@ -51,7 +62,12 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
     }
 }
 
-async fn dispatch(grip: &Arc<Grip>, frame_type: &str, session: &str) -> Result<String> {
+async fn dispatch(
+    grip: &Arc<Grip>,
+    frame_type: &str,
+    session: &str,
+    terminal: &str,
+) -> Result<String> {
     let Role::Gateway(router) = &grip.role else {
         anyhow::bail!("debug frames are a gateway concern");
     };
@@ -150,6 +166,37 @@ async fn dispatch(grip: &Arc<Grip>, frame_type: &str, session: &str) -> Result<S
                 "session": session,
                 "ok": true,
                 "terminals": reply.get("terminals").cloned().unwrap_or(json!([])),
+            })
+            .to_string())
+        }
+
+        // Closing one shell from the drawer's trash button.
+        //
+        // Like `terminals`, this never materializes a worker: with none live
+        // there is no shell to close, and spawning one in order to kill nothing
+        // would be a surprising side effect of a delete button.
+        "terminal-close" => {
+            anyhow::ensure!(!terminal.is_empty(), "missing 'terminal'");
+            let id = terminal;
+            let Some(peer) = router.live_peer(session).await else {
+                return Ok(json!({
+                    "type": "terminal-close",
+                    "session": session,
+                    "ok": true,
+                    "id": id,
+                    "note": "that sandbox is not running, so it holds no shells",
+                })
+                .to_string());
+            };
+            let reply = peer
+                .call("terminals.close", json!({ "session": session, "id": id }))
+                .await?;
+            Ok(json!({
+                "type": "terminal-close",
+                "session": session,
+                "ok": reply.get("ok").and_then(|v| v.as_bool()).unwrap_or(true),
+                "id": id,
+                "note": reply.get("note").cloned().unwrap_or(json!(null)),
             })
             .to_string())
         }

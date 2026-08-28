@@ -61,6 +61,17 @@ pub struct TerminalView {
     /// The ssh host the session runs on, empty for a local shell. A drawer tab
     /// has to say which machine a command ran on.
     pub remote: String,
+    /// The agent's label for the session, empty when it did not give one.
+    pub name: String,
+    /// The shell's own process id, which is also its process group leader.
+    /// Shown in the details card, and the one number that lets someone
+    /// correlate a drawer tab with what `ps` on the box is telling them.
+    pub pid: i32,
+    /// Whether the far side allocated a terminal. Governs whether an interrupt
+    /// can be delivered at all, so it belongs in the details.
+    pub pty: bool,
+    /// The user the shell runs as, for the prompt line.
+    pub user: String,
 }
 
 /// What to open, gathered into one struct because the argument list had grown
@@ -100,6 +111,10 @@ struct Session {
     remote: String,
     /// Whether the far side has a terminal. Only a pty can carry an interrupt.
     pty: bool,
+    /// Who the shell runs as, for the drawer's `user@host:cwd $` prompt line.
+    /// Resolved once at open: for a local shell from the environment, for a
+    /// remote one from the ssh host's login user.
+    user: String,
     /// The marker a backgrounded command will print when it finishes.
     ///
     /// This is what makes "start it and come back later" work without a second
@@ -248,6 +263,10 @@ impl Terminals {
                 alive: matches!(s.child.try_wait(), Ok(None)),
                 commands: s.commands,
                 remote: s.remote.clone(),
+                name: s.name.clone(),
+                pid: s.pgid,
+                pty: s.pty,
+                user: s.user.clone(),
                 transcript: s
                     .display
                     .lock()
@@ -413,6 +432,15 @@ impl Terminals {
             None => cfg.terminal.shell.clone(),
         };
         let remote = host.as_ref().map(|h| h.name.clone()).unwrap_or_default();
+        // A remote host may not state a user, in which case ssh falls back to
+        // the local one — same rule as ssh's, so the prompt cannot claim a
+        // login that is not what happened.
+        let user = match &host {
+            Some(host) if !host.user.is_empty() => host.user.clone(),
+            _ => std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_default(),
+        };
 
         sessions.insert(
             id.clone(),
@@ -423,6 +451,7 @@ impl Terminals {
                 shell: shell.clone(),
                 remote: remote.clone(),
                 pty: host.as_ref().is_some_and(|h| h.pty),
+                user,
                 pending: None,
                 child,
                 stdin,
@@ -837,7 +866,7 @@ impl Terminals {
         // stdin, and a script larger than the pipe buffer parks there — and
         // holding the map lock across that froze every other terminal call,
         // including the `terminal_list` someone would use to diagnose it.
-        let (buffer, display, stdin, pgid, leader, cwd, shell) = {
+        let (buffer, display, stdin, pgid, leader, cwd, shell, user) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(id)
@@ -861,13 +890,20 @@ impl Terminals {
                 session.child.id().unwrap_or(0) as i32,
                 session.cwd.clone(),
                 session.shell.clone(),
+                session.user.clone(),
             )
         };
 
         // The command itself, echoed into the watcher's transcript. A shell fed
         // from a pipe prints no prompt and no echo, so without this the drawer
         // would show output with nothing to say what produced it.
-        let prompt = format!("$ {command}\n");
+        //
+        // Styled as a real prompt — `user@host:cwd $ command` — because the
+        // drawer shows several shells that may sit on different machines in
+        // different directories, and a bare `$` cannot tell them apart. The
+        // pieces are wrapped in the marker prefix's sibling escape below rather
+        // than coloured here; see `prompt_line`.
+        let prompt = prompt_line(&user, &remote, &cwd, command);
         append_display(&display, &prompt);
         self.announce(id, "command", prompt, &cwd, &shell, &remote);
 
@@ -1270,7 +1306,7 @@ where
             if line.contains(MARKER_PREFIX) {
                 continue;
             }
-            let text = format!("{line}\n");
+            let text = indent_output(line);
             append_display(&watch.display, &text);
             // cwd, shell and remote are left empty on an output event: the
             // drawer already has them from `opened`, and the pump would have to
@@ -1285,6 +1321,69 @@ where
             });
         }
     });
+}
+
+/// The prompt line the drawer shows above a command's output.
+///
+/// A shell fed from a pipe never prints a prompt, so this is synthesised. It is
+/// coloured with SGR escapes rather than styled in CSS because the transcript
+/// is a single stream of text inside the emulator — there is no DOM node per
+/// line to attach a class to.
+///
+/// The command is written last and never coloured, so a command containing its
+/// own escapes cannot leak style into the prompt that follows it: everything is
+/// reset before the command begins.
+fn prompt_line(user: &str, remote: &str, cwd: &str, command: &str) -> String {
+    let mut out = String::from("\r\n\x1b[38;5;71m");
+    if user.is_empty() {
+        out.push_str("shell");
+    } else {
+        out.push_str(user);
+    }
+    // A local shell says the directory only; a remote one has to name the
+    // machine, since two tabs may otherwise look identical.
+    if !remote.is_empty() {
+        out.push('@');
+        out.push_str(remote);
+    }
+    out.push_str("\x1b[0m:\x1b[38;5;110m");
+    out.push_str(&contract_home(cwd));
+    out.push_str("\x1b[0m\x1b[38;5;245m $ \x1b[0m");
+    // A multi-line command would break the indent of the output that follows,
+    // so continuation lines are folded onto one with a visible marker.
+    let flat = command.trim_end();
+    if flat.contains('\n') {
+        let joined: Vec<&str> = flat.lines().map(str::trim).collect();
+        out.push_str(&joined.join(" \x1b[38;5;245m⏎\x1b[0m "));
+    } else {
+        out.push_str(flat);
+    }
+    out.push_str("\r\n");
+    out
+}
+
+/// Replaces the home directory with `~`, as a shell prompt does. Keeps a deep
+/// path from pushing the `$` off the end of a narrow drawer.
+fn contract_home(cwd: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && cwd.starts_with(&home) {
+        return format!("~{}", &cwd[home.len()..]);
+    }
+    cwd.to_string()
+}
+
+/// Indents one line of command output so it reads as subordinate to the prompt
+/// above it.
+///
+/// The indent is written after any escape the line begins with, and `\r` is
+/// emitted first, because a program that returns the carriage to redraw a
+/// progress line would otherwise overwrite the indent and leave the line
+/// hanging two columns left of its neighbours.
+fn indent_output(line: &str) -> String {
+    if line.is_empty() {
+        return "\r\n".to_string();
+    }
+    format!("\r  {line}\r\n")
 }
 
 fn take(buffer: &Arc<Mutex<String>>) -> String {
@@ -1343,6 +1442,73 @@ mod tests {
 
     fn buffer_of(text: &str) -> Arc<Mutex<String>> {
         Arc::new(Mutex::new(text.to_string()))
+    }
+
+    /// Strips SGR escapes, so a test can assert on what a human reads rather
+    /// than on the colour codes wrapped around it.
+    fn plain(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Consume through the terminating 'm' of a CSI sequence.
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_prompt_line_names_the_user_and_the_directory() {
+        let line = prompt_line("bitmuse", "", "/srv/app", "cargo build");
+        assert_eq!(plain(&line), "\r\nbitmuse:/srv/app $ cargo build\r\n");
+        // The command is written after a reset, so a command containing its own
+        // escapes cannot leak style into what follows.
+        assert!(line.ends_with("\x1b[0mcargo build\r\n"));
+    }
+
+    #[test]
+    fn a_remote_prompt_names_the_machine() {
+        let line = prompt_line("build", "buildbox", "/srv/app", "make");
+        assert_eq!(plain(&line), "\r\nbuild@buildbox:/srv/app $ make\r\n");
+    }
+
+    #[test]
+    fn a_missing_user_still_produces_a_usable_prompt() {
+        let line = prompt_line("", "", "/tmp", "ls");
+        assert_eq!(plain(&line), "\r\nshell:/tmp $ ls\r\n");
+    }
+
+    #[test]
+    fn a_multi_line_command_is_folded_onto_one_prompt_line() {
+        // Otherwise the continuation lines land at column zero and break the
+        // indent of the output beneath them.
+        let line = prompt_line("u", "", "/tmp", "for f in *; do\n  echo $f\ndone");
+        let text = plain(&line);
+        assert_eq!(text.matches('\n').count(), 2, "only the wrapping newlines: {text:?}");
+        assert!(text.contains("for f in *; do ⏎ echo $f ⏎ done"), "{text:?}");
+    }
+
+    #[test]
+    fn output_is_indented_under_its_prompt() {
+        assert_eq!(indent_output("Compiling thetis"), "\r  Compiling thetis\r\n");
+        // A blank line stays blank rather than becoming two stray spaces.
+        assert_eq!(indent_output(""), "\r\n");
+    }
+
+    #[test]
+    fn the_indent_survives_a_carriage_return_redraw() {
+        // A progress bar rewrites its line with \r. The indent is re-emitted
+        // after it, so the redrawn line does not end up two columns left of
+        // its neighbours.
+        let out = indent_output("\rDownloading 50%");
+        assert!(out.starts_with("\r  "), "{out:?}");
     }
 
     #[test]

@@ -154,6 +154,36 @@ impl Handler for WorkerHandler {
                 "terminals.list" => Ok(serde_json::json!({
                     "terminals": grip.terminals.views().await,
                 })),
+                // Closing a shell from the drawer. The agent may be holding
+                // this session, so the kill goes through the same `close` the
+                // agent's own tool uses — process group and all — and the
+                // resulting `closed` feed event is what updates every watching
+                // tab, including the one that asked.
+                "terminals.close" => {
+                    let id = params
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if id.is_empty() {
+                        anyhow::bail!("terminals.close needs an id");
+                    }
+                    match grip.terminals.close(&id).await {
+                        Ok(note) => Ok(serde_json::json!({
+                            "ok": true,
+                            "id": id,
+                            "note": note,
+                        })),
+                        // A shell that has already gone is the outcome the
+                        // caller wanted, so this is reported as success rather
+                        // than as an error the drawer would have to explain.
+                        Err(e) => Ok(serde_json::json!({
+                            "ok": true,
+                            "id": id,
+                            "note": format!("{e:#}"),
+                        })),
+                    }
+                }
                 "live_revisions" => {
                     let map: std::collections::BTreeMap<String, u64> = grip
                         .loader

@@ -73,6 +73,10 @@ connection.onOpen(() => {
 // and a newly opened shell all funnel through the same request.
 const terminals = mountTerminals({
   onRequest: (id) => connection.send({ type: "terminals", id }),
+  // `id` is the conversation everywhere on this socket, so the shell goes in
+  // its own field rather than overloading it.
+  onKill: (terminal) =>
+    connection.send({ type: "terminal-close", id: store.current, terminal }),
 });
 
 // A reconnect replays `open` for the same conversation, which `setSession`
@@ -261,6 +265,18 @@ connection
   // Pushed by the worker as it happens rather than polled: watching a build
   // scroll is the entire point of the drawer.
   .on("terminal", terminals.onFeed)
+  // The outcome of the drawer's own kill button. The list is not rebuilt from
+  // this: the `closed` feed event that follows is what removes the row, so a
+  // shell killed from another tab disappears the same way. This only has to
+  // report a failure, since success is already visible.
+  .on("terminal-close", (frame) => {
+    if (frame.session && frame.session !== store.current) return;
+    if (!frame.ok) {
+      toast(frame.message || `Could not close ${frame.id || "that shell"}.`, { tone: "error" });
+    } else if (frame.note) {
+      toast(frame.note, { tone: "info" });
+    }
+  })
 
   .on("turn-cancel", (frame) => {
     if (frame.session && frame.session !== store.current) return;
@@ -300,7 +316,7 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?)/.test(frame.message || "")) return;
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-)/.test(frame.message || "")) return;
     // An error naming the frame it answers is that frame's verdict. A `send`
     // that reached the host and then failed — a worker that will not start,
     // say — arrives exactly this way, and the composer is locked behind an
