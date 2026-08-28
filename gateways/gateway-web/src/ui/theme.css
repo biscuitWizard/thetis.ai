@@ -1,0 +1,81 @@
+/* Thetis design tokens.
+ *
+ * Everything visual is expressed here, so restyling the whole surface is a
+ * one-file change. Layout and component rules live in app.css and refer to
+ * these names only.
+ */
+
+:root {
+  /* Depth: each surface sits one step above the last. */
+  --bg:          #0b0b0f;
+  --surface-1:   #101016;
+  --surface-2:   #16161f;
+  --surface-3:   #1d1d28;
+  --hairline:    #24242f;
+  --hairline-strong: #32323f;
+
+  /* Text */
+  --text:        #ececf2;
+  --text-dim:    #a3a3b4;
+  --text-faint:  #6e6e82;
+
+  /* Accent — a single hue, used sparingly */
+  --accent:      #7c9cff;
+  --accent-hot:  #96b0ff;
+  --accent-deep: #4a5fd0;
+  --accent-wash: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-edge: color-mix(in srgb, var(--accent) 38%, transparent);
+
+  /* Semantic */
+  --ok:          #7fd18f;
+  --warn:        #e8b673;
+  --err:         #f2788f;
+  --ok-wash:     color-mix(in srgb, var(--ok) 12%, transparent);
+  --err-wash:    color-mix(in srgb, var(--err) 12%, transparent);
+  --warn-wash:   color-mix(in srgb, var(--warn) 12%, transparent);
+
+  /* Type */
+  --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --text-xs:  11.5px;
+  --text-sm:  12.5px;
+  --text-md:  14px;
+  --text-lg:  15.5px;
+  --leading:  1.65;
+
+  /* Shape */
+  --r-sm: 7px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 18px;
+  --r-pill: 999px;
+
+  /* Space */
+  --gap-1: 4px;
+  --gap-2: 8px;
+  --gap-3: 12px;
+  --gap-4: 16px;
+  --gap-5: 24px;
+  --gap-6: 32px;
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, .35);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, .5);
+
+  /* Motion — short enough to feel immediate, long enough to read */
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  --fast: 110ms;
+  --med: 180ms;
+
+  /* Layout */
+  --sidebar-w: 272px;
+  --measure: 48rem;
+  /* The system status bar's height. Anything that pins itself to the bottom of
+     the viewport clears this rather than guessing. */
+  --statusbar-h: 26px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --fast: 0ms; --med: 0ms; }
+}
