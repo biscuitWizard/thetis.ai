@@ -24,7 +24,8 @@ fn err(msg: impl Into<String>) -> wasmtime::Error {
 }
 
 use crate::bindings::types::{
-    Attachment, CompileReport, ConfigEntry, Dependency, EventRecord, ExecResult, FsEntry, InboxItem,
+    Attachment, CompactionProgress, CompileReport, ConfigEntry, Dependency, EventRecord,
+    ExecResult, FsEntry, InboxItem,
     LlmError, LogLevel, ModeInfo, ModTarget, ModelInfo, SessionEvent,
     SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen, TerminalOutput,
     ToolManifest,
@@ -266,6 +267,25 @@ impl session::Host for HostState {
         Ok(())
     }
 
+    /// Compaction progress, transient like a token delta.
+    ///
+    /// Not persisted: the log already records the outcome as
+    /// `context-compacted`, and how far along a summary run got is only
+    /// interesting while it is running. What it buys is a surface that shows
+    /// something during the tens of seconds compaction can take, instead of a
+    /// started turn that says nothing.
+    async fn emit_compaction_progress(
+        &mut self,
+        session_id: String,
+        progress: CompactionProgress,
+    ) -> Result<()> {
+        self.budget.entered_host("emit_compaction_progress");
+        self.scope_ok(&session_id)?;
+        self.grip()
+            .publish_transient(&session_id, SessionEvent::CompactionProgress(progress));
+        Ok(())
+    }
+
     async fn poll_inbox(&mut self, session_id: String) -> Result<Vec<InboxItem>> {
         self.budget.entered_host("poll_inbox");
         self.scope_ok(&session_id)?;
@@ -496,9 +516,18 @@ impl llm::Host for HostState {
             return Ok(Err(e));
         }
         let llm = self.grip.llm.clone();
-        let result = llm.chat(&request_json).await;
+        // Interruptible, unlike `stream_next`'s own hand-rolled race, because
+        // this is a single await that can last tens of seconds and had no stop
+        // checkpoint at all. Compaction is the caller that made this matter:
+        // it runs several of these back to back before the turn's first
+        // completion, and while they ran the stop button, the terminal views
+        // and everything else driven by the turn were dead.
+        let result = self.interruptible("the completion", llm.chat(&request_json)).await;
         self.yielded();
-        Ok(result)
+        Ok(match result {
+            Ok(result) => result,
+            Err(stopped) => Err(LlmError::Transport(stopped)),
+        })
     }
 
     async fn stream_open(

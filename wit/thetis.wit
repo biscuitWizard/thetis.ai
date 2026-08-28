@@ -99,6 +99,33 @@ interface types {
     tokens-before: u32,
   }
 
+  /// How far a compaction has got, streamed to clients while it runs.
+  ///
+  /// Compaction happens before the first completion of a turn and can take tens
+  /// of seconds: several calls to the summary model, one per span. Without this
+  /// the surface shows a turn that has started and then says nothing at all,
+  /// which reads as a hang. Transient, like `stream-delta`: the log already
+  /// records the outcome as `context-compacted`, and progress is only
+  /// interesting while it is happening.
+  record compaction-progress {
+    /// "planning" | "summarizing" | "finished" | "failed" | "cancelled"
+    phase: string,
+    /// 1-based span being summarized now; 0 when not summarizing.
+    span: u32,
+    /// Spans this compaction will summarize; 0 until planning is done.
+    spans: u32,
+    /// Messages the plan replaces, so far.
+    messages: u32,
+    /// The provider's count of the context that triggered this.
+    tokens-before: u32,
+    /// What the policy is aiming to get down to.
+    tokens-target: u32,
+    /// The model doing the summarizing.
+    model: string,
+    /// A short human-readable line for the surface to show.
+    detail: string,
+  }
+
   // A branch operation on this conversation's sandbox: trunk updates,
   // merges, resets, conflict handoffs. In the log so the transcript shows
   // version history inline and every tab sees it the same way.
@@ -126,6 +153,8 @@ interface types {
     stream-delta(string),
     context-compacted(compaction),
     branch-op(branch-op),
+    // Transient, like `stream-delta`: never persisted, only rendered.
+    compaction-progress(compaction-progress),
   }
 
   record event-record {
@@ -454,12 +483,16 @@ interface sys {
 
 interface session {
   use types.{attachment, event-record, session-event, session-meta, inbox-item,
-             tool-manifest};
+             tool-manifest, compaction-progress};
 
   events: func(session-id: string, from-seq: u64) -> list<event-record>;
   append: func(session-id: string, event: session-event) -> u64;
   // Streams a token fragment to connected clients without persisting it.
   emit-output: func(session-id: string, chunk: string);
+  // Streams compaction progress to connected clients without persisting it.
+  // Separate from `emit-output` because it is structured: the surface draws a
+  // progress element from it rather than appending text.
+  emit-compaction-progress: func(session-id: string, progress: compaction-progress);
   // Drains mid-turn user input (nudges / cancel) so a running turn can steer.
   poll-inbox: func(session-id: string) -> list<inbox-item>;
 
