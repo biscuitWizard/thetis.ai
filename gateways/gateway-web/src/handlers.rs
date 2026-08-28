@@ -86,6 +86,19 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
             None => vec![error("tools requires an id")],
         },
 
+        // Overriding which tool groups this conversation offers the model.
+        // Replies with the whole `tools` frame rather than an acknowledgement,
+        // so the panel redraws from what the store now actually holds instead
+        // of from what the client hoped it wrote.
+        "tool-groups-set" => match id {
+            Some(session) => set_tool_groups(session, frame),
+            None => vec![error("tool-groups-set requires an id")],
+        },
+        "tool-groups-reset" => match id {
+            Some(session) => reset_tool_groups(session),
+            None => vec![error("tool-groups-reset requires an id")],
+        },
+
         "set-model" => match (id, frame.get("model").and_then(Value::as_str)) {
             (Some(session), Some(model)) => {
                 host::set_session_model(session, model);
@@ -499,51 +512,294 @@ fn skills(session_id: &str) -> GatewayAction {
     }))
 }
 
-/// The domain a tool belongs to, so the surface can be shown grouped by what a
-/// tool touches rather than as one long flat list. Derived from the name —
-/// names are stable and already domain-scoped — with a plain "Other" fallback
-/// for anything unrecognised, such as a new component or a connected MCP tool.
-fn tool_group(name: &str) -> &'static str {
-    match name {
-        "read_file" | "write_file" | "read_path" | "write_path" | "list_path"
-        | "delete_path" | "edit_path" | "search_files" | "find_files" => "Files",
-        "exec" => "Shell",
-        "remember" | "recall" => "Memory",
-        "list_config" | "read_config" | "set_config" | "config-probe" => "Configuration",
-        "new_tool" | "read_code" | "write_code" | "patch_code" | "list_code"
-        | "add_dependency" | "remove_dependency" | "list_dependencies"
-        | "restart_orchestrator" => "Code & tools",
-        "update_from_trunk" | "reset_branch" | "complete_merge" | "abort_merge" => {
-            "Version control"
-        }
-        // The ssh host registry belongs with the terminal: its whole purpose is
-        // naming a machine `terminal_open` can open a session on.
-        _ if name.starts_with("terminal_") || name.starts_with("ssh_host") => "Shell",
-        _ if name.starts_with("skill_") => "Skills",
-        _ if name.starts_with("branch_") => "Version control",
-        _ if name.starts_with("web-") || name.starts_with("web_") => "Web",
-        _ if name.starts_with("notion-") => "Notion",
-        // The git-* components and the git_clone built-in. Kept apart from
-        // "Version control", which is this conversation's own sandbox branch —
-        // a different thing from a remote repository on GitHub.
-        _ if name.starts_with("git-") || name.starts_with("git_") => "Git",
-        _ => "Other",
-    }
+// --- tool groups ------------------------------------------------------------
+//
+// The agent owns the group table and the routing; this reads both out of the KV
+// store rather than asking, and writes the pin back to override.
+//
+// Why the store and not a call: `available-tools` asks the agent directly, but
+// it routes through `workers::call_session`, so it needs a live worker. Workers
+// are the shortest-lived thing in the system, and opening a panel must not
+// spawn one — a group inspector that did would be empty for exactly the stopped
+// and archived conversations someone is most likely to be inspecting. The agent
+// publishes its table once per turn instead.
+//
+// These four literals are the seam between two components that cannot share a
+// constant. Their definitions, with the reasoning, are in
+// `agents/agent-core/src/groups.rs`; a rename there means a grep for them here.
+const TABLE_KEY: &str = "__tool_group_table";
+const PIN_KEY: &str = "__tool_groups";
+const WHY_KEY: &str = "__tool_groups_why";
+const REASON_MANUAL: &str = "manual";
+
+
+/// The published group table, or `None` before the agent has ever run a turn.
+fn group_table() -> Option<Value> {
+    serde_json::from_str(&sys::kv_get("global", TABLE_KEY)?).ok()
 }
 
-/// Exactly the tools the agent would offer for this conversation's mode.
+/// The pinned active set for a conversation. Empty means never routed, which is
+/// not the same as routed to nothing — with no pin the agent offers everything.
+fn pinned_groups(session_id: &str) -> Vec<String> {
+    sys::kv_get(session_id, PIN_KEY)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why each active group is active, as written during routing.
+fn group_reasons(session_id: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    for line in sys::kv_get(session_id, WHY_KEY).unwrap_or_default().lines() {
+        if let Some((id, reason)) = line.split_once('=') {
+            let id = id.trim();
+            if !id.is_empty() {
+                out.insert(id.to_string(), json!(reason.trim()));
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Which group a tool belongs to, according to the agent's published table.
+///
+/// Mirrors `groups::component_group`: a component's own `group:<id>` capability
+/// wins, then the name-prefix convention, then the ungrouped fallback. Built-in
+/// membership is a straight table lookup.
+///
+/// This replaced a second, name-derived grouping that used to live here with
+/// different ids and different boundaries — so the panel grouped tools one way
+/// while the agent scoped them another, and neither knew about the other. There
+/// is one table now, and it is the one that decides what the model sees.
+fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
+    let ungrouped = table
+        .get("ungrouped")
+        .and_then(Value::as_str)
+        .unwrap_or("extra");
+    let groups = table.get("groups").and_then(Value::as_array);
+
+    if let Some(groups) = groups {
+        for group in groups {
+            let members = group.get("members").and_then(Value::as_array);
+            let hit = members.is_some_and(|m| m.iter().any(|v| v.as_str() == Some(name)));
+            if hit {
+                return group
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(ungrouped)
+                    .to_string();
+            }
+        }
+    }
+
+    let known = |id: &str| {
+        groups.is_some_and(|gs| {
+            gs.iter()
+                .any(|g| g.get("id").and_then(Value::as_str) == Some(id))
+        })
+    };
+
+    for cap in capabilities {
+        if let Some(id) = cap.strip_prefix("group:") {
+            let id = id.trim();
+            return if known(id) { id } else { ungrouped }.to_string();
+        }
+    }
+    for (prefix, id) in [
+        ("bq-", "bigquery"),
+        ("notion-", "notion"),
+        ("web-", "web"),
+        ("git-", "github"),
+    ] {
+        if name.starts_with(prefix) && known(id) {
+            return id.to_string();
+        }
+    }
+    ungrouped.to_string()
+}
+
+/// Exactly the tools the agent would offer for this conversation's mode, each
+/// tagged with its group, plus the group table and what is currently attached.
+///
+/// `available_tools` still answers what the agent would offer, so the tool list
+/// cannot drift from reality. The group state is layered on top from the store.
 fn tools(session_id: &str) -> GatewayAction {
+    let table = group_table();
+    let pinned = pinned_groups(session_id);
+    let enabled = table
+        .as_ref()
+        .and_then(|t| t.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // With scoping off, or before any routing has happened, every group is
+    // attached — that is exactly what the agent does with no pin.
+    let all_ids: Vec<String> = table
+        .as_ref()
+        .and_then(|t| t.get("groups"))
+        .and_then(Value::as_array)
+        .map(|gs| {
+            gs.iter()
+                .filter_map(|g| g.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let active: Vec<String> = if !enabled || pinned.is_empty() {
+        all_ids.clone()
+    } else {
+        pinned.clone()
+    };
+
+    // Whether the panel knows enough to claim a tool is being withheld.
+    //
+    // Before the agent's first turn there is no published table, so every tool
+    // resolves to the ungrouped fallback and matches no active id — which the
+    // naive reading turns into "0 of 75 tools attached", the exact opposite of
+    // the truth, since an unrouted conversation is offered everything. The
+    // fallback has to fail towards "attached": an unmarked tool that is in fact
+    // withheld is a missing hint, while a tool marked withheld that is really
+    // in the prompt is the panel lying about the thing it exists to report.
+    let known = enabled && table.is_some();
+
+    let tools: Vec<Value> = host::available_tools(session_id)
+        .iter()
+        .map(|t| {
+            let group = table
+                .as_ref()
+                .map(|tb| tool_group_id(tb, &t.name, &t.capabilities))
+                .unwrap_or_else(|| "extra".to_string());
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "schema": t.args_schema_json,
+                "capabilities": t.capabilities,
+                "group": group,
+                // Whether this tool's definition is actually in the prompt.
+                // `available_tools` reports the mode-filtered surface; scoping
+                // narrows it further, and that difference is the thing the
+                // panel exists to show.
+                "attached": !known || active.iter().any(|a| *a == group),
+            })
+        })
+        .collect();
+
     reply(json!({
         "type": "tools",
         "session": session_id,
-        "tools": host::available_tools(session_id).iter().map(|t| json!({
-            "name": t.name,
-            "description": t.description,
-            "schema": t.args_schema_json,
-            "capabilities": t.capabilities,
-            "group": tool_group(&t.name),
-        })).collect::<Vec<_>>(),
+        "tools": tools,
+        "groups": table.as_ref().and_then(|t| t.get("groups")).cloned().unwrap_or(json!([])),
+        "active": active,
+        "reasons": group_reasons(session_id),
+        "grouping": enabled,
+        // Distinguishes "the user has overridden or the agent has routed" from
+        // "nothing has decided yet", which the active set alone cannot say.
+        "routed": !pinned.is_empty(),
     }))
+}
+
+/// Whether the published table marks a group as always attached.
+fn always_on(table: Option<&Value>, id: &str) -> bool {
+    table
+        .and_then(|t| t.get("groups"))
+        .and_then(Value::as_array)
+        .and_then(|gs| {
+            gs.iter()
+                .find(|g| g.get("id").and_then(Value::as_str) == Some(id))
+        })
+        .and_then(|g| g.get("always_on"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Overrides which groups this conversation offers the model.
+///
+/// Writes the pin the agent reads. Deliberately not validated here beyond
+/// dropping unknown ids: `groups::read_pin` repairs the pin on every read —
+/// forcing always-on groups back in — so the invariant that `tool_search`
+/// survives is enforced by the component that depends on it, not by this one.
+/// A gateway bug therefore cannot strand a conversation without an escape
+/// hatch.
+fn set_tool_groups(session_id: &str, frame: &Value) -> Vec<GatewayAction> {
+    let Some(wanted) = frame.get("groups").and_then(Value::as_array) else {
+        return vec![error("tool-groups-set requires a groups array")];
+    };
+    // The table is published on the agent's first turn, so a conversation that
+    // has never run one has no group vocabulary to check against. That used to
+    // be a hard error, which made the buttons dead on exactly the conversation
+    // someone is most likely to be setting up by hand. Refuse only when there
+    // is genuinely nothing to validate against.
+    let table = group_table();
+    let known: Vec<String> = table
+        .as_ref()
+        .and_then(|t| t.get("groups"))
+        .and_then(Value::as_array)
+        .map(|gs| {
+            gs.iter()
+                .filter_map(|g| g.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if known.is_empty() {
+        return vec![error(
+            "the agent has not published its tool groups yet — send a message first",
+        )];
+    }
+
+    // Kept in table order, so the tool block the agent builds from this is
+    // byte-identical whatever order the client sent, and the provider's prompt
+    // cache is not missed by a reordering alone.
+    //
+    // Always-on groups are written in whether or not they were asked for. Two
+    // reasons: the agent forces them back on read anyway, so omitting them
+    // would make the panel disagree with the prompt; and an empty pin means
+    // "never routed", not "routed to nothing" — so a request for no groups at
+    // all would silently read as a reset and attach everything, the opposite of
+    // what was asked. With the floor written, the pin is never empty.
+    let chosen: Vec<String> = known
+        .iter()
+        .filter(|id| {
+            let asked = wanted
+                .iter()
+                .any(|w| w.as_str().map(|w| w == id.as_str()).unwrap_or(false));
+            asked || always_on(table.as_ref(), id)
+        })
+        .cloned()
+        .collect();
+
+    sys::kv_put(session_id, PIN_KEY, &chosen.join("\n"));
+
+    // Reasons are rewritten wholesale: a group the user removed and re-added
+    // must not still claim it arrived by tag match. Always-on groups are
+    // labelled as such even though the agent will re-add them regardless, so
+    // the panel can explain why they cannot be switched off.
+    let why: String = chosen
+        .iter()
+        .map(|id| {
+            let reason = if always_on(table.as_ref(), id) {
+                "always-on"
+            } else {
+                REASON_MANUAL
+            };
+            format!("{id}={reason}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sys::kv_put(session_id, WHY_KEY, &why);
+
+    vec![tools(session_id)]
+}
+
+/// Clears the override, letting the agent route this conversation again from
+/// its own evidence on the next turn.
+fn reset_tool_groups(session_id: &str) -> Vec<GatewayAction> {
+    sys::kv_put(session_id, PIN_KEY, "");
+    sys::kv_put(session_id, WHY_KEY, "");
+    vec![tools(session_id)]
 }
 
 fn session_settings(session_id: &str) -> GatewayAction {

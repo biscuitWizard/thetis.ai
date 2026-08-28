@@ -23,6 +23,9 @@ WANTED = [
     "pub fn score(",
     "pub fn coverage_gaps(",
     "fn in_table_order(",
+    # The pin is written by the web gateway as well as by the agent, so its
+    # repair-on-read is a safety property rather than an internal detail.
+    "fn repair_pin(",
 ]
 
 lines = src.split("\n")

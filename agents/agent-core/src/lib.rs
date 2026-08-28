@@ -642,6 +642,10 @@ impl Turn {
         // thing that would ever say so.
         groups::check_coverage(&tools::builtin_names());
 
+        // Published whether or not grouping is on, so the panel can show the
+        // table — and say that scoping is off — without needing a live worker.
+        groups::publish_table();
+
         if !groups::grouping_enabled() {
             return;
         }
