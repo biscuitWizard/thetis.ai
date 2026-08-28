@@ -27,6 +27,7 @@ use thetis::grip::types::{
 use serde_json::{json, Value};
 
 mod compaction;
+mod groups;
 mod tools;
 
 struct Component;
@@ -88,6 +89,10 @@ struct Turn {
     completion_tokens: u32,
     cost_usd: f64,
     tools_used: Vec<String>,
+    /// How many tool definitions this turn offered, and roughly what they cost
+    /// in tokens. Set at the first completion and left alone, so the turn-end
+    /// report can put it against `tools_used`. `(0, 0)` means no completion ran.
+    offered: (usize, usize),
     stopped_by: &'static str,
     /// Nudge text seen at a checkpoint where a `user` message would not have
     /// been legal yet, waiting to be added by `flush_pending`.
@@ -125,6 +130,7 @@ impl Turn {
             completion_tokens: 0,
             cost_usd: 0.0,
             tools_used: Vec::new(),
+            offered: (0, 0),
             stopped_by: "stop",
             pending: Vec::new(),
             cancelled: false,
@@ -136,6 +142,10 @@ impl Turn {
         // Before the first completion, so the cards are present for the answer
         // they were chosen for rather than the one after it.
         self.retrieve_skills_once();
+        // Strictly after skill retrieval: a retrieved skill's `tool-group:` tags
+        // are the strongest evidence for which groups this conversation wants,
+        // and they do not exist until the pin does.
+        self.route_tools_once();
         self.maybe_compact();
 
         // A stop pressed during compaction should end the turn there, not after
@@ -277,6 +287,8 @@ impl Turn {
             self.flush_pending();
         }
 
+        self.report_tool_accounting();
+
         Ok(TurnStats {
             iterations: self.iterations,
             prompt_tokens: self.prompt_tokens,
@@ -285,6 +297,44 @@ impl Turn {
             tools_used: self.tools_used,
             stopped_by: self.stopped_by.to_string(),
         })
+    }
+
+    /// The one line per turn that says whether scoping is worth it.
+    ///
+    /// Emitted at turn end rather than per iteration because the comparison only
+    /// closes here: what was offered is known at the first completion, but what
+    /// was *used* is not known until the loop stops. Logged at info, since a
+    /// measurement nobody reads cannot settle the question it exists for.
+    fn report_tool_accounting(&self) {
+        if !groups::accounting_enabled() {
+            return;
+        }
+        let (offered, tokens) = self.offered;
+        if offered == 0 {
+            // No completion happened — cancelled before starting, say. Nothing
+            // was offered, so there is no ratio to report.
+            return;
+        }
+        let used = self.tools_used.len();
+        let scope = if groups::grouping_enabled() {
+            groups::active(&self.session_id).join("+")
+        } else {
+            "off".to_string()
+        };
+        // Waste is the honest headline: the tokens spent describing tools the
+        // model did not touch. It is an upper bound on what scoping could save,
+        // not a claim that scoping would have saved it — some of those
+        // definitions are why the model correctly chose another.
+        let unused = offered.saturating_sub(used);
+        sys::log(
+            LogLevel::Info,
+            &format!(
+                "tool accounting: offered {offered} tools (~{tokens} tokens), used {used} \
+                 ({}), {unused} unused, iterations={}, scope={scope}",
+                self.tools_used.join(", "),
+                self.iterations,
+            ),
+        );
     }
 
     /// Rebuilds the model's view of the conversation from the event log.
@@ -511,6 +561,23 @@ impl Turn {
             prompt.push('\n');
         }
 
+        // Scoping has to be *told*, not just done. Withholding a tool tells the
+        // model what it cannot do and never what it should do instead: left to
+        // itself it meets the gap and works around it — writes a shell pipeline
+        // rather than asking for the tool that does the job. The same reasoning
+        // as the mode prompt above.
+        if groups::grouping_enabled() {
+            let active = groups::active(&self.session_id);
+            prompt.push_str(
+                "\n# Tool groups\n\
+                 Your tool list is scoped to what this conversation looks like it needs, so \
+                 capabilities you have may not be visible right now. Call `tool_search` to load \
+                 a group the moment you suspect a tool exists but cannot see it — do not work \
+                 around the gap. Nothing is ever unloaded.\n\n",
+            );
+            prompt.push_str(&groups::catalogue(&active));
+        }
+
         prompt
     }
 
@@ -558,6 +625,74 @@ impl Turn {
         self.rehydrate();
     }
 
+    /// Decides which tool groups this conversation gets, once, and pins them.
+    ///
+    /// Deliberately cheap and deliberately generous: no embedding call, no
+    /// extra model round trip, and a single tag match is enough to admit a
+    /// group. The asymmetry is the point — a group admitted needlessly costs
+    /// some tokens, whereas a group wrongly withheld costs a capability, and
+    /// "How Many Tools Should an LLM Agent See?" (2605.24660) is the warning
+    /// there: its adaptive cut-off scored 0% on hard queries that a fixed,
+    /// larger candidate set got 16.7% on, because a candidate that never enters
+    /// the pool cannot be recovered later. Here it can — `tool_search` exists
+    /// precisely so that this decision is never final.
+    fn route_tools_once(&mut self) {
+        // Checked whether or not grouping is on: with it off, an untabled
+        // built-in is invisible in every observable way, and this is the only
+        // thing that would ever say so.
+        groups::check_coverage(&tools::builtin_names());
+
+        if !groups::grouping_enabled() {
+            return;
+        }
+        let query = self.first_user_message().unwrap_or_default();
+        let before = groups::active(&self.session_id);
+        let active = groups::route_once(&self.session_id, &query);
+        // The prompt names the active groups, so a first-time routing changes
+        // it and the rebuilt version is what the completion should see.
+        if before != active {
+            self.rehydrate();
+        }
+    }
+
+    /// The tool groups this turn may offer, or `None` for every tool.
+    ///
+    /// Read from the pin rather than recomputed, so the serialised tool block is
+    /// byte-identical between turns and the provider's prompt cache keeps
+    /// hitting — the same constraint that makes skill retrieval a once-per-
+    /// session operation. `tool_search` changes the pin, and that is the one
+    /// case where a cache miss is worth paying for.
+    fn tool_scope(&self) -> Option<Vec<String>> {
+        if !groups::grouping_enabled() {
+            return None;
+        }
+        Some(groups::active(&self.session_id))
+    }
+
+    /// Logs what the tool block costs and how much of it gets used.
+    ///
+    /// The reason this exists at all: the published results disagree about
+    /// whether scoping helps, and every one of them is measured on a different
+    /// corpus. The only way to know which side of the line this deployment sits
+    /// on is to record the number here — tokens offered against tools actually
+    /// called — before and after turning grouping on. Runs whether or not
+    /// grouping is enabled, because the baseline is half the measurement.
+    ///
+    /// The token figure is an estimate: the provider reports one prompt total
+    /// for system prompt, tools and history together, so the tool block cannot
+    /// be billed separately. Four characters per token is close enough for
+    /// JSON to compare one turn against another, which is all it is for.
+    fn account_for_tools(&mut self, defs: &[Value]) {
+        if !groups::accounting_enabled() || self.offered.0 != 0 {
+            // Recorded once: the tool block is identical across a turn's
+            // iterations by design, so measuring it again each time would only
+            // inflate the log and invite double-counting the cost.
+            return;
+        }
+        let chars: usize = defs.iter().map(|d| d.to_string().len()).sum();
+        self.offered = (defs.len(), chars / 4);
+    }
+
     /// The text of the first thing the user said in this conversation.
     fn first_user_message(&self) -> Option<String> {
         host::events(&self.session_id, 0).into_iter().find_map(|r| {
@@ -570,10 +705,14 @@ impl Turn {
     }
 
     fn stream_completion(&mut self) -> Result<Reply, String> {
+        let scope = self.tool_scope();
+
+        let defs = tools::definitions_for(&self.mode, scope.as_deref());
+        self.account_for_tools(&defs);
         let request = json!({
             "model": self.model,
             "messages": self.messages,
-            "tools": tools::definitions(&self.mode),
+            "tools": defs,
         });
 
         let stream = llm::stream_open(&request.to_string()).map_err(describe_llm_error)?;

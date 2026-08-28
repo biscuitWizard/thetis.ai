@@ -214,6 +214,12 @@ impl sys::Host for HostState {
             }),
             "keep_head" => Some(cfg.context.keep_head.to_string()),
             "keep_tail" => Some(cfg.context.keep_tail.to_string()),
+            // Tool-surface scoping. The agent owns which groups it offers
+            // itself, so it reads the policy rather than being handed a list.
+            "tool_grouping_enabled" => Some(cfg.tool_groups.grouping_enabled.to_string()),
+            "tool_accounting_enabled" => Some(cfg.tool_groups.accounting_enabled.to_string()),
+            "tool_groups_always_on" => Some(cfg.tool_groups.always_on.join(",")),
+            "tool_route_threshold" => Some(cfg.tool_groups.route_threshold.to_string()),
             _ => None,
         })
     }

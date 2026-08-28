@@ -12,6 +12,7 @@ use crate::thetis::grip::types::{
 use crate::thetis::grip::{
     branch, configuration, control, devkit, hostfs, sandbox, skills, sys, terminal, tooling,
 };
+use crate::groups;
 use serde_json::{json, Value};
 
 /// The mode assumed when a session has not chosen one.
@@ -115,6 +116,9 @@ fn component_read_safe(name: &str) -> bool {
 /// a configuration where it is never offered.
 fn all_builtins() -> Vec<ToolDef> {
     let mut tools = available(DEFAULT_MODE);
+    if !sandbox_available() {
+        tools.extend(sandbox_tools());
+    }
     if !devkit_available() {
         tools.extend(devkit_tools());
     }
@@ -131,6 +135,49 @@ fn all_builtins() -> Vec<ToolDef> {
         tools.extend(ssh_host_tools());
     }
     tools
+}
+
+/// The isolated per-session container: running a command and moving files in and
+/// out of its workspace.
+///
+/// A named group rather than an inline block in `available`, so that
+/// `all_builtins` can add it back when the sandbox is unavailable. Without that
+/// these three names were unclassifiable — `is_mutating` fell through to the
+/// component path and defaulted them to mutating, and the group table's coverage
+/// check reported them as tools that do not exist.
+fn sandbox_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "exec",
+            description: "Run a shell command in this session's isolated container.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "command": string_prop("The command line to run."),
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds." },
+                }),
+                &["command"],
+            ),
+        },
+        ToolDef {
+            name: "write_file",
+            description: "Write a file in the session's container workspace.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "path": string_prop("Path inside the workspace."),
+                    "contents": string_prop("Full file contents."),
+                }),
+                &["path", "contents"],
+            ),
+        },
+        ToolDef {
+            name: "read_file",
+            description: "Read a file from the session's container workspace.",
+            mutating: false,
+            parameters: obj(json!({ "path": string_prop("Path inside the workspace.") }), &["path"]),
+        },
+    ]
 }
 
 /// Reading and changing the grip's own settings.
@@ -200,6 +247,41 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
             mutating: false,
             parameters: obj(
                 json!({ "key": string_prop("The note to read; omit to list all keys.") }),
+                &[],
+            ),
+        },
+        // --- recovering a withheld tool group -------------------------------
+        //
+        // Always offered, even when grouping is off, so that the escape hatch
+        // is not itself something that can be scoped away. With grouping off it
+        // reports every group as loaded, which is true and harmless.
+        //
+        // Not mutating: it changes what this conversation can see, not anything
+        // outside it, and a read-only session needs the escape hatch as much as
+        // any other. The mode filter still applies to whatever it admits.
+        ToolDef {
+            name: TOOL_SEARCH,
+            description:
+                "Find and load a group of tools that is not currently in your tool list. Your \
+                 tool surface is scoped to what this conversation looks like it needs, so \
+                 capabilities you have — BigQuery, Notion, the web, GitHub, ssh hosts, the dev \
+                 kit — may not be visible right now. Call this with a description of what you \
+                 are trying to do, or with a group id, and the matching groups are added for \
+                 the rest of the conversation. Nothing is ever removed. Call it the moment you \
+                 suspect a tool exists but cannot see it, rather than working around the gap.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "query": string_prop(
+                        "What you need to do, in natural language, or a group id. Omit to list \
+                         every group without loading anything."
+                    ),
+                    "load": {
+                        "type": "array",
+                        "description": "Group ids to load outright, skipping the ranking.",
+                        "items": { "type": "string" },
+                    },
+                }),
                 &[],
             ),
         },
@@ -363,36 +445,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     ];
 
     if sandbox_available() {
-        tools.push(ToolDef {
-            name: "exec",
-            description: "Run a shell command in this session's isolated container.",
-            mutating: true,
-            parameters: obj(
-                json!({
-                    "command": string_prop("The command line to run."),
-                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds." },
-                }),
-                &["command"],
-            ),
-        });
-        tools.push(ToolDef {
-            name: "write_file",
-            description: "Write a file in the session's container workspace.",
-            mutating: true,
-            parameters: obj(
-                json!({
-                    "path": string_prop("Path inside the workspace."),
-                    "contents": string_prop("Full file contents."),
-                }),
-                &["path", "contents"],
-            ),
-        });
-        tools.push(ToolDef {
-            name: "read_file",
-            description: "Read a file from the session's container workspace.",
-            mutating: false,
-            parameters: obj(json!({ "path": string_prop("Path inside the workspace.") }), &["path"]),
-        });
+        tools.extend(sandbox_tools());
     }
 
     if devkit_available() {
@@ -1127,10 +1180,21 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
 }
 
 /// Tool definitions in the format the chat completions API expects, including
-/// any hot-loaded tool components the orchestrator has registered.
-pub fn definitions(mode: &str) -> Vec<Value> {
+/// any hot-loaded tool components the orchestrator has registered, restricted
+/// to an active set of tool groups.
+///
+/// `None` means every group, which is the behaviour before grouping existed and
+/// what runs whenever `tool_groups.grouping_enabled` is off. A group filter is
+/// applied *after* the mode filter, never instead of it: scoping is about what
+/// is likely wanted, read-only modes are about what is permitted, and confusing
+/// the two would let a task-shaped signal hand back a mutating tool.
+pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
     let mut defs: Vec<Value> = available(mode)
         .iter()
+        .filter(|t| match active {
+            Some(active) => groups::builtin_active(t.name, active),
+            None => true,
+        })
         .map(|t| {
             json!({
                 "type": "function",
@@ -1152,6 +1216,14 @@ pub fn definitions(mode: &str) -> Vec<Value> {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
             continue;
         }
+        // The manifest is already in hand, so its group is read from it rather
+        // than looked up again through the registry it came from.
+        if let Some(active) = active {
+            let group = groups::component_group(&manifest.name, &manifest.capabilities);
+            if !active.iter().any(|a| *a == group) {
+                continue;
+            }
+        }
         let parameters = serde_json::from_str::<Value>(&manifest.args_schema_json)
             .unwrap_or_else(|_| obj(json!({}), &[]));
         defs.push(json!({
@@ -1165,6 +1237,14 @@ pub fn definitions(mode: &str) -> Vec<Value> {
     }
 
     defs
+}
+
+/// Every built-in name the agent could offer, for the group-coverage check.
+pub fn builtin_names() -> Vec<String> {
+    all_builtins()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect()
 }
 
 // --- dispatch ---------------------------------------------------------------
@@ -1184,6 +1264,25 @@ pub fn invoke(
         ));
     }
 
+    // A tool called from outside the active groups is honoured, and its group is
+    // admitted on the way through. Scoping is an attention and token
+    // optimisation, never a permission boundary — the permission boundary is
+    // the mode check above, and it has already run. If the model knows a tool
+    // exists (from earlier in the conversation, from a skill body, from the
+    // group catalogue) then refusing it would turn a saving into a capability
+    // loss, which is the one failure this whole design is arranged to avoid.
+    if groups::grouping_enabled() {
+        let active = groups::active(session_id);
+        if !groups::is_active(name, &active) {
+            let group = groups::group_of(name);
+            groups::admit(session_id, &[group.clone()]);
+            sys::log(
+                LogLevel::Info,
+                &format!("'{name}' was called from outside the active groups; admitted '{group}'"),
+            );
+        }
+    }
+
     let args: Value = serde_json::from_str(args_json)
         .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
 
@@ -1191,6 +1290,7 @@ pub fn invoke(
         "remember" => remember(session_id, &args),
         "recall" => recall(session_id, &args),
         ASK_USER => ask_user(&args),
+        TOOL_SEARCH => tool_search(session_id, &args),
 
         "skill_fetch" => skills::fetch(
             &req_str(&args, "id")?,
@@ -1560,6 +1660,93 @@ const MAX_QUESTIONS: usize = 5;
 /// the turn after a question is asked. A literal in both spots could drift
 /// apart, and the failure would be silent: the pause would stop happening.
 pub const ASK_USER: &str = "ask_user";
+
+/// The name of the tool that recovers a withheld tool group.
+pub const TOOL_SEARCH: &str = "tool_search";
+
+/// Ranks tool groups against a description and loads the ones that match.
+///
+/// Append-only by construction (see `groups::admit`): the model can widen its
+/// own surface but never narrow it, so a tool it has already been shown cannot
+/// disappear underneath it. The threshold here is looser than the routing one
+/// because an explicit search is explicit evidence — the failure this guards
+/// against is a capability the model cannot reach, which is worse than a few
+/// hundred tokens of tool schema it does not use.
+fn tool_search(session_id: &str, args: &Value) -> Result<String, String> {
+    let query = opt_str(args, "query");
+    let explicit: Vec<String> = args
+        .get("load")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !groups::grouping_enabled() {
+        return Ok(format!(
+            "Tool scoping is off in this deployment: every tool is already in your list. \
+             The groups are:\n\n{}",
+            groups::catalogue(&groups::all_ids())
+        ));
+    }
+
+    let mut wanted = explicit.clone();
+
+    if wanted.is_empty() && !query.trim().is_empty() {
+        // Every group scoring above zero, plus the best one regardless. A search
+        // that matched nothing but still names a real need should get the
+        // closest thing rather than nothing at all.
+        let ranked = groups::rank(&query);
+        for (group, s) in ranked.iter() {
+            if *s > 0.0 {
+                wanted.push(group.id.to_string());
+            }
+        }
+        if wanted.is_empty() {
+            if let Some((best, _)) = ranked.first() {
+                wanted.push(best.id.to_string());
+            }
+        }
+    }
+
+    if wanted.is_empty() {
+        let active = groups::active(session_id);
+        return Ok(format!(
+            "Tool groups:\n\n{}\nCall this again with a query or `load` to add one.",
+            groups::catalogue(&active)
+        ));
+    }
+
+    let added = groups::admit(session_id, &wanted);
+    let active = groups::active(session_id);
+
+    if added.is_empty() {
+        return Ok(format!(
+            "Nothing to add — those groups are already loaded.\n\n{}",
+            groups::catalogue(&active)
+        ));
+    }
+
+    sys::log(
+        LogLevel::Info,
+        &format!("tool_search loaded groups: {}", added.join(", ")),
+    );
+
+    Ok(format!(
+        "Loaded {} for the rest of this conversation; the tools appear in your list from your \
+         next message onward.\n\n{}",
+        added
+            .iter()
+            .map(|id| format!("`{id}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        groups::catalogue(&active)
+    ))
+}
 
 /// Choices per question. Discord's select menu allows 25 options, and one is
 /// spent on "something else", so 24 is the real ceiling.
