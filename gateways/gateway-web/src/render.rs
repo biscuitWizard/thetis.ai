@@ -55,6 +55,10 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "content": out.content,
         }),
 
+        // `name` on both arms is what lets the transcript special-case a tool
+        // whose call renders as a form rather than a row.
+        // `name` on both arms is what lets the transcript special-case a tool
+        // whose call renders as a form rather than a row.
         SessionEvent::Nudge(text) => json!({ "kind": "nudge", "text": text }),
         SessionEvent::SystemNote(text) => json!({ "kind": "note", "text": text }),
         SessionEvent::Incident(text) => json!({ "kind": "incident", "text": text }),
