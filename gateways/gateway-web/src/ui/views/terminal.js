@@ -49,6 +49,9 @@ const ICONS = {
 let dock = null;
 let tabsEl = null;
 let bodyEl = null;
+/** Holds the emulator itself. Separate from `bodyEl`, which now also holds the
+ *  shell list beside it — clearing the whole body would take the list out. */
+let paneWrapEl = null;
 let footEl = null;
 let chipEl = null;
 
@@ -121,27 +124,27 @@ function themeColors() {
   const css = getComputedStyle(document.documentElement);
   const tok = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
   return {
-    background: tok("--term-bg", "#0c0c12"),
-    foreground: tok("--term-fg", "#d7d7e3"),
-    cursor: tok("--term-cursor", "#7c9cff"),
-    cursorAccent: tok("--term-bg", "#0c0c12"),
-    selectionBackground: tok("--term-selection", "#2c3560"),
-    black: tok("--term-black", "#2b2b38"),
-    red: tok("--term-red", "#f2788f"),
-    green: tok("--term-green", "#7fd18f"),
-    yellow: tok("--term-yellow", "#e8b673"),
-    blue: tok("--term-blue", "#7c9cff"),
-    magenta: tok("--term-magenta", "#c69bf0"),
-    cyan: tok("--term-cyan", "#74ccd4"),
-    white: tok("--term-white", "#c6c6d4"),
-    brightBlack: tok("--term-bright-black", "#4e4e62"),
-    brightRed: tok("--term-bright-red", "#ff93a7"),
-    brightGreen: tok("--term-bright-green", "#9ce0a9"),
-    brightYellow: tok("--term-bright-yellow", "#f5cd93"),
-    brightBlue: tok("--term-bright-blue", "#9db4ff"),
-    brightMagenta: tok("--term-bright-magenta", "#d9b6ff"),
-    brightCyan: tok("--term-bright-cyan", "#96e2e9"),
-    brightWhite: tok("--term-bright-white", "#f0f0f6"),
+    background: tok("--term-bg", "#141414"),
+    foreground: tok("--term-fg", "#d4d4d4"),
+    cursor: tok("--term-cursor", "#a3b8cc"),
+    cursorAccent: tok("--term-bg", "#141414"),
+    selectionBackground: tok("--term-selection", "#2f4a3a"),
+    black: tok("--term-black", "#232323"),
+    red: tok("--term-red", "#e387a7"),
+    green: tok("--term-green", "#3a8e5b"),
+    yellow: tok("--term-yellow", "#d9b48a"),
+    blue: tok("--term-blue", "#81a1c1"),
+    magenta: tok("--term-magenta", "#e394dc"),
+    cyan: tok("--term-cyan", "#82d2ce"),
+    white: tok("--term-white", "#d4d4d4"),
+    brightBlack: tok("--term-bright-black", "#5a5a5a"),
+    brightRed: tok("--term-bright-red", "#f0a3bd"),
+    brightGreen: tok("--term-bright-green", "#70b489"),
+    brightYellow: tok("--term-bright-yellow", "#e8cba6"),
+    brightBlue: tok("--term-bright-blue", "#a3bcd6"),
+    brightMagenta: tok("--term-bright-magenta", "#f0b3ea"),
+    brightCyan: tok("--term-bright-cyan", "#a0e0dd"),
+    brightWhite: tok("--term-bright-white", "#f0f0f0"),
   };
 }
 
@@ -161,14 +164,19 @@ export function mountTerminals({ onRequest }) {
     onpointerdown: beginDrag,
   });
 
-  tabsEl = el("nav", { class: "term-tabs", "aria-label": "Terminal sessions" });
-  bodyEl = el("div", { class: "term-body" });
+  // A list, not a tab strip. Cursor puts the shells down the right-hand side,
+  // and it is the better shape here for the same reason: a shell's name, its
+  // state and its directory do not fit in a tab, and the list has room to grow
+  // downwards where a strip would start scrolling sideways after four.
+  tabsEl = el("nav", { class: "term-list", "aria-label": "Terminal sessions" });
+  paneWrapEl = el("div", { class: "term-panes" });
+  bodyEl = el("div", { class: "term-body" }, paneWrapEl, tabsEl);
   footEl = el("div", { class: "term-foot" });
 
   const head = el(
     "header",
     { class: "term-head" },
-    tabsEl,
+    el("span", { class: "term-title" }, "Terminal"),
     el(
       "div",
       { class: "term-head-actions" },
@@ -325,6 +333,14 @@ function scheduleFit() {
 
 // --- tabs -------------------------------------------------------------------
 
+/** The last path segment, which is what identifies a shell at a glance. The
+ *  full path is in the title and in the footer, so nothing is lost. */
+function leaf(path) {
+  if (!path) return "";
+  const parts = path.replace(/\/+$/, "").split("/");
+  return parts[parts.length - 1] || "/";
+}
+
 function drawTabs() {
   clear(tabsEl);
   const ordered = [...tabs.values()].sort((a, b) => collate(a.id, b.id));
@@ -345,10 +361,20 @@ function drawTabs() {
           onclick: () => showTab(tab.id),
         },
         el("span", { class: dot }),
-        el("span", { class: "term-tab-label mono" }, tab.id),
-        // Which machine, on the tab itself. A command that ran somewhere else
-        // is the thing you most need not to misread.
-        tab.remote && el("span", { class: "term-tab-host" }, tab.remote),
+        el(
+          "span",
+          { class: "term-tab-text" },
+          el("span", { class: "term-tab-label mono" }, tab.id),
+          // Where it is, on a second line. In a strip there was no room for
+          // this; in a list it is the thing that tells two shells apart.
+          el(
+            "span",
+            { class: "term-tab-sub" },
+            // Which machine first: a command that ran somewhere else is the
+            // thing you most need not to misread.
+            tab.remote ? `${tab.remote}:${leaf(tab.cwd)}` : leaf(tab.cwd)
+          )
+        ),
         !tab.alive && el("span", { class: "term-tab-note" }, "exited")
       )
     );
@@ -360,7 +386,7 @@ function drawTabs() {
   }
 }
 
-/** Sorts `term-2` before `term-10`, which a plain string sort gets backwards. */
+/** Puts `term-2` ahead of `term-10`, which a plain string sort gets backwards. */
 function collate(a, b) {
   return a.localeCompare(b, undefined, { numeric: true });
 }
@@ -394,11 +420,11 @@ function showTab(id) {
   drawTabs();
   drawFoot();
 
-  clear(bodyEl);
+  clear(paneWrapEl);
   ensureEmulator(tab)
     .then(() => {
       if (activeId !== tab.id) return;
-      clear(bodyEl).append(tab.pane);
+      clear(paneWrapEl).append(tab.pane);
       // The instance may have been created while detached, in which case xterm
       // has never measured a cell; opening it here is what gives it a size.
       if (!tab.opened) {
@@ -410,7 +436,7 @@ function showTab(id) {
       tab.term.scrollToBottom();
     })
     .catch((e) => {
-      clear(bodyEl).append(
+      clear(paneWrapEl).append(
         el(
           "div",
           { class: "term-fallback" },
@@ -437,9 +463,14 @@ async function ensureEmulator(tab) {
     disableStdin: true,
     cursorBlink: false,
     scrollback: 5000,
+    // Typography has to be set on the emulator: xterm measures a cell from
+    // these and positions every glyph absolutely, so a CSS font-size on the
+    // pane would shift the text out of the grid it drew.
     fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono").trim(),
-    fontSize: 12,
-    lineHeight: 1.25,
+    fontSize: 12.5,
+    // Looser than xterm's default. Dense output is the drawer's normal state,
+    // and 1.25 packed it into a slab that was hard to scan a line of.
+    lineHeight: 1.45,
     theme: themeColors(),
   });
   if (Fit) {
@@ -535,7 +566,7 @@ function dispose() {
   }
   tabs.clear();
   activeId = null;
-  if (bodyEl) clear(bodyEl);
+  if (paneWrapEl) clear(paneWrapEl);
 }
 
 // --- the wire ---------------------------------------------------------------
