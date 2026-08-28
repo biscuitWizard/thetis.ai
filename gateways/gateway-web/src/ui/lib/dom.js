@@ -2,6 +2,17 @@
 
 export const $ = (id) => document.getElementById(id);
 
+/* The agent's configured name, for anywhere the UI speaks of the agent rather
+ * than of the harness. The harness is always Thetis; the agent is whatever
+ * agent.name says, so the two must not be conflated in the wording.
+ *
+ * Read once: the value is substituted into the document at serve time and
+ * cannot change without a reload. The fallback matters only if the attribute is
+ * missing, which means the page was served by something that does not
+ * substitute — the built-in default is the right guess there. */
+export const AGENT_NAME =
+  document.documentElement.dataset.agentName?.trim() || "Thetis";
+
 /** Creates an element. Children may be nodes or strings (inserted as text). */
 export function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
