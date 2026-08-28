@@ -985,7 +985,17 @@ fn spawn_worker_process(
         // retarget it by editing its own copy of thetis.toml.
         .env("THETIS_DATA_DIR", &cfg.paths.data)
         .env("THETIS_ARTIFACTS_DIR", &cfg.paths.artifacts)
-        .env("THETIS_TARGET_DIR", &cfg.build.target_dir)
+        // Deliberately NOT pinning THETIS_TARGET_DIR. A cargo target directory
+        // is not shared state: it is keyed by nothing but its own path, so two
+        // checkouts building the same aspect into one target dir write the same
+        // output file and each can be handed the other's component. That is a
+        // correctness bug, and the workaround for it (dirtying a source file
+        // before every build, so cargo always re-links) fed the file watcher a
+        // real-looking modify event and made every build trigger the next one.
+        // Letting each worktree resolve `target-wasm` against its own root cuts
+        // both problems off at the root. Cross-branch reuse is not lost: it
+        // lives in the content-addressed artifact cache, which IS shared, and
+        // which serves an identical tree with no toolchain at all.
         .env("THETIS_LOCAL_CONFIG", cfg.local_overlay())
         .env("THETIS_TRUNK", trunk)
         // A worker must never mistake itself for a supervised service: its
