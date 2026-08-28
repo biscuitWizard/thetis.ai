@@ -440,22 +440,33 @@ async fn admin_branch_action(
                             crate::publish::REMOTE_BRANCH
                         ));
                     };
-                    // Everyone's page is served from trunk's build, and trunk
-                    // just moved.
-                    crate::roles::gateway::load_ui_gateway(grip).await;
+                    // The guest aspects hot-swap; the kernel does not. When the
+                    // pull moved native source or the contract, the running
+                    // binary is now older than trunk, and the order is forced:
+                    // the kernel is the host half of the WIT, so a guest built
+                    // from trunk's newer contract imports functions this process
+                    // cannot supply and will not instantiate. Building the UI
+                    // first would therefore fail, and the failure is silent
+                    // until a restart finds nothing loadable at all. Rebuild and
+                    // restart instead; the incoming process loads the UI itself.
+                    let kernel_moved =
+                        crate::control::kernel_source_moved(root, &before, "HEAD").await;
                     let mut msg = format!(
                         "pulled {count} commit(s) from origin/{}; trunk is at {}",
                         crate::publish::REMOTE_BRANCH,
                         &commit[..12.min(commit.len())]
                     );
-                    // The guest aspects hot-swap; the kernel does not, and
-                    // nothing here rebuilds it — say so rather than leave the
-                    // operator running a binary older than trunk unawares.
-                    if crate::control::kernel_source_moved(root, &before, "HEAD").await {
+                    if kernel_moved {
+                        crate::merge::refresh_trunk_kernel(grip, &before, None).await;
                         msg.push_str(
                             ". This moved the orchestrator's own source, so trunk's binary is \
-                             now older than trunk — rebuild and restart to run it",
+                             being rebuilt; Thetis restarts onto it once it builds and passes \
+                             its startup probe. Watch the journal if it does not come back",
                         );
+                    } else {
+                        // Everyone's page is served from trunk's build, and
+                        // trunk just moved.
+                        crate::roles::gateway::load_ui_gateway(grip).await;
                     }
                     Ok(msg)
                 }

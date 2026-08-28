@@ -192,13 +192,22 @@ pub async fn merge_to_trunk(
     )
     .await;
 
-    // Everyone loads the page from trunk's build; pick up the one that just
-    // landed. Content addressing means the branch already built it.
-    crate::roles::gateway::load_ui_gateway(grip).await;
-
     // The guest aspects are hot-swappable; the kernel is not. If this merge moved
     // the orchestrator's own source, trunk's binary is now older than trunk.
-    refresh_trunk_kernel(grip, &from, session_id).await;
+    //
+    // Kernel first, and exclusively: the kernel is the host half of the WIT, so
+    // once it has moved, a guest built from trunk's contract is keyed and
+    // linked against a binary this process is not. Loading the UI here would at
+    // best miss the cache and at worst smoke-test against a contract that is
+    // about to stop existing. The process that restarts loads the UI itself.
+    let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
+    if crate::control::kernel_source_moved(&root, &from, "HEAD").await {
+        refresh_trunk_kernel(grip, &from, Some(session_id)).await;
+    } else {
+        // Everyone loads the page from trunk's build; pick up the one that just
+        // landed. Content addressing means the branch already built it.
+        crate::roles::gateway::load_ui_gateway(grip).await;
+    }
 
     Ok(MergeResult::Merged { from, to })
 }
@@ -405,8 +414,15 @@ async fn summarize_subject(
     Ok(subject)
 }
 
-/// Rebuilds trunk's orchestrator binary after a merge moved its source, and
+/// Rebuilds trunk's orchestrator binary after an update moved its source, and
 /// restarts the gateway onto it.
+///
+/// Both ways trunk moves need this: a conversation merging, and an operator
+/// pulling in what another checkout published. The latter used only to print
+/// advice, which left the running binary older than the contract on trunk —
+/// and since a guest built from the newer WIT imports host functions the older
+/// binary does not export, every such guest then failed to instantiate. That
+/// is invisible until the next restart, at which point nothing loads at all.
 ///
 /// Guest components hot-swap, so a merge of agent, gateway or tool code takes
 /// effect on its own. Native code cannot: the gateway process, and every worker
@@ -416,21 +432,30 @@ async fn summarize_subject(
 /// The whole system goes away for a moment, so the order is strict: build,
 /// probe, only then restart. A build or probe failure leaves trunk serving the
 /// binary it already had and files an incident in the conversation that merged
-/// — the source is on trunk either way, so this is staleness, not loss.
+/// — the source is on trunk either way, so this is staleness, not loss. An
+/// operator-initiated refresh passes no session and reports to the journal.
 ///
 /// Runs detached: the build takes minutes and the browser's merge request must
 /// not wait on it.
-async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) {
+pub(crate) async fn refresh_trunk_kernel(
+    grip: &Arc<Grip>,
+    before: &str,
+    session_id: Option<&str>,
+) {
     let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
     if !crate::control::kernel_source_moved(&root, before, "HEAD").await {
         return;
     }
 
     let grip = grip.clone();
-    let session = session_id.to_string();
+    let session = session_id.map(str::to_string);
     tokio::spawn(async move {
-        let incident = |grip: Arc<Grip>, session: String, text: String| async move {
+        // A merge names the conversation that made it, and the incident shows
+        // up in that transcript. An operator pulling from the admin page has no
+        // conversation, so for that caller the journal is the whole record.
+        let incident = |grip: Arc<Grip>, session: Option<String>, text: String| async move {
             tracing::warn!(%text, "trunk's kernel was not refreshed");
+            let Some(session) = session else { return };
             let _ = grip
                 .append_event(
                     &session,
@@ -439,17 +464,18 @@ async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) 
                 .await;
         };
 
-        let _ = grip
-            .append_event(
-                &session,
-                crate::bindings::types::SessionEvent::Incident(
-                    "This merge moved the orchestrator's own source, so trunk's binary is \
-                     being rebuilt. Thetis will restart onto it once it builds and answers \
-                     its startup probe."
-                        .to_string(),
-                ),
-            )
-            .await;
+        let starting = "This update moved the orchestrator's own source, so trunk's binary is \
+                        being rebuilt. Thetis will restart onto it once it builds and answers \
+                        its startup probe.";
+        tracing::info!("{starting}");
+        if let Some(session) = &session {
+            let _ = grip
+                .append_event(
+                    session,
+                    crate::bindings::types::SessionEvent::Incident(starting.to_string()),
+                )
+                .await;
+        }
 
         let built = match crate::control::build_kernel(&grip.cfg).await {
             Ok(path) => path,
@@ -458,9 +484,9 @@ async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) 
                     grip.clone(),
                     session,
                     format!(
-                        "The merge landed on trunk, but rebuilding trunk's orchestrator \
+                        "The update landed on trunk, but rebuilding trunk's orchestrator \
                          binary failed, so Thetis is still running the one built before \
-                         the merge: {e:#}"
+                         it: {e:#}"
                     ),
                 )
                 .await;
@@ -511,10 +537,9 @@ async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) 
 
         if let Err(e) = crate::control::request_restart(
             &grip,
-            "a merge to trunk moved the orchestrator's own code; restarting on the \
-             rebuilt kernel",
+            "trunk moved the orchestrator's own code; restarting on the rebuilt kernel",
             true,
-            Some(&session),
+            session.as_deref(),
         )
         .await
         {
