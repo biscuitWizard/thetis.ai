@@ -155,7 +155,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "github-file"
+name = "git-file"
 version = "0.1.0"
 dependencies = [
  "base64",
