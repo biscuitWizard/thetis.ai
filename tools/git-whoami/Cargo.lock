@@ -155,7 +155,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "github-whoami"
+name = "git-whoami"
 version = "0.1.0"
 dependencies = [
  "base64",
