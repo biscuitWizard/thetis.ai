@@ -4,9 +4,8 @@
 //! own git worktree. Workers are children of the gateway, not systemd units:
 //! the control socket is inherited at spawn, a replacement can be a
 //! *different* binary (a branch that rebuilt its own kernel), and
-//! and a worker that finds itself orphaned exits on its own, so a dying
-//! gateway still takes its workers with it — no orphan can squat on a
-//! worktree or wedge a terminal.
+//! `PR_SET_PDEATHSIG` guarantees a dying gateway takes its workers with it —
+//! no orphan can ever squat on a worktree or wedge a terminal.
 //!
 //! Materialization is lazy: a conversation gets its branch, worktree, and
 //! worker at its first message. A worker that dies is respawned by the next
@@ -405,29 +404,7 @@ async fn supervise(
     // Whichever arm won, callers still parked on this peer must be woken now
     // rather than at CALL_TIMEOUT, and no new call may be admitted.
     peer.force_close();
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .ok()
-        .and_then(Result::ok);
-    // How it died, not merely that it did. A worker that ends silently is
-    // indistinguishable from one that was killed, and telling those apart is
-    // the whole difference between a bug in the turn and something outside
-    // reaching in.
-    match status {
-        Some(status) => {
-            use std::os::unix::process::ExitStatusExt;
-            tracing::info!(
-                session = %session_id,
-                code = ?status.code(),
-                signal = ?status.signal(),
-                "worker process ended"
-            );
-        }
-        None => tracing::warn!(
-            session = %session_id,
-            "worker process did not exit within 5s of its socket closing"
-        ),
-    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     let _ = child.start_kill();
     let _ = child.wait().await;
     let requested = router
@@ -488,7 +465,7 @@ async fn supervise(
                     ),
                 )
                 .await;
-            reconcile_session(&grip, &session_id).await;
+            reconcile_and_resume(&grip).await;
             return;
         }
 
@@ -511,9 +488,9 @@ async fn supervise(
     }
 
     tracing::info!(session = %session_id, "worker exited");
-    // Repair whatever *this* death interrupted; resuming re-materializes the
-    // worker on demand. Deliberately scoped: see `reconcile_session`.
-    reconcile_session(&grip, &session_id).await;
+    // Repair whatever the death interrupted; resuming re-materializes the
+    // worker on demand.
+    reconcile_and_resume(&grip).await;
 }
 
 /// Points a branch back at the trunk kernel. True when it was on its own.
@@ -674,7 +651,6 @@ impl ipc::Handler for GatewayHandler {
             // The worker's aspects are up and it is accepting turns.
             "ready" => {
                 let _ = self.ready.send(true);
-                let session_id = self.session_id.clone();
                 tokio::spawn(async move {
                     // A fresh deployment serves the fallback page until some
                     // worker's first build lands in the cache; a branch at
@@ -683,7 +659,7 @@ impl ipc::Handler for GatewayHandler {
                     if grip.loader.get(&ui).is_none() {
                         crate::roles::gateway::load_ui_gateway(&grip).await;
                     }
-                    reconcile_session(&grip, &session_id).await;
+                    reconcile_and_resume(&grip).await;
                 });
             }
             // The worker wants itself restarted — after a kernel rebuild in
@@ -773,25 +749,10 @@ pub fn reconcile_and_resume(
     grip: &Arc<Grip>,
 ) -> futures_util::future::BoxFuture<'static, ()> {
     let grip = grip.clone();
-    Box::pin(async move { reconcile_and_resume_inner(grip, None).await })
+    Box::pin(async move { reconcile_and_resume_inner(grip).await })
 }
 
-/// Reconciles one conversation, for the common case: its own worker died.
-///
-/// A worker's death says nothing about anyone else, and the fleet-wide sweep
-/// used to drag in every session that merely had no worker at that instant —
-/// including agents part-way through a restart they asked for. With several
-/// self-modifying conversations running that fed back on itself.
-pub fn reconcile_session(
-    grip: &Arc<Grip>,
-    session_id: &str,
-) -> futures_util::future::BoxFuture<'static, ()> {
-    let grip = grip.clone();
-    let session_id = session_id.to_string();
-    Box::pin(async move { reconcile_and_resume_inner(grip, Some(session_id)).await })
-}
-
-async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
+async fn reconcile_and_resume_inner(grip: Arc<Grip>) {
     // One at a time: readiness and death fire this from several places, and
     // two scans racing each other once synthesized duplicate tool results.
     static RECONCILING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -807,10 +768,9 @@ async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
         Role::Worker(_) => Vec::new(),
     };
     let interrupted = match store.reconcile_interrupted_turns(
-        "This turn was interrupted and has been picked back up. Carry on from where \
-         you left off; anything you were part-way through may need doing again.",
+        "This turn was interrupted when Thetis restarted. Carry on from where you \
+         left off; anything you were part-way through may need doing again.",
         &live,
-        only.as_deref(),
     ) {
         Ok(found) => found,
         Err(e) => {
@@ -996,23 +956,14 @@ fn spawn_worker_process(
         cmd.env("THETIS_WORKSPACE_DIR", workspace);
     }
 
-    // After fork, before exec: pin the socket to the agreed fd. Only
-    // async-signal-safe calls are allowed here.
-    //
-    // Deliberately *not* `PR_SET_PDEATHSIG`. The kernel delivers that when the
-    // thread that forked dies, not when the parent process does — and a tokio
-    // worker thread is not a stable thing to hang a process's life on. Threads
-    // move between the core and blocking pools (`offload::blocking` uses
-    // `block_in_place`, which does exactly that) and retired blocking threads
-    // exit, at which point every worker forked from one is SIGKILLed while the
-    // gateway is perfectly healthy. That is what was killing conversations
-    // mid-turn: `signal=9`, no shutdown request, nothing in the log. The
-    // guarantee it was there for — no orphan squatting on a worktree — is kept
-    // by the worker watching its own parent instead, which is a property of
-    // the process and cannot be undone by a thread going away.
+    // After fork, before exec: pin the socket to the agreed fd and arrange to
+    // die with the gateway. Only async-signal-safe calls are allowed here.
     unsafe {
         cmd.pre_exec(move || {
             if libc::dup2(theirs_fd, WORKER_SOCKET_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

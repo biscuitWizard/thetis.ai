@@ -87,44 +87,6 @@ export function section(spec) {
 /** The name the skills panel has always used for it. */
 export const skillSection = section;
 
-/** A section whose rows fold away behind its heading.
- *
- * The same heading, count and note as `section`, but as a disclosure holding
- * the rows themselves. Panels with many long rows per group — Tools, where a
- * dozen groups of paragraph-length descriptions made the list unscannable —
- * open collapsed, so the reader picks a domain before reading any prose.
- *
- * @param {object} spec              title, count, note, and `open`
- * @param {Node[]} rows              the group's cards
- * @param {(open:boolean)=>void} [spec.onToggle]  told when the user folds it,
- *   so the caller can remember the state across a redraw
- */
-export function collapsibleSection(spec, rows) {
-  const head = el(
-    "summary",
-    { class: "panel-group-summary" },
-    el(
-      "div",
-      { class: "panel-section-head" },
-      el("h3", { class: "panel-section-title" }, spec.title),
-      typeof spec.count === "number"
-        ? el("span", { class: "panel-section-count" }, String(spec.count))
-        : null
-    ),
-    spec.note && el("p", { class: "panel-section-note" }, spec.note)
-  );
-
-  const node = el(
-    "details",
-    { class: "panel-group", open: spec.open === true },
-    head,
-    el("div", { class: "panel-group-body" }, rows.filter(Boolean))
-  );
-
-  if (spec.onToggle) node.addEventListener("toggle", () => spec.onToggle(node.open));
-  return node;
-}
-
 /** A lint diagnostic. These were counted in the subtitle but never shown, so a
  *  broken skill reported itself as a number and nothing more. */
 export function skillDiagnostic(diag) {
@@ -471,12 +433,7 @@ export function commitItem(commit, { isHead, onReset } = {}) {
   );
 }
 
-/** A tool: what it does, how it is provided, and its arguments.
- *
- * The description is a sibling of the head rather than a child of the heading:
- * inside it, the badge column stole a third of the width and a paragraph of
- * prose wrapped into a ragged gutter. The name and its badges share the top
- * line; the prose gets the whole card. */
+/** A tool: what it does, how it is provided, and its arguments. */
 export function toolItem(tool) {
   const badges = (tool.capabilities || []).map((cap) =>
     el("span", { class: `badge is-${cap.replace(/[^a-z]/gi, "-")}` }, cap)
@@ -488,10 +445,14 @@ export function toolItem(tool) {
     el(
       "div",
       { class: "card-head" },
-      el("div", { class: "card-heading" }, el("h3", { class: "card-title mono" }, tool.name)),
+      el(
+        "div",
+        { class: "card-heading" },
+        el("h3", { class: "card-title mono" }, tool.name),
+        tool.description && el("p", { class: "card-desc" }, tool.description)
+      ),
       badges.length ? el("div", { class: "badges" }, badges) : null
     ),
-    tool.description ? el("p", { class: "card-desc" }, tool.description) : null,
     el(
       "details",
       { class: "card-more" },
