@@ -165,8 +165,11 @@ pub async fn run(
 
         "stop" => {
             let session_id = session_for(grip, key).await?;
-            grip.cancel(&session_id).await;
-            "Stopped.".to_string()
+            if grip.cancel(&session_id).await {
+                "Stopping.".to_string()
+            } else {
+                "Nothing was running.".to_string()
+            }
         }
 
         "status" => {
