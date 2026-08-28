@@ -97,6 +97,22 @@ Authorization is re-checked on the interaction path. It never passes through
 `decide`, so omitting it would make every command reachable by anyone who can see
 the bot.
 
+## INTERACTION_CREATE carries three different things
+
+`INTERACTION_CREATE` is not only slash commands. The dispatch splits by
+interaction type, and the parsers are disjoint so a payload can never match both:
+
+| Type | Parser | Event |
+|---|---|---|
+| 2 APPLICATION_COMMAND | `parse_interaction` | `Event::Command` |
+| 3 MESSAGE_COMPONENT | `parse_component` | `Event::Interacted` |
+| 5 MODAL_SUBMIT | `parse_component` | `Event::Interacted` |
+
+Types 3 and 5 exist to serve the `ask_user` question flow — buttons, select
+menus and modals. The same re-authorization rule applies to them and matters
+more, because a component sits in a channel where anyone can click it: see
+`asking-the-user` for that flow and its invariants.
+
 ## Archiving is the cross-surface "start over"
 
 `session_for` maps a channel to a conversation through the KV table, and the
