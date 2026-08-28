@@ -93,18 +93,37 @@ async fn dispatch(grip: &Arc<Grip>, frame_type: &str, session: &str) -> Result<S
         }
 
         // Stop the running turn. Politely a no-op when nothing is running.
+        //
+        // Deliberately never spawns a worker: a session with no live worker has
+        // no turn to stop, so materializing one to tell it to do nothing would
+        // be both slow and pointless.
         "turn-cancel" => {
             let Some(peer) = router.live_peer(session).await else {
                 return Ok(json!({
                     "type": "turn-cancel",
                     "session": session,
                     "ok": true,
+                    "stopped": false,
                     "message": "nothing running",
                 })
                 .to_string());
             };
-            peer.call("cancel", json!({ "session": session })).await?;
-            Ok(json!({ "type": "turn-cancel", "session": session, "ok": true }).to_string())
+            // The worker sets its stop flag synchronously before replying, so
+            // by the time this returns the interruption is already visible to
+            // every host call that conversation has in flight.
+            let reply = peer.call("cancel", json!({ "session": session })).await?;
+            let stopped = reply
+                .get("stopped")
+                .and_then(Value::as_bool)
+                // An older worker answers `null`; it did do the cancel.
+                .unwrap_or(true);
+            Ok(json!({
+                "type": "turn-cancel",
+                "session": session,
+                "ok": true,
+                "stopped": stopped,
+            })
+            .to_string())
         }
 
         other => anyhow::bail!("unknown frame type: {other}"),
