@@ -1,0 +1,712 @@
+//! The Discord bot connector.
+//!
+//! Discord's gateway is an outbound WebSocket that must be held open and
+//! heartbeated. A WebAssembly gateway component cannot do that: the `gateway`
+//! world is only ever called in response to something arriving, a fresh
+//! instance is made per call so nothing can be held open, and `wasi:http` has
+//! no socket upgrade. So this lives in the orchestrator, and reaches the agent
+//! through the same `submit` path the browser uses.
+//!
+//! ## The safety property
+//!
+//! Every session created here is stamped with a read-only mode, and the agent
+//! withholds mutating tools for such a mode in two places: when it lists tools
+//! for the model, and again at dispatch. This connector therefore adds no tool
+//! policy of its own — it only has to make sure the mode is right and that
+//! nothing exposed over Discord can change it. There is deliberately no command
+//! to switch modes.
+
+pub mod api;
+pub mod commands;
+pub mod policy;
+
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
+
+use crate::bindings::types::SessionEvent;
+use crate::grip::Grip;
+
+use api::{Event, Incoming, Interaction, Rest, Shard};
+use policy::Decision;
+
+/// KV scope and key holding the paired user ids.
+const PAIR_SCOPE: &str = "global";
+const PAIR_KEY: &str = "discord.paired_users";
+
+/// Starts the connector, unless it is switched off or misconfigured.
+///
+/// Returns without spawning anything when there is no token, which is the
+/// ordinary case for an install that does not use Discord.
+pub fn spawn(grip: Arc<Grip>) -> Result<()> {
+    let cfg = &grip.cfg.discord;
+
+    if !cfg.enabled {
+        tracing::debug!("the Discord connector is disabled");
+        return Ok(());
+    }
+    let Some(token) = cfg.bot_token.clone() else {
+        tracing::debug!("no Discord bot token; the connector stays off");
+        return Ok(());
+    };
+
+    // The mode is the whole of the tool restriction, so verify it here rather
+    // than trusting it. `read_only()` in the agent treats an unknown mode as
+    // full access, so a typo would otherwise hand a public chat surface the dev
+    // kit. Refuse to start instead, and say why.
+    let mode = grip.cfg.mode(&cfg.mode).ok_or_else(|| {
+        anyhow!(
+            "the Discord connector is configured for mode '{}', which does not exist. \
+             Refusing to start: an unknown mode would be treated as full access.",
+            cfg.mode
+        )
+    })?;
+    if !mode.read_only {
+        return Err(anyhow!(
+            "the Discord connector is configured for mode '{}', which is not read-only. \
+             Refusing to start: that would expose tools that modify this machine over chat.",
+            cfg.mode
+        ));
+    }
+
+    if cfg.allow_all_users {
+        tracing::warn!(
+            "DISCORD_ALLOW_ALL_USERS is on: anyone who can see the bot may talk to it"
+        );
+    } else if cfg.allowed_users.is_empty() {
+        tracing::warn!(
+            "no Discord users are allowed yet; add ids to discord.allowed_users, \
+             or an admin can use /pair once one is set"
+        );
+    }
+
+    tracing::info!(mode = %cfg.mode, "starting the Discord connector");
+    tokio::spawn(async move {
+        if let Err(e) = run(grip, token.expose().to_string()).await {
+            tracing::error!(error = %format!("{e:#}"), "the Discord connector stopped");
+        }
+    });
+    Ok(())
+}
+
+/// Reconnect loop. A dropped socket is normal operation on Discord, not a
+/// failure, so this backs off and resumes rather than giving up.
+async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
+    let rest = Rest::new(token.clone(), grip.cfg.request_timeout)?;
+    let mut backoff = Duration::from_secs(1);
+    let mut resume: Option<(String, u64)> = None;
+    let mut bot_id = String::new();
+    // Commands only need registering once per process: a reconnect does not
+    // clear them, and Discord rate-limits the endpoint globally.
+    let mut commands_registered = false;
+
+    loop {
+        match Shard::connect(&token, resume.clone()).await {
+            Ok(mut shard) => {
+                loop {
+                    match shard.next_event().await {
+                        Ok(Event::Ready {
+                            bot_id: id,
+                            application_id,
+                        }) => {
+                            // Reset the backoff *here*, not on `connect`.
+                            // `Shard::connect` returns as soon as the socket is
+                            // open, before Discord has accepted the session, so
+                            // a rejected IDENTIFY — a bad token, a shard limit —
+                            // reconnected once a second forever instead of
+                            // backing off.
+                            backoff = Duration::from_secs(1);
+                            if !id.is_empty() {
+                                bot_id = id;
+                            }
+                            tracing::info!(bot = %bot_id, "connected to Discord");
+
+                            // Without this the Discord client has nothing to
+                            // match `/new` against, so it refuses to send it
+                            // and the bot never hears about it at all.
+                            if !commands_registered && !application_id.is_empty() {
+                                match rest
+                                    .register_commands(&application_id, commands::schema())
+                                    .await
+                                {
+                                    Ok(count) => {
+                                        commands_registered = true;
+                                        tracing::info!(
+                                            count,
+                                            "registered the Discord slash commands; \
+                                             global commands can take up to an hour to \
+                                             appear in a guild that was already joined"
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "could not register the Discord slash commands; \
+                                         typed commands still work"
+                                    ),
+                                }
+                            }
+                        }
+                        Ok(Event::Message(msg)) => {
+                            // Each message is handled on its own task: a turn
+                            // takes far longer than the heartbeat interval, and
+                            // blocking here would kill the connection.
+                            let h = grip.clone();
+                            let r = rest.clone();
+                            let bot = bot_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle(h, r, bot, msg).await {
+                                    tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "failed to handle a Discord message"
+                                    );
+                                }
+                            });
+                        }
+                        Ok(Event::Command(interaction)) => {
+                            let h = grip.clone();
+                            let r = rest.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_command(h, r, interaction).await {
+                                    tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        "failed to handle a Discord slash command"
+                                    );
+                                }
+                            });
+                        }
+                        Ok(Event::Disconnected(why)) => {
+                            tracing::warn!(%why, "the Discord socket dropped");
+                            resume = shard.resume_state();
+                            break;
+                        }
+                        Ok(Event::Fatal(why)) => {
+                            tracing::error!(%why, "the Discord connector cannot continue");
+                            return Err(anyhow!(why));
+                        }
+                        Err(e) => {
+                            // A rejected token or a missing privileged intent
+                            // will never succeed, however long we wait. Stop,
+                            // and say what to change: retrying is what gets an
+                            // address rate-limited.
+                            if let Some(code) = shard.close_code() {
+                                if api::is_fatal_close(code) {
+                                    tracing::error!(
+                                        code,
+                                        advice = api::fatal_advice(code),
+                                        "the Discord connector cannot continue"
+                                    );
+                                    return Err(anyhow!(
+                                        "Discord closed the connection with {code}: {}",
+                                        api::fatal_advice(code)
+                                    ));
+                                }
+                            }
+                            tracing::warn!(error = %format!("{e:#}"), "Discord gateway error");
+                            resume = shard.resume_state();
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    backoff_secs = backoff.as_secs(),
+                    "cannot reach the Discord gateway"
+                );
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        // Capped exponential backoff, so a long outage does not become a busy
+        // loop against Discord's gateway.
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+// --- pairing ---------------------------------------------------------------
+
+/// Users authorised by a pairing code, persisted so they survive a restart.
+///
+/// Stored in the existing scoped KV table rather than a new one: it is a short
+/// list of ids, and a schema of its own would be more machinery than the data
+/// deserves.
+async fn paired_users(grip: &Grip) -> Vec<String> {
+    grip
+        .persist
+        .kv_get(PAIR_SCOPE, PAIR_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn add_paired_user(grip: &Grip, user_id: &str) -> Result<()> {
+    let mut users = paired_users(grip).await;
+    if !users.iter().any(|u| u == user_id) {
+        users.push(user_id.to_string());
+    }
+    grip
+        .persist
+        .kv_put(PAIR_SCOPE, PAIR_KEY, &users.join(","))
+        .await
+        .map_err(Into::into)
+}
+
+/// Outstanding pairing codes, with the moment each expires.
+///
+/// In memory only: a code is meant to be used within minutes, and one that did
+/// not survive a restart is safer than one that did.
+static CODES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>> =
+    std::sync::OnceLock::new();
+
+fn codes() -> &'static std::sync::Mutex<HashMap<String, (String, std::time::Instant)>> {
+    CODES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// A short code that is easy to read aloud: no vowels, so it cannot spell
+/// anything, and no characters that look alike in a chat font.
+async fn new_code(grip: &Grip) -> String {
+    const ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ23456789";
+    let seed = grip
+        .persist
+        .kv_get(PAIR_SCOPE, "discord.code_counter")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let _ = grip
+        .persist
+        .kv_put(PAIR_SCOPE, "discord.code_counter", &(seed + 1).to_string())
+        .await;
+
+    let mut n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(seed)
+        ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+    let mut code = String::new();
+    for _ in 0..6 {
+        code.push(ALPHABET[(n % ALPHABET.len() as u64) as usize] as char);
+        n /= ALPHABET.len() as u64;
+    }
+    code
+}
+
+async fn issue_code(grip: &Grip, issuer: &str) -> String {
+    let code = new_code(grip).await;
+    let expiry = std::time::Instant::now() + grip.cfg.discord.pairing_code_ttl;
+    if let Ok(mut map) = codes().lock() {
+        map.retain(|_, (_, exp)| *exp > std::time::Instant::now());
+        map.insert(code.clone(), (issuer.to_string(), expiry));
+    }
+    code
+}
+
+/// Redeems a code, returning true when the user is now authorised.
+async fn redeem_code(grip: &Grip, code: &str, user_id: &str) -> bool {
+    let found = {
+        let Ok(mut map) = codes().lock() else {
+            return false;
+        };
+        map.retain(|_, (_, exp)| *exp > std::time::Instant::now());
+        map.remove(&code.to_uppercase())
+    };
+    if found.is_none() {
+        return false;
+    }
+    if let Err(e) = add_paired_user(grip, user_id).await {
+        tracing::warn!(error = %e, "could not persist a paired user");
+        return false;
+    }
+    tracing::info!(user = %user_id, "a Discord user was paired");
+    true
+}
+
+// --- message handling ------------------------------------------------------
+
+async fn handle(
+    grip: Arc<Grip>,
+    rest: Rest,
+    bot_id: String,
+    msg: Incoming,
+) -> Result<()> {
+    let cfg = grip.cfg.discord.clone();
+    let paired = paired_users(&grip).await;
+
+    // A pairing code is the one thing an unauthorized user may send, so it is
+    // checked before the authorization decision.
+    let trimmed = msg.content.trim().to_string();
+    if !cfg.authorized(&msg.author_id, &paired)
+        && msg.is_dm()
+        && trimmed.len() <= 12
+        && trimmed.chars().all(|c| c.is_ascii_alphanumeric())
+        && !trimmed.is_empty()
+        && redeem_code(&grip, &trimmed, &msg.author_id).await
+    {
+        rest.send_message(
+            &msg.channel_id,
+            "Paired. You can talk to me now. This surface is read-only: I can \
+             read and research, but I cannot change anything on this machine.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    match policy::decide(&cfg, &bot_id, &paired, &msg) {
+        Decision::Answer => {}
+        Decision::Ignore(why) => {
+            tracing::trace!(%why, "ignoring a Discord message");
+            return Ok(());
+        }
+        Decision::Unauthorized => {
+            // Only answer in a DM. Saying this in a channel would be noise for
+            // everyone else present.
+            if msg.is_dm() {
+                rest.send_message(
+                    &msg.channel_id,
+                    "I do not know you, so I will not answer. If you should have \
+                     access, ask an administrator for a pairing code with /pair \
+                     and send me the code.",
+                )
+                .await?;
+            }
+            tracing::info!(user = %msg.author_id, "refused an unauthorized Discord user");
+            return Ok(());
+        }
+    }
+
+    let text = policy::strip_mention(&msg.content, &bot_id);
+    let key = policy::session_key(&cfg, &msg);
+
+    if let Some(reply) = typed_command(&grip, &cfg, &msg, &key, &text).await? {
+        rest.send_message(&msg.channel_id, &reply).await?;
+        return Ok(());
+    }
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let session_id = session_for(&grip, &key).await?;
+    let attributed = policy::attribute(&msg, &text, cfg.group_sessions_per_user);
+
+    // Subscribe before submitting, or a fast first token could be missed.
+    let events = grip.events_tx.subscribe();
+    grip.submit(&session_id, attributed, Vec::new()).await?;
+    let _ = rest.typing(&msg.channel_id).await;
+
+    stream_reply(grip, rest, msg.channel_id, session_id, events).await
+}
+
+/// Runs a slash command that arrived as an interaction.
+///
+/// Authorization is repeated here rather than borrowed from the message path:
+/// an interaction never passes through `decide`, so leaving it out would make
+/// every command reachable by anyone who can see the bot.
+async fn handle_command(
+    grip: Arc<Grip>,
+    rest: Rest,
+    interaction: Interaction,
+) -> Result<()> {
+    let cfg = grip.cfg.discord.clone();
+    let paired = paired_users(&grip).await;
+
+    if !cfg.authorized(&interaction.user_id, &paired) {
+        tracing::info!(user = %interaction.user_id,
+            "refused a slash command from an unauthorized Discord user");
+        // Ephemeral, so a refusal in a channel is not an announcement.
+        rest.respond_to_interaction(
+            &interaction.id,
+            &interaction.token,
+            "I do not know you, so I will not answer. If you should have access, \
+             ask an administrator for a pairing code with /pair and send me the \
+             code in a direct message.",
+            true,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let key = policy::session_key_for(
+        &cfg,
+        interaction.is_dm(),
+        policy::is_thread_type(interaction.channel_type),
+        &interaction.channel_id,
+        &interaction.user_id,
+    );
+
+    let reply = commands::run(
+        &grip,
+        &cfg,
+        &commands::Invoker {
+            user_id: interaction.user_id.clone(),
+            is_dm: interaction.is_dm(),
+        },
+        &key,
+        &interaction.name,
+        &interaction.argument,
+    )
+    .await?
+    .unwrap_or_else(|| {
+        format!("`/{}` is not a command I know. Try /help.", interaction.name)
+    });
+
+    // Discord shows "the application did not respond" after three seconds, and
+    // every one of these commands is a database read or write, not a turn.
+    rest.respond_to_interaction(&interaction.id, &interaction.token, &reply, true)
+        .await
+}
+
+/// Finds or creates the Thetis session backing a Discord conversation.
+///
+/// The mapping is persisted, so a channel keeps its history across restarts.
+/// The mode is stamped at creation: this is the point where the read-only
+/// guarantee is applied, and nothing exposed over Discord can undo it.
+///
+/// A conversation that is gone *or archived* is not reused. Archiving is how
+/// someone says they are finished with a transcript: it shuts the worker down
+/// and releases the checkout, so reviving it from chat would contradict an
+/// explicit decision made in the web UI and quietly resurrect state that was
+/// meant to be at rest. Discord gets a fresh conversation instead, exactly as
+/// if the channel had never spoken. Archiving is therefore equivalent to `/new`
+/// for every surface at once, and the archived transcript stays readable.
+async fn session_for(grip: &Grip, key: &str) -> Result<String> {
+    let kv_key = format!("discord.session.{key}");
+    if let Some(existing) = grip.persist.kv_get(PAIR_SCOPE, &kv_key).await? {
+        // `get_session` returns archived sessions too — archiving only sets a
+        // flag, it does not delete — so the flag has to be read, not merely
+        // the session's existence.
+        let found = grip.persist.get_session(&existing).await?;
+        if policy::may_reuse_session(found.as_ref().map(|m| m.archived)) {
+            return Ok(existing);
+        }
+        match found {
+            Some(_) => tracing::info!(session = %existing, %key,
+                "the Discord conversation was archived; starting a fresh one"),
+            None => tracing::info!(session = %existing, %key,
+                "the Discord conversation is gone; starting a fresh one"),
+        }
+    }
+
+    let title = format!("Discord {key}");
+    let meta = grip
+        .persist
+        .create_session(Some(title), &grip.cfg.discord.mode).await?;
+    grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
+    tracing::info!(session = %meta.id, %key, mode = %grip.cfg.discord.mode,
+        "created a Discord session");
+    Ok(meta.id)
+}
+
+/// Streams a turn's output into one Discord message, edited as it grows.
+///
+/// Discord rate-limits edits, so the text is buffered and the message is
+/// updated on an interval rather than per token.
+async fn stream_reply(
+    grip: Arc<Grip>,
+    rest: Rest,
+    channel_id: String,
+    session_id: String,
+    mut events: tokio::sync::broadcast::Receiver<crate::bindings::types::OutboundEvent>,
+) -> Result<()> {
+    let interval = grip.cfg.discord.stream_edit_interval;
+    let mut buffer = String::new();
+    let mut message_id: Option<String> = None;
+    let mut last_edit = std::time::Instant::now();
+    let mut last_sent = String::new();
+
+    loop {
+        let event = tokio::select! {
+            received = events.recv() => received,
+            // Refresh the typing indicator, which Discord clears after about
+            // ten seconds, while a long turn is still working.
+            _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                if buffer.is_empty() {
+                    let _ = rest.typing(&channel_id).await;
+                }
+                continue;
+            }
+        };
+
+        let event = match event {
+            Ok(e) => e,
+            Err(RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "the Discord reader fell behind");
+                continue;
+            }
+            Err(RecvError::Closed) => break,
+        };
+
+        if event.session_id != session_id {
+            continue;
+        }
+
+        match event.event {
+            SessionEvent::StreamDelta(chunk) => {
+                buffer.push_str(&chunk);
+                if last_edit.elapsed() >= interval && buffer.trim() != last_sent.trim() {
+                    flush(&rest, &channel_id, &mut message_id, &buffer).await;
+                    last_sent = buffer.clone();
+                    last_edit = std::time::Instant::now();
+                }
+            }
+            SessionEvent::AssistantMessage(m) => {
+                // The final text is authoritative: streamed deltas can be
+                // missing a tail, and a tool-only turn has no deltas at all.
+                if !m.content.trim().is_empty() {
+                    buffer = m.content.clone();
+                }
+            }
+            SessionEvent::ToolInvocation(call) => {
+                // Only shown while nothing has been said yet, so a long
+                // research turn does not look stalled.
+                if buffer.trim().is_empty() {
+                    let note = format!("_… {}_", call.name);
+                    if last_edit.elapsed() >= interval {
+                        flush(&rest, &channel_id, &mut message_id, &note).await;
+                        last_edit = std::time::Instant::now();
+                    }
+                }
+            }
+            SessionEvent::Incident(detail) => {
+                buffer.push_str(&format!("\n\n**Something went wrong:** {detail}"));
+            }
+            SessionEvent::TurnFinished(stats) => {
+                if buffer.trim().is_empty() {
+                    buffer = format!(
+                        "I finished without saying anything (stopped by {}).",
+                        stats.stopped_by
+                    );
+                }
+                flush(&rest, &channel_id, &mut message_id, &buffer).await;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Sends the reply, or edits it if one is already posted.
+async fn flush(
+    rest: &Rest,
+    channel_id: &str,
+    message_id: &mut Option<String>,
+    content: &str,
+) {
+    if content.trim().is_empty() {
+        return;
+    }
+    match message_id {
+        Some(id) => {
+            if let Err(e) = rest.edit_message(channel_id, id, content).await {
+                tracing::warn!(error = %format!("{e:#}"), "could not edit a Discord reply");
+            }
+        }
+        None => match rest.send_message(channel_id, content).await {
+            Ok(id) => *message_id = Some(id),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not send a Discord reply")
+            }
+        },
+    }
+}
+
+// --- commands --------------------------------------------------------------
+
+/// Handles a command typed as ordinary text, returning the reply to send.
+///
+/// `Ok(None)` means the text was not a command and should go to the agent.
+///
+/// Registered slash commands do not come this way — Discord turns those into
+/// interactions, handled by `handle_command`. This path catches the same words
+/// typed literally, which is what a client sees during the hour a freshly
+/// registered global command takes to propagate. `commands::run` is shared, so
+/// the two cannot answer differently.
+async fn typed_command(
+    grip: &Arc<Grip>,
+    cfg: &crate::config::DiscordSettings,
+    msg: &Incoming,
+    key: &str,
+    text: &str,
+) -> Result<Option<String>> {
+    let Some((name, argument)) = commands::parse_typed(text) else {
+        return Ok(None);
+    };
+    let invoker = commands::Invoker {
+        user_id: msg.author_id.clone(),
+        is_dm: msg.is_dm(),
+    };
+    commands::run(grip, cfg, &invoker, key, &name, &argument).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::Config;
+
+    /// The connector's whole tool restriction is the mode it stamps, so a mode
+    /// that is missing or not read-only must stop it from starting. The agent
+    /// treats an unknown mode as full access, so failing open here would put
+    /// the dev kit on a public chat surface.
+    fn usable(cfg: &Config, mode_id: &str) -> bool {
+        cfg.mode(mode_id).map(|m| m.read_only).unwrap_or(false)
+    }
+
+    /// Loads the shipped `thetis.toml`. `load()` resolves the root by walking
+    /// up for the marker, and the crate directory is two levels below it, so no
+    /// environment fiddling is needed.
+    fn shipped() -> Config {
+        Config::load().expect("the shipped config should load")
+    }
+
+    #[test]
+    fn the_shipped_discord_mode_is_read_only() {
+        let cfg = shipped();
+        assert!(
+            usable(&cfg, &cfg.discord.mode),
+            "discord.mode ({}) must name a read-only mode",
+            cfg.discord.mode
+        );
+    }
+
+    #[test]
+    fn a_missing_mode_would_not_be_usable() {
+        assert!(!usable(&shipped(), "no-such-mode"));
+    }
+
+    #[test]
+    fn a_writable_mode_would_not_be_usable() {
+        // "agent" exists and is deliberately not read-only.
+        assert!(!usable(&shipped(), "agent"));
+    }
+
+    #[test]
+    fn the_bot_token_is_masked_in_the_settings_listing() {
+        let cfg = shipped();
+        let shown = crate::settings::list(&cfg, None).expect("settings should list");
+        let entry = shown
+            .iter()
+            .find(|s| s.key == "discord.bot_token")
+            .expect("discord.bot_token should be listed");
+        // Empty in the shipped file; the masking itself is asserted by the
+        // secrets test in `settings`, and the key is registered there.
+        assert!(
+            entry.value.is_empty() || entry.value == "***",
+            "a token must never be shown, got {:?}",
+            entry.value
+        );
+    }
+}

@@ -1,0 +1,772 @@
+// ---------------------------------------------------------------------------
+// Thetis grip contract.
+//
+// This file is the boundary between the trusted orchestrator (host) and every
+// hot-loaded guest (agent, gateways, tools). Guests hold NO ambient authority:
+// everything they can observe or affect is an import declared here.
+//
+// Changing this file forces a rebuild of every guest, so it is orchestrator-
+// owned: the dev-kit refuses agent writes that touch it.
+// ---------------------------------------------------------------------------
+package thetis:grip@0.1.0;
+
+interface types {
+  // --- accounting -----------------------------------------------------------
+  record token-usage {
+    prompt-tokens: u32,
+    completion-tokens: u32,
+    cost-usd: f64,
+    /// Prompt tokens served from the provider's cache rather than re-read.
+    cached-tokens: u32,
+    /// Prompt tokens written into the cache by this request.
+    cache-write-tokens: u32,
+  }
+
+  // --- conversation ---------------------------------------------------------
+
+  /// A file the user attached to a message.
+  ///
+  /// Contents stay base64-encoded end to end: the browser produces them that
+  /// way and the model API consumes them that way, so nothing has to re-encode
+  /// on the path between.
+  record attachment {
+    name: string,
+    mime: string,
+    data-base64: string,
+  }
+
+  record user-msg {
+    text: string,
+    attachments: list<attachment>,
+  }
+
+  record tool-call {
+    id: string,
+    name: string,
+    arguments-json: string,
+  }
+
+  record tool-outcome {
+    call-id: string,
+    name: string,
+    ok: bool,
+    content: string,
+  }
+
+  record assistant-msg {
+    content: string,
+    tool-calls: list<tool-call>,
+    model: string,
+    usage: option<token-usage>,
+  }
+
+  record turn-stats {
+    iterations: u32,
+    prompt-tokens: u32,
+    completion-tokens: u32,
+    cost-usd: f64,
+    tools-used: list<string>,
+    stopped-by: string,
+  }
+
+  record mod-result {
+    aspect: string,
+    revision: option<u64>,
+    success: bool,
+    detail: string,
+  }
+
+  // One entry in a session's append-only log. `stream-delta` is the sole
+  // transient case: it is rendered to clients but never persisted.
+  /// A stretch of the event log, by sequence number, inclusive at both ends.
+  record seq-span {
+    from-seq: u64,
+    through-seq: u64,
+  }
+
+  /// A summary standing in for stretches of the log when the conversation is
+  /// rebuilt for the model.
+  ///
+  /// The events themselves are never removed - the log stays append-only, and
+  /// compaction only changes how it is projected into messages. That is what
+  /// makes the originals recoverable without a separate offload store.
+  record compaction {
+    /// What this summary replaces. Several spans, because preserved user
+    /// messages break the summarized region into pieces.
+    spans: list<seq-span>,
+    summary: string,
+    messages-replaced: u32,
+    tokens-before: u32,
+  }
+
+  // A branch operation on this conversation's sandbox: trunk updates,
+  // merges, resets, conflict handoffs. In the log so the transcript shows
+  // version history inline and every tab sees it the same way.
+  record branch-op {
+    /// "update" | "merge" | "reset" | "resolve-handoff" | "merge-completed" | "abort"
+    op: string,
+    ok: bool,
+    from-rev: string,
+    to-rev: string,
+    conflicts: list<string>,
+    detail: string,
+  }
+
+  variant session-event {
+    user-message(user-msg),
+    assistant-message(assistant-msg),
+    tool-invocation(tool-call),
+    tool-result(tool-outcome),
+    nudge(string),
+    system-note(string),
+    modification(mod-result),
+    incident(string),
+    turn-started,
+    turn-finished(turn-stats),
+    stream-delta(string),
+    context-compacted(compaction),
+    branch-op(branch-op),
+  }
+
+  record event-record {
+    seq: u64,
+    ts-ms: u64,
+    event: session-event,
+  }
+
+  record session-meta {
+    id: string,
+    title: string,
+    created-ms: u64,
+    updated-ms: u64,
+    event-count: u64,
+    archived: bool,
+    preview: string,
+    /// How the agent should behave in this session, e.g. "agent" or "plan".
+    mode: string,
+    /// Model override for this session; empty means the grip default.
+    model: string,
+  }
+
+  /// A model the user may pick for a session.
+  record model-info {
+    id: string,
+    label: string,
+  }
+
+  /// A named set of instructions that can be attached to a conversation to
+  /// shape how the agent works. Discovered from `skills/*.md`.
+  record skill-info {
+    id: string,
+    name: string,
+    description: string,
+    instructions: string,
+    /// Whether this skill is attached to the session it was listed for.
+    enabled: bool,
+  }
+
+  /// What the agent sees about a skill before reading its instructions.
+  ///
+  /// This is the retrieval unit: briefs and cards are what get matched and
+  /// injected, so the body is deliberately absent. Fetch it with `skills.fetch`
+  /// once a card looks relevant.
+  record skill-card {
+    /// Path-derived, e.g. "careful-surgery" or "careful-surgery/rollback".
+    id: string,
+    /// Parent's id, empty for a top-level skill.
+    parent: string,
+    name: string,
+    /// One line, at most 200 characters. This is what goes in the prompt.
+    brief: string,
+    /// When the skill applies, and when it does not.
+    when-to-use: string,
+    tags: list<string>,
+    /// Ids of nested skills, so the agent can descend without another call.
+    children: list<string>,
+    /// Whether this skill is named in every system prompt.
+    universal: bool,
+    /// Fetchable sibling files, e.g. "references/format.md".
+    resources: list<string>,
+    /// Retrieval score, 0 when this card did not come from ranking.
+    score: f64,
+    /// Why this card is here: "dense", "lexical", "parent-of-match",
+    /// "whole-corpus", "universal", or "pinned".
+    how: string,
+  }
+
+  /// A skill's instructions, or one of its resource files.
+  ///
+  /// Long files come back in slices: `offset` plus the length of `content` is
+  /// where to resume, and `total` is how much there is altogether.
+  record skill-body {
+    id: string,
+    name: string,
+    /// Empty for the skill's own body, else the resource path that was read.
+    /// Named `file` because `resource` is a reserved word in WIT.
+    file: string,
+    content: string,
+    resources: list<string>,
+    children: list<string>,
+    /// Character offset this slice starts at.
+    offset: u32,
+    /// Total length of the file in characters.
+    total: u32,
+    /// Whether content stops short of the end.
+    truncated: bool,
+  }
+
+  /// Something the linter found. Severity is "error", "warning" or "note".
+  record skill-diagnostic {
+    /// The skill it concerns; empty when it is about the tree as a whole.
+    id: string,
+    severity: string,
+    message: string,
+  }
+
+  /// The result of writing a skill, with whatever linting found afterwards.
+  record skill-write {
+    id: string,
+    /// Path relative to the skills directory.
+    path: string,
+    /// Whether this created the file rather than replacing it.
+    created: bool,
+    diagnostics: list<skill-diagnostic>,
+  }
+
+  /// A way of working the user may pick for a session. The agent interprets
+  /// the id; the grip only carries it.
+  record mode-info {
+    id: string,
+    label: string,
+    description: string,
+    /// Whether tools that change things are withheld. The agent reads this
+    /// rather than knowing any mode by name, so a new mode is configuration.
+    read-only: bool,
+    /// Appended to the system prompt while this mode is active. Empty for a
+    /// mode that only changes which tools are offered.
+    prompt: string,
+  }
+
+  // Delivered to the gateway for rendering. `seq` is none for transient events.
+  record outbound-event {
+    session-id: string,
+    seq: option<u64>,
+    ts-ms: u64,
+    event: session-event,
+  }
+
+  // --- mid-turn control -----------------------------------------------------
+  variant inbox-item {
+    nudge(string),
+    cancel,
+    control(string),
+  }
+
+  // --- llm ------------------------------------------------------------------
+  record finish-info {
+    reason: string,
+    usage: option<token-usage>,
+    model: string,
+  }
+
+  variant stream-chunk {
+    delta(string),
+    tool-calls(list<tool-call>),
+    finished(finish-info),
+  }
+
+  variant llm-error {
+    auth(string),
+    rate-limited(string),
+    transport(string),
+    model-error(string),
+    budget(string),
+    bad-request(string),
+  }
+
+  // --- host filesystem ------------------------------------------------------
+  record fs-entry {
+    name: string,
+    /// Path relative to the root it was listed under.
+    path: string,
+    is-dir: bool,
+    size: u64,
+  }
+
+  // --- terminals ------------------------------------------------------------
+  record terminal-output {
+    output: string,
+    timed-out: bool,
+    truncated: bool,
+  }
+
+  record terminal-info {
+    id: string,
+    cwd: string,
+    shell: string,
+    alive: bool,
+    /// Commands run in this session so far.
+    commands: u32,
+  }
+
+  // --- execution ------------------------------------------------------------
+  record exec-result {
+    exit-code: s32,
+    stdout: string,
+    stderr: string,
+    timed-out: bool,
+    truncated: bool,
+  }
+
+  // --- code modification ----------------------------------------------------
+  variant mod-target {
+    agent-self,
+    tool(string),
+    gateway(string),
+  }
+
+  // Returned inline from every mutating dev-kit call so the model sees the
+  // compiler's verdict in the same loop iteration that made the edit.
+  record compile-report {
+    success: bool,
+    aspect: string,
+    revision: option<u64>,
+    stderr: string,
+    duration-ms: u64,
+    pending-swap: bool,
+    detail: string,
+  }
+
+  /// A registry dependency of a guest crate.
+  record dependency {
+    name: string,
+    /// A cargo version requirement: "1", "0.4.31", "^1.2".
+    version: string,
+    features: list<string>,
+    default-features: bool,
+  }
+
+  // --- configuration --------------------------------------------------------
+  record config-entry {
+    /// Dotted path, e.g. "llm.model".
+    key: string,
+    /// Current value, or "***" where the setting holds a secret.
+    value: string,
+    /// Whether `set` will accept a change to it.
+    editable: bool,
+    /// Whether the running process would pick a change up without a restart.
+    live: bool,
+  }
+
+  // --- manifests ------------------------------------------------------------
+  record tool-manifest {
+    name: string,
+    description: string,
+    args-schema-json: string,
+    capabilities: list<string>,
+  }
+
+  record agent-manifest {
+    name: string,
+    version-note: string,
+    skills: list<string>,
+  }
+
+  record gateway-manifest {
+    name: string,
+    version-note: string,
+  }
+
+  record asset {
+    mime: string,
+    bytes: list<u8>,
+  }
+
+  enum log-level { trace, debug, info, warn, error }
+}
+
+// ---------------------------------------------------------------------------
+// Host interfaces
+// ---------------------------------------------------------------------------
+
+interface sys {
+  use types.{log-level, model-info, mode-info};
+
+  log: func(level: log-level, msg: string);
+  now-ms: func() -> u64;
+  // Namespaced scratch storage. `scope` is "global" or a session id.
+  kv-get: func(scope: string, key: string) -> option<string>;
+  kv-put: func(scope: string, key: string, value: string);
+  // Orchestrator-owned configuration the guest may read (never secrets).
+  config-get: func(key: string) -> option<string>;
+
+  // Catalogues the chat surface offers the user.
+  list-models: func() -> list<model-info>;
+  list-modes: func() -> list<mode-info>;
+}
+
+interface session {
+  use types.{attachment, event-record, session-event, session-meta, inbox-item,
+             tool-manifest};
+
+  events: func(session-id: string, from-seq: u64) -> list<event-record>;
+  append: func(session-id: string, event: session-event) -> u64;
+  // Streams a token fragment to connected clients without persisting it.
+  emit-output: func(session-id: string, chunk: string);
+  // Drains mid-turn user input (nudges / cancel) so a running turn can steer.
+  poll-inbox: func(session-id: string) -> list<inbox-item>;
+
+  list-sessions: func(include-archived: bool) -> list<session-meta>;
+  get-session: func(session-id: string) -> option<session-meta>;
+  create-session: func(title: option<string>) -> string;
+  rename-session: func(session-id: string, title: string);
+  archive-session: func(session-id: string, archived: bool);
+  // Routes a user message into a session actor, starting or nudging a turn.
+  submit: func(session-id: string, message: string, attachments: list<attachment>);
+  set-session-mode: func(session-id: string, mode: string);
+  set-session-model: func(session-id: string, model: string);
+
+  // Exactly the tools the agent would offer the model for this session, asked
+  // of the agent itself so the answer cannot drift from what it really does.
+  available-tools: func(session-id: string) -> list<tool-manifest>;
+}
+
+// Skills: the progressive-disclosure knowledge base.
+//
+// Disclosure has four levels, and each function here serves one of them:
+//   L0  `universal` - briefs named in every system prompt.
+//   L1  `retrieve` / `search` / `pinned` - cards chosen for a conversation.
+//   L2  `fetch` with an empty resource - one skill's instructions.
+//   L3  `fetch` with a resource - a bundled reference, script or asset.
+//
+// The point is that a large corpus costs a constant amount of context: only
+// briefs are always present, and everything else is pulled when it is wanted.
+//
+// Agent-only, because it can write. The chat surface gets `skills-view`.
+interface skills {
+  use types.{skill-card, skill-body, skill-diagnostic, skill-write};
+
+  /// Skills marked universal, capped by configuration.
+  universal: func() -> list<skill-card>;
+
+  /// Ranks the corpus for a session and remembers the result.
+  ///
+  /// Call once, on the opening message. The choice is pinned so later turns
+  /// rebuild an identical system prompt, which is what keeps the provider's
+  /// prompt cache warm; re-ranking every turn would invalidate it.
+  ///
+  /// `limit` of 0 means the configured default. May return fewer: the lexical
+  /// fallback drops skills that share no term with the query rather than
+  /// padding the result with irrelevant cards.
+  retrieve: func(session-id: string, query: string, limit: u32) -> list<skill-card>;
+
+  /// Ranks without remembering, for looking something up mid-conversation.
+  search: func(query: string, limit: u32) -> list<skill-card>;
+
+  /// What `retrieve` last chose for this session.
+  pinned: func(session-id: string) -> list<skill-card>;
+
+  /// Replaces the pinned set. Refuses the whole call if any id is unknown, so
+  /// the list cannot fill up with ids that no longer resolve.
+  pin: func(session-id: string, ids: list<string>) -> result<list<skill-card>, string>;
+
+  /// One skill's instructions, or one of its resources.
+  ///
+  /// `file` empty means the body. `offset` and `limit` are in characters;
+  /// `limit` of 0 means as much as the host will give at once. Slicing never
+  /// splits a multi-byte character.
+  fetch: func(id: string, file: string, offset: u32, limit: u32) -> result<skill-body, string>;
+
+  /// Creates or replaces a skill, or one of its resources, then lints it.
+  ///
+  /// The whole file is replaced, as with code edits. Diagnostics come back in
+  /// the same call, so malformed frontmatter is visible immediately rather than
+  /// at the next retrieval. Confined to the skills directory.
+  upsert: func(id: string, file: string, contents: string) -> result<skill-write, string>;
+
+  /// Deletes a skill. Refuses one with nested skills unless `recursive`, so a
+  /// subtree cannot be orphaned by accident.
+  remove: func(id: string, recursive: bool) -> result<string, string>;
+
+  /// Lints one skill, or the whole tree when `id` is empty.
+  lint: func(id: string) -> list<skill-diagnostic>;
+}
+
+// The read-only view of the same corpus, for the chat surface.
+//
+// Separate from `skills` so the gateway can show what the agent knows without
+// being able to change it: a gateway renders, it does not author.
+interface skills-view {
+  use types.{skill-card, skill-diagnostic};
+
+  /// Every skill, parents before children, for a tree view.
+  all: func() -> list<skill-card>;
+  /// The always-present briefs.
+  universal: func() -> list<skill-card>;
+  /// What was retrieved for a conversation, with scores.
+  pinned: func(session-id: string) -> list<skill-card>;
+  /// Whatever linting found across the tree.
+  lint: func() -> list<skill-diagnostic>;
+}
+
+interface llm {
+  use types.{stream-chunk, llm-error};
+
+  // Non-streaming convenience call; returns the raw provider JSON response.
+  chat: func(request-json: string) -> result<string, llm-error>;
+
+  // Streaming: open once, then pull chunks until `finished`. The host owns the
+  // socket, accumulates partial tool-call deltas, and enforces spend ceilings.
+  stream-open: func(request-json: string) -> result<u64, llm-error>;
+  stream-next: func(stream-id: u64) -> result<stream-chunk, llm-error>;
+  stream-close: func(stream-id: u64);
+}
+
+interface sandbox {
+  use types.{exec-result};
+
+  // Runs a command inside the session's Docker container. Never on the host.
+  exec: func(session-id: string, command: string, stdin: option<string>, timeout-ms: u32) -> exec-result;
+  write-file: func(session-id: string, path: string, contents: string) -> result<_, string>;
+  read-file: func(session-id: string, path: string) -> result<string, string>;
+  list-files: func(session-id: string, path: string) -> result<list<string>, string>;
+  available: func() -> bool;
+}
+
+interface tooling {
+  use types.{tool-manifest};
+
+  // Hot-loaded tool components currently active in the registry.
+  registry: func() -> list<tool-manifest>;
+  invoke: func(name: string, session-id: string, args-json: string) -> result<string, string>;
+
+  mcp-list-tools: func() -> list<tool-manifest>;
+  mcp-call-tool: func(name: string, args-json: string) -> result<string, string>;
+}
+
+// The host filesystem, confined to the roots named in configuration.
+//
+// This is separate from `sandbox`, which runs code in a container. These
+// operations touch the machine the orchestrator is running on, so the whole
+// interface is off unless configuration turns it on.
+interface hostfs {
+  use types.{fs-entry};
+
+  available: func() -> bool;
+  read-file: func(path: string) -> result<string, string>;
+  write-file: func(path: string, contents: string) -> result<string, string>;
+  list-dir: func(path: string) -> result<list<fs-entry>, string>;
+  delete-path: func(path: string, recursive: bool) -> result<string, string>;
+
+  // Reading a window of a file, numbered from 1. Line numbers are what make a
+  // later edit anchorable, and a window is what keeps a large file from
+  // spending the whole context to answer a question about ten lines of it.
+  //
+  // `offset` is the first line, 1-based; `limit` is how many, 0 for the
+  // default.
+  read-file-range: func(path: string, offset: u32, limit: u32) -> result<string, string>;
+
+  // Replacing an exact snippet in place. Whole-file writes cost the file's
+  // length twice and risk losing whatever the caller did not echo back, so
+  // this is the instrument for an ordinary change.
+  //
+  // Ambiguity is refused rather than guessed: text that appears more than once
+  // needs `replace-all` or more surrounding context.
+  edit-file: func(path: string, old-text: string, new-text: string, replace-all: bool)
+    -> result<string, string>;
+
+  // Searching file contents for a regular expression, returning a rendered
+  // `path:line: text` report. `mode` is content, files, or count; `glob`
+  // narrows by file name; `max-results` bounds the answer, 0 for the default.
+  search-files: func(pattern: string, path: option<string>, glob: option<string>,
+                     mode: string, max-results: u32) -> result<string, string>;
+
+  // Listing paths that match a glob, most recently modified first.
+  find-files: func(glob: string, path: option<string>, max-results: u32)
+    -> result<string, string>;
+}
+
+// Long-lived shell sessions on the host.
+//
+// A session keeps its working directory and shell state between commands,
+// which is what separates it from a one-shot exec.
+interface terminal {
+  use types.{terminal-output, terminal-info};
+
+  available: func() -> bool;
+  open: func(cwd: option<string>) -> result<string, string>;
+  run: func(id: string, command: string, timeout-ms: u32) -> result<terminal-output, string>;
+  read: func(id: string) -> result<string, string>;
+  close: func(id: string) -> result<string, string>;
+  sessions: func() -> list<terminal-info>;
+}
+
+// Control over the orchestrator process itself.
+interface control {
+  available: func() -> bool;
+  // Restarts the orchestrator shortly after the current turn ends, so the call
+  // returns and the user sees why before the process goes away.
+  //
+  // With `resume`, the interrupted turn is picked up again once the new process
+  // is serving; without it, the turn ends at the restart.
+  restart: func(reason: string, resume: bool) -> result<string, string>;
+}
+
+// Reading and changing the grip's own configuration.
+//
+// Writes go to the file the process was started from, with its comments
+// intact, and are rejected unless the result would still load. Nothing takes
+// effect until Thetis restarts.
+interface configuration {
+  use types.{config-entry};
+
+  // Every setting, optionally narrowed to those under a dotted prefix.
+  settings: func(prefix: option<string>) -> list<config-entry>;
+  get: func(key: string) -> option<config-entry>;
+  set: func(key: string, value: string) -> result<string, string>;
+}
+
+// The self-development kit. Every mutating call rebuilds the target aspect and
+// returns the compiler's verdict inline.
+interface devkit {
+  use types.{compile-report, mod-target, dependency};
+
+  new-tool: func(name: string, description: string) -> compile-report;
+  write-file: func(target: mod-target, path: string, contents: string) -> compile-report;
+  patch-file: func(target: mod-target, path: string, old-text: string, new-text: string) -> compile-report;
+  read-file: func(target: mod-target, path: string) -> result<string, string>;
+  list-files: func(target: mod-target) -> result<list<string>, string>;
+
+  /// Add a crate to a component's dependencies, then rebuild it.
+  ///
+  /// Adding a dependency makes cargo reach the network, so this can take far
+  /// longer than an ordinary edit; the build is killed if it overruns the
+  /// configured timeout and the previous revision keeps serving.
+  add-dependency: func(target: mod-target, dep: dependency) -> compile-report;
+  /// Drop a dependency and rebuild. Refuses to remove one the component needs
+  /// in order to be a component at all.
+  remove-dependency: func(target: mod-target, name: string) -> compile-report;
+  list-dependencies: func(target: mod-target) -> result<list<dependency>, string>;
+}
+
+// This conversation's sandbox branch. Every conversation runs on its own
+// branch of the source tree; these are the version-control verbs the agent
+// gets. Merging to trunk is deliberately absent — landing changes on trunk
+// is a human decision, made in the UI.
+interface branch {
+  record branch-state {
+    /// e.g. "conv/3fa2c1d8"
+    branch: string,
+    /// "clean" | "dirty" | "conflict"
+    state: string,
+    /// Commits this branch has that trunk lacks.
+    ahead: u32,
+    /// Commits trunk has that this branch lacks.
+    behind: u32,
+    head-rev: string,
+    trunk-rev: string,
+    /// Paths with unresolved conflicts, when state is "conflict".
+    conflicts: list<string>,
+    detail: string,
+  }
+
+  record commit-info {
+    rev: string,
+    subject: string,
+    author: string,
+    ts-ms: u64,
+    /// Whether trunk already contains this commit.
+    on-trunk: bool,
+  }
+
+  status: func() -> result<branch-state, string>;
+  log: func(limit: u32) -> list<commit-info>;
+
+  /// Bring the latest trunk into this branch (a merge; fast-forward when the
+  /// branch has no commits of its own). Conflicts come back as state
+  /// "conflict" with markers left in the working tree — resolve them with
+  /// the ordinary editing tools, then call complete-merge.
+  update-from-trunk: func() -> result<branch-state, string>;
+  /// Restore the whole branch to how it was at `rev`, as a new commit —
+  /// history is preserved, nothing is rewritten. The rollback replacement.
+  reset-to: func(rev: string) -> result<branch-state, string>;
+  /// Commit a conflicted merge whose conflicts have been resolved in the
+  /// working tree. Refuses while conflict markers remain.
+  complete-merge: func(message: option<string>) -> result<branch-state, string>;
+  abort-merge: func() -> result<branch-state, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Worlds
+// ---------------------------------------------------------------------------
+
+world agent {
+  use types.{turn-stats, agent-manifest, tool-manifest};
+
+  import sys;
+  import session;
+  import skills;
+  import llm;
+  import sandbox;
+  import tooling;
+  import devkit;
+  import branch;
+  import hostfs;
+  import terminal;
+  import control;
+  import configuration;
+
+  // Runs one full agentic turn for a session. The agent is stateless across
+  // turns: it rehydrates from the session log every time.
+  export handle-turn: func(session-id: string) -> result<turn-stats, string>;
+  // Liveness probe used by the watchdog and the validation gate.
+  export health: func() -> string;
+  export describe: func() -> agent-manifest;
+  // The tool surface for a given mode. The agent is the authority on this, so
+  // the chat interface asks rather than guessing.
+  export list-tools: func(mode: string) -> list<tool-manifest>;
+}
+
+world gateway {
+  use types.{asset, outbound-event, gateway-manifest};
+
+  import sys;
+  import session;
+  import skills-view;
+
+  record broadcast-frame {
+    session-id: string,
+    frame: string,
+  }
+
+  variant gateway-action {
+    reply(string),
+    broadcast(broadcast-frame),
+    subscribe(string),
+    unsubscribe(string),
+  }
+
+  // Serves the embedded single-page UI. The host owns the socket; the gateway
+  // owns every byte the user sees.
+  export serve-asset: func(path: string) -> option<asset>;
+  export on-client-message: func(client-id: string, frame-json: string) -> list<gateway-action>;
+  export render-event: func(event: outbound-event) -> option<string>;
+  export describe: func() -> gateway-manifest;
+}
+
+world tool {
+  use types.{tool-manifest};
+
+  import sys;
+  import sandbox;
+
+  export describe: func() -> tool-manifest;
+  // `config-json` is the tool's own `[tools.<name>]` block from thetis.toml,
+  // or `{}` when it has none. A tool is handed its own settings and never sees
+  // another's, nor anything else in the configuration.
+  export invoke: func(
+    session-id: string,
+    args-json: string,
+    config-json: string,
+  ) -> result<string, string>;
+}
