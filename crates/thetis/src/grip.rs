@@ -605,6 +605,21 @@ impl Grip {
         }
     }
 
+    /// Takes a aspect out of service, the mirror of [`install_component`].
+    ///
+    /// Used when a aspect's source is gone: without this the loader keeps serving
+    /// the last artifact forever, so a deleted tool stays callable and every
+    /// rebuild fails with "no crate found". Order matters — drop the manifest
+    /// first, because `tool_registry` filters the manifest map by what the
+    /// loader holds, and a reader between the two writes must see a tool that
+    /// is missing rather than one that is loaded but undescribed.
+    pub fn uninstall_component(&self, aspect: &Aspect) {
+        if let Aspect::Tool(name) = aspect {
+            self.forget_tool(name);
+        }
+        self.loader.remove(aspect);
+    }
+
     /// Installs a component, keeping the tool registry in step with the loader.
     ///
     /// These two must never disagree: a tool that is loaded but unregistered is
