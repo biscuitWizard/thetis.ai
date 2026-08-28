@@ -471,7 +471,13 @@ const RENDERERS = {
     );
   },
 
-  "turn-started": () => store.set({ busy: true, liveTurn: null }),
+  // Deliberately does *not* clear `liveTurn`. A turn cut short by a restart
+  // leaves spend that no ledger row covers yet — the host sweeps it into the
+  // next row to be written — so clearing here made the header drop by whatever
+  // the killed turn had cost, which is the "reset" this whole fix is about.
+  // `liveTurn` therefore means "spend since the last ledger row", matching the
+  // host's anchor exactly, and only a finished turn retires it.
+  "turn-started": () => store.set({ busy: true }),
 
   "turn-finished"(ev) {
     store.set({ busy: false });
@@ -480,19 +486,23 @@ const RENDERERS = {
     // The ledger the Usage view and the header's spend chip read. These totals
     // are authoritative for the turn, so the running tally it was accumulating
     // is dropped rather than added to them.
-    store.turnStats.push({
-      cost: ev.cost || 0,
-      prompt_tokens: ev.prompt_tokens || 0,
-      completion_tokens: ev.completion_tokens || 0,
-      iterations: ev.iterations || 1,
-      stopped_by: ev.stopped_by || "stop",
-      ts: ev.ts,
-    });
-    store.set({
-      spendSession: (store.spendSession || 0) + (ev.cost || 0),
-      liveTurn: null,
-    });
-    store.touch("turnStats");
+    // Keyed by sequence so a row cannot land twice. A frame can arrive both
+    // live and again in a replay — a reconnect mid-turn does exactly that — and
+    // an accumulating total counted the same turn twice when it did.
+    const seq = ev.seq ?? `t${store.turnStats.length}`;
+    if (!store.turnStats.some((t) => t.seq === seq)) {
+      store.turnStats.push({
+        seq,
+        cost: ev.cost || 0,
+        prompt_tokens: ev.prompt_tokens || 0,
+        completion_tokens: ev.completion_tokens || 0,
+        iterations: ev.iterations || 1,
+        stopped_by: ev.stopped_by || "stop",
+        ts: ev.ts,
+      });
+    }
+    store.set({ liveTurn: null });
+    recomputeTotals();
 
     const bits = [];
     if (ev.iterations > 1) bits.push(`${ev.iterations} steps`);
@@ -520,6 +530,20 @@ const RENDERERS = {
   },
 };
 
+/* Session totals, recomputed from the ledger rather than accumulated.
+ *
+ * A running `+=` total is only correct if every contribution arrives exactly
+ * once, and on a socket that reconnects and replays, that is not a property the
+ * UI can assume. Deriving the total from the rows means a duplicate frame, a
+ * replay or a late arrival cannot corrupt it: the same rows always give the same
+ * total, and it is right after a refresh because the rows come from the log.
+ */
+function recomputeTotals() {
+  const cost = store.turnStats.reduce((sum, t) => sum + (t.cost || 0), 0);
+  store.set({ spendSession: cost });
+  store.touch("turnStats");
+}
+
 export function applyEvent(ev) {
   const follow = atBottom();
   // Any event at all means this conversation is no longer empty, so the
@@ -536,7 +560,7 @@ export function replay(events) {
     return;
   }
   events.forEach((ev) => RENDERERS[ev.kind]?.(ev));
-  store.touch("turnStats");
+  recomputeTotals();
   // A restored transcript should start at the end, without animating there.
   toBottom(true);
 }
