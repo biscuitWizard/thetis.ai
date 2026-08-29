@@ -189,6 +189,14 @@ pub struct State {
     pub index: usize,
     /// When the form was posted, in epoch milliseconds.
     pub created_ms: i64,
+    /// The message carrying the controls, once it is posted.
+    ///
+    /// Needed so a form that is superseded can have its controls taken away
+    /// rather than left clickable: a stale form nobody retired is a second
+    /// answer stream into the same conversation. `default` so state written by
+    /// an earlier build still loads instead of stranding a live form.
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 impl State {
@@ -201,6 +209,7 @@ impl State {
             answers: Vec::new(),
             index: 0,
             created_ms: now_ms,
+            message_id: None,
         }
     }
 
@@ -232,6 +241,60 @@ impl State {
 /// The KV key holding a form's state.
 pub fn key(state_id: &str) -> String {
     format!("discord.ask.{state_id}")
+}
+
+/// The KV key naming the form posted for one `ask_user` call.
+///
+/// A tool call is the unit of asking, so it is the unit of claiming: whoever
+/// writes this key first owns posting the form, and everyone else finds it
+/// taken. Several readers of the event stream can see the same
+/// `tool-invocation` — a message arriving mid-turn starts a second follower of
+/// the same session, and a reconnect can replay one — and without a claim each
+/// of them posts its own form. Two live forms for one question is the fork:
+/// both are answerable, and both submit, so the model is handed two answers to
+/// a question it asked once.
+///
+/// Never cleared. A few dozen bytes per call buys idempotence that survives a
+/// restart, which a key expiring with the form would not.
+pub fn claim_key(session_id: &str, call_id: &str) -> String {
+    format!("discord.ask.call.{session_id}.{call_id}")
+}
+
+/// The KV key naming the one form a session may currently have outstanding.
+///
+/// A session answers into a single conversation, so it may have at most one
+/// answerable form. Per-call claiming alone does not give that: two *different*
+/// calls — a second turn asking again before the first form was dealt with —
+/// each claim their own key and each post, leaving two sets of controls live in
+/// the channel. Both are answerable and both submit, so one conversation
+/// receives two independent answer streams, which is the fork.
+///
+/// Holds the state id of the live form, or empty for none, so posting a new
+/// form can retire the previous one in the same compare-and-set that installs
+/// it.
+pub fn live_key(session_id: &str) -> String {
+    format!("discord.ask.live.{session_id}")
+}
+
+/// A short stable id for a string, for a call that arrives without one.
+///
+/// FNV-1a, in base36. Not a secret and nothing depends on its strength; it only
+/// has to give the same answer twice, so two readers seeing the same call agree
+/// on the same claim key. A provider that omitted `id` would otherwise leave
+/// every reader free to claim separately, which is the fork this prevents.
+pub fn digest(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut out = String::new();
+    let mut v = hash;
+    for _ in 0..12 {
+        out.push(char::from_digit((v % 36) as u32, 36).unwrap_or('0'));
+        v /= 36;
+    }
+    out
 }
 
 // --- custom ids ------------------------------------------------------------
@@ -786,5 +849,77 @@ mod tests {
         assert!(text.contains("first"), "{text}");
         assert!(text.contains("yes"), "{text}");
         assert!(text.contains("Question 2 of 2"), "{text}");
+    }
+
+    #[test]
+    fn a_call_is_claimed_by_its_own_key_and_nothing_elses() {
+        // The claim key is what makes posting idempotent per call, so it must
+        // distinguish calls and sessions and nothing else.
+        let a = claim_key("sess-1", "call-1");
+        assert_eq!(claim_key("sess-1", "call-1"), a, "must be stable");
+        assert_ne!(claim_key("sess-1", "call-2"), a);
+        assert_ne!(claim_key("sess-2", "call-1"), a);
+        // Distinct from the form-state key, or claiming would destroy the state.
+        assert_ne!(a, key("call-1"));
+    }
+
+    #[test]
+    fn the_digest_is_stable_and_distinguishes_different_calls() {
+        // Stands in for a missing call id, so two readers of the same event must
+        // land on the same claim, and two different calls must not collide.
+        let args = r#"{"questions":[{"question":"q"}]}"#;
+        assert_eq!(digest(args), digest(args));
+        assert_ne!(digest(args), digest(r#"{"questions":[{"question":"r"}]}"#));
+        assert!(!digest(args).is_empty());
+        // Short enough to sit inside a 100-character custom_id alongside the
+        // rest of the key.
+        assert!(digest(args).chars().count() <= 12);
+        assert!(digest(args).chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn a_session_has_one_live_form_pointer_distinct_from_call_and_state_keys() {
+        // At most one form per session may be answerable, and the pointer that
+        // enforces it must not collide with the per-call claim or the form
+        // state — either collision would destroy the thing it names.
+        let live = live_key("sess-1");
+        assert_eq!(live_key("sess-1"), live);
+        assert_ne!(live_key("sess-2"), live);
+        assert_ne!(live, claim_key("sess-1", "call-1"));
+        assert_ne!(live, key("sess-1"));
+    }
+
+    #[test]
+    fn state_from_a_build_without_a_message_id_still_loads() {
+        // A form outliving a deploy must stay answerable, so the new field is
+        // defaulted rather than required.
+        let old = r#"{"session_id":"s","channel_id":"c","user_id":"u",
+            "ask":{"intro":"","questions":[{"prompt":"q","kind":"Open",
+            "options":[],"multiple":false}]},"answers":[],"index":0,
+            "created_ms":0}"#;
+        let state: State = serde_json::from_str(old).expect("old state should load");
+        assert_eq!(state.message_id, None);
+        assert_eq!(state.ask.questions.len(), 1);
+    }
+
+    #[test]
+    fn recording_an_answer_changes_the_serialized_state() {
+        // The compare-and-set in `advance_form` is against these bytes, so a
+        // recorded answer has to change them or the guard would pass twice and
+        // one question could be answered two ways.
+        let state = State::new(
+            "s",
+            "c",
+            "u",
+            ask_of(r#"{"questions":[{"question":"first"},{"question":"second"}]}"#),
+            0,
+        );
+        let before = serde_json::to_string(&state).unwrap();
+        let mut after = state.clone();
+        after.record(Answer {
+            skipped: false,
+            text: "yes".into(),
+        });
+        assert_ne!(before, serde_json::to_string(&after).unwrap());
     }
 }
