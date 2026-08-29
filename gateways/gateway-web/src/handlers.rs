@@ -26,7 +26,7 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
     let previous = frame.get("previous").and_then(Value::as_str);
 
     match kind {
-        "hello" => vec![catalog(), sessions()],
+        "hello" => vec![catalog(), sessions(), user_avatar()],
         "list" => vec![sessions()],
         "catalog" => vec![catalog()],
 
@@ -113,6 +113,16 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
         // instead, which means a slug typed here is selectable in the same
         // breath - and `set-session-model` accepts any slug, so it works.
         "models" => vec![catalog()],
+
+        // The user's own avatar, shown beside the conversation. Kept in the KV
+        // store rather than config for the same reason the model overlay is:
+        // `thetis.toml` is read only at startup, so a picture chosen here could
+        // not appear until a restart. The agent's avatar is the opposite case —
+        // it is identity, set by whoever configures the installation, and is
+        // substituted into the markup at serve time.
+        "user-avatar" => vec![user_avatar()],
+        "user-avatar-set" => set_user_avatar(frame, id),
+
         "model-save" => save_model(frame, id),
         "model-remove" => remove_model(frame, id),
         "model-restore" => restore_model(frame, id),
@@ -429,6 +439,68 @@ fn restore_model(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
     overlay.retain(|e| e.id != slug);
     save_overlay(&overlay);
     catalog_replies(session)
+}
+
+// --- the user's avatar ------------------------------------------------------
+
+/// Where the user's picture is kept. Global scope: it is the person using the
+/// installation, not a property of one conversation.
+const USER_AVATAR_KEY: &str = "gateway.web.user_avatar";
+
+/// Ceiling on the stored value, in characters. A `data:` URI is base64, so this
+/// is roughly a 1.5 MB image — generous for a portrait, and far enough under the
+/// 16 MiB websocket cap that the frame carrying it can never be the thing that
+/// trips it. The client downscales before uploading; this is the backstop.
+const MAX_AVATAR_CHARS: usize = 2_000_000;
+
+/// The stored picture, or an empty string when there is none. Empty is a real
+/// answer rather than a missing one: it selects the drawn fallback mark.
+pub fn user_avatar() -> GatewayAction {
+    reply(json!({
+        "type": "user-avatar",
+        "avatar": sys::kv_get("global", USER_AVATAR_KEY).unwrap_or_default(),
+    }))
+}
+
+/// Stores a new picture, or clears it when `avatar` is empty.
+///
+/// Replies with the whole `user-avatar` frame, and broadcasts it to every tab on
+/// the open conversation, so a second window is not left showing the old face.
+fn set_user_avatar(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
+    let raw = frame
+        .get("avatar")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+
+    if raw.chars().count() > MAX_AVATAR_CHARS {
+        return vec![error(
+            "that image is too large — pick one under about 1.5 MB",
+        )];
+    }
+    // Only a `data:` image or an http(s) URL. Anything else — `javascript:`
+    // above all — would end up in a `src` attribute, so it is refused here
+    // rather than trusted to the client's own escaping.
+    let allowed = raw.is_empty()
+        || raw.starts_with("data:image/")
+        || raw.starts_with("https://")
+        || raw.starts_with("http://");
+    if !allowed {
+        return vec![error("an avatar must be an image file or an http(s) URL")];
+    }
+
+    sys::kv_put("global", USER_AVATAR_KEY, raw);
+
+    let mut actions = vec![user_avatar()];
+    if let Some(session) = session {
+        if let GatewayAction::Reply(frame) = user_avatar() {
+            actions.push(GatewayAction::Broadcast(crate::BroadcastFrame {
+                session_id: session.to_string(),
+                frame,
+            }));
+        }
+    }
+    actions
 }
 
 // --- frames -----------------------------------------------------------------
