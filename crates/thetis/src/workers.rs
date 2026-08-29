@@ -1019,6 +1019,11 @@ fn spawn_worker_process(
         // which serves an identical tree with no toolchain at all.
         .env("THETIS_LOCAL_CONFIG", cfg.local_overlay())
         .env("THETIS_TRUNK", trunk)
+        // The browser sidecar's token is deliberately NOT pinned here. A worker
+        // is spawned by whichever gateway is running, normally trunk's binary,
+        // so a branch adding an `.env()` call here would not affect its own
+        // workers at all. It travels through a file in the shared data
+        // directory instead. See `browser::token`.
         // A worker must never mistake itself for a supervised service: its
         // restart path is the gateway, not systemd.
         .env_remove("INVOCATION_ID")

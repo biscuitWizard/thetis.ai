@@ -334,6 +334,22 @@ pub fn all() -> &'static [ToolGroup] {
             members: &[],
         },
         ToolGroup {
+            id: "browser",
+            brief: "A real headless browser: navigate, read the page, click, type, screenshot.",
+            // "browser" and "page" are dropped deliberately: in this repo a
+            // browser is usually the thing a gateway is served to, and a page is
+            // as often a Notion one. The tags left are the ones that only occur
+            // when someone wants a page actually driven — and the skill edge
+            // from `web-ui-design/verifying-on-a-branch` is the better signal
+            // anyway, since verifying a UI change is the main use.
+            tags: &[
+                "playwright", "headless", "click", "screenshot", "dom", "css",
+                "viewport", "responsive", "render", "frontend",
+            ],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
             id: "github",
             brief: "The GitHub API: reading and committing files, repos, branches, PRs.",
             // "commit" is a `branch` tag and means the local branch more often;
@@ -368,9 +384,14 @@ pub fn all_ids() -> Vec<String> {
 /// A stopgap by design: a component *should* say `group:<id>` in its
 /// capabilities. Until it does, the naming convention already in use carries
 /// the same information and costs nothing to read.
+/// Order matters: the first match wins. `web-browser-` must precede `web-`, or
+/// the whole browser family lands in the `web` group — which is not merely
+/// untidy, it would attach a headless browser to every conversation that
+/// mentioned an article.
 const PREFIX_RULES: &[(&str, &str)] = &[
     ("bq-", "bigquery"),
     ("notion-", "notion"),
+    ("web-browser-", "browser"),
     ("web-", "web"),
     ("git-", "github"),
 ];
