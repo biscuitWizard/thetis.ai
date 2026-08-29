@@ -221,6 +221,55 @@ impl Outcome {
     }
 }
 
+/// Files a smoke-passing artifact in the build cache under the tree that
+/// produced it, so every branch holding that tree — and the merge gate — can
+/// recognise it as green without a toolchain.
+///
+/// Called from both green exits of the pipeline: the one where the component
+/// changed, and the one where cargo produced bytes identical to what is already
+/// serving. The second is easy to overlook and was the source of a merge
+/// deadlock, so the two paths share this function rather than each remembering
+/// to cache.
+///
+/// Keyed off `HEAD`, so it must be called *after* the source has been
+/// committed: the key names the committed tree, and caching against a tree that
+/// does not exist yet would file the artifact where nothing will look for it.
+async fn cache_green(
+    grip: &Arc<Grip>,
+    aspect: &Aspect,
+    wasm: &std::path::Path,
+    artifact_sha256: &str,
+    source_commit: Option<String>,
+    note: &str,
+    origin: Origin,
+) {
+    let Some(key) = aspect_cache_key(grip, "HEAD", aspect).await else {
+        return;
+    };
+    let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg.aspect_source_rel(aspect)) {
+        (Some(git), Some(rel)) => (
+            git.tree_oid("HEAD", &rel).await.ok().flatten().unwrap_or_default(),
+            git.tree_oid("HEAD", "wit").await.ok().flatten().unwrap_or_default(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let meta = BuildMeta {
+        aspect: aspect.key(),
+        key,
+        artifact_sha256: artifact_sha256.to_string(),
+        smoke: SmokeVerdict::Pass,
+        source_commit: source_commit.unwrap_or_default(),
+        aspect_tree,
+        wit_tree,
+        created_ms: crate::buildcache::now_ms(),
+        note: format!("{}: {note}", origin.label()),
+    };
+    if let Err(e) = grip.buildcache.store(wasm, CACHE_ARTIFACT, &meta) {
+        // A cache miss later costs a rebuild, not correctness.
+        tracing::warn!(%aspect, error = %e, "could not cache the artifact");
+    }
+}
+
 /// Builds an aspect's current source and, if every gate passes, puts it live.
 pub async fn build_and_activate(
     grip: &Arc<Grip>,
@@ -411,9 +460,31 @@ pub async fn build_and_activate_with(
         .get(aspect)
         .is_some_and(|loaded| loaded.artifact_sha256 == fresh_hash);
     if already_serving {
-        let _ = grip
+        let commit = grip
             .commit_worktree(&format!("{}: {note} ({aspect})", origin.label()))
-            .await;
+            .await
+            .ok()
+            .flatten();
+        // File the artifact under the tree that just got committed, exactly as
+        // a changed build would.
+        //
+        // Skipping this was a real bug, not an optimisation. The merge gate
+        // recognises a green build by *tree identity*, so a commit with no
+        // cache entry is indistinguishable from one that was never built — and
+        // this path is reached precisely by the edits that do not alter the
+        // compiled output: a reworded comment, whitespace, or a rebuild after
+        // `update_from_trunk` brought in changes to other aspects only. Every
+        // such commit moved the tree, cached nothing, and left the branch
+        // permanently unmergeable with "its latest state has no green build".
+        // Rebuilding could never clear it: the second attempt is byte-identical
+        // too, so it landed here again.
+        //
+        // Claiming `Pass` without re-running the smoke test is sound here and
+        // only here: these bytes are byte-identical to what the loader is
+        // serving, and a component only becomes live by passing the smoke test
+        // under a cache key carrying *this* kernel's contract fingerprint. Same
+        // bytes, same kernel, same verdict.
+        cache_green(grip, aspect, &wasm, &fresh_hash, commit, note, origin).await;
         return Ok(Outcome {
             success: true,
             aspect: aspect.key(),
@@ -456,30 +527,7 @@ pub async fn build_and_activate_with(
         .flatten();
     let key = aspect_cache_key(grip, "HEAD", aspect).await;
     let revision = key.as_deref().map(key_revision).unwrap_or(0);
-    if let Some(key) = &key {
-        let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg.aspect_source_rel(aspect)) {
-            (Some(git), Some(rel)) => (
-                git.tree_oid("HEAD", &rel).await.ok().flatten().unwrap_or_default(),
-                git.tree_oid("HEAD", "wit").await.ok().flatten().unwrap_or_default(),
-            ),
-            _ => (String::new(), String::new()),
-        };
-        let meta = BuildMeta {
-            aspect: aspect.key(),
-            key: key.clone(),
-            artifact_sha256: fresh_hash.clone(),
-            smoke: SmokeVerdict::Pass,
-            source_commit: commit.unwrap_or_default(),
-            aspect_tree,
-            wit_tree,
-            created_ms: crate::buildcache::now_ms(),
-            note: format!("{}: {note}", origin.label()),
-        };
-        if let Err(e) = grip.buildcache.store(&wasm, CACHE_ARTIFACT, &meta) {
-            // A cache miss later costs a rebuild, not correctness.
-            tracing::warn!(%aspect, error = %e, "could not cache the artifact");
-        }
-    }
+    cache_green(grip, aspect, &wasm, &fresh_hash, commit, note, origin).await;
 
     // 8. Live. Installing through the grip keeps the tool registry in step.
     let component = Arc::new(crate::loader::LoadedComponent {
