@@ -107,12 +107,12 @@
          clones this, so the serve-time substitution happens once and the
          transcript never has to know whether a picture is configured. -->
     <template id="agent-avatar-template">
-      <span class="byline-avatar">
+      <span class="turn-avatar">
         <!-- Same two-element trick as the brand: exactly one is shown, chosen
              at serve time, so a broken URL can fall back to the mark at runtime
              rather than to a broken-image glyph. -->
-        <img class="byline-img" src="{agent_avatar}" alt="" decoding="async" {agent_avatar_hidden}>
-        <svg class="byline-mark" viewBox="0 0 32 32" aria-hidden="true" {agent_mark_hidden}>
+        <img class="turn-img" src="{agent_avatar}" alt="" decoding="async" {agent_avatar_hidden}>
+        <svg class="turn-mark" viewBox="0 0 32 32" aria-hidden="true" {agent_mark_hidden}>
           <circle cx="16" cy="16" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
           <circle cx="16" cy="16" r="3" fill="currentColor"/>
         </svg>
@@ -123,9 +123,9 @@
          host KV store and arrives over the wire, so avatars.js fills in every
          clone — including the ones already on screen — when it lands. -->
     <template id="user-avatar-template">
-      <span class="byline-avatar is-user">
-        <img class="byline-img" alt="" decoding="async" hidden>
-        <svg class="byline-mark" viewBox="0 0 20 20" aria-hidden="true">
+      <span class="turn-avatar is-user">
+        <img class="turn-img" alt="" decoding="async" hidden>
+        <svg class="turn-mark" viewBox="0 0 20 20" aria-hidden="true">
           <circle cx="10" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.4"/>
           <path d="M4.2 16.2a5.8 5.8 0 0 1 11.6 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
         </svg>

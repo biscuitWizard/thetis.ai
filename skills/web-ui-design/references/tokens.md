@@ -66,7 +66,7 @@ self-served.
 | Space | `--gap-1` 4 · `--gap-2` 8 · `--gap-3` 12 · `--gap-4` 16 · `--gap-5` 24 · `--gap-6` 32 |
 | Shadow | `--shadow-sm` · `--shadow-md` · `--shadow-lg` — floating layers only |
 | Motion | `--ease` `cubic-bezier(.2,.7,.3,1)` · `--fast` 110ms · `--med` 180ms, both 0 under `prefers-reduced-motion` |
-| Layout | `--sidebar-w` 272px · `--measure` 48rem · `--avatar-sm` 26px |
+| Layout | `--sidebar-w` 272px · `--measure` 48rem · `--avatar-lg` 44px · `--avatar-gutter` 56px |
 
 Radius by role: `--r-sm` for inputs and small chips, `--r-md` for cards, buttons
 and panels' inner blocks, `--r-lg` for a message bubble, `--r-xl` for the
@@ -81,20 +81,42 @@ composer, `--r-pill` for pills and the send button.
 | Under 1100px | Panel goes `position: fixed`, floats over the chat, strip stays |
 | Under 860px | Sidebar narrows to 210px, composer hint hides |
 
-### Byline avatars
+### Turn avatars
 
-A `.byline-avatar` tile sits at the head of each turn, inside `.row-head`
-beside the name: `--avatar-sm` (26px) square, `--r-sm`, the image cropped
-`object-position: top center`. Squares, not portrait crops — at this size a 3:4
-tile reads as a sliver, and squares line up down the transcript's left edge.
+A `.turn-avatar` tile per turn — `--avatar-lg` (44px), `--r-md`, cropped
+`object-position: top center` — in a gutter to the **left of the text column**,
+not inside the byline. Squares, not portrait crops: squares line up down the
+transcript's edge and keep a face in frame whatever the source ratio.
 
-**Put avatars in the byline, not in a gutter beside the conversation.** Flanking
-columns were built first, at 132/208px with container-query thresholds, and were
-wrong: the ask was "next to the name on each turn", and a decorative portrait
-that appears only above 1116px is not the same feature as an attribution mark
-that is always there. The byline version costs the conversation no width, works
-at every size, and needs no breakpoint at all. If a per-turn face is what is
-wanted, the row is where it goes.
+**How the gutter is made, and why this way.** `--avatar-gutter` is added to the
+*left padding of the scroll container*, and the tile is `position: absolute`
+into it (`right: calc(100% + var(--gap-3))` against a `position: relative` row).
+Every centred child of the transcript is `max-width: --measure; margin: 0 auto`,
+so shrinking the content box moves all of them together — rows, tool cards,
+meta lines, ask forms, the compaction card — with no per-element change. Seven
+`max-width: var(--measure)` rules kept working untouched. `.composer-wrap` takes
+the same left padding so the composer stays on the text's axis.
+
+Two things this gets right that are easy to get wrong:
+
+- **Padding, not margin.** Margin is slack that vanishes as the window narrows,
+  and an avatar positioned into vanished slack lands on the sidebar. Reserved
+  padding shrinks the text column instead — recoverable, and it never overlaps.
+  Verified at 760px with a rail panel docked: `main_w` 506, text down to 440px,
+  `tile_clear_of_sidebar` still true, nothing overflowing.
+- **Out of flow, so the byline is untouched.** The tile is a child of the row,
+  not of `.row-head`, so the name still starts at the text column's left edge
+  (`head_starts_at_row` true) whether or not a face is present.
+
+At ≤860px both tokens shrink together (30px tile, 42px gutter) rather than the
+gutter being dropped — dropping it would leave the absolutely-positioned tile
+outside the row, over the sidebar. Keep `--avatar-gutter` ≥ avatar + `--gap-3`
+for the same reason.
+
+Three rows are built outside the normal `row()` path and each needs the tile
+adding by hand: the optimistic "sending" row in `showPending`, and the streaming
+row, which must keep its avatar when the final message replaces the streamed
+text. All three are worth re-checking after any change here.
 
 Both roles come from `<template>` elements in `index.html`, cloned per row, so
 the markup for a face lives in one place rather than in each renderer.
@@ -103,14 +125,14 @@ the markup for a face lives in one place rather than in each renderer.
 is `agent.avatar` from config, substituted into its template at serve time, so
 it is right on the first paint. Yours lives in the host KV store and arrives on
 a `user-avatar` frame *after* rows are on screen — so `draw()` repaints every
-`.byline-avatar.is-user` already in the DOM as well as recording the value for
+`.turn-avatar.is-user` already in the DOM as well as recording the value for
 tiles minted later. Without that, an upload appears only on subsequent turns and
-a replayed transcript keeps the blank mark. Verified: two rows rendered before
-the upload both picked it up, `tiles_showing_both: 0`, and a row rendered
-afterwards came out already filled.
+a replayed transcript keeps the blank mark. Verified: a row rendered before the
+upload picked it up, `user_showing_both: 0`, and a row rendered afterwards came
+out already filled.
 
-A role with no face (a system note, a tool row) gets a byline with no tile,
-rather than an empty square: `bylineAvatar()` returns null and `el()` skips it.
+A role with no face (a system note, a tool row) gets no tile rather than an empty
+square: `turnAvatar()` returns null and `el()` skips it.
 
 ## Component markup
 
