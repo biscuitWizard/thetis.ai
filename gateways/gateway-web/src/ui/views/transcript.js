@@ -20,6 +20,20 @@ const ASK_TOOL = "ask_user";
 
 let root = null;
 let live = null; // element collecting streamed tokens
+let thinking = null; // element collecting streamed reasoning, if any
+
+// Collapses the open reasoning block and stops collecting into it. Called when
+// the answer starts or the turn ends, so thinking never absorbs later output.
+function settleReasoning() {
+  if (!thinking) return;
+  const box = thinking.closest("details.reasoning");
+  if (box) {
+    box.removeAttribute("open");
+    const label = box.querySelector("summary");
+    if (label) label.textContent = "Thought for a moment";
+  }
+  thinking = null;
+}
 let onInspect = null; // opens the Context tab at the latest request
 let onAnswer = null; // sends an ask_user form's answers as a user message
 let pendingNode = null; // the optimistic row for a message not yet acknowledged
@@ -45,6 +59,7 @@ export function mountTranscript(hooks = {}) {
 
 export function reset() {
   live = null;
+  thinking = null;
   pendingNode = null;
   compactNode = null;
   openAsks = [];
@@ -415,6 +430,9 @@ const RENDERERS = {
   },
 
   delta(ev) {
+    // The answer has begun, so the thinking is done: fold it away rather than
+    // leaving a wall of reasoning above every reply.
+    settleReasoning();
     if (!live) {
       const node = row("assistant", AGENT_NAME, el("div", { class: "bubble-text is-streaming" }));
       live = node.querySelector(".bubble-text");
@@ -422,7 +440,22 @@ const RENDERERS = {
     live.textContent += ev.text;
   },
 
+  // A reasoning model can spend most of its output thinking. Shown in its own
+  // collapsible block so the wait is visible, but never mixed into the answer.
+  reasoning(ev) {
+    if (!thinking) {
+      const box = el("details", { class: "reasoning", open: "" },
+        el("summary", {}, "Thinking\u2026"),
+        el("div", { class: "reasoning-text" }));
+      row("assistant", AGENT_NAME, box);
+      thinking = box.querySelector(".reasoning-text");
+    }
+    thinking.textContent += ev.text;
+  },
+
   assistant(ev) {
+    // The answer is here, so whatever thinking preceded it is finished.
+    settleReasoning();
     // The final message is authoritative: it replaces whatever streamed (as
     // rendered markdown), so a reconnect part-way through still lands right.
     if (live) {
@@ -624,6 +657,7 @@ const RENDERERS = {
 
   "turn-finished"(ev) {
     store.set({ busy: false });
+    settleReasoning();
     live = null;
     compactNode?.remove();
     compactNode = null;

@@ -630,6 +630,45 @@ body { display: flex; flex-direction: column; }
 }
 @keyframes blink { to { opacity: 0; } }
 
+/* Reasoning: a model's thinking, which is not its answer. Deliberately quieter
+ * than the reply — dim, smaller, monospaced — so a long think reads as
+ * machinery rather than as content. Open while it streams, folded once the
+ * answer arrives. */
+.reasoning {
+  border-left: 2px solid var(--hairline-strong);
+  padding-left: 10px;
+  margin: 2px 0;
+}
+.reasoning > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  list-style: none;
+  user-select: none;
+}
+.reasoning > summary::-webkit-details-marker { display: none; }
+.reasoning > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 1em;
+  transition: transform 120ms ease;
+}
+.reasoning[open] > summary::before { transform: rotate(90deg); }
+.reasoning > summary:hover { color: var(--text-dim); }
+.reasoning-text {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  /* A very long think should not push the answer off-screen. */
+  max-height: 14em;
+  overflow-y: auto;
+}
+
 /* A message the host has not acknowledged yet: present and readable, but
  * visibly not yet part of the record. Dimming the whole row is the point —
  * it says "in flight" without a second colour or a badge shouting about it. */

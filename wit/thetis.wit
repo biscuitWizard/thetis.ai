@@ -151,6 +151,9 @@ interface types {
     turn-started,
     turn-finished(turn-stats),
     stream-delta(string),
+    // Transient, like `stream-delta`: a fragment of the model's thinking,
+    // rendered as it arrives and never persisted.
+    reasoning-delta(string),
     context-compacted(compaction),
     branch-op(branch-op),
     // Transient, like `stream-delta`: never persisted, only rendered.
@@ -300,6 +303,13 @@ interface types {
 
   variant stream-chunk {
     delta(string),
+    // A fragment of the model's thinking, not of its answer. Reasoning models
+    // served over an OpenAI-compatible endpoint send this as
+    // `delta.reasoning_content`, and it can be the bulk of a response. Kept
+    // apart from `delta` so it is never spliced into the assistant message:
+    // the answer is what gets persisted and replayed to the model, the
+    // reasoning is only shown as it arrives.
+    reasoning(string),
     tool-calls(list<tool-call>),
     finished(finish-info),
   }
@@ -489,6 +499,10 @@ interface session {
   append: func(session-id: string, event: session-event) -> u64;
   // Streams a token fragment to connected clients without persisting it.
   emit-output: func(session-id: string, chunk: string);
+  // Streams a reasoning fragment. Separate from `emit-output` because
+  // reasoning must not land in the assistant message: the surface renders it
+  // as its own element, and it is never persisted.
+  emit-reasoning: func(session-id: string, chunk: string);
   // Streams compaction progress to connected clients without persisting it.
   // Separate from `emit-output` because it is structured: the surface draws a
   // progress element from it rather than appending text.
