@@ -1,9 +1,4 @@
-//! Run JavaScript in the page and get the result back, for reading computed values the accessibility tree does not show.
-//!
-//! A Thetis tool component. `describe` tells the model what this tool is and
-//! what arguments it takes; `invoke` does the work. Edit this file with
-//! `write_code` or `patch_code` — every edit rebuilds and reloads immediately,
-//! and the compiler's output comes back in the tool result.
+//! Run JavaScript in the page.
 
 wit_bindgen::generate!({
     world: "tool",
@@ -11,11 +6,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// `tool-manifest` is already in scope from the world's own `use types.{...}`;
-// anything else has to be imported from the types interface.
-use thetis::grip::sys;
-use thetis::grip::types::LogLevel;
-use serde_json::{json, Value};
+mod client;
+
+use serde_json::json;
 
 struct Component;
 
@@ -23,48 +16,43 @@ impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
             name: "web-browser-evaluate".to_string(),
-            description: "Run JavaScript in the page and get the result back, for reading computed values the accessibility tree does not show.".to_string(),
-            // Must be a JSON Schema object: it becomes the tool's parameter
-            // definition in the model's tool list.
+            description: "Run JavaScript in the page and get its return value back as JSON. \
+                          This is the escape hatch for what the accessibility tree does not \
+                          show — a computed style, scroll position, the contents of a canvas \
+                          or a shadow root, or an app's own state on `window`. Pass an \
+                          expression or an arrow function; with `target` the element is \
+                          handed to the function as its first argument. The value must be \
+                          JSON-serialisable, so return a string or a plain object rather \
+                          than a DOM node."
+                .to_string(),
             args_schema_json: json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "function": {
                         "type": "string",
-                        "description": "What to work on."
+                        "description": "The JavaScript to run: an expression like 'document.title', or an arrow function like '() => window.scrollY'. With `target`, take the element as the argument: 'el => el.className'."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Optional element to pass into the function: a ref like 'e7' from a snapshot, or a CSS selector."
                     }
                 },
-                "required": ["input"],
+                "required": ["function"],
                 "additionalProperties": false
             })
             .to_string(),
-            // Host capabilities this tool needs, e.g. "sandbox".
-            capabilities: vec![],
+            // Not read-only: arbitrary page script can submit forms and mutate
+            // remote state as readily as a click can.
+            capabilities: vec!["http".to_string(), "group:browser".to_string()],
         }
     }
 
-    /// `config_json` is this tool's own `[tools.web-browser-evaluate]` block from
-    /// thetis.toml, or `{}` when it has none. Settings a tool needs — an API
-    /// key, an endpoint, a default — belong there rather than hardcoded here.
-    fn invoke(
-        _session_id: String,
-        args_json: String,
-        config_json: String,
-    ) -> Result<String, String> {
-        let args: Value = serde_json::from_str(&args_json)
-            .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
-        let config: Value = serde_json::from_str(&config_json).unwrap_or(json!({}));
-        let _ = &config;
-
-        let input = args
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or("missing required argument 'input'")?;
-
-        sys::log(LogLevel::Debug, &format!("web-browser-evaluate invoked with: {input}"));
-
-        // Replace this with the real implementation.
-        Ok(format!("web-browser-evaluate is a stub; it received: {input}"))
+    fn invoke(session_id: String, args_json: String, config_json: String) -> Result<String, String> {
+        let args = client::args(&args_json)?;
+        if args.get("function").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
+            return Err("evaluate needs `function`: the JavaScript to run.".to_string());
+        }
+        client::call("evaluate", &session_id, args, &config_json)
     }
 }
 
