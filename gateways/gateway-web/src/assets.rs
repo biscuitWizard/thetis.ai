@@ -35,6 +35,9 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/views/transcript.js", mime: JS, body: include_str!("ui/views/transcript.js") },
     Asset { path: "/views/composer.js", mime: JS, body: include_str!("ui/views/composer.js") },
     Asset { path: "/views/picker.js", mime: JS, body: include_str!("ui/views/picker.js") },
+    // @-mentions in the composer: the workspace index, the match menu, the
+    // highlight, and turning mentioned paths into attachments.
+    Asset { path: "/views/mentions.js", mime: JS, body: include_str!("ui/views/mentions.js") },
     Asset { path: "/views/panel.js", mime: JS, body: include_str!("ui/views/panel.js") },
     Asset { path: "/views/branch.js", mime: JS, body: include_str!("ui/views/branch.js") },
     Asset { path: "/views/workspace.js", mime: JS, body: include_str!("ui/views/workspace.js") },

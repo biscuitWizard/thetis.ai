@@ -297,9 +297,23 @@ connection
     if (rail.isOpen("branch") && store.branchView === "history") drawBranchHistory();
   })
 
-  .on("workspace-list", workspace.onList)
+  /* Workspace frames feed two surfaces: the Files tab, and the composer's
+   * @-mention index. Both get every frame rather than one claiming it — the
+   * explorer ignores listings for a directory it is not showing, and the
+   * mention index is crawling directories the explorer knows nothing about, so
+   * routing by path would need a registry neither of them wants to keep. */
+  .on("workspace-list", (frame) => {
+    workspace.onList(frame);
+    composer.mentions.onList(frame);
+  })
+  // Fuzzy path search for the composer's `@` menu. Answered host-side from a
+  // cached walk: the shared workspace is far too large to index in a browser.
+  .on("workspace-find", (frame) => composer.mentions.onFind(frame))
   .on("workspace-file", workspace.onFile)
-  .on("workspace-result", workspace.onResult)
+  .on("workspace-result", (frame) => {
+    workspace.onResult(frame);
+    composer.mentions.onResult(frame);
+  })
 
   .on("debug-request", context.onFrame)
 
@@ -504,10 +518,19 @@ const INVALIDATED_BY = {
   skills: ["modification", "turn-finished"],
 };
 
+/** Event kinds after which the composer's @-mention index cannot be trusted. */
+const MENTION_STALED_BY = ["tool-result", "modification", "turn-finished"];
+
 const INVALIDATE_COALESCE_MS = 500;
 let invalidateTimer = null;
 
 function invalidate(kind) {
+  /* The @-mention index is a derived view too (rule 8), but it is not a rail
+   * tab and it must not be refreshed on a timer: it is only read when someone
+   * types `@`. So it is marked stale here and re-crawled on demand, whichever
+   * tab is open — otherwise the menu would offer files a turn ago deleted. */
+  if (MENTION_STALED_BY.includes(kind)) composer.mentions.invalidate();
+
   if (!INVALIDATED_BY[rail.activeTab()]?.includes(kind)) return;
   clearTimeout(invalidateTimer);
   invalidateTimer = setTimeout(() => {
@@ -1306,6 +1329,9 @@ const composer = mountComposer({
   onStop: () => {
     if (store.current) connection.send({ type: "turn-cancel", id: store.current });
   },
+  // The @-mention index is built from `workspace-list` frames, which the host
+  // answers directly — so mentions need the raw socket, not the send path.
+  sendFrame: (frame) => connection.send(frame),
 });
 
 // The status bar polls the host, so it needs a live socket: it asks on every

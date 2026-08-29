@@ -679,6 +679,31 @@ body { display: flex; flex-direction: column; }
   background: var(--surface-2);
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Non-image attachments on a sent message. Labelled, because the contents went
+ * to the model and nothing else on the row would say so. */
+.attached-files {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  width: 100%;
+}
+.attached-label { font-size: var(--text-xs); color: var(--text-faint); }
+
+/* A mention in a sent message: the same link-like treatment the composer gives
+ * it while typing, so the message reads as it was written. */
+.mention-ref {
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--accent-wash);
+  box-shadow: 0 1px 0 var(--accent-edge);
+  color: var(--accent);
 }
 
 /* --- meta lines ----------------------------------------------------------- */
@@ -1045,18 +1070,108 @@ body { display: flex; flex-direction: column; }
 .composer.is-locked .composer-input { color: var(--text-dim); cursor: default; }
 .composer.is-locked .composer-tools { opacity: .5; pointer-events: none; }
 
-.composer-input {
+/* The input and its highlight mirror share one stacking context. `position:
+ * relative` is also what anchors the @-mention menu. */
+.composer-field { position: relative; }
+
+.composer-input,
+.composer-mirror {
+  /* Every property that affects wrapping must be identical in both, or the
+   * highlight rectangles drift from the glyphs they are meant to sit under. */
   display: block;
   width: 100%;
-  max-height: 40vh;
   padding: 6px 4px;
-  background: transparent;
   border: 0;
+  font: inherit;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  tab-size: 4;
+}
+
+.composer-input {
+  position: relative;
+  max-height: 40vh;
+  background: transparent;
   outline: none;
   resize: none;
-  line-height: 1.55;
 }
 .composer-input::placeholder { color: var(--text-faint); }
+
+/* Behind the text, sized by the textarea rather than by its own content: it is
+ * absolutely positioned over the same box, so it cannot change the layout even
+ * if a paint goes wrong. Transparent glyphs, visible backgrounds. */
+.composer-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* A mentioned path reads as a link, because that is what it is: a reference the
+ * message carries rather than words the reader typed. Tinted text and a
+ * hairline underline, no fill — the accent stays reserved. */
+.mention-hit {
+  border-radius: 3px;
+  background: var(--accent-wash);
+  box-shadow: 0 1px 0 var(--accent-edge);
+  color: transparent;
+}
+.mention-hit.is-dir { background: var(--warn-wash); box-shadow: 0 1px 0 var(--warn); }
+
+/* --- @-mention menu ------------------------------------------------------- */
+
+/* Floats above the composer rather than below it: the composer already sits at
+ * the foot of the viewport, so a menu underneath would be off screen. */
+.mention-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + var(--gap-2));
+  z-index: 40;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: var(--gap-1);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+}
+
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  width: 100%;
+  padding: 5px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+.mention-item.is-active { background: var(--accent-wash); color: var(--text); }
+.mention-icon { flex: 0 0 auto; display: grid; place-items: center; color: var(--text-faint); }
+.mention-item.is-active .mention-icon { color: var(--accent); }
+.mention-name { flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* The tail of a path identifies it; the head is the part worth losing. */
+  direction: rtl;
+}
+.mention-note { padding: 8px 10px; font-size: var(--text-xs); color: var(--text-faint); }
 
 .composer-bar {
   display: flex;
