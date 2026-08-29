@@ -32,6 +32,19 @@ pub async fn run() -> Result<()> {
     let router = WorkerRouter::new();
     let grip = Grip::gateway(cfg.clone(), runtime, db.clone(), router.clone())?;
 
+    // Trunk is where the kernel's own WIT came from, so these agreeing is the
+    // normal case — but `rebuild-kernel.sh` deliberately keeps the previous
+    // binary when a build fails, and that is exactly how a running kernel ends
+    // up older than the contract in the checkout. Said once, up front: it
+    // explains every guest that will not load afterwards, here or in a worker.
+    //
+    // Diagnosis only, and structurally so: a gateway grip carries no `GitCtl`,
+    // so the reconcile stops at `Unrepairable` rather than merging. That is the
+    // right stopping point — the checkout it reads *is* trunk, so a mismatch
+    // here is a stale binary, and no branch this process could move would fix
+    // it.
+    crate::pipeline::reconcile_wit_contract(&grip).await.report();
+
     // Serve the UI from the last activated build straight away; if there is
     // none yet, the fallback page covers the gap until the worker's first
     // build lands and announces itself.
