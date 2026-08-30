@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="380" viewBox="0 0 900 380" font-family="ui-sans-serif,system-ui,sans-serif">
+<rect width="900" height="380" fill="#0d1117"/>
+<text x="60" y="20" fill="#e6edf3" font-size="13">Thetis retrieval benchmark &#183; 4 datapoint(s)</text>
+<line x1="60" y1="310.0" x2="730" y2="310.0" stroke="#30363d" stroke-width="1"/>
+<text x="52" y="314.0" fill="#8b949e" font-size="10" text-anchor="end">0.0</text>
+<line x1="60" y1="254.0" x2="730" y2="254.0" stroke="#30363d" stroke-width="1"/>
+<text x="52" y="258.0" fill="#8b949e" font-size="10" text-anchor="end">0.2</text>
+<line x1="60" y1="198.0" x2="730" y2="198.0" stroke="#30363d" stroke-width="1"/>
+<text x="52" y="202.0" fill="#8b949e" font-size="10" text-anchor="end">0.4</text>
+<line x1="60" y1="142.0" x2="730" y2="142.0" stroke="#30363d" stroke-width="1"/>
+<text x="52" y="146.0" fill="#8b949e" font-size="10" text-anchor="end">0.6</text>
+<line x1="60" y1="86.0" x2="730" y2="86.0" stroke="#30363d" stroke-width="1"/>
+<text x="52" y="90.0" fill="#8b949e" font-size="10" text-anchor="end">0.8</text>
+<line x1="60" y1="30.0" x2="730" y2="30.0" stroke="#30363d" stroke-width="1"/>
+<text x="52" y="34.0" fill="#8b949e" font-size="10" text-anchor="end">1.0</text>
+<circle cx="60.0" cy="213.5" r="2.5" fill="#4f8ef7"/>
+<circle cx="283.3" cy="181.3" r="2.5" fill="#4f8ef7"/>
+<polyline points="506.7,180.6 730.0,180.6" fill="none" stroke="#4f8ef7" stroke-width="2"/>
+<circle cx="506.7" cy="180.6" r="2.5" fill="#4f8ef7"/>
+<circle cx="730.0" cy="180.6" r="2.5" fill="#4f8ef7"/>
+<circle cx="60.0" cy="146.7" r="2.5" fill="#7ec8e3"/>
+<circle cx="283.3" cy="92.2" r="2.5" fill="#7ec8e3"/>
+<polyline points="506.7,84.4 730.0,84.4" fill="none" stroke="#7ec8e3" stroke-width="2"/>
+<circle cx="506.7" cy="84.4" r="2.5" fill="#7ec8e3"/>
+<circle cx="730.0" cy="84.4" r="2.5" fill="#7ec8e3"/>
+<circle cx="60.0" cy="202.1" r="2.5" fill="#b07ef7"/>
+<circle cx="283.3" cy="166.1" r="2.5" fill="#b07ef7"/>
+<polyline points="506.7,155.7 730.0,155.7" fill="none" stroke="#b07ef7" stroke-width="2"/>
+<circle cx="506.7" cy="155.7" r="2.5" fill="#b07ef7"/>
+<circle cx="730.0" cy="155.7" r="2.5" fill="#b07ef7"/>
+<circle cx="60.0" cy="31.7" r="2.5" fill="#3fb950"/>
+<circle cx="283.3" cy="31.7" r="2.5" fill="#3fb950"/>
+<polyline points="506.7,31.7 730.0,31.7" fill="none" stroke="#3fb950" stroke-width="2"/>
+<circle cx="506.7" cy="31.7" r="2.5" fill="#3fb950"/>
+<circle cx="730.0" cy="31.7" r="2.5" fill="#3fb950"/>
+<circle cx="60.0" cy="30.0" r="2.5" fill="#8fd694"/>
+<circle cx="283.3" cy="30.0" r="2.5" fill="#8fd694"/>
+<polyline points="506.7,30.0 730.0,30.0" fill="none" stroke="#8fd694" stroke-width="2"/>
+<circle cx="506.7" cy="30.0" r="2.5" fill="#8fd694"/>
+<circle cx="730.0" cy="30.0" r="2.5" fill="#8fd694"/>
+<circle cx="60.0" cy="39.9" r="2.5" fill="#d29922"/>
+<circle cx="283.3" cy="39.9" r="2.5" fill="#d29922"/>
+<polyline points="506.7,39.9 730.0,39.9" fill="none" stroke="#d29922" stroke-width="2"/>
+<circle cx="506.7" cy="39.9" r="2.5" fill="#d29922"/>
+<circle cx="730.0" cy="39.9" r="2.5" fill="#d29922"/>
+<text x="60.0" y="326" fill="#8b949e" font-size="9" text-anchor="end" transform="rotate(-45 60.0 326)">934b817</text>
+<text x="283.3" y="326" fill="#8b949e" font-size="9" text-anchor="end" transform="rotate(-45 283.3 326)">2cf17b8</text>
+<text x="506.7" y="326" fill="#8b949e" font-size="9" text-anchor="end" transform="rotate(-45 506.7 326)">95cfab9</text>
+<text x="730.0" y="326" fill="#8b949e" font-size="9" text-anchor="end" transform="rotate(-45 730.0 326)">7bd645e</text>
+<line x1="744" y1="36" x2="762" y2="36" stroke="#4f8ef7" stroke-width="2"/>
+<text x="768" y="40" fill="#c9d1d9" font-size="10">SkillRet nDCG@k</text>
+<line x1="744" y1="53" x2="762" y2="53" stroke="#7ec8e3" stroke-width="2"/>
+<text x="768" y="57" fill="#c9d1d9" font-size="10">SkillRet hit@1</text>
+<line x1="744" y1="70" x2="762" y2="70" stroke="#b07ef7" stroke-width="2"/>
+<text x="768" y="74" fill="#c9d1d9" font-size="10">SkillRet recall@k</text>
+<line x1="744" y1="87" x2="762" y2="87" stroke="#3fb950" stroke-width="2"/>
+<text x="768" y="91" fill="#c9d1d9" font-size="10">ToolRet F1</text>
+<line x1="744" y1="104" x2="762" y2="104" stroke="#8fd694" stroke-width="2"/>
+<text x="768" y="108" fill="#c9d1d9" font-size="10">ToolRet recall</text>
+<line x1="744" y1="121" x2="762" y2="121" stroke="#d29922" stroke-width="2"/>
+<text x="768" y="125" fill="#c9d1d9" font-size="10">ToolRet F1 (tags only)</text>
+<text x="60" y="368" fill="#8b949e" font-size="9">solid = dense &#183; dashed = lexical (BM25 fallback) &#183; series are never joined across modes</text>
+</svg>

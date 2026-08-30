@@ -1,0 +1,7 @@
+commit    date        mode     corp  nDCG   hit@1  tF1    tRec    subject
+934b817c  2026-08-30  lexical  61    0.345  0.583  0.994  1.000  Add ToolRet and SkillRet retrieval
+2cf17b8e  2026-08-30  lexical  61    0.460  0.778  0.994  1.000  Add pinned skill corpus and ablati
+95cfab96  2026-08-30  dense    61    0.462  0.806  0.994  1.000  Add multi-metric skill retrieval b
+7bd645e6  2026-08-30  dense    61    0.462  0.806  0.994  1.000  Build thetis bench results from th
+
+first and last differ in mode (lexical/live (unrecorded) vs dense/pinned corpus/v1); not comparable
