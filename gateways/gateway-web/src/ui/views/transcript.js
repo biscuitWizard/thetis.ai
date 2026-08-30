@@ -18,7 +18,10 @@ import { turnAvatar as avatarFor } from "./avatars.js";
 /** The tool whose call renders as a form instead of a tool row. */
 const ASK_TOOL = "ask_user";
 
-let root = null;
+let root = null; // the scroll container
+// Where rows are appended. Normally `root`, but a sub-agent's frames go into
+// that sub-agent's own block instead. See `inAgent`.
+let sink = null;
 let live = null; // element collecting streamed tokens
 let thinking = null; // element collecting streamed reasoning, if any
 
@@ -45,25 +48,125 @@ let compactNode = null;
 let openAsks = [];
 // Tool calls awaiting their result, by call id. A call and its result are one
 // row, so the result has to find the row the call opened.
-const open = new Map();
+let open = new Map();
 
 /** Tool output longer than this starts folded behind "show all". */
 const RESULT_PREVIEW_CHARS = 4000;
 
+/* --- sub-agents -------------------------------------------------------------
+ *
+ * A sub-agent is a separate conversation whose frames are re-addressed to the
+ * conversation the user is watching, tagged with `agent`, `agent_label` and
+ * `agent_parent`. Several can run at once, so their frames interleave: two
+ * children streaming at the same time would otherwise splice their sentences
+ * together in one column.
+ *
+ * So each child owns a *block*, and every renderer's append target is `sink`
+ * rather than `root`. A tagged frame swaps in that child's block along with its
+ * own streaming state — a child's half-written message must not be completed by
+ * another child's `assistant` frame, and its tool rows must not be matched
+ * against the parent's call ids. `inAgent` does that swap and always restores,
+ * which is what keeps the parent's own rendering exactly as it was.
+ *
+ * The block is a `<details>`, open while the child works and folded when it
+ * ends: a finished sub-agent's forty tool calls are the thing the parent
+ * delegated in order *not* to read, and its answer has already been quoted back
+ * into the parent's transcript. */
+const agents = new Map();
+
+/** A block per sub-agent, minted on its first frame and reused after. */
+function agentBlock(id, label) {
+  const found = agents.get(id);
+  if (found) return found;
+
+  const body = el("div", { class: "agent-body" });
+  const block = el(
+    "details",
+    { class: "agent is-running", open: "", dataset: { agent: id } },
+    el(
+      "summary",
+      {},
+      el("span", { class: "agent-dot" }),
+      el("span", { class: "agent-label" }, label || "sub-agent"),
+      el("span", { class: "agent-state" }, "working"),
+      el("span", { class: "agent-meta" }, "")
+    ),
+    body
+  );
+  root.append(block);
+
+  // Each child keeps its own streaming cursors and its own open-call map, so
+  // concurrent children cannot corrupt each other's rows.
+  const entry = { block, body, live: null, thinking: null, open: new Map() };
+  agents.set(id, entry);
+  return entry;
+}
+
+/** Runs a renderer with a sub-agent's block and state swapped in. */
+function inAgent(ev, render) {
+  const entry = agentBlock(ev.agent, ev.agent_label);
+
+  const outer = { sink, live, thinking, open };
+  sink = entry.body;
+  live = entry.live;
+  thinking = entry.thinking;
+  open = entry.open;
+
+  try {
+    render(ev);
+  } finally {
+    // Whatever the renderer left mid-stream belongs to this child.
+    entry.live = live;
+    entry.thinking = thinking;
+    entry.open = open;
+    sink = outer.sink;
+    live = outer.live;
+    thinking = outer.thinking;
+    open = outer.open;
+  }
+  return entry;
+}
+
+/* Marks a child finished and folds it away.
+ *
+ * Driven from the child's own `turn-finished` frame rather than from anything
+ * the parent reports, because that frame arrives whatever happens — a clean
+ * stop, an error, a cancellation — and is the only signal that is never
+ * missing. */
+function settleAgent(entry, ev) {
+  const failed = ev.stopped_by && ev.stopped_by !== "stop" && ev.stopped_by !== "asked";
+  entry.block.classList.remove("is-running");
+  entry.block.classList.toggle("is-bad", !!failed);
+  entry.block.removeAttribute("open");
+
+  const state = entry.block.querySelector(".agent-state");
+  if (state) state.textContent = failed ? ev.stopped_by : "done";
+
+  const bits = [];
+  if (ev.iterations > 1) bits.push(`${ev.iterations} steps`);
+  if (ev.cost > 0) bits.push(`$${ev.cost.toFixed(4)}`);
+  if (ev.prompt_tokens > 0) bits.push(`${fmtK(ev.prompt_tokens)} tok`);
+  const info = entry.block.querySelector(".agent-meta");
+  if (info) info.textContent = bits.join(" · ");
+}
+
 export function mountTranscript(hooks = {}) {
   root = $("transcript");
+  sink = root;
   onInspect = hooks.onInspect || null;
   onAnswer = hooks.onAnswer || null;
   showEmpty();
 }
 
 export function reset() {
+  sink = root;
   live = null;
   thinking = null;
   pendingNode = null;
   compactNode = null;
   openAsks = [];
-  open.clear();
+  open = new Map();
+  agents.clear();
   clear(root);
   store.set({
     turnStats: [],
@@ -130,6 +233,10 @@ export function showPending({ text, attachments, note }) {
     pendingThumbs(attachments),
     el("div", { class: "pending-note" }, el("span", { class: "spinner" }), note || "")
   );
+  // `root`, not `sink`: this is the user typing into *this* conversation, so it
+  // is the one append in this module that must never be redirected.
+  // belongs in the parent's column even if a sub-agent block happens to be the
+  // current append target. A user never types into a sub-agent.
   root.append(pendingNode);
   toBottom(false);
 }
@@ -205,12 +312,12 @@ function row(role, who, ...content) {
     el("div", { class: "row-head" }, who),
     ...content
   );
-  root.append(node);
+  sink.append(node);
   return node;
 }
 
 function meta(content, tone = "") {
-  root.append(el("div", { class: `meta ${tone}`.trim() }, content));
+  sink.append(el("div", { class: `meta ${tone}`.trim() }, content));
 }
 
 function cut(text, max) {
@@ -292,7 +399,7 @@ function toolRow(ev) {
     ),
     ...section("arguments", pretty(ev.arguments))
   );
-  root.append(node);
+  sink.append(node);
   return node;
 }
 
@@ -308,7 +415,7 @@ function completeToolRow(ev) {
       el("span", { class: "tool-name" }, ev.name),
       el("span", { class: "tool-args" }, ""),
       el("span", { class: "tool-status" }, "")));
-    root.append(node);
+    sink.append(node);
   }
 
   node.classList.remove("is-running");
@@ -400,7 +507,7 @@ function askRow(ev) {
       return sent === undefined ? false : sent;
     },
   });
-  root.append(card);
+  sink.append(card);
   openAsks.push(card);
   return true;
 }
@@ -469,7 +576,13 @@ const RENDERERS = {
 
     // Each step reports its own usage, so the turn's cost can be watched as it
     // is spent instead of landing all at once when the turn ends.
-    if (ev.usage) {
+    //
+    // A sub-agent's steps are accounted by `dispatch` instead: its spend is
+    // real and belongs to this conversation, but it retires on the *child's*
+    // turn-finished rather than the parent's, and `lastModel` must keep naming
+    // the model this conversation is using rather than whichever child last
+    // spoke.
+    if (ev.usage && !ev.agent) {
       store.set({ lastUsage: ev.usage, lastModel: ev.model || "" });
       const live = store.liveTurn || { cost: 0, prompt: 0, completion: 0, steps: 0 };
       store.set({
@@ -534,7 +647,7 @@ const RENDERERS = {
         el("div", { class: "compacting-detail" }, ""),
         el("div", { class: "compacting-foot" }, "")
       );
-      root.append(compactNode);
+      sink.append(compactNode);
     }
 
     const done = ev.phase === "finished" || ev.phase === "failed" || ev.phase === "cancelled";
@@ -594,7 +707,7 @@ const RENDERERS = {
       ),
       ...section("summary", ev.summary)
     );
-    root.append(node);
+    sink.append(node);
   },
 
   nudge: (ev) => meta(`you interrupted: ${ev.text}`, "is-nudge"),
@@ -729,12 +842,72 @@ function recomputeTotals() {
   store.touch("turnStats");
 }
 
+/* Renders one frame, in the parent's column or inside a sub-agent's block.
+ *
+ * A child's frames are the parent's frames in every respect but two, and both
+ * are about not letting a child speak for the conversation:
+ *
+ *  - `busy` is the parent's. It drives the composer lock and the stop button,
+ *    which act on the conversation, not on a child. A child that outlives its
+ *    parent's turn would otherwise leave the composer locked with nothing the
+ *    user could stop.
+ *  - a turn ledger row is keyed by sequence, and a child numbers its own log
+ *    from one, so its sequences collide with the parent's. Prefixing with the
+ *    child id keeps the de-duplication honest while still counting the spend:
+ *    a sub-agent's tokens are this conversation's tokens.
+ */
+function dispatch(ev) {
+  if (!ev.agent) {
+    RENDERERS[ev.kind]?.(ev);
+    return;
+  }
+
+  // A child's own compaction card belongs in its block, not the parent's.
+  const outerCompact = compactNode;
+  compactNode = null;
+  const entry = inAgent(ev, (child) => {
+    switch (child.kind) {
+      // A child's turn boundaries drive its own block's header, never the
+      // conversation's busy state or ledger. Its streaming cursors still have
+      // to be closed off, or a second turn in the same child would append to
+      // the previous turn's half-finished bubble.
+      case "turn-started":
+        break;
+      case "turn-finished":
+        settleReasoning();
+        live = null;
+        break;
+      default:
+        RENDERERS[child.kind]?.(child);
+    }
+  });
+  compactNode = outerCompact;
+
+  if (ev.kind === "turn-finished") {
+    settleAgent(entry, ev);
+    const seq = `${ev.agent}:${ev.seq ?? 0}`;
+    if (!store.turnStats.some((t) => t.seq === seq)) {
+      store.turnStats.push({
+        seq,
+        agent: ev.agent_label || "sub-agent",
+        cost: ev.cost || 0,
+        prompt_tokens: ev.prompt_tokens || 0,
+        completion_tokens: ev.completion_tokens || 0,
+        iterations: ev.iterations || 1,
+        stopped_by: ev.stopped_by || "stop",
+        ts: ev.ts,
+      });
+      recomputeTotals();
+    }
+  }
+}
+
 export function applyEvent(ev) {
   const follow = atBottom();
   // Any event at all means this conversation is no longer empty, so the
   // placeholder goes before the first message is appended after it.
   root.querySelector(".empty")?.remove();
-  RENDERERS[ev.kind]?.(ev);
+  dispatch(ev);
   if (follow) toBottom(false);
 }
 
@@ -744,7 +917,7 @@ export function replay(events) {
     showEmpty("No messages yet.", "Say something to get started.");
     return;
   }
-  events.forEach((ev) => RENDERERS[ev.kind]?.(ev));
+  events.forEach(dispatch);
   recomputeTotals();
   // A restored transcript should start at the end, without animating there.
   toBottom(true);

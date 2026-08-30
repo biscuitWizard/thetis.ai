@@ -3,7 +3,7 @@ name = "Verifying a UI change on a branch"
 brief = "Prove a UI change works before merging, by running your branch's own gateway on a spare port and driving headless Chrome over CDP."
 when_to_use = "Use when a UI edit under gateways/gateway-web/src/ui builds green but the running page does not show it, when curl on the live port 404s a file you just added to assets.rs, or when a change needs real browser evidence — layout geometry, console errors, responsive behaviour — before it is merged to trunk. Also use when playwright MCP tools are unavailable and there is no node on the box. Not for reasoning about CSS or picking tokens; that is the parent skill."
 tags = ["ui", "verify", "browser", "headless", "chrome", "cdp", "gateway", "branch", "404", "stale", "tool-group:shell", "tool-group:selfmod", "tool-group:browser"]
-version = 3
+version = 4
 ---
 
 # Verifying a UI change on a branch
@@ -20,6 +20,15 @@ chase. `curl -s http://127.0.0.1:7777/views/new.js` returning 404 while
 running system.** Rebuild `gateway:web`, then open it. That is the sanctioned
 route, it needs no second instance, and it costs seconds rather than the ~5
 minutes a cold bootstrap takes.
+
+**`/preview/` cannot work if your branch changed `wit/thetis.wit`.** It looks
+the build up in the cache, and `pipeline::cache_key_with` mixes
+`kernel_wit_fingerprint()` — the *running* kernel's compiled-in contract — into
+the key. A branch holding a different contract therefore never gets a hit, and
+you get the "has not built gateway/web yet" fallback however many times the
+guest builds green. Do not chase it. Either restart onto a kernel this branch
+built, or verify the module directly (see *Driving a view module under Node*
+below), which is usually the cheaper answer for renderer logic.
 
 Only fall through to a second gateway when `/preview/` genuinely cannot answer
 the question, and say why. It starts another Thetis, which
@@ -199,6 +208,47 @@ For a host frame alone, an `#[ignore]`d integration test under
 see `ws_system.rs`. Run it with `THETIS_WS_URL=ws://127.0.0.1:7788/ws
 cargo test -p thetis --test <name> -- --ignored --nocapture`.
 
+## Driving a view module under Node
+
+For a change that is renderer *logic* — which node an event lands under, what
+state a stream keeps, how two concurrent sources are kept apart — a whole
+gateway is a slow way to ask. The `ui/` tree is plain ES modules, so Node plus
+`linkedom` runs the real file with no build step and no browser.
+
+```
+cp -r <worktree>/gateways/gateway-web/src/ui/* /opt/thetis/workspace/<name>/
+cd /opt/thetis/workspace/<name> && npm init -y && npm i linkedom
+# package.json needs "type": "module", or the imports fail to parse
+```
+
+The harness parses the real `index.html` so the templates the views clone are
+present, publishes the globals the modules expect, then calls the module's own
+entry point:
+
+```js
+import { parseHTML } from "linkedom";
+const { window } = parseHTML(readFileSync("./index.html", "utf8"));
+for (const k of ["window", "document", "Node", "customElements",
+                 "getComputedStyle", "HTMLElement"]) globalThis[k] = window[k];
+globalThis.requestAnimationFrame = (fn) => fn();
+const transcript = await import("./views/transcript.js");
+transcript.mountTranscript({});
+frames.forEach((f) => transcript.applyEvent(f));
+```
+
+Then assert on the tree with `querySelector` and on the module's own store.
+
+What this proves and what it does not: it is the real code path, so it catches
+every logic error, and it runs in about a second. It says nothing about CSS,
+because linkedom does no layout — `getBoundingClientRect` returns zeros. So use
+it for structure and state, and keep `/preview/` or a second gateway for
+geometry and appearance.
+
+Feed it the *adversarial* stream, not the happy one. Two concurrent sources with
+colliding ids is the case that finds flat-keyed state: a sub-agent numbers its
+event log from 1, so two children emit the same `seq` and the same tool-call id
+as each other and as the parent.
+
 ## 4. Clean up
 
 Kill by port, never by path: `pkill -f /tmp/uitest` also kills the Chrome whose
@@ -218,7 +268,8 @@ helper script has to live in the worktree and be cleaned up after.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| New `ui/` file 404s on the live port | Gateway serves committed trunk | Expected. Use a second gateway |
+| New `ui/` file 404s on the live port | Gateway serves committed trunk | Expected. Use `/preview/`, or a second gateway |
+| `/preview/` 404s and says "has not built gateway/web yet" | The branch changed `wit/thetis.wit`, so the cache key never matches the running kernel's contract | Not fixable by rebuilding. Verify under Node, or restart onto this branch's kernel |
 | Test gateway shows trunk's UI, not yours | Shared `THETIS_TARGET_DIR` / `THETIS_ARTIFACTS_DIR` | Override both; delete them and restart |
 | `bootstrap build did not run` | `env -i` dropped cargo from `PATH` | Add `$HOME/.cargo/bin` |
 | `Address already in use` after a restart | Previous instance still holds the port | Kill by pid from `ss -ltnp` |
