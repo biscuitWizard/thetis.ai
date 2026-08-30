@@ -1,12 +1,12 @@
 ---
 name = "Getting a world into and out of mooR"
 brief = "Choose the right part of mooR's import and export path: objdef source directories, LambdaMOO textdump import, and the cores bundled in the repository."
-when_to_use = "Use when a mooR database must be created, exported, updated or moved: --import and --import-format, objdef .moo directories, constants.moo, import_export_id, checkpoint exports, load_object/reload_object/dump_object, moorc, moor-emh, importing a LambdaMOO or ToastStunt textdump, or bringing up cowbell, lambda-moor or minimal-core. Use it also when a world starts but nobody can log in, or an import stops part way. Use it to pick the child skill. Not for the MOO language or the compiler, not for the transaction engine, not for the Torchship game database (the torchship skills own that), not for in-world verb authoring for a specific game, and not for Thetis's own internals."
+when_to_use = "Use when a mooR database must be created, exported, updated or moved, or when a world starts but nobody can log in. Use it to pick the child skill. Not for the MOO language or the compiler, not for the transaction engine, not for the Torchship game database (the torchship skills own that), not for in-world verb authoring for a specific game, and not for Thetis's own internals."
 universal = false
-tags = ["moor", "moo", "objdef", "textdump", "import", "export", "core", "cowbell", "lambdacore", "lambda-moor", "minimal-core", "moorc", "moor-emh", "checkpoint", "load_object", "constants.moo", "bootstrap", "database"]
+tags = ["moor", "moo", "objdef", "textdump", "import", "export", "core", "cowbell", "lambdacore", "lambda-moor", "minimal-core", "moorc", "moor-emh", "checkpoint", "load_object", "constants.moo", "bootstrap", "database", "--import", "--import-format", "objdef .moo directories", "import_export_id", "reload_object", "dump_object", "lambdamoo textdump", "toaststunt textdump"]
 children = "auto"
 related = ["moor/working-in-the-repo/build-and-run", "moor/storage-and-state/world-state-model"]
-version = 1
+version = 2
 ---
 
 # Getting a world into and out of mooR
@@ -22,17 +22,15 @@ Read this page to choose a child. Do not act from this page alone.
 
 ## Which child to read
 
-| Question | Read |
-|---|---|
-| What is in a `.moo` object file, and how does a directory become a world? | `objdef-format` |
-| What survives a dump and a re-import, and what does not? | `objdef-format` |
-| How do I load or replace one object in a live world, and resolve the conflicts? | `objdef-format` |
-| Can mooR read my old LambdaMOO or ToastStunt database? | `textdump-compat` |
-| Which textdump features are dropped, approximated, or refused? | `textdump-compat` |
-| What is a core, and which bundled one should I start from? | `cores-and-bootstrap` |
-| How do I bring a world up from nothing, and how does the first start differ? | `cores-and-bootstrap` |
-| What objects, properties and verbs does the server itself require? | `cores-and-bootstrap` |
-| My world starts but no one can log in. | `cores-and-bootstrap` |
+- [objdef-format](skill:moor/content-pipeline/objdef-format) — what is in a
+  `.moo` object file, how a directory becomes a world, what survives a dump and
+  a re-import, and how to load or replace one object in a live world.
+- [textdump-compat](skill:moor/content-pipeline/textdump-compat) — reading an
+  old LambdaMOO or ToastStunt database, and which textdump features are
+  dropped, approximated, or refused.
+- [cores-and-bootstrap](skill:moor/content-pipeline/cores-and-bootstrap) — what
+  a core is, which bundled one to start from, how a world comes up from
+  nothing, and why it starts but no one can log in.
 
 ## Common to all three
 
@@ -111,9 +109,11 @@ statements no longer match the code, and the code is correct.
 
 ## Read next
 
-- `moor/working-in-the-repo/build-and-run` — how to start the stack that performs an
-  import.
-- `moor/working-in-the-repo/repo-tooling` — `moorc`, `moor-emh` and the other tools.
-- `moor/services/daemon-and-rpc` — the process that owns the import and the
-  checkpoint thread.
-- `moor/storage-and-state/world-state-model` — the model that both formats describe.
+- [build-and-run](skill:moor/working-in-the-repo/build-and-run) — how to start
+  the stack that performs an import.
+- [repo-tooling](skill:moor/working-in-the-repo/repo-tooling) — `moorc`,
+  `moor-emh` and the other tools.
+- [daemon-and-rpc](skill:moor/services/daemon-and-rpc) — the process that owns
+  the import and the checkpoint thread.
+- [world-state-model](skill:moor/storage-and-state/world-state-model) — the
+  model that both formats describe.

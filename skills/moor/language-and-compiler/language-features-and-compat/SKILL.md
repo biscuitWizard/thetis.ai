@@ -1,10 +1,10 @@
 ---
 name = "MOO language features and LambdaMOO compatibility"
 brief = "Which MOO features are mooR extensions over LambdaMOO, how CompileOptions and FeaturesConfig select them, and what the engine guarantees an imported core."
-when_to_use = "Use when deciding whether a MOO language feature is standard LambdaMOO or a mooR extension, when adding a feature switch, when a verb fails to compile with a DisabledFeature or UnknownBuiltinFunction error, when a LambdaMOO or ToastStunt core will not import, or when choosing the features section of a daemon config or the moorc flags. Not for how to write MOO verbs in a game; torchship/torchship-programming/moor-book teaches MOO as an authoring language, including syntax, builtins and verb-writing gotchas. This skill is about how the engine defines the language, not how to use it. Not for the compiler stages, which are compiler-pipeline. Not for the value types themselves, which are value-model. Not for textdump file parsing, which is moor/content-pipeline/textdump-compat. Not for the Torchship database. Not for Thetis internals."
+when_to_use = "Use when deciding whether a MOO language feature is standard LambdaMOO or a mooR extension, adding a feature switch, or a core will not import. Not for writing MOO verbs (read torchship/torchship-programming/moor-book), not for the compiler stages (read compiler-pipeline), and not for value types (read value-model)."
 universal = false
-tags = ["moor", "moo", "lambdamoo", "toaststunt", "compatibility", "extensions", "compileoptions", "featuresconfig", "feature flags", "disabled feature", "legacy type constants", "import", "core", "moorc"]
-version = 1
+tags = ["moor", "moo", "lambdamoo", "toaststunt", "compatibility", "extensions", "compileoptions", "featuresconfig", "feature flags", "disabled feature", "unknownbuiltinfunction", "legacy type constants", "import", "core", "moorc", "daemon config"]
+version = 2
 ---
 
 # MOO language features and LambdaMOO compatibility

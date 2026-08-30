@@ -1,11 +1,11 @@
 ---
 name = "Measuring and profiling mooR"
-brief = "Prove a mooR optimisation instead of asserting it: where the benches are, how to profile with perf and Chrome traces, and what zero-copy means in the db, var and kernel crates."
-when_to_use = "Use when a change is meant to make mooR faster, when you must show a before and after, when something is slow and you do not know where, or when you must read runtime counters from a live server. Use it before you write a bench, run perf, or turn on trace_events. Do not use it to choose a correctness test or to run the suite; that is testing. Do not use it to compile or start a server; that is build-and-run. Not for the Torchship game database, for tuning MOO verbs inside a running world, or for Thetis's own internals."
+brief = "Prove a mooR optimisation instead of asserting it: where the benches are, how to profile with perf, and what zero-copy means in the db, var and kernel crates."
+when_to_use = "Use when a change is meant to make mooR faster, when you must show a before and after, when something is slow and you do not know where, or when you must read runtime counters from a live server. Use it before you write a bench, run perf, or turn on trace_events. Not for choosing a correctness test or compiling and starting a server, and not for the Torchship database or Thetis's own internals."
 universal = false
-tags = ["moor", "performance", "benchmark", "profiling", "perf", "flamegraph", "tracing", "trace_events", "counters", "metrics", "optimisation", "slow", "micromeasure", "cache"]
+tags = ["moor", "performance", "benchmark", "profiling", "perf", "flamegraph", "tracing", "trace_events", "counters", "metrics", "optimisation", "slow", "micromeasure", "cache", "runtime counters", "chrome traces"]
 related = ["moor/storage-and-state/storage-engine", "moor/execution/virtual-machine"]
-version = 1
+version = 2
 ---
 
 # Measuring and profiling mooR
@@ -13,7 +13,8 @@ version = 1
 The project states that performance is paramount in the hot crates, and that an
 optimisation must be proved rather than asserted. This skill is how you prove
 it. It owns the benches, the profilers, the trace facility and the runtime
-counters; `conventions` states the rule and points here, and `build-and-run`
+counters; [conventions](skill:moor/working-in-the-repo/conventions) states the
+rule and points here, and [build-and-run](skill:moor/working-in-the-repo/build-and-run)
 gives the profiles a measurement needs.
 
 The hot crates are `crates/db` and `crates/kernel`, named as such in `AGENTS.md`.
@@ -123,7 +124,8 @@ that return a map of name to count and elapsed nanoseconds, one for builtin
 functions, one for database operations and one for the scheduler. Two more
 report process memory and database size on disk. The names are registered in the
 kernel's server builtins; get the current set from the builtin documentation
-rather than from a list here, and see `moor/execution/builtin-functions`.
+rather than from a list here, and see
+[builtin-functions](skill:moor/execution/builtin-functions).
 
 The database also exposes statistics for its verb, property and ancestry caches.
 A cache hit rate that has dropped is often the whole explanation for a
@@ -179,8 +181,8 @@ trait object to any of these paths, measure. After you add it, measure again.
    measuring.
 5. **Match the rung to the claim.** A claim about the database or the scheduler
    needs a rung-2 result. A claim about one function may stop at rung 1.
-6. **Keep the evidence.** Put the numbers in the pull request. `conventions`
-   requires it.
+6. **Keep the evidence.** Put the numbers in the pull request.
+   [conventions](skill:moor/working-in-the-repo/conventions) requires it.
 
 ## Failure branches
 
@@ -193,14 +195,18 @@ trait object to any of these paths, measure. After you add it, measure again.
 | Symbols do not resolve in a recording | The binary was rebuilt or is in a container | Use `tools/perf/profile-running-moor.sh`, which bundles the exact image with the recording |
 | No trace file appears | The binary was built without `trace_events`, the output path was not given, or the directory is not writable | Check all three. `doc/TRACING.md` lists the same three |
 | The trace file grows unmanageably | Tracing was left on for a long run | Trace a bounded period. A shorter, focused capture is easier to read as well as smaller |
-| A counter builtin returns an error | It is wizard-only | Run it as a wizard. See `moor/execution/permissions-and-security` |
-| A regression appears with no code change in the hot path | A cache hit rate fell, or a transaction is retrying | Read the database cache statistics and the transaction counters before you read any code. See `moor/storage-and-state/transactions` |
+| A counter builtin returns an error | It is wizard-only | Run it as a wizard. See [permissions-and-security](skill:moor/execution/permissions-and-security) |
+| A regression appears with no code change in the hot path | A cache hit rate fell, or a transaction is retrying | Read the database cache statistics and the transaction counters before you read any code. See [transactions](skill:moor/storage-and-state/transactions) |
 | A change is faster but the reviewer objects | The gain came at a readability cost with no number behind it | The project accepts a readability cost only with evidence. Produce it, or revert |
 
 ## Read first / read next
 
-Read `conventions` for the rule this skill serves, and `build-and-run` for the
-profiles and the `trace_events` feature. Read `testing` for the load and
-consistency tools, which double as the rung-2 measurement. Read
-`moor/storage-and-state/storage-engine` before optimising in `crates/db`, and
-`moor/execution/virtual-machine` before optimising in the interpreter.
+Read [conventions](skill:moor/working-in-the-repo/conventions) for the rule
+this skill serves, and [build-and-run](skill:moor/working-in-the-repo/build-and-run)
+for the profiles and the `trace_events` feature. Read
+[testing](skill:moor/working-in-the-repo/testing) for the load and consistency
+tools, which double as the rung-2 measurement. Read
+[storage-engine](skill:moor/storage-and-state/storage-engine) before
+optimising in `crates/db`, and
+[virtual-machine](skill:moor/execution/virtual-machine) before optimising in
+the interpreter.

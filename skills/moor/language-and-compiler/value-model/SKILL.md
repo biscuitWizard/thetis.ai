@@ -1,10 +1,10 @@
 ---
 name = "The MOO value model"
 brief = "How MOO values work in mooR: the 16-byte immutable Var, structural sharing, symbols, flyweights, errors as values, and what each operation costs."
-when_to_use = "Use when working in crates/var or with any MOO value: Var, Variant, List, Map, Str, Symbol, Obj, Flyweight, Binary, Lambda, Error and ErrorCode. Use it when deciding how to represent something in a builtin, when a value comparison behaves unexpectedly (case-insensitive strings, error equality, map key rules), when a builtin needs to raise or return an error, or when reasoning about the memory and copy cost of a MOO data structure. Not for how the VM unwinds an error, which is moor/execution/virtual-machine. Not for how values are stored in the database, which is moor/storage-and-state/world-state-model. Not for the compiled program format, which is program-and-opcodes. Not for writing MOO verbs in a game, and not for the Torchship database. Not for Thetis internals."
+when_to_use = "Use when working with a MOO value, a comparison behaves unexpectedly, a builtin needs to raise or return an error, or you are reasoning about the memory cost of a data structure. Not for how the VM unwinds an error (read moor/execution/virtual-machine), not for storage (read moor/storage-and-state/world-state-model), and not for the program format (read program-and-opcodes)."
 universal = false
-tags = ["moor", "moo", "var", "value types", "immutable", "symbol", "flyweight", "lambda", "error", "e_type", "list", "map", "string", "case insensitive", "memory", "performance", "moor-var"]
-version = 1
+tags = ["moor", "moo", "var", "variant", "value types", "immutable", "symbol", "flyweight", "lambda", "binary", "obj", "str", "errorcode", "error", "e_type", "list", "map", "string", "case insensitive", "memory", "performance", "moor-var", "crates/var"]
+version = 2
 ---
 
 # The MOO value model

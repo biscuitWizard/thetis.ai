@@ -1,10 +1,10 @@
 ---
 name = "The mooR MCP host"
 brief = "What moor-mcp-host exposes to an AI assistant, how it authenticates as an ordinary MOO player, and where its safety boundary actually sits."
-when_to_use = "Use when connecting an AI assistant to a running MOO through moor-mcp-host or the browser-backed moor-web-mcp: configuring credentials, the programmer and wizard connections, the moo_* tool set, resources and prompts, or auditing what an assistant can reach. Use it when a tool returns a permission error, when the connection goes stale, or when deciding whether to run one at all. Not for the RPC layer it sits on (read daemon-and-rpc), not for what a MOO permission actually allows (read moor/execution/permissions-and-security), not for out-of-process workers (read workers), and not for MOO verb code inside a running world such as the Torchship database, which the torchship skills own, or for Thetis internals."
+when_to_use = "Use when connecting an AI assistant to a running MOO, or auditing what it can reach. Use it when a tool returns a permission error or the connection goes stale. Not for the RPC layer it sits on (read daemon-and-rpc), and not for what a MOO permission actually allows (read moor/execution/permissions-and-security) or out-of-process workers (read workers)."
 universal = false
-tags = ["moor", "mcp", "model context protocol", "ai assistant", "moor-mcp-host", "moor-web-mcp", "stdio", "wizard", "programmer", "tools", "safety"]
-version = 1
+tags = ["moor", "mcp", "model context protocol", "ai assistant", "moor-mcp-host", "moor-web-mcp", "stdio", "wizard", "programmer", "moo_*", "resources", "prompts", "credentials", "tools", "safety"]
+version = 2
 ---
 
 # The mooR MCP host

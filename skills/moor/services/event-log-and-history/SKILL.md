@@ -1,10 +1,10 @@
 ---
 name = "The mooR event log and history replay"
-brief = "What mooR stores as player history, why every record is age-encrypted with a key the server never has, how a client replays scrollback, and what that costs an operator."
-when_to_use = "Use when working on persistent history or scrollback in mooR: the event log database, set_pubkey and get_pubkey, the /v1/event-log endpoints, HistoryRecall, presentations, event_log() and notify() logging, player_event_log_stats and purge_player_event_log, or the enable-eventlog feature flag. Use it when history is empty, cannot be decrypted, or must be deleted for a person. Not for live event delivery and sequence numbers (read daemon-and-rpc), not for the session buffers that feed it (read hosts-and-sessions), not for the FlatBuffer record shape (read wire-schema), and not for MOO verb code inside a running world such as the Torchship database, which the torchship skills own, or for Thetis internals."
+brief = "What mooR stores as player history, why every record is age-encrypted with a key the server never has, and how a client replays scrollback."
+when_to_use = "Use when working on persistent history or scrollback in mooR, or when history is empty, cannot be decrypted, or must be deleted for a person. Not for live event delivery and sequence numbers (read daemon-and-rpc), not for the session buffers that feed it (read hosts-and-sessions), and not for the FlatBuffer record shape (read wire-schema) or Thetis internals."
 universal = false
-tags = ["moor", "event log", "history", "scrollback", "encryption", "age", "argon2", "pubkey", "presentations", "privacy", "enable_eventlog", "fjall"]
-version = 1
+tags = ["moor", "event log", "history", "scrollback", "encryption", "age", "argon2", "set_pubkey", "get_pubkey", "/v1/event-log", "historyrecall", "presentations", "notify", "player_event_log_stats", "purge_player_event_log", "enable-eventlog", "privacy", "fjall"]
+version = 2
 ---
 
 # The mooR event log and history replay

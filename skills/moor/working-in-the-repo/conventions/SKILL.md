@@ -1,11 +1,11 @@
 ---
 name = "mooR contribution rules"
-brief = "The rules a mooR patch must satisfy: licence headers, nightly rustfmt and dprint, clippy-clean, dependency and export policy, no legacy shims, and commit and pull-request norms."
-when_to_use = "Use before writing or submitting a change to mooR: which formatter to run, where a dependency version goes, why a module is not public, what the licence header must say, how a commit message and pull request should read, and what the project asks an AI coding partner not to do. Use it when a formatting or licence check fails. Do not use it to compile or start a server, or to choose a test; those are build-and-run and testing. Not for the Torchship game database, for authoring MOO verbs inside a running world, or for Thetis's own internals."
+brief = "The rules a mooR patch must satisfy: licence headers, formatting, clippy, dependency and export policy, no legacy shims, and commit and pull-request norms."
+when_to_use = "Use before writing or submitting a change to mooR: which formatter to run, why a module is not public, what the licence header must say, or what the project asks an AI coding partner not to do. Use it when a formatting or licence check fails. Not for compiling, starting a server, or choosing a test, and not for the Torchship database or Thetis's own internals."
 universal = false
-tags = ["moor", "conventions", "style", "rustfmt", "dprint", "clippy", "licence header", "licensure", "dependencies", "commit message", "pull request", "code review", "agents.md"]
+tags = ["moor", "conventions", "style", "rustfmt", "dprint", "clippy", "licence header", "licensure", "dependencies", "dependency version", "commit message", "pull request", "code review", "agents.md", "ai coding partner"]
 related = ["moor/storage-and-state/storage-engine"]
-version = 1
+version = 2
 ---
 
 # mooR contribution rules
@@ -25,7 +25,7 @@ CI fails on any of these. Run each before you submit.
 | Gate | Command | Notes |
 |---|---|---|
 | Build | `cargo build --workspace --exclude lambdamoo-harness --all-features --all-targets` | CI builds all features and all targets, so benches and tests compile too |
-| Tests | `cargo test --workspace --exclude lambdamoo-harness`, then the documentation tests | See `testing` |
+| Tests | `cargo test --workspace --exclude lambdamoo-harness`, then the documentation tests | See [testing](skill:moor/working-in-the-repo/testing) |
 | Rust formatting | `scripts/format-rust.sh`, or `--check` for the check | Nightly rustfmt, with three import settings |
 | Clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Every warning is an error |
 | Other formatting | `npx dprint fmt`, or `npm run format:check` | JSON, TOML, Markdown, TypeScript and Dockerfiles |
@@ -129,8 +129,9 @@ follow cache-friendly access patterns, and avoid allocation in a hot path.
 The rule that decides a review: **an optimisation must be proved, not
 asserted.** A change presented as faster comes with a before and an after. An
 unmeasured optimisation is not acceptable, and neither is a readability
-sacrifice with no number behind it. `performance-and-profiling` owns how to
-produce that evidence, and what these words mean concretely in each hot crate.
+sacrifice with no number behind it. [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling)
+owns how to produce that evidence, and what these words mean concretely in each
+hot crate.
 
 ### Comments and documentation
 
@@ -211,13 +212,21 @@ matters.
 | The licence check fails on a file you added | No header, or the wrong licence for that path | Run licensure in write mode through the wrapper script, and check the path rules above |
 | The licence check touches files you did not add | You ran licensure over the whole tree | Use `scripts/licensure-project.sh`, which limits itself to tracked files |
 | Clippy passes locally and fails in CI | You did not pass `--all-targets --all-features` | Benches and test code are linted too. Use the full command |
-| A reviewer asks for the number behind an optimisation | The project requires evidence for performance claims | Produce a before and after from the same machine, with release builds. See `performance-and-profiling` |
+| A reviewer asks for the number behind an optimisation | The project requires evidence for performance claims | Produce a before and after from the same machine, with release builds. See [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling) |
 | You cannot reach a type in another crate | The crate exports from `lib.rs` and that type is not exported | Export it there. Do not make the module public to reach in |
 | A change touches many unrelated files | Formatting or a rename leaked into the change | Split it. One pull request, one problem |
 
 ## Read first / read next
 
 Read `AGENTS.md` and `CONTRIBUTING.md` in the repository; this skill is their
-summary, not their replacement. Read `testing` for the evidence a change needs,
-and `repo-tooling` for how to install and run licensure, dprint and the book
-tools.
+summary, not their replacement. Read [testing](skill:moor/working-in-the-repo/testing)
+for the evidence a change needs, and [repo-tooling](skill:moor/working-in-the-repo/repo-tooling)
+for how to install and run licensure, dprint and the book tools.
+
+## Verify this still holds
+
+```
+scripts/format-rust.sh --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+scripts/licensure-project.sh --check
+```

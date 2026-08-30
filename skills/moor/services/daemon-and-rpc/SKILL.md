@@ -1,10 +1,10 @@
 ---
 name = "The mooR daemon and its RPC layer"
-brief = "How moor-daemon serves hosts and workers over ZeroMQ: request/reply versus pub/sub, CURVE enrollment, PASETO client and auth tokens, and how an event reaches a player."
-when_to_use = "Use when working on moor-daemon or the RPC between processes: adding or changing an RPC message, host registration, enrollment tokens, CURVE keys, ZAP authentication, allowed-hosts, PASETO ClientToken or AuthToken, listener broadcast, client event sequence numbers and replay, or ping timeouts. Use it when a host cannot enroll, an event never arrives, or a client is dropped for a backlog. Not for the FlatBuffer definitions themselves (read wire-schema), not for what a host does with an event (read hosts-and-sessions), not for worker dispatch (read workers), and not for MOO verb code inside a running world such as the Torchship database, which the torchship skills own, or for Thetis internals."
+brief = "How moor-daemon serves hosts and workers over ZeroMQ: request/reply versus pub/sub, CURVE enrollment, PASETO tokens, and how an event reaches a player."
+when_to_use = "Use when working on the daemon or the RPC between processes: an RPC message, host registration, or enrollment. Use it when a host cannot enroll, an event never arrives, or a client is dropped for a backlog. Not for the FlatBuffer definitions (read wire-schema), and not for what a host does with an event (read hosts-and-sessions) or worker dispatch (read workers)."
 universal = false
-tags = ["moor", "daemon", "rpc", "zeromq", "curve", "zap", "paseto", "enrollment", "pub-sub", "client token", "auth token", "listeners", "moor-daemon"]
-version = 1
+tags = ["moor", "daemon", "rpc", "zeromq", "curve", "zap authentication", "allowed-hosts", "paseto", "clienttoken", "authtoken", "enrollment", "pub-sub", "client token", "auth token", "listeners", "moor-daemon", "sequence numbers", "ping timeout"]
+version = 2
 ---
 
 # The mooR daemon and its RPC layer

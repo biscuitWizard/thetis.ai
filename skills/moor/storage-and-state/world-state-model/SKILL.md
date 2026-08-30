@@ -1,10 +1,10 @@
 ---
 name = "The world-state model"
 brief = "How mooR stores objects, properties, verbs and inheritance as relations, how name resolution walks ancestry, and which layer checks permissions."
-when_to_use = "Use when you must know where an object attribute, property value, verb program or permission bit actually lives; when adding or changing a relation; when property or verb lookup returns the wrong thing; when a resolution cache goes stale; or when deciding whether a caller needs TaskPermissions. Covers the WorldState, LoaderInterface and SnapshotInterface traits and the DbWorldState adapter. Not for transaction conflict and retry, not for the on-disk format, not for object creation and collection, which the sibling skills own. Not for the Torchship game database (the torchship skills own that), in-world verb authoring, or Thetis's own internals."
+when_to_use = "Use when you must know where an object attribute, property, verb program or permission bit actually lives, when adding a relation, or when a lookup or resolution cache is wrong. Not for transaction conflict and retry, the on-disk format, or object lifecycle, which the sibling skills own, and not for the Torchship database."
 universal = false
-tags = ["moor", "worldstate", "relations", "objects", "properties", "verbs", "inheritance", "parent", "propdef", "verbdef", "permissions", "DbWorldState", "LoaderInterface", "resolution cache", "ancestry", "moor-db"]
-version = 1
+tags = ["moor", "worldstate", "loaderinterface", "snapshotinterface", "dbworldstate", "taskpermissions", "relations", "objects", "properties", "verbs", "inheritance", "parent", "propdef", "verbdef", "permissions", "resolution cache", "ancestry", "moor-db"]
+version = 2
 ---
 
 # The world-state model

@@ -1,10 +1,10 @@
 ---
 name = "Object lifecycle and garbage collection"
 brief = "How mooR creates, recycles, renumbers and collects objects, what makes an anonymous object unreachable, and why object references are unsafe to hold."
-when_to_use = "Use when work touches object creation, recycle, renumber, object number allocation, UUID objects, anonymous objects, or the mark-and-sweep collector: gc_interval, the GC mark thread, the sweep pause, GCInterface, or an object that vanished or should have vanished. Use it before changing what a create or recycle writes, or where GC roots come from. Not for transaction conflict, the relation model, or the on-disk format, which the sibling skills own. Not for the Torchship game database (the torchship skills own that), in-world verb authoring, or Thetis's own internals."
+when_to_use = "Use when work touches object creation, recycle, renumber, anonymous objects, or the mark-and-sweep collector, or an object that vanished or should have vanished. Not for transaction conflict, the relation model, or the on-disk format, which the sibling skills own, and not for the Torchship database."
 universal = false
-tags = ["moor", "objects", "create", "recycle", "renumber", "anonymous objects", "garbage collection", "gc", "mark and sweep", "object numbers", "uuid objects", "reachability", "GCInterface", "moor-db"]
-version = 1
+tags = ["moor", "objects", "create", "recycle", "renumber", "object number allocation", "anonymous objects", "garbage collection", "gc", "gc_interval", "mark and sweep", "gc mark thread", "sweep pause", "object numbers", "uuid objects", "reachability", "gcinterface", "moor-db"]
+version = 2
 ---
 
 # Object lifecycle and garbage collection

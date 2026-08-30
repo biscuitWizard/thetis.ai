@@ -1,10 +1,10 @@
 ---
 name = "mooR out-of-process workers"
-brief = "Why blocking or untrusted work runs outside the daemon in mooR, how worker_request() dispatches to moor-curl-worker or moor-file-worker, and how to write a new worker."
-when_to_use = "Use when MOO code must reach something outside the database: outbound HTTP, files, or any new capability. Use it when working on moor-curl-worker, moor-file-worker, the worker protocol in moor-runtime-api and moor-zmq-client, the worker_request() builtin, worker attach/ping/detach, or when a task hangs, returns E_INVARG for no worker available, or a worker never answers. Also use it to write a worker in another language. Not for the RPC between hosts and the daemon (read daemon-and-rpc), not for the FlatBuffer message definitions (read wire-schema), not for scheduler internals (read moor/execution/task-scheduler), and not for MOO verb code inside a running world such as the Torchship database, which the torchship skills own, or for Thetis internals."
+brief = "Why blocking or untrusted work runs outside the daemon in mooR, how worker_request() dispatches to a worker process, and how to write a new one."
+when_to_use = "Use when MOO code must reach something outside the database — outbound HTTP, files, or any new capability — or a task hangs or a worker never answers. Not for the RPC between hosts and the daemon (read daemon-and-rpc), and not for the FlatBuffer message definitions (read wire-schema) or scheduler internals (read moor/execution/task-scheduler)."
 universal = false
-tags = ["moor", "workers", "worker_request", "curl-worker", "file-worker", "outbound http", "filesystem", "capability", "sandbox", "python worker", "zeromq"]
-version = 1
+tags = ["moor", "workers", "worker_request", "moor-curl-worker", "moor-file-worker", "moor-runtime-api", "moor-zmq-client", "attach", "ping", "detach", "e_invarg", "outbound http", "filesystem", "capability", "sandbox", "python worker", "zeromq"]
+version = 2
 ---
 
 # mooR out-of-process workers
