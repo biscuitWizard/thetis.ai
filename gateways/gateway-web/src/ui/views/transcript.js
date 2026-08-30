@@ -14,6 +14,7 @@ import { store } from "../lib/store.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { askCard, parseAsk } from "./askuser.js";
 import { turnAvatar as avatarFor } from "./avatars.js";
+import * as stage from "./stage.js";
 
 /** The tool whose call renders as a form instead of a tool row. */
 const ASK_TOOL = "ask_user";
@@ -74,7 +75,15 @@ const RESULT_PREVIEW_CHARS = 4000;
  * into the parent's transcript. */
 const agents = new Map();
 
-/** A block per sub-agent, minted on its first frame and reused after. */
+/* A block per sub-agent, minted on its first frame and reused after.
+ *
+ * Two homes, not one. The inline block stays where it always was — a child's
+ * work belongs in the parent's narrative, at the point the parent delegated —
+ * and a second, unfolded copy renders into the child's own stage tab, where it
+ * can be read at full size after the block has folded itself away. Each home
+ * gets its own streaming cursors and its own open-call map, because they are
+ * two independent renders of the same stream and one's half-written bubble must
+ * not be completed by the other's `assistant` frame. */
 function agentBlock(id, label) {
   const found = agents.get(id);
   if (found) return found;
@@ -96,20 +105,34 @@ function agentBlock(id, label) {
   root.append(block);
 
   // Each child keeps its own streaming cursors and its own open-call map, so
-  // concurrent children cannot corrupt each other's rows.
+  // concurrent children cannot corrupt each other's rows — and one set per
+  // *home*, since the same stream is rendered twice.
   const entry = {
     block,
     body,
-    live: null,
-    thinking: null,
-    open: new Map(),
+    homes: [home(body, null), home(stage.openAgentPane(id, label), null)],
     label: label || "sub-agent",
     state: "running",
     cost: 0,
   };
+  // The stage pane's copy is read on its own, not as an aside in someone
+  // else's narrative, so it keeps the scroll-following behaviour the main
+  // transcript has.
+  entry.homes[1].scroller = entry.homes[1].body.parentElement;
   agents.set(id, entry);
   publishAgents();
   return entry;
+}
+
+/* One render of a child's stream: an append target plus every piece of state a
+ * renderer leaves behind mid-stream.
+ *
+ * All of it has to be per-home. `live` and `thinking` are the obvious ones, but
+ * `open` (the call id → row map) matters just as much: the two copies mint two
+ * rows for one call, and each result has to find the row in its own copy.
+ * `compactNode` and `openAsks` are here for the same reason. */
+function home(body, scroller) {
+  return { body, scroller, live: null, thinking: null, open: new Map(), compactNode: null, openAsks: [] };
 }
 
 /* Mirrors the block map into the store, for the sidebar.
@@ -128,28 +151,51 @@ function publishAgents() {
   });
 }
 
-/** Runs a renderer with a sub-agent's block and state swapped in. */
+/* Runs a renderer once per home, with that home's block and state swapped in.
+ *
+ * Rendering twice rather than moving one DOM subtree between the inline block
+ * and the stage tab: a node can only be in one place, and both copies have to
+ * be live at once — the reader may be watching the child's tab while the
+ * conversation's own tab is scrolled to the delegation that spawned it. The
+ * renderers are pure appends into `sink`, so running them again is cheap and
+ * cannot disagree with itself. */
 function inAgent(ev, render) {
   const entry = agentBlock(ev.agent, ev.agent_label);
 
-  const outer = { sink, live, thinking, open };
-  sink = entry.body;
-  live = entry.live;
-  thinking = entry.thinking;
-  open = entry.open;
+  const outer = { sink, live, thinking, open, compactNode, openAsks };
+  for (const spot of entry.homes) {
+    sink = spot.body;
+    live = spot.live;
+    thinking = spot.thinking;
+    open = spot.open;
+    compactNode = spot.compactNode;
+    openAsks = spot.openAsks;
 
-  try {
-    render(ev);
-  } finally {
-    // Whatever the renderer left mid-stream belongs to this child.
-    entry.live = live;
-    entry.thinking = thinking;
-    entry.open = open;
-    sink = outer.sink;
-    live = outer.live;
-    thinking = outer.thinking;
-    open = outer.open;
+    // A home whose reader is following along stays at the bottom; one they have
+    // scrolled up in is left where they put it.
+    const follow = spot.scroller
+      ? spot.scroller.scrollHeight - spot.scroller.scrollTop - spot.scroller.clientHeight < 140
+      : false;
+
+    try {
+      render(ev);
+    } finally {
+      // Whatever the renderer left mid-stream belongs to this home.
+      spot.live = live;
+      spot.thinking = thinking;
+      spot.open = open;
+      spot.compactNode = compactNode;
+      spot.openAsks = openAsks;
+    }
+    if (follow) spot.scroller.scrollTop = spot.scroller.scrollHeight;
   }
+
+  sink = outer.sink;
+  live = outer.live;
+  thinking = outer.thinking;
+  open = outer.open;
+  compactNode = outer.compactNode;
+  openAsks = outer.openAsks;
   return entry;
 }
 
@@ -893,9 +939,8 @@ function dispatch(ev) {
     return;
   }
 
-  // A child's own compaction card belongs in its block, not the parent's.
-  const outerCompact = compactNode;
-  compactNode = null;
+  // `inAgent` swaps the compaction card and the open ask forms per home too, so
+  // a child's own card stays in the child's copies and never in the parent's.
   const entry = inAgent(ev, (child) => {
     switch (child.kind) {
       // A child's turn boundaries drive its own block's header, never the
@@ -912,7 +957,6 @@ function dispatch(ev) {
         RENDERERS[child.kind]?.(child);
     }
   });
-  compactNode = outerCompact;
 
   if (ev.kind === "turn-finished") {
     settleAgent(entry, ev);
