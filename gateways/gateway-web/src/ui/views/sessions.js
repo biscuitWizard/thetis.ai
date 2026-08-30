@@ -10,7 +10,38 @@ import { store } from "../lib/store.js";
 
 let query = "";
 
-export function mountSessions({ onOpen, onNew, onUnarchive }) {
+/* A sub-agent's row, nested under the conversation that spawned it.
+ *
+ * Deliberately not a sibling of the conversations. A child has no composer and
+ * cannot be talked into, so a top-level row would be an invitation to do the
+ * one thing it does not support; indenting under the owner is also the only
+ * honest picture of what a sub-agent *is* — work belonging to a conversation,
+ * not a conversation of its own.
+ *
+ * Clicking reveals the child's block in the transcript instead of navigating.
+ * That is where its output already is, in full. */
+const agentRow = (agent, onReveal) =>
+  el(
+    "button",
+    {
+      class: `session-agent is-${agent.state === "running" ? "running" : agent.state === "done" ? "done" : "bad"}`,
+      title:
+        agent.state === "running"
+          ? `${agent.label} is working — click to show it in the transcript`
+          : `${agent.label} ${agent.state}${agent.cost ? ` · $${agent.cost.toFixed(4)}` : ""}`,
+      onClick: () => onReveal(agent.id),
+    },
+    el("span", { class: "session-agent-dot" }),
+    el("span", { class: "session-agent-label" }, agent.label),
+    el(
+      "span",
+      { class: "session-agent-state" },
+      agent.state === "running" ? "working" : agent.state === "done" ? "done" : agent.state
+    )
+  );
+
+export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
+  const reveal = onRevealAgent || (() => {});
   const list = $("session-list");
   const search = $("session-search");
   $("new-chat").addEventListener("click", onNew);
@@ -106,6 +137,14 @@ export function mountSessions({ onOpen, onNew, onUnarchive }) {
         list.append(heading(group));
       }
       list.append(row(session));
+      // Only the conversation on screen can have known children: the client
+      // learns of a sub-agent from its frames, and frames only arrive for what
+      // is being watched.
+      if (session.id === store.current) {
+        for (const agent of store.agents || []) {
+          list.append(agentRow(agent, reveal));
+        }
+      }
     }
 
     if (archived.length) {
@@ -126,5 +165,6 @@ export function mountSessions({ onOpen, onNew, onUnarchive }) {
 
   store.watch("sessions", draw);
   store.watch("current", draw);
+  store.watch("agents", draw);
   draw();
 }
