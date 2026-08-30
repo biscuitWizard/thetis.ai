@@ -172,6 +172,16 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                                     .register_commands(&application_id, commands::schema())
                                     .await
                                 {
+                                    // `count` is the number Discord stored in a
+                                    // usable state, not the number sent, so a
+                                    // registration that is accepted and then
+                                    // silently unusable reports zero rather
+                                    // than looking like a success.
+                                    Ok(0) => tracing::error!(
+                                        "Discord accepted the slash commands but stored \
+                                         none of them in a usable state; the picker will \
+                                         offer nothing and no interaction will arrive"
+                                    ),
                                     Ok(count) => {
                                         commands_registered = true;
                                         tracing::info!(
