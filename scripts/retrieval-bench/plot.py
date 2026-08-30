@@ -63,6 +63,27 @@ def mode_of(point):
     return "dense" if "dense" in point.get("skillret", {}).get("mode", "") else "lexical"
 
 
+def corpus_of(point):
+    """Which corpus produced the point: the pinned fixture, or a live tree.
+
+    Older datapoints predate the field; they were all taken against a live tree,
+    so that is the honest default rather than assuming they were pinned.
+    """
+    return point.get("corpus", "live (unrecorded)")
+
+
+def regime_of(point):
+    """The comparability key. Two points may be joined by a line only if this
+    matches, because both halves change the number without the ranker changing:
+
+      mode    dense and BM25 are different code paths (~0.3 nDCG apart here).
+      corpus  a live tree differs between checkouts and grows over time. The
+              same commit scored 0.750 on a 127-skill tree and 0.583 on a
+              61-skill one; drawing one line through both invents a regression.
+    """
+    return (mode_of(point), corpus_of(point))
+
+
 def svg(points):
     out = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
@@ -97,12 +118,13 @@ def svg(points):
             f'text-anchor="end">{v:.1f}</text>'
         )
 
-    # Split each metric into runs of consecutive same-mode points.
+    # Split each metric into runs of consecutive points sharing a regime, so a
+    # line is only ever drawn between two numbers that mean the same thing.
     for section, key, label, colour in SERIES:
         segments, current = [], []
         for i, p in enumerate(points):
             v = value(p, section, key)
-            m = mode_of(p)
+            m = regime_of(p)
             if v is None:
                 if current:
                     segments.append(current)
@@ -116,7 +138,7 @@ def svg(points):
             segments.append(current)
 
         for seg in segments:
-            dash = ' stroke-dasharray="4 3"' if seg[0][2] == "lexical" else ""
+            dash = ' stroke-dasharray="4 3"' if seg[0][2][0] == "lexical" else ""
             if len(seg) > 1:
                 pts = " ".join(f"{x_of(i):.1f},{y_of(v):.1f}" for i, v, _ in seg)
                 out.append(
@@ -184,10 +206,12 @@ def table(points):
     if len(points) >= 2:
         a, b = points[0], points[-1]
         rows.append("")
-        if mode_of(a) != mode_of(b):
+        if regime_of(a) != regime_of(b):
+            ra, rb = regime_of(a), regime_of(b)
+            what = "mode" if ra[0] != rb[0] else "corpus"
             rows.append(
-                f"first and last differ in mode ({mode_of(a)} vs {mode_of(b)}); "
-                "not comparable"
+                f"first and last differ in {what} "
+                f"({ra[0]}/{ra[1]} vs {rb[0]}/{rb[1]}); not comparable"
             )
         else:
             for section, key, label, _ in SERIES:

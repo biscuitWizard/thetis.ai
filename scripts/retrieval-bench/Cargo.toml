@@ -7,6 +7,15 @@ default-run = "retrieval-bench"
 # Detached from the host workspace on purpose. This crate is compiled inside a
 # throwaway worktree of an arbitrary past revision, where the workspace manifest
 # may not even list the same members.
+# The ablation sweep is genuinely compute-bound: 13 arms x 1600 queries x 9500
+# documents x 1536 dimensions is tens of GFLOP of cosine similarity, and an
+# unoptimised build turns a one-minute job into an hour. `opt-level = 2` on the
+# dev profile keeps `cargo test` honest while making the sweep usable, so nobody
+# has to remember `--release` to get a result the same day.
+[profile.dev]
+opt-level = 2
+debug = false
+
 [workspace]
 
 [dependencies]

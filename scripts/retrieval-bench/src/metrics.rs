@@ -116,6 +116,62 @@ pub fn reciprocal_rank(ranked: &[String], gold: &Gold) -> f64 {
 }
 
 /// Mean of a slice, or 0 for an empty one.
+/// A paired bootstrap test over per-query scores.
+///
+/// Why this is not optional. Every arm answers the *same* queries, so the two
+/// score vectors are paired and the interesting quantity is the mean of their
+/// per-query differences. Reporting a bare delta invites the two mistakes this
+/// benchmark exists to prevent: keeping a mechanism whose +0.004 is one lucky
+/// query, and cutting one whose real gain hid under sampling noise.
+///
+/// Resampling queries with replacement makes no assumption about how nDCG is
+/// distributed — it is bounded, discrete and badly skewed, so a t-test's
+/// normality assumption does not hold.
+///
+/// Returns (mean difference, p-value, 95% confidence interval). The p-value is
+/// two-sided: the fraction of resamples whose mean difference lands on the
+/// opposite side of zero from the observed one, doubled.
+pub fn paired_bootstrap(a: &[f64], b: &[f64], iterations: usize) -> (f64, f64, (f64, f64)) {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return (0.0, 1.0, (0.0, 0.0));
+    }
+    let diffs: Vec<f64> = (0..n).map(|i| a[i] - b[i]).collect();
+    let observed = mean(&diffs);
+
+    // A fixed seed: a benchmark that reports a different p-value each run is
+    // not a benchmark. xorshift64* is plenty for resampling and avoids a dep.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state = state.wrapping_mul(0x2545F4914F6CDD1D);
+        state
+    };
+
+    let mut means = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let mut acc = 0.0;
+        for _ in 0..n {
+            acc += diffs[(next() % n as u64) as usize];
+        }
+        means.push(acc / n as f64);
+    }
+    means.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+
+    let tail = if observed >= 0.0 {
+        means.iter().filter(|m| **m <= 0.0).count()
+    } else {
+        means.iter().filter(|m| **m >= 0.0).count()
+    };
+    let p = (2.0 * tail as f64 / iterations as f64).min(1.0);
+
+    let lo = means[(iterations as f64 * 0.025) as usize];
+    let hi = means[((iterations as f64 * 0.975) as usize).min(iterations - 1)];
+    (observed, p, (lo, hi))
+}
+
 pub fn mean(xs: &[f64]) -> f64 {
     if xs.is_empty() {
         0.0
@@ -247,5 +303,61 @@ mod tests {
         };
         assert_eq!(s.recall(), 1.0);
         assert_eq!(s.f1(), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn identical_arms_are_not_significant() {
+        // The null case. Two arms that scored identically must never be reported
+        // as different, and the interval must contain zero.
+        let a = vec![0.5, 0.2, 0.9, 0.1, 0.7, 0.3];
+        let (d, p, (lo, hi)) = paired_bootstrap(&a, &a, 2000);
+        assert_eq!(d, 0.0);
+        assert!(p > 0.9, "p was {p}");
+        assert!(lo <= 0.0 && hi >= 0.0);
+    }
+
+    #[test]
+    fn a_consistent_win_is_significant() {
+        // Every query improves by 0.2: no resample can undo that.
+        let a: Vec<f64> = (0..40).map(|i| 0.2 + (i % 5) as f64 * 0.1).collect();
+        let b: Vec<f64> = a.iter().map(|x| x - 0.2).collect();
+        let (d, p, (lo, _)) = paired_bootstrap(&a, &b, 2000);
+        assert!((d - 0.2).abs() < 1e-9);
+        assert!(p < 0.01, "p was {p}");
+        assert!(lo > 0.0, "CI should exclude zero, got lo={lo}");
+    }
+
+    #[test]
+    fn one_lucky_query_is_not_significant() {
+        // Exactly the mistake this guards against: a single large win among
+        // many ties moves the mean but must not clear the bar.
+        let mut a = vec![0.4; 40];
+        let mut b = vec![0.4; 40];
+        a[0] = 1.0;
+        b[0] = 0.0;
+        let (d, p, (lo, hi)) = paired_bootstrap(&a, &b, 4000);
+        assert!(d > 0.0);
+        assert!(p > 0.05, "a single outlier should not be significant, p={p}");
+        assert!(lo <= 0.0 && hi >= 0.0);
+    }
+
+    #[test]
+    fn bootstrap_is_deterministic() {
+        // A benchmark that reports a different p each run cannot be tracked.
+        let a = vec![0.6, 0.3, 0.8, 0.2, 0.5];
+        let b = vec![0.5, 0.4, 0.6, 0.3, 0.4];
+        assert_eq!(paired_bootstrap(&a, &b, 1000), paired_bootstrap(&a, &b, 1000));
+    }
+
+    #[test]
+    fn empty_input_is_safe() {
+        let (d, p, _) = paired_bootstrap(&[], &[], 100);
+        assert_eq!(d, 0.0);
+        assert_eq!(p, 1.0);
     }
 }

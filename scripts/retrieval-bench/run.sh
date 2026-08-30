@@ -35,14 +35,43 @@ CACHE="$WORK/cache"
 REV=""
 LAST=""
 OUT=""
+# Which ref --last and --rev all walk. Defaults to HEAD, but the interesting
+# history often lives on another branch: Thetis pushes selectively, so a
+# conversation branch and origin/main diverge by design.
+BRANCH="HEAD"
 PASSTHRU=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rev)  REV="$2"; shift 2 ;;
-        --last) LAST="$2"; shift 2 ;;
-        --out)  OUT="$2"; shift 2 ;;
-        *)      PASSTHRU+=("$1"); shift ;;
+        --rev)    REV="$2"; shift 2 ;;
+        --last)   LAST="$2"; shift 2 ;;
+        --out)    OUT="$2"; shift 2 ;;
+        --branch) BRANCH="$2"; shift 2 ;;
+        # Lift the real source and compile, then stop. ablate.sh uses this so it
+        # can build once and then drive the binary itself across several corpora.
+        --build-only) BUILD_ONLY=1; shift ;;
+        -h|--help)
+            sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            cat <<'USAGE'
+
+Usage:
+  run.sh [--branch REF] [--rev RANGE|all] [--last N] [--out FILE] [-- passthru]
+
+  --branch REF   ref that --rev/--last walk (default HEAD)
+  --rev RANGE    a git range (a..b), a single rev, or `all` for every
+                 commit on --branch including the root
+  --last N       the N most recent commits on --branch
+  --out FILE     append one JSON line per revision
+  --lexical      skip dense ranking and measure the BM25 fallback
+  --skills DIR   grade a live skills tree instead of the pinned fixture
+
+Examples:
+  run.sh                                   # working tree, pinned corpus
+  run.sh --branch origin/main --rev all --out full.jsonl
+  run.sh --last 20 --out recent.jsonl
+USAGE
+            exit 0 ;;
+        *)        PASSTHRU+=("$1"); shift ;;
     esac
 done
 
@@ -64,6 +93,26 @@ lift_into() {
             ok=$((ok + 1))
         fi
     done
+
+    # Open up skill_index's internals so the ablation harness can call the real
+    # scoring stages individually instead of only the whole of rank().
+    #
+    # This is the point of the whole exercise: to say "dense beats BM25 by N" we
+    # must run *the shipped scorers*, not lookalikes. The alternative -- copying
+    # dense_scores and bm25_scores into the harness -- means measuring code that
+    # can drift away from what actually runs.
+    #
+    # Only visibility changes, never logic. `sed` is confined to `fn` and `const`
+    # declarations at column zero, and ablate.rs asserts the symbols it needs are
+    # reachable, so a silent miss becomes a compile error rather than a wrong
+    # number. CANDIDATE_POOL becomes an overridable static because pool size is
+    # itself one of the knobs worth sweeping.
+    if [[ -f "$dest/lifted/skill_index.rs" ]]; then
+        sed -i \
+            -e 's/^fn \(dense_scores\|bm25_scores\|absorb_into_parents\|promote_parents\)/pub fn \1/' \
+            -e 's/^const \(CANDIDATE_POOL\|BM25_K1\|BM25_B\)/pub const \1/' \
+            "$dest/lifted/skill_index.rs"
+    fi
 
     if [[ $ok -lt 2 ]]; then
         echo "  no liftable ranker at this revision ($ok/2 core files); skipping" >&2
@@ -113,6 +162,12 @@ measure() {
     mkdir -p "$build"
     cp "$HERE/Cargo.toml" "$build/"
     cp -r "$HERE/gold" "$build/"
+    # The pinned corpus travels with the harness, exactly as the gold set does.
+    # Both are the frozen half of the measurement: the code under test comes
+    # from the revision, the questions and the cards come from here. Without
+    # this copy the binary finds no fixture and silently grades the live tree,
+    # whose contents differ per checkout.
+    [[ -d "$HERE/corpus" ]] && cp -r "$HERE/corpus" "$build/"
     mkdir -p "$build/src"
     cp "$HERE/src"/*.rs "$build/src/"
 
@@ -127,6 +182,12 @@ measure() {
     # Share one target dir across revisions: the dependency graph is identical,
     # so only the harness itself recompiles and a 12-point backfill costs one
     # cold build instead of twelve.
+    if [[ -n "${BUILD_ONLY:-}" ]]; then
+        CARGO_TARGET_DIR="$WORK/target" \
+            cargo build --quiet --manifest-path "$build/Cargo.toml" "${features[@]}"
+        return $?
+    fi
+
     local args=(--root "$src_root" --cache "$CACHE")
     [[ -n "$OUT" ]] && args+=(--json "$build/point.json")
 
@@ -156,7 +217,11 @@ fi
 # --- past revisions ---------------------------------------------------------
 
 if [[ -n "$LAST" ]]; then
-    mapfile -t REVS < <(git -C "$REPO" rev-list --reverse -n "$LAST" HEAD)
+    mapfile -t REVS < <(git -C "$REPO" rev-list --reverse -n "$LAST" "$BRANCH")
+elif [[ "$REV" == "all" ]]; then
+    # Every commit on the branch, root included. `<root>^..tip` cannot express
+    # this: the root commit has no parent, so git rejects the range outright.
+    mapfile -t REVS < <(git -C "$REPO" rev-list --reverse "$BRANCH")
 elif [[ "$REV" == *..* ]]; then
     mapfile -t REVS < <(git -C "$REPO" rev-list --reverse "$REV")
 else
