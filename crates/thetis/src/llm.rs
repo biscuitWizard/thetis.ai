@@ -182,6 +182,14 @@ impl LlmClient {
             );
         }
 
+        let trimmed = trim_failed_tool_rounds(&mut body);
+        if trimmed > 0 {
+            tracing::warn!(
+                count = trimmed,
+                "trimmed failed tool call/result pairs before prompt-cache checkpoints"
+            );
+        }
+
         // Last, and only once the model is settled: which provider is about to
         // serve this decides whether breakpoints help or merely cost writes.
         let marked = crate::cache::apply(&mut body, &model, &self.cfg.cache);
@@ -791,6 +799,65 @@ fn dedupe_tool_results(body: &mut serde_json::Value) -> usize {
     before - messages.len()
 }
 
+/// Removes failed tool calls and their results before cache breakpoints are
+/// selected. The guest annotates failed results with `thetis_tool_ok = false`;
+/// this host-only marker is consumed here and never reaches a provider.
+///
+/// A whole failed pair is removed so the remaining request is structurally
+/// valid. Successful/unknown results merely lose the private marker. If an
+/// assistant mixed failed and successful calls, only the failed calls go; an
+/// assistant message left with neither text nor calls is removed as well.
+fn trim_failed_tool_rounds(body: &mut serde_json::Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+
+    let failed: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|m| {
+            m.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                && m.get("thetis_tool_ok").and_then(serde_json::Value::as_bool) == Some(false)
+        })
+        .filter_map(|m| m.get("tool_call_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    let mut removed = 0;
+    messages.retain_mut(|message| {
+        let role = message.get("role").and_then(serde_json::Value::as_str).unwrap_or("");
+        if role == "tool" {
+            let is_failed = message
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| failed.contains(id));
+            message.as_object_mut().map(|o| o.remove("thetis_tool_ok"));
+            if is_failed {
+                removed += 1;
+                return false;
+            }
+        } else if role == "assistant" {
+            let empty_text = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty);
+            if let Some(calls) = message.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+                let before = calls.len();
+                calls.retain(|call| {
+                    call.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|id| !failed.contains(id))
+                });
+                removed += before - calls.len();
+                if before > 0 && calls.is_empty() && empty_text {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,6 +1192,26 @@ mod tests {
         ]});
         assert_eq!(normalize_system_roles(&mut body), 1);
         assert_eq!(roles(&body)[2], "user");
+    }
+
+    #[test]
+    fn failed_tool_pairs_are_trimmed_before_caching() {
+        let mut body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "prompt" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "bad", "function": { "name": "x", "arguments": "{}" } },
+                { "id": "good", "function": { "name": "y", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "bad", "content": "failed", "thetis_tool_ok": false },
+            { "role": "tool", "tool_call_id": "good", "content": "worked", "thetis_tool_ok": true }
+        ]});
+
+        assert_eq!(trim_failed_tool_rounds(&mut body), 2);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "good");
+        assert!(messages[2].get("thetis_tool_ok").is_none());
     }
 
     #[test]

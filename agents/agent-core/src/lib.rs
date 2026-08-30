@@ -105,6 +105,10 @@ struct Turn {
     /// Nudge text seen at a checkpoint where a `user` message would not have
     /// been legal yet, waiting to be added by `flush_pending`.
     pending: Vec<String>,
+    /// Do not immediately retry a compaction that failed or made negligible
+    /// progress. The value is the context size that must be reached before the
+    /// next attempt; zero means no backoff.
+    compaction_backoff_until: u32,
     /// Whether the user has stopped this turn. Sticky: a stop stays stopped
     /// however many further checkpoints the loop passes through.
     cancelled: bool,
@@ -142,6 +146,7 @@ impl Turn {
             offered: (0, 0),
             stopped_by: "stop",
             pending: Vec::new(),
+            compaction_backoff_until: 0,
             cancelled: false,
         }
     }
@@ -462,6 +467,9 @@ impl Turn {
                             "role": "tool",
                             "tool_call_id": out.call_id,
                             "content": out.content,
+                            // Host request preparation removes failed call/result
+                            // pairs before choosing prompt-cache checkpoints.
+                            "thetis_tool_ok": out.ok,
                         }),
                         seq,
                     );
@@ -519,6 +527,9 @@ impl Turn {
             return;
         }
         let context_tokens = self.context_estimate();
+        if context_tokens < self.compaction_backoff_until {
+            return;
+        }
         if !policy.should_compact(context_tokens) {
             return;
         }
@@ -530,6 +541,10 @@ impl Turn {
             context_tokens,
             &policy,
         ) else {
+            // The protected head/tail can leave nothing eligible. Retrying the
+            // same selection before the context has grown materially is a hot
+            // loop with no possible different result.
+            self.compaction_backoff_until = context_tokens.saturating_add(context_tokens / 10);
             return;
         };
 
@@ -541,14 +556,33 @@ impl Turn {
         self.pending.extend(carried);
 
         let Some(record) = result else {
+            // Summary-provider failures used to be retried before every model
+            // completion, trapping a turn in compaction. Back off until the
+            // context grows by 25%; at that point the overflow risk justifies
+            // another attempt.
+            self.compaction_backoff_until = context_tokens.saturating_add(context_tokens / 4);
             return;
         };
 
         let replaced = record.messages_replaced;
         host::append(&self.session_id, &SessionEvent::ContextCompacted(record));
 
-        // Rebuild through the compaction just recorded.
+        // Rebuild through the compaction just recorded, then require real
+        // progress. A summary can itself be unexpectedly large; if it shed less
+        // than 10%, do not repeatedly summarize adjacent tiny spans.
         self.rehydrate();
+        let after = self.context_estimate();
+        if after >= context_tokens.saturating_sub(context_tokens / 10) {
+            self.compaction_backoff_until = context_tokens.saturating_add(context_tokens / 4);
+            sys::log(
+                LogLevel::Warn,
+                &format!(
+                    "compaction: negligible progress (~{context_tokens} to ~{after} tokens); backing off"
+                ),
+            );
+        } else {
+            self.compaction_backoff_until = 0;
+        }
         sys::log(
             LogLevel::Info,
             &format!("compaction: {replaced} messages replaced by a summary"),
@@ -890,6 +924,7 @@ impl Turn {
                 "role": "tool",
                 "tool_call_id": result.call_id,
                 "content": result.content,
+                "thetis_tool_ok": result.ok,
             }),
             seq,
         );
@@ -973,6 +1008,7 @@ impl Turn {
                     "role": "tool",
                     "tool_call_id": result.call_id,
                     "content": result.content,
+                    "thetis_tool_ok": false,
                 }),
                 seq,
             );
