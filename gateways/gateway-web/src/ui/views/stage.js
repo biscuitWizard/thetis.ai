@@ -8,6 +8,10 @@
  *    have one is to read that without hunting for a folded block.
  *  - a file gets one when it is double-clicked in the Files explorer, with an
  *    editor in it.
+ *  - the plan gets one as soon as the conversation has a plan. It is the only
+ *    tab the agent opens by writing a document rather than by starting a
+ *    process, and the only one with an action bar that starts a turn: Execute,
+ *    with a mode and a model beside it.
  *
  * The panes are all in the DOM at once and exactly one is visible, hidden
  * through the `hidden` attribute. That is deliberate: a sub-agent streaming into
@@ -25,8 +29,10 @@
  */
 
 import { $, clear, el, icon, setHidden } from "../lib/dom.js";
+import { renderMarkdown } from "../lib/markdown.js";
 import { store } from "../lib/store.js";
 import { toast } from "../lib/toast.js";
+import { Picker } from "./picker.js";
 
 const CHAT = "chat";
 
@@ -84,6 +90,7 @@ function drawStrip() {
       },
       tab.kind === "agent" ? el("span", { class: `stage-dot is-${tab.state || "running"}` }) : null,
       tab.kind === "file" ? el("span", { class: "stage-tab-icon" }, icon(["M5 3.5h7l3 3v10H5z", "M12 3.5v3h3"], { size: 13, width: 1.6 })) : null,
+      tab.kind === "plan" ? el("span", { class: "stage-tab-icon" }, icon(["M6 4.5h8M6 8h8M6 11.5h5", "M3.5 4.5h.01M3.5 8h.01M3.5 11.5h.01"], { size: 13, width: 1.6 })) : null,
       label,
       tab.note ? el("span", { class: "stage-tab-note" }, tab.note) : null,
       tab.closable
@@ -312,6 +319,227 @@ export function onAgentPaneShown(id, fn) {
 /** Brings a sub-agent's tab forward. Used by the sidebar's sub-agent rows. */
 export function focusAgent(id) {
   return show(`agent:${id}`);
+}
+
+// --- the plan tab -------------------------------------------------------------
+//
+// A plan is neither a transcript nor a file, and giving it a tab of its own is
+// the point of this section. In the transcript a plan is a wall of prose that
+// scrolls away under the investigation that produced it, and every revision
+// appears as another copy — the reader has to work out which one is current. As
+// a tab it is one document that changes in place, with the thing you actually
+// want to do to a plan attached to it: hand it to an agent and watch it happen.
+//
+// The tab is read-only markdown, deliberately. Editing the plan is the agent's
+// job through `plan_edit`, because a plan the user has silently rewritten is one
+// the agent will keep editing against text that is no longer there. What the
+// user gets instead is Execute, a mode, a model, and a note box — the levers
+// that matter at the moment of approval.
+
+const PLAN = "plan:doc";
+
+
+/** Modes and models the Execute bar may offer, as the host last described them,
+ *  along with what the user picked. Held here rather than in the tab so a redraw
+ *  from a fresh `plan` frame does not lose the selection. */
+const planChoice = { mode: "", model: "", modes: [], models: [] };
+
+/** Opens the plan tab, or brings it forward. Called when a `plan` frame arrives
+ *  with a body, and by the sidebar/keyboard route that asks for the plan. */
+export function openPlan(focus = true) {
+  let tab = find(PLAN);
+  if (!tab) {
+    tab = add({
+      id: PLAN,
+      kind: "plan",
+      label: "Plan",
+      hint: "The plan for this conversation",
+      // Closable: a plan that has been executed is clutter until it is wanted
+      // again, and the tab comes straight back from the sidebar. Closing it
+      // never destroys the document — that lives in the session store.
+      closable: true,
+      plan: null,
+    });
+    buildPlan(tab);
+  }
+  if (focus) show(PLAN);
+  return tab;
+}
+
+/* The furniture: an action bar, then the document.
+ *
+ * Same discipline as a file tab — built once, contents replaced — because the
+ * note box is a live `<textarea>` the user may be halfway through typing when a
+ * revision lands, and rebuilding the bar around it would take the caret with it.
+ */
+function buildPlan(tab) {
+  clear(tab.pane);
+
+  tab.planTitle = el("span", { class: "stage-bar-name" }, "Plan");
+  tab.planRev = el("span", { class: "stage-bar-state" }, "");
+
+  tab.modeMount = el("span", { class: "picker" });
+  tab.modelMount = el("span", { class: "picker" });
+  tab.execBtn = el(
+    "button",
+    {
+      type: "button",
+      class: "ghost-btn is-primary",
+      title: "Switch this conversation into the chosen mode and start carrying the plan out",
+      onClick: () => execute(tab),
+    },
+    "Execute"
+  );
+
+  tab.planBar = el(
+    "div",
+    { class: "stage-bar is-plan" },
+    tab.planTitle,
+    tab.planRev,
+    el("span", { class: "stage-bar-gap" }),
+    el("span", { class: "plan-exec" }, tab.modeMount, tab.modelMount, tab.execBtn)
+  );
+
+  tab.planBody = el("div", { class: "stage-body plan-body" }, el("p", { class: "panel-note" }, "Loading the plan…"));
+
+  // A place to say something at the moment of approval — "skip step 3", "start
+  // with the tests". It rides along with the execute message instead of becoming
+  // a separate turn, because a note sent after the agent is already working
+  // arrives as an interruption rather than as an instruction.
+  tab.planNote = el("textarea", {
+    class: "plan-note",
+    rows: "2",
+    spellcheck: "false",
+    placeholder: "Anything to add before it starts (optional)",
+  });
+  tab.planStatus = el("span", { class: "file-status" }, "");
+
+  tab.pane.append(
+    tab.planBar,
+    tab.planBody,
+    el("div", { class: "plan-foot" }, tab.planNote, tab.planStatus)
+  );
+
+  // `drop: "down"` because this bar is at the top of the pane. The composer's
+  // pickers open upward, which here would put the menu off the top of the
+  // screen with none of its options clickable.
+  tab.modePicker = new Picker(tab.modeMount, {
+    drop: "down",
+    title: "Which mode to execute in",
+    options: () => planChoice.modes,
+    selected: () => planChoice.mode,
+    onSelect: (id) => {
+      planChoice.mode = id;
+      tab.modePicker.refresh();
+    },
+    render: (id) => planChoice.modes.find((m) => m.id === id)?.label || id || "mode",
+  });
+  tab.modelPicker = new Picker(tab.modelMount, {
+    drop: "down",
+    title: "Which model to execute with",
+    options: () => [{ id: "", label: "Current model" }, ...planChoice.models],
+    selected: () => planChoice.model,
+    onSelect: (id) => {
+      planChoice.model = id;
+      tab.modelPicker.refresh();
+    },
+    render: (id) => planChoice.models.find((m) => m.id === id)?.label || "Current model",
+  });
+}
+
+/* A `plan` frame: the document as the host holds it.
+ *
+ * Opens the tab when there is a plan and the tab is not there yet, so the plan
+ * appearing is itself the notification — the same way a spawning sub-agent gets
+ * a tab. It does not steal focus: the plan is usually written while the user is
+ * reading the conversation, and yanking the view away mid-sentence is worse than
+ * a dot on a tab. */
+export function onPlan(frame) {
+  planChoice.modes = frame.modes || [];
+  planChoice.models = frame.models || [];
+  if (!planChoice.mode || !planChoice.modes.some((m) => m.id === planChoice.mode)) {
+    planChoice.mode = planChoice.modes[0]?.id || "";
+  }
+  if (planChoice.model && !planChoice.models.some((m) => m.id === planChoice.model)) {
+    planChoice.model = "";
+  }
+
+  if (!frame.has_plan) {
+    // The plan was never written, or this is a different conversation that has
+    // none. An open tab is closed rather than left showing the last one's.
+    if (find(PLAN)) close(PLAN);
+    return;
+  }
+
+  const tab = openPlan(false);
+  const fresh = tab.plan && tab.plan.revision !== frame.revision;
+  tab.plan = frame;
+  tab.label = frame.title?.trim() || "Plan";
+  tab.hint = `${tab.label} — revision ${frame.revision}`;
+  // A revision arriving while the user is looking elsewhere is worth a mark, the
+  // same as a sub-agent's dot. Cleared when the tab is next shown.
+  if (fresh && active !== PLAN) tab.note = "revised";
+  drawPlan(tab);
+  drawStrip();
+}
+
+function drawPlan(tab) {
+  const plan = tab.plan;
+  if (!plan) return;
+  tab.planTitle.textContent = plan.title?.trim() || "Plan";
+  tab.planRev.textContent = [
+    `revision ${plan.revision}`,
+    plan.updated_ms ? when(plan.updated_ms) : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  clear(tab.planBody);
+  // `renderMarkdown` hands back an array of block nodes, so it spreads —
+  // appending the array itself would stringify it into the pane.
+  tab.planBody.append(...renderMarkdown(plan.body || ""));
+
+  // No writable mode configured means Execute cannot do anything; saying so on
+  // the disabled button beats a click that reports the problem afterwards.
+  const ready = planChoice.modes.length > 0;
+  tab.execBtn.disabled = !ready;
+  if (!ready) tab.execBtn.title = "No writable mode is configured, so the plan cannot be executed";
+  tab.modePicker.refresh();
+  tab.modelPicker.refresh();
+
+  tab.onShow = () => {
+    if (!tab.note) return;
+    tab.note = "";
+    drawStrip();
+  };
+}
+
+function execute(tab) {
+  if (!tab.plan || !store.current) return;
+  const note = tab.planNote.value.trim();
+  send({
+    type: "plan-execute",
+    id: store.current,
+    mode: planChoice.mode,
+    model: planChoice.model || null,
+    note,
+  });
+  tab.planNote.value = "";
+  tab.planStatus.textContent = "handed to the agent — switching to the conversation";
+  tab.planStatus.classList.remove("is-error");
+  // The work shows up in the transcript, so that is where the user wants to be
+  // the moment the button is pressed. Staying on a static document while a turn
+  // begins elsewhere is the surest way to make the click feel like it failed.
+  show(CHAT);
+}
+
+/** A refusal from `plan-execute` — no plan, or an unusable mode. */
+export function onPlanError(message) {
+  const tab = find(PLAN);
+  if (!tab) return false;
+  tab.planStatus.textContent = message;
+  tab.planStatus.classList.add("is-error");
+  return true;
 }
 
 // --- file tabs ----------------------------------------------------------------
@@ -629,5 +857,5 @@ export function mountStage(hooks = {}) {
   setHidden($("pane-chat"), false);
   drawStrip();
 
-  return { show, openFile, focusAgent, openAgentPane, setChatTitle, activeTab };
+  return { show, openFile, focusAgent, openAgentPane, setChatTitle, activeTab, openPlan };
 }

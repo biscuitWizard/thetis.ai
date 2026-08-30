@@ -228,6 +228,10 @@ connection
     // The drawer belongs to the conversation, so it drops the previous one's
     // emulators and asks for this one's shells.
     terminals.setSession(frame.session);
+    // And whether this conversation has a plan. Asked on every open rather than
+    // only when a tab is showing, because the plan's tab existing *is* how the
+    // user finds out there is one.
+    connection.send({ type: "plan", id: frame.session });
   })
 
   .on("settings", (frame) => {
@@ -235,6 +239,11 @@ connection
     store.set({ mode: frame.mode || "agent", model: frame.model || "" });
     setHeader();
   })
+
+  // The plan document. Owned by the stage, which opens or closes its tab from
+  // this frame — so a conversation with a plan shows it on reload, and one
+  // without never carries the previous conversation's tab over.
+  .on("plan", stage.onPlan)
 
   .on("opened", (frame) => store.set({ current: frame.session }))
 
@@ -273,6 +282,13 @@ connection
     // status broadcast covers mutations, this covers turn-driven commits.
     if (frame.kind === "branch-op" || frame.kind === "turn-finished" || frame.kind === "modification") {
       connection.send({ type: "branch-status", id: store.current });
+    }
+    // A plan tool that ran means the document moved. Keyed off the tool's name
+    // rather than off `turn-finished` so the tab tracks a plan being built up
+    // step by step during a long turn, which is exactly when the user is
+    // watching it.
+    if (frame.kind === "tool-result" && PLAN_TOOLS.includes(frame.name)) {
+      connection.send({ type: "plan", id: store.current });
     }
     transcript.applyEvent(frame);
     invalidate(frame.kind);
@@ -416,7 +432,12 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar)/.test(frame.message || "")) return;
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan)/.test(frame.message || "")) return;
+    // A refusal from Execute belongs on the plan tab, beside the button that
+    // caused it, rather than in a toast that outlives the view it refers to.
+    if (frame.replying_to === "plan-execute" && stage.onPlanError(frame.message || "That was refused.")) {
+      return;
+    }
     // An error naming the frame it answers is that frame's verdict. A `send`
     // that reached the host and then failed — a worker that will not start,
     // say — arrives exactly this way, and the composer is locked behind an
@@ -558,6 +579,10 @@ const INVALIDATED_BY = {
   tools: ["modification", "turn-finished"],
   skills: ["modification", "turn-finished"],
 };
+
+/** Tools whose result means the plan document has changed. Kept in step with
+ *  the `plan_*` family in `agents/agent-core/src/tools.rs`. */
+const PLAN_TOOLS = ["plan_write", "plan_edit", "plan_append"];
 
 /** Event kinds after which the composer's @-mention index cannot be trusted. */
 const MENTION_STALED_BY = ["tool-result", "modification", "turn-finished"];
