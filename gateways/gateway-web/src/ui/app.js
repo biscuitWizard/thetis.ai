@@ -126,7 +126,27 @@ const centre = stage.mountStage({
     store.set({ title });
     setHeader();
   },
+  onRevealInline: (id) => revealInlineAgent(id),
 });
+
+/* Shows a sub-agent's work in the conversation itself, rather than in its tab.
+ *
+ * Goes through the transcript instead of querying the DOM for the block: the
+ * inline copy's rows are built lazily, and `revealAgent` materialises them
+ * before anything measures where to scroll. Both callers — the sidebar row when
+ * the tab has gone, and the "Show in conversation" button on a sub-agent tab —
+ * need identical behaviour, so it lives here once. */
+function revealInlineAgent(id) {
+  centre.show("chat");
+  const block = transcript.revealAgent(id);
+  if (!block) {
+    toast("That sub-agent's output is no longer on screen.", { tone: "error" });
+    return;
+  }
+  block.scrollIntoView({ behavior: "smooth", block: "center" });
+  block.classList.add("is-flashed");
+  setTimeout(() => block.classList.remove("is-flashed"), 1200);
+}
 
 // A reconnect replays `open` for the same conversation, which `setSession`
 // short-circuits — so the drawer would keep whatever it had from before the
@@ -1295,13 +1315,7 @@ mountSessions({
    * conversation is no longer open. */
   onRevealAgent: (id) => {
     if (centre.focusAgent(id)) return;
-    const block = document.querySelector(`details.agent[data-agent="${id}"]`);
-    if (!block) return toast("That sub-agent's output is no longer on screen.", { tone: "error" });
-    centre.show("chat");
-    block.open = true;
-    block.scrollIntoView({ behavior: "smooth", block: "center" });
-    block.classList.add("is-flashed");
-    setTimeout(() => block.classList.remove("is-flashed"), 1200);
+    revealInlineAgent(id);
   },
 });
 
