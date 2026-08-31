@@ -18,6 +18,7 @@
 import { el, icon } from "../lib/dom.js";
 import { popover, toast } from "../lib/toast.js";
 import * as rail from "./rail.js";
+import * as stage from "./stage.js";
 
 let send = () => {};
 
@@ -65,8 +66,10 @@ function when(ms) {
   return ms ? new Date(ms).toLocaleString() : "";
 }
 
-/** The raw-bytes URL for a workspace path, encoded a segment at a time. */
-function rawUrl(rel) {
+/** The raw-bytes URL for a workspace path, encoded a segment at a time.
+ *  Exported because the composer's @-mentions read file bytes over the same
+ *  route rather than through frames, and two spellings of this would drift. */
+export function rawUrl(rel) {
   const segments = rel.split("/").filter(Boolean).map(encodeURIComponent);
   return `/workspace/file/${segments.join("/")}`;
 }
@@ -82,7 +85,15 @@ function list(path) {
   send({ type: "workspace-list", path });
 }
 
+/* Paths this view has asked to read.
+ *
+ * Editor tabs on the centre stage read files over the same frames, and a
+ * `workspace-file` reply says nothing about who wanted it. Without this, opening
+ * a file in a tab would also yank the rail off the listing it was showing. */
+const asked = new Set();
+
 function openFile(path) {
+  asked.add(path);
   send({ type: "workspace-read", path });
 }
 
@@ -368,6 +379,8 @@ export function onList(frame) {
 }
 
 export function onFile(frame) {
+  if (!asked.has(frame.path)) return;
+  asked.delete(frame.path);
   state.file = frame;
   state.editing = false;
   state.draft = frame.text || "";
@@ -375,6 +388,10 @@ export function onFile(frame) {
 }
 
 export function onResult(frame) {
+  // A read that failed produces no `workspace-file`, so the claim on that path
+  // would otherwise sit in `asked` for good and adopt somebody else's later
+  // reply for it.
+  if (frame.op === "read" && !frame.ok) asked.delete(frame.path);
   // A failure always speaks, even mid-upload — but a success must not replace
   // the progress line, or the mkdirs an upload fires would report "created
   // folder X" over the top of "uploading 40 of 300".
@@ -455,7 +472,10 @@ function toolbar() {
               onConfirm: (name) => {
                 const path = joinPath(state.path, name);
                 send({ type: "workspace-write", path, text: "" });
-                openFile(path);
+                // Straight into an editor tab: a new empty file is created in
+                // order to type into it, and the rail's preview of nothing is
+                // not what was asked for.
+                stage.openFile(path);
               },
             });
           },
@@ -496,8 +516,34 @@ function toolbar() {
   );
 }
 
+/* How long a file row waits before previewing, so a double-click can cancel it.
+ *
+ * A double-click fires two `click` events first, and without this the single
+ * click's `workspace-read` would race the editor tab's — same path, two
+ * readers, and whichever reply landed last would win. Deferring the preview by
+ * one interval and cancelling it on `dblclick` makes the two gestures mean two
+ * different things without either of them firing both. A folder needs no delay:
+ * entering it is what both gestures mean. */
+const PREVIEW_DELAY_MS = 220;
+
 function entryRow(entry) {
-  const enter = () => (entry.is_dir ? list(entry.path) : openFile(entry.path));
+  let previewTimer = null;
+
+  const enter = () => {
+    if (entry.is_dir) return list(entry.path);
+    // Preview in the rail, as before — unless a second click arrives first, in
+    // which case the file opens as an editor tab on the stage instead.
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => openFile(entry.path), PREVIEW_DELAY_MS);
+  };
+
+  /** Double-click opens the file as its own tab on the centre stage. */
+  const openAsTab = () => {
+    clearTimeout(previewTimer);
+    previewTimer = null;
+    if (entry.is_dir) return list(entry.path);
+    stage.openFile(entry.path);
+  };
 
   const meta = entry.is_dir
     ? when(entry.modified_ms)
@@ -559,9 +605,19 @@ function entryRow(entry) {
 
   const row = el(
     "div",
-    { class: `ws-row${entry.is_dir ? " is-dir" : ""}`, role: "button", tabindex: "0", onClick: enter,
-      title: entry.is_dir ? `Drop files here to upload into ${entry.path}` : undefined,
-      onKeydown: (event) => { if (event.key === "Enter") enter(); } },
+    { class: `ws-row${entry.is_dir ? " is-dir" : ""}`, role: "button", tabindex: "0",
+      onClick: enter,
+      onDblclick: openAsTab,
+      title: entry.is_dir
+        ? `Drop files here to upload into ${entry.path}`
+        : "Click to preview here · double-click to open in an editor tab",
+      // Enter previews as a click does; the editor tab is a modifier away, so
+      // the keyboard reaches both gestures.
+      onKeydown: (event) => {
+        if (event.key !== "Enter") return;
+        if (event.metaKey || event.ctrlKey || event.shiftKey) openAsTab();
+        else enter();
+      } },
     el("span", { class: `ws-icon is-${entry.kind}` }, fileIcon(entry.kind)),
     el(
       "span",
@@ -630,6 +686,14 @@ function fileBlocks() {
     back,
     el("span", { class: "ws-file-name mono" }, file.path || file.name),
     el("span", { class: "ws-meta" }, [human(file.size), when(file.modified_ms)].filter(Boolean).join(" · ")),
+    // The rail is 360px wide and this is a preview; anything more than a glance
+    // wants the full width of the stage.
+    el(
+      "button",
+      { type: "button", class: "ghost-btn", title: "Open this file in its own editor tab",
+        onClick: () => stage.openFile(file.path) },
+      "Open in a tab"
+    ),
     el("a", { class: "ghost-btn", href: `${file.url}?download=1`, download: file.name }, "Download")
   );
 

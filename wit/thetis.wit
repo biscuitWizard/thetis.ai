@@ -151,6 +151,9 @@ interface types {
     turn-started,
     turn-finished(turn-stats),
     stream-delta(string),
+    // Transient, like `stream-delta`: a fragment of the model's thinking,
+    // rendered as it arrives and never persisted.
+    reasoning-delta(string),
     context-compacted(compaction),
     branch-op(branch-op),
     // Transient, like `stream-delta`: never persisted, only rendered.
@@ -216,6 +219,15 @@ interface types {
     universal: bool,
     /// Fetchable sibling files, e.g. "references/format.md".
     resources: list<string>,
+    /// Ids of neighbouring skills, from frontmatter `related`. A reference that
+    /// belongs to the whole skill rather than to one sentence of its body.
+    related: list<string>,
+    /// "active" or "retired". Empty means active and unstated. A retired skill
+    /// still ranks — it describes a system that existed, and a reader arriving
+    /// from old code needs it — so say so on the card rather than hiding it.
+    status: string,
+    /// For a retired skill, the id that replaced it. Empty otherwise.
+    superseded-by: string,
     /// Retrieval score, 0 when this card did not come from ranking.
     score: f64,
     /// Why this card is here: "dense", "lexical", "parent-of-match",
@@ -300,6 +312,13 @@ interface types {
 
   variant stream-chunk {
     delta(string),
+    // A fragment of the model's thinking, not of its answer. Reasoning models
+    // served over an OpenAI-compatible endpoint send this as
+    // `delta.reasoning_content`, and it can be the bulk of a response. Kept
+    // apart from `delta` so it is never spliced into the assistant message:
+    // the answer is what gets persisted and replayed to the model, the
+    // reasoning is only shown as it arrives.
+    reasoning(string),
     tool-calls(list<tool-call>),
     finished(finish-info),
   }
@@ -489,6 +508,10 @@ interface session {
   append: func(session-id: string, event: session-event) -> u64;
   // Streams a token fragment to connected clients without persisting it.
   emit-output: func(session-id: string, chunk: string);
+  // Streams a reasoning fragment. Separate from `emit-output` because
+  // reasoning must not land in the assistant message: the surface renders it
+  // as its own element, and it is never persisted.
+  emit-reasoning: func(session-id: string, chunk: string);
   // Streams compaction progress to connected clients without persisting it.
   // Separate from `emit-output` because it is structured: the surface draws a
   // progress element from it rather than appending text.
@@ -570,6 +593,128 @@ interface skills {
 
   /// Lints one skill, or the whole tree when `id` is empty.
   lint: func(id: string) -> list<skill-diagnostic>;
+}
+
+// Delegation: an agent spawning agents.
+//
+// A sub-agent is a child session with its own event log, context window and
+// turn loop, sharing the parent's worker process, branch and checkout. The
+// isolation that matters is of *context*: a child explores a subproblem and
+// hands back one answer, so the parent pays for the conclusion rather than for
+// every step that produced it.
+//
+// Two rules are structural rather than stylistic, and both are enforced by the
+// host in two places — by withholding the capability, and again at the call:
+//
+//   1. A sub-agent cannot spawn sub-agents. One level keeps fan-out bounded,
+//      accounting attributable and the transcript readable.
+//   2. A child never asks a question. Its only correspondent is a parent that
+//      is itself mid-turn, so a question would wait forever.
+//
+// Agent-only. A gateway shows sub-agents from the frames it already receives.
+interface delegation {
+  use types.{event-record};
+
+  record agent-profile-info {
+    id: string,
+    label: string,
+    description: string,
+    // Empty means the grip default.
+    model: string,
+    mode: string,
+  }
+
+  record delegation-limits {
+    // Ceiling on *live* children at once, not on children ever spawned.
+    max-children: u32,
+    // Longest a single wait may block, whatever the caller asks for.
+    max-wait-secs: u64,
+    // A child's answer is clamped to this before it reaches the parent.
+    max-result-bytes: u32,
+  }
+
+  record spawn-request {
+    // Short human name, shown in the parent's transcript and in the UI.
+    label: string,
+    // The brief. The child sees this and nothing else about why it exists, so
+    // it must carry the objective, the output format and the boundaries.
+    task: string,
+    // Profile id from configuration, or empty for a plain child.
+    profile: string,
+    // Overrides the profile's model. Empty to inherit.
+    model: string,
+    // Overrides the profile's mode. Empty to inherit.
+    mode: string,
+  }
+
+  record subagent-info {
+    id: string,
+    label: string,
+    task: string,
+    profile: string,
+    model: string,
+    mode: string,
+    // running | done | failed | cancelled
+    state: string,
+    // The child's final answer, once it has one. Clamped.
+    // Named `answer` rather than `result` because `result` is a WIT keyword.
+    answer: string,
+    // Why it failed, when it did.
+    detail: string,
+    cost-usd: f64,
+    created-ms: u64,
+    // 0 while still running.
+    finished-ms: u64,
+  }
+
+  record wait-result {
+    // Why the wait ended: a predicate description, or "timeout".
+    reason: string,
+    timed-out: bool,
+    // Every child of the caller, as it stands now — not only what matched.
+    children: list<subagent-info>,
+  }
+
+  /// Whether this session may delegate at all. False for a sub-agent, and
+  /// false when delegation is switched off in configuration.
+  available: func() -> bool;
+
+  /// The configured agent profiles a spawn may name.
+  profiles: func() -> list<agent-profile-info>;
+
+  limits: func() -> delegation-limits;
+
+  /// Creates a child session, briefs it, and starts its turn.
+  ///
+  /// Returns when the turn has been *started*, never when it finishes, so a
+  /// parent can fan out. Blocking delegation is spawn followed by `wait` on
+  /// that one child.
+  spawn: func(req: spawn-request) -> result<subagent-info, string>;
+
+  /// Every sub-agent this session has spawned, running or finished.
+  children: func() -> list<subagent-info>;
+ 
+  /// Blocks the caller's turn until a predicate holds or the deadline passes.
+  ///
+  /// `until` is one of:
+  ///   time | duration     - sleep out the whole timeout
+  ///   all | all-children  - every named child has finished
+  ///   any | any-child     - one named child has finished
+  ///   first-failure       - a named child failed or was cancelled
+  ///
+  /// `children` names which to watch; empty means all of them. A wait always
+  /// has a deadline, capped by `max-wait-secs`: a wait that could run forever
+  /// is indistinguishable from a hung turn.
+  wait: func(until: string, children: list<string>, timeout-secs: u64)
+      -> result<wait-result, string>;
+
+  /// Stops one of this session's children.
+  cancel-child: func(child-id: string) -> result<subagent-info, string>;
+
+  /// A child's own event log, for when the final answer is not enough —
+  /// diagnosing a failure, usually. Scoped to this session's children.
+  child-transcript: func(child-id: string, from-seq: u64)
+      -> result<list<event-record>, string>;
 }
 
 // The read-only view of the same corpus, for the chat surface.
@@ -819,6 +964,11 @@ world agent {
   import terminal;
   import control;
   import configuration;
+  // Spawning agents. Only this world imports it: a sub-agent is itself an
+  // agent, so the one-level rule cannot be expressed by who gets the import
+  // and is enforced by the host instead — `available` answers false for a
+  // child, and `spawn` refuses one outright.
+  import delegation;
 
   // Runs one full agentic turn for a session. The agent is stateless across
   // turns: it rehydrates from the session log every time.
@@ -856,6 +1006,26 @@ world gateway {
   export on-client-message: func(client-id: string, frame-json: string) -> list<gateway-action>;
   export render-event: func(event: outbound-event) -> option<string>;
   export describe: func() -> gateway-manifest;
+}
+
+// Staging ground for an interface the host can answer before any guest asks.
+//
+// The orchestrator generates its `Host` traits from a world, so an interface no
+// world imports has no Rust to implement. That makes a contract addition
+// circular: the host cannot be ready first, which is the one ordering rule that
+// keeps a WIT change from taking the agent and the gateway down together.
+//
+// This world breaks the circle. It is compiled only by the host, so an
+// interface listed here becomes implementable and gets registered in the
+// agent's linker without any guest world mentioning it yet. Once the host is
+// live, the real world imports it and finds it already answered.
+//
+// Nothing exports from here and no guest builds it. Entries are temporary: an
+// interface graduates to the world that needs it.
+world host-staging {
+  // Empty. `delegation` graduated to `world agent` once the host was live.
+  // Leave the world here: the next contract addition needs the same staging
+  // step, and rediscovering why is more expensive than keeping four lines.
 }
 
 world tool {

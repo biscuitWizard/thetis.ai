@@ -53,8 +53,102 @@ impl std::fmt::Debug for Secret {
 
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
+    /// How the model is named everywhere inside Thetis: in the picker, in a
+    /// session's stored model, in `THETIS_MODEL`.
     pub id: String,
     pub label: String,
+    /// Which `[[providers]]` entry serves it. Empty means `llm.provider`.
+    pub provider: String,
+    /// What goes in the request's `model` field, when that differs from `id`.
+    /// A local llama.cpp server usually wants a bare name where the picker
+    /// wants something namespaced, so the two are allowed to differ.
+    pub wire_model: String,
+}
+
+impl ModelSpec {
+    /// The name to put on the wire for this model.
+    pub fn wire(&self) -> &str {
+        if self.wire_model.is_empty() {
+            &self.id
+        } else {
+            &self.wire_model
+        }
+    }
+}
+
+/// The id of the provider synthesized from `[llm]`, and the default when
+/// nothing names one.
+pub const DEFAULT_PROVIDER_ID: &str = "openrouter";
+
+/// One OpenAI-compatible endpoint: OpenRouter, a local llama.cpp server, an
+/// OpenAI-shaped gateway of any kind.
+#[derive(Debug, Clone)]
+pub struct ProviderSpec {
+    pub id: String,
+    pub label: String,
+    /// One or more interchangeable base URLs, without trailing slashes.
+    /// `/chat/completions` and `/embeddings` are appended to one of them.
+    ///
+    /// More than one entry means replicas of the same model: several
+    /// llama-server processes on different ports, or different machines.
+    /// Requests are handed out round-robin, so a provider scales by gaining
+    /// entries here rather than by being duplicated under a new id — the
+    /// model ids in the picker do not change when you add capacity.
+    ///
+    /// Never empty; `base_url()` is always safe.
+    pub base_urls: Vec<String>,
+    /// Absent means send no `Authorization` header at all, which is what an
+    /// unauthenticated local server wants — an empty bearer token is rejected
+    /// by some and silently mishandled by others.
+    pub api_key: Option<Secret>,
+    /// Extra headers on every request to this provider.
+    pub headers: Vec<(String, String)>,
+}
+
+impl ProviderSpec {
+    /// The first endpoint. Use this for identity and for display; use
+    /// `url()` to actually address the provider, so replicas are used.
+    pub fn base_url(&self) -> &str {
+        self.base_urls
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    /// How many interchangeable endpoints serve this provider.
+    pub fn replicas(&self) -> usize {
+        self.base_urls.len()
+    }
+
+    /// A request URL against a specific replica, chosen by `index` modulo the
+    /// number of endpoints. The caller owns the counter, so the rotation is
+    /// shared across a whole process rather than restarting per request.
+    pub fn url_for(&self, path: &str, index: usize) -> String {
+        let base = if self.base_urls.is_empty() {
+            ""
+        } else {
+            self.base_urls[index % self.base_urls.len()].as_str()
+        };
+        format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+    }
+
+    /// A request URL against the first endpoint, for callers with no counter.
+    pub fn url(&self, path: &str) -> String {
+        self.url_for(path, 0)
+    }
+
+    /// OpenRouter attributes requests with these; nobody else wants them.
+    pub fn is_openrouter(&self) -> bool {
+        self.base_url().contains("openrouter.ai")
+    }
+}
+
+/// A model request resolved to the endpoint that will serve it.
+#[derive(Debug, Clone)]
+pub struct ResolvedModel<'a> {
+    /// The name to send as `model`.
+    pub wire_model: String,
+    pub provider: &'a ProviderSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +165,74 @@ pub struct ModeSpec {
     /// should do instead - it just meets the gap and works around it. This is
     /// where a mode says what it is for.
     pub prompt: String,
+}
+
+/// A named kind of agent a parent may delegate to.
+///
+/// A profile is a *bundle* of the things that make one agent different from
+/// another — which model thinks, which mode constrains it, and what standing
+/// instruction it starts from. Bundling them is what makes delegation legible
+/// at the call site: `agent = "reviewer"` says what the child is for, where
+/// three separate overrides only say how it is configured.
+///
+/// Profiles are configuration rather than code because the useful ones are
+/// discovered by use. The research on orchestrator-worker systems is consistent
+/// that a cheap fast worker under an expensive lead is the arrangement that
+/// pays, and that is a two-line config change here.
+#[derive(Debug, Clone)]
+pub struct AgentProfile {
+    pub id: String,
+    pub label: String,
+    /// Shown to the spawning agent, so it can choose between profiles.
+    pub description: String,
+    /// Model id from `[[models]]`. Empty inherits the parent's.
+    pub model: String,
+    /// Mode id from `[[modes]]`. Empty inherits the grip default.
+    pub mode: String,
+    /// Prepended to the child's task briefing. This is the profile's character:
+    /// "you review, you do not edit", "you search widely and cite".
+    pub prompt: String,
+}
+
+/// Delegation policy: whether an agent may spawn sub-agents, and how far.
+#[derive(Debug, Clone)]
+pub struct SubagentSettings {
+    /// Master switch. Off withholds the delegation tools entirely.
+    pub enabled: bool,
+    /// Live children one parent may have at once. The multi-agent failure
+    /// literature names unbounded fan-out explicitly, and a cap on *live*
+    /// children rather than on total spawns is the one that bounds cost without
+    /// bounding usefulness.
+    pub max_children: usize,
+    /// Ceiling on a single `wait` call, in seconds. A parent that waits forever
+    /// is indistinguishable from a hung turn.
+    pub max_wait_secs: u64,
+    /// How much of a child's answer is spliced into the parent's tool result.
+    /// The point of delegation is that the parent pays for the conclusion, so
+    /// this is deliberately far smaller than a context window.
+    pub max_result_bytes: usize,
+    /// Mode a child runs in when neither the profile nor the call names one.
+    pub default_mode: String,
+    pub profiles: Vec<AgentProfile>,
+}
+
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_children: 8,
+            max_wait_secs: 1800,
+            max_result_bytes: 24_576,
+            default_mode: String::new(),
+            profiles: Vec::new(),
+        }
+    }
+}
+
+impl SubagentSettings {
+    pub fn profile(&self, id: &str) -> Option<&AgentProfile> {
+        self.profiles.iter().find(|p| p.id == id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +393,9 @@ pub struct SkillSettings {
     pub retrieve_limit: usize,
     /// Embedding model. Must honour the `dimensions` parameter.
     pub embedding_model: String,
+    /// Which provider serves embeddings. Empty routes by the model id, exactly
+    /// as a chat model does.
+    pub embedding_provider: String,
     /// Vector width requested from the provider.
     pub embedding_dimensions: u32,
     /// Opening-message prefix that gets embedded as the retrieval query.
@@ -245,6 +410,7 @@ impl Default for SkillSettings {
             retrieval_enabled: true,
             retrieve_limit: 10,
             embedding_model: "openai/text-embedding-3-small".into(),
+            embedding_provider: String::new(),
             embedding_dimensions: 1536,
             max_query_chars: 2000,
             max_universal: 20,
@@ -466,6 +632,12 @@ pub struct Config {
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub models: Vec<ModelSpec>,
+    /// Every configured endpoint. Always non-empty: the first entry is the one
+    /// built from `[llm]`, so a config that names no provider behaves exactly
+    /// as it did before providers existed.
+    pub providers: Vec<ProviderSpec>,
+    /// Which provider serves a model that does not name one.
+    pub default_provider: String,
 
     // --- agent loop --------------------------------------------------------
     /// What the agent calls itself: in its system prompt, in the web UI's
@@ -503,6 +675,7 @@ pub struct Config {
     pub cache: CacheSettings,
     pub skills: SkillSettings,
     pub tool_groups: ToolGroupSettings,
+    pub subagents: SubagentSettings,
     pub build: BuildSettings,
     pub wasi: WasiSettings,
     pub watchdog: WatchdogSettings,
@@ -518,6 +691,72 @@ pub struct Config {
 impl Config {
     pub fn db_path(&self) -> PathBuf {
         self.paths.data.join("thetis.redb")
+    }
+
+    /// A provider by id, or `None` when nothing is configured under that name.
+    pub fn provider(&self, id: &str) -> Option<&ProviderSpec> {
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// The provider used when a model names none. Falls back to the first
+    /// configured one, which always exists.
+    pub fn fallback_provider(&self) -> &ProviderSpec {
+        self.provider(&self.default_provider)
+            .or_else(|| self.providers.first())
+            .expect("providers is never empty")
+    }
+
+    /// Works out which endpoint serves a model id, and under what name.
+    ///
+    /// Three ways a model reaches a provider, in order:
+    ///
+    /// 1. a `provider = "..."` prefix on the id (`local/qwen3` where `local`
+    ///    is a configured provider), which is how a model can be used without
+    ///    being listed in `[[models]]` at all;
+    /// 2. a matching `[[models]]` entry naming a provider;
+    /// 3. the default provider, which is OpenRouter unless changed.
+    ///
+    /// A prefix that is not a configured provider is left alone — `anthropic/`
+    /// in an OpenRouter id must not be mistaken for a provider name.
+    pub fn resolve_model(&self, model: &str) -> ResolvedModel<'_> {
+        let model = model.trim();
+
+        if let Some(spec) = self.models.iter().find(|m| m.id == model) {
+            if !spec.provider.is_empty() {
+                if let Some(provider) = self.provider(&spec.provider) {
+                    return ResolvedModel {
+                        wire_model: spec.wire().to_string(),
+                        provider,
+                    };
+                }
+                tracing::warn!(
+                    model = %model,
+                    provider = %spec.provider,
+                    "model names an unconfigured provider; using the default"
+                );
+            }
+            return ResolvedModel {
+                wire_model: spec.wire().to_string(),
+                provider: self.fallback_provider(),
+            };
+        }
+
+        // Not listed: an id may still address a provider by prefix.
+        if let Some((prefix, rest)) = model.split_once('/') {
+            if !rest.is_empty() {
+                if let Some(provider) = self.provider(prefix) {
+                    return ResolvedModel {
+                        wire_model: rest.to_string(),
+                        provider,
+                    };
+                }
+            }
+        }
+
+        ResolvedModel {
+            wire_model: model.to_string(),
+            provider: self.fallback_provider(),
+        }
     }
 
     /// An aspect's source directory relative to the checkout root — the path
@@ -630,7 +869,7 @@ impl Config {
                 t.entry("endpoint".to_string())
                     .or_insert_with(|| toml::Value::String(self.browser.base_url()));
                 t.entry("token".to_string())
-                    .or_insert_with(|| toml::Value::String(crate::browser::token().to_string()));
+                    .or_insert_with(|| toml::Value::String(crate::browser::token(self).to_string()));
                 t.entry("enabled".to_string())
                     .or_insert_with(|| toml::Value::Boolean(self.browser.enabled));
             }
@@ -778,8 +1017,10 @@ mod spec {
         pub paths: Paths,
         pub skills: Skills,
         pub tool_groups: ToolGroups,
+        pub subagents: Subagents,
         pub llm: Llm,
         pub agent: Agent,
+        pub providers: Vec<Provider>,
         pub models: Vec<Model>,
         pub modes: Vec<Mode>,
         pub budgets: Budgets,
@@ -857,6 +1098,7 @@ mod spec {
         pub retrieval_enabled: bool,
         pub retrieve_limit: usize,
         pub embedding_model: String,
+        pub embedding_provider: String,
         pub embedding_dimensions: u32,
         pub max_query_chars: usize,
         pub max_universal: usize,
@@ -868,6 +1110,7 @@ mod spec {
                 retrieval_enabled: d.retrieval_enabled,
                 retrieve_limit: d.retrieve_limit,
                 embedding_model: d.embedding_model,
+                embedding_provider: d.embedding_provider,
                 embedding_dimensions: d.embedding_dimensions,
                 max_query_chars: d.max_query_chars,
                 max_universal: d.max_universal,
@@ -903,6 +1146,9 @@ mod spec {
         pub api_key: String,
         pub request_timeout_secs: u64,
         pub max_retries: u32,
+        /// Which `[[providers]]` entry serves a model that names none. Empty
+        /// means the one built from this section.
+        pub provider: String,
     }
     impl Default for Llm {
         fn default() -> Self {
@@ -912,8 +1158,33 @@ mod spec {
                 api_key: String::new(),
                 request_timeout_secs: 180,
                 max_retries: 3,
+                provider: String::new(),
             }
         }
+    }
+
+    /// One OpenAI-compatible endpoint. No `Debug`: it holds an API key.
+    #[derive(Deserialize)]
+    pub struct Provider {
+        pub id: String,
+        #[serde(default)]
+        pub label: String,
+        /// A single endpoint. Give this or `base_urls`, not both.
+        #[serde(default)]
+        pub base_url: String,
+        /// Interchangeable replicas of the same model, used round-robin. This
+        /// is how a provider scales: adding a port here adds capacity without
+        /// changing any model id.
+        #[serde(default)]
+        pub base_urls: Vec<String>,
+        /// Literal key, or empty for an unauthenticated endpoint. A value of
+        /// the form `env:NAME` is read from that environment variable instead,
+        /// so a real key need not sit in the file.
+        #[serde(default)]
+        pub api_key: String,
+        /// Extra request headers, e.g. `{ "X-Org" = "acme" }`.
+        #[serde(default)]
+        pub headers: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -950,6 +1221,12 @@ mod spec {
         pub id: String,
         #[serde(default)]
         pub label: String,
+        /// Which provider serves it. Empty means the default one.
+        #[serde(default)]
+        pub provider: String,
+        /// What to send as `model` when it differs from `id`.
+        #[serde(default)]
+        pub wire_model: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -962,6 +1239,45 @@ mod spec {
         pub description: String,
         #[serde(default)]
         pub read_only: bool,
+        #[serde(default)]
+        pub prompt: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(default)]
+    pub struct Subagents {
+        pub enabled: bool,
+        pub max_children: usize,
+        pub max_wait_secs: u64,
+        pub max_result_bytes: usize,
+        pub default_mode: String,
+        pub profiles: Vec<AgentProfile>,
+    }
+    impl Default for Subagents {
+        fn default() -> Self {
+            let d = super::SubagentSettings::default();
+            Self {
+                enabled: d.enabled,
+                max_children: d.max_children,
+                max_wait_secs: d.max_wait_secs,
+                max_result_bytes: d.max_result_bytes,
+                default_mode: d.default_mode,
+                profiles: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct AgentProfile {
+        pub id: String,
+        #[serde(default)]
+        pub label: String,
+        #[serde(default)]
+        pub description: String,
+        #[serde(default)]
+        pub model: String,
+        #[serde(default)]
+        pub mode: String,
         #[serde(default)]
         pub prompt: String,
     }
@@ -1026,7 +1342,7 @@ mod spec {
                 // Deliberately below any real window: the point is to compact
                 // well before the provider starts refusing, not at the cliff.
                 window_tokens: 200_000,
-                compact_threshold: 0.6,
+                compact_threshold: 1.0,
                 compact_target: 0.25,
                 // Empty means "whatever the session is using".
                 summary_model: String::new(),
@@ -1685,10 +2001,92 @@ impl Config {
                 .map(|m| ModelSpec {
                     label: if m.label.is_empty() { m.id.clone() } else { m.label },
                     id: m.id,
+                    provider: m.provider,
+                    wire_model: m.wire_model,
                 })
                 .collect(),
             None => builtin_models(),
         };
+
+        // `[llm]` is always a provider, so every existing config keeps working
+        // and the `[[providers]]` list is purely additive.
+        let llm_api_key = resolve_api_key(env.string("OPENROUTER_API_KEY"), &file.llm.api_key);
+        let llm_base = env.string("OPENROUTER_BASE_URL").unwrap_or(file.llm.base_url);
+        let mut providers = vec![ProviderSpec {
+            id: DEFAULT_PROVIDER_ID.to_string(),
+            label: "OpenRouter".into(),
+            base_urls: vec![llm_base.clone()],
+            api_key: llm_api_key.clone(),
+            headers: Vec::new(),
+        }];
+        for p in file.providers {
+            let id = p.id.trim().to_string();
+            if id.is_empty() {
+                anyhow::bail!("a [[providers]] entry has no id");
+            }
+            // `base_url` and `base_urls` are the same field, one endpoint or
+            // several. Accept either spelling and normalize to the list.
+            let mut base_urls: Vec<String> = Vec::new();
+            if !p.base_url.trim().is_empty() {
+                base_urls.push(p.base_url.trim().to_string());
+            }
+            for url in &p.base_urls {
+                let url = url.trim();
+                if url.is_empty() {
+                    anyhow::bail!("provider `{id}` has an empty entry in base_urls");
+                }
+                if !base_urls.iter().any(|existing| existing == url) {
+                    base_urls.push(url.to_string());
+                }
+            }
+            if base_urls.is_empty() {
+                anyhow::bail!("provider `{id}` has no base_url");
+            }
+            let api_key = resolve_provider_key(env, &p.api_key);
+            let spec = ProviderSpec {
+                label: if p.label.is_empty() { id.clone() } else { p.label },
+                id: id.clone(),
+                base_urls,
+                api_key,
+                headers: p.headers.into_iter().collect(),
+            };
+            // A [[providers]] entry named `openrouter` replaces the synthesized
+            // one rather than sitting unreachable behind it.
+            match providers.iter_mut().find(|existing| existing.id == id) {
+                Some(existing) => *existing = spec,
+                None => providers.push(spec),
+            }
+        }
+
+        let default_provider = env
+            .string("THETIS_PROVIDER")
+            .unwrap_or(file.llm.provider)
+            .trim()
+            .to_string();
+        let default_provider = if default_provider.is_empty() {
+            DEFAULT_PROVIDER_ID.to_string()
+        } else {
+            if !providers.iter().any(|p| p.id == default_provider) {
+                anyhow::bail!(
+                    "llm.provider `{default_provider}` is not one of the configured providers ({})",
+                    providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+            default_provider
+        };
+
+        // A model naming a provider that does not exist would only fail at
+        // request time, long after the mistake was made.
+        for m in &models {
+            if !m.provider.is_empty() && !providers.iter().any(|p| p.id == m.provider) {
+                anyhow::bail!(
+                    "model `{}` names provider `{}`, which is not configured ({})",
+                    m.id,
+                    m.provider,
+                    providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
 
         let mut modes: Vec<ModeSpec> = if file.modes.is_empty() {
             builtin_modes()
@@ -1722,6 +2120,49 @@ impl Config {
             );
         }
 
+        // Delegation profiles. Validated here rather than at spawn time: a
+        // profile naming a model or mode that does not exist is a typo in the
+        // config, and finding it at startup is far better than finding it when
+        // an agent tries to delegate mid-turn.
+        let mut profiles: Vec<AgentProfile> = Vec::new();
+        for p in file.subagents.profiles {
+            if p.id.is_empty() {
+                anyhow::bail!("every [[subagents.profiles]] entry needs an id");
+            }
+            if !p.model.is_empty() && !models.iter().any(|m| m.id == p.model) {
+                anyhow::bail!(
+                    "agent profile `{}` names model `{}`, which is not in [[models]]",
+                    p.id,
+                    p.model
+                );
+            }
+            if !p.mode.is_empty() && !modes.iter().any(|m| m.id == p.mode) {
+                anyhow::bail!(
+                    "agent profile `{}` names mode `{}`, which is not in [[modes]]",
+                    p.id,
+                    p.mode
+                );
+            }
+            profiles.push(AgentProfile {
+                label: if p.label.is_empty() { p.id.clone() } else { p.label },
+                id: p.id,
+                description: p.description,
+                model: p.model,
+                mode: p.mode,
+                prompt: p.prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name),
+            });
+        }
+        let subagent_default_mode = if file.subagents.default_mode.is_empty() {
+            default_mode.clone()
+        } else {
+            file.subagents.default_mode
+        };
+        if !modes.iter().any(|m| m.id == subagent_default_mode) {
+            anyhow::bail!(
+                "subagents.default_mode `{subagent_default_mode}` is not one of the configured modes"
+            );
+        }
+
         let config = Self {
             paths,
             bind_addr,
@@ -1729,11 +2170,8 @@ impl Config {
                 .unwrap_or(file.server.primary_gateway),
             admin_enabled: env.parse("THETIS_ADMIN", file.server.admin_enabled),
 
-            openrouter_api_key: resolve_api_key(
-                env.string("OPENROUTER_API_KEY"),
-                &file.llm.api_key,
-            ),
-            openrouter_base: env.string("OPENROUTER_BASE_URL").unwrap_or(file.llm.base_url),
+            openrouter_api_key: llm_api_key,
+            openrouter_base: llm_base,
             model: env.string("THETIS_MODEL").unwrap_or(file.llm.model),
             request_timeout: Duration::from_secs(env.parse(
                 "THETIS_REQUEST_TIMEOUT_SECS",
@@ -1741,6 +2179,8 @@ impl Config {
             )),
             max_retries: env.parse("THETIS_MAX_RETRIES", file.llm.max_retries),
             models,
+            providers,
+            default_provider,
 
             agent_name,
             agent_avatar,
@@ -1786,7 +2226,7 @@ impl Config {
             context: ContextSettings {
                 enabled: env.parse("THETIS_COMPACT", file.context.enabled),
                 window: env.parse("THETIS_CONTEXT_WINDOW", file.context.window_tokens).max(1),
-                compact_threshold: file.context.compact_threshold.clamp(0.05, 0.99),
+                compact_threshold: file.context.compact_threshold.clamp(0.05, 1.0),
                 compact_target: file.context.compact_target.clamp(0.01, 0.95),
                 summary_model: env.string("THETIS_SUMMARY_MODEL")
                     .unwrap_or(file.context.summary_model),
@@ -1811,6 +2251,8 @@ impl Config {
                 retrieve_limit: file.skills.retrieve_limit.clamp(1, 50),
                 embedding_model: env.string("THETIS_EMBEDDING_MODEL")
                     .unwrap_or(file.skills.embedding_model),
+                embedding_provider: env.string("THETIS_EMBEDDING_PROVIDER")
+                    .unwrap_or(file.skills.embedding_provider),
                 embedding_dimensions: file.skills.embedding_dimensions.clamp(64, 4096),
                 max_query_chars: file.skills.max_query_chars.clamp(64, 32_768),
                 max_universal: file.skills.max_universal.min(20),
@@ -1824,6 +2266,18 @@ impl Config {
                 accounting_enabled: file.tool_groups.accounting_enabled,
                 always_on: file.tool_groups.always_on,
                 route_threshold: file.tool_groups.route_threshold.clamp(0.0, 1.0),
+            },
+
+            subagents: SubagentSettings {
+                enabled: env.parse("THETIS_SUBAGENTS", file.subagents.enabled),
+                // Zero would mean "no children at all", which is what
+                // `enabled = false` is for; clamped so a stray 0 cannot
+                // silently disable delegation.
+                max_children: file.subagents.max_children.clamp(1, 64),
+                max_wait_secs: file.subagents.max_wait_secs.clamp(1, 21_600),
+                max_result_bytes: file.subagents.max_result_bytes.clamp(1_024, 1_048_576),
+                default_mode: subagent_default_mode,
+                profiles,
             },
 
             build: BuildSettings {
@@ -2013,6 +2467,26 @@ fn resolve_api_key(from_env: Option<String>, from_file: &str) -> Option<Secret> 
         .map(Secret::new)
 }
 
+/// A provider's key, with `env:NAME` indirection.
+///
+/// Empty stays empty and means *send no auth header*, which is what a local
+/// llama.cpp server wants. `env:NAME` that is unset is also empty rather than
+/// an error: an unauthenticated endpoint is a perfectly good outcome, and a
+/// wrong key fails loudly at the first request anyway.
+fn resolve_provider_key(env: Env, raw: &str) -> Option<Secret> {
+    let raw = raw.trim();
+    let value = match raw.strip_prefix("env:") {
+        Some(name) => env.string(name.trim()).unwrap_or_default(),
+        None => raw.to_string(),
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(Secret::new(value))
+    }
+}
+
 /// `THETIS_MODELS` is a comma-separated list of `id=Label` pairs; a bare id
 /// uses itself as the label.
 fn parse_models_env(raw: &str) -> Vec<ModelSpec> {
@@ -2020,15 +2494,18 @@ fn parse_models_env(raw: &str) -> Vec<ModelSpec> {
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| match entry.split_once('=') {
-            Some((id, label)) => ModelSpec {
-                id: id.trim().to_string(),
-                label: label.trim().to_string(),
-            },
-            None => ModelSpec {
-                id: entry.to_string(),
-                label: entry.to_string(),
-            },
+        .map(|entry| {
+            let (id, label) = match entry.split_once('=') {
+                Some((id, label)) => (id.trim().to_string(), label.trim().to_string()),
+                None => (entry.to_string(), entry.to_string()),
+            };
+            ModelSpec {
+                id,
+                label,
+                // An env-declared model routes by id prefix, if at all.
+                provider: String::new(),
+                wire_model: String::new(),
+            }
         })
         .collect();
 
@@ -2053,6 +2530,8 @@ fn builtin_models() -> Vec<ModelSpec> {
     .map(|(id, label)| ModelSpec {
         id: id.to_string(),
         label: label.to_string(),
+        provider: String::new(),
+        wire_model: String::new(),
     })
     .collect()
 }
@@ -2462,6 +2941,216 @@ max_universal = 3
         assert_eq!(file.skills.embedding_dimensions, 256);
         assert_eq!(file.skills.max_query_chars, 99);
         assert_eq!(file.skills.max_universal, 3);
+    }
+
+    /// The config a llama.cpp user would write: one extra provider, one model
+    /// pointed at it, OpenRouter left exactly as it was.
+    const LOCAL_PROVIDER: &str = r#"
+        [llm]
+        model = "anthropic/claude-sonnet-4.5"
+        api_key = "sk-or-test"
+
+        [[providers]]
+        id = "local"
+        label = "llama.cpp"
+        base_url = "http://127.0.0.1:8080/v1"
+
+        [[models]]
+        id = "anthropic/claude-sonnet-4.5"
+        label = "Claude Sonnet 4.5"
+
+        [[models]]
+        id = "local/qwen3-30b"
+        label = "Qwen3 30B (local)"
+        provider = "local"
+        wire_model = "qwen3-30b-a3b"
+    "#;
+
+    #[test]
+    fn openrouter_is_always_a_provider_even_with_none_configured() {
+        let cfg = from_toml("[llm]\napi_key = \"sk-or-test\"\n").unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.default_provider, DEFAULT_PROVIDER_ID);
+
+        let provider = cfg.fallback_provider();
+        assert_eq!(provider.base_url(), "https://openrouter.ai/api/v1");
+        assert!(provider.is_openrouter());
+        assert_eq!(provider.api_key.as_ref().unwrap().expose(), "sk-or-test");
+    }
+
+    #[test]
+    fn a_local_provider_serves_the_model_that_names_it() {
+        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
+
+        let local = cfg.resolve_model("local/qwen3-30b");
+        assert_eq!(local.provider.id, "local");
+        assert_eq!(local.provider.url("chat/completions"), "http://127.0.0.1:8080/v1/chat/completions");
+        // The picker's id and the name on the wire are allowed to differ.
+        assert_eq!(local.wire_model, "qwen3-30b-a3b");
+        // No key configured means no Authorization header at all, which is what
+        // an unauthenticated local server needs.
+        assert!(local.provider.api_key.is_none());
+        assert!(!local.provider.is_openrouter());
+
+        // Adding a provider must not move anything that was already working.
+        let remote = cfg.resolve_model("anthropic/claude-sonnet-4.5");
+        assert_eq!(remote.provider.id, DEFAULT_PROVIDER_ID);
+        assert_eq!(remote.wire_model, "anthropic/claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn an_unlisted_model_can_still_address_a_provider_by_prefix() {
+        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
+        let resolved = cfg.resolve_model("local/some-gguf-i-just-loaded");
+        assert_eq!(resolved.provider.id, "local");
+        // The prefix is the routing instruction, so it comes off the wire name.
+        assert_eq!(resolved.wire_model, "some-gguf-i-just-loaded");
+    }
+
+    #[test]
+    fn a_vendor_prefix_is_not_mistaken_for_a_provider() {
+        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
+        // `anthropic` is a vendor within OpenRouter, not a configured provider,
+        // so the id must reach the wire whole.
+        let resolved = cfg.resolve_model("anthropic/claude-opus-4.1");
+        assert_eq!(resolved.provider.id, DEFAULT_PROVIDER_ID);
+        assert_eq!(resolved.wire_model, "anthropic/claude-opus-4.1");
+    }
+
+    #[test]
+    fn a_local_provider_can_be_made_the_default() {
+        let cfg = from_toml(
+            r#"
+            [llm]
+            model = "qwen3-30b"
+            provider = "local"
+
+            [[providers]]
+            id = "local"
+            base_url = "http://127.0.0.1:8080/v1"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.default_provider, "local");
+        let resolved = cfg.resolve_model("qwen3-30b");
+        assert_eq!(resolved.provider.id, "local");
+        assert_eq!(resolved.wire_model, "qwen3-30b");
+        // A label falls back to the id rather than showing blank in the picker.
+        assert_eq!(cfg.provider("local").unwrap().label, "local");
+    }
+
+    #[test]
+    fn a_provider_key_can_come_from_the_environment() {
+        // `env:` indirection keeps a real key out of the file.
+        std::env::set_var("THETIS_TEST_PROVIDER_KEY", "sk-local-abc");
+        let cfg = Config::assemble(
+            PathBuf::from("/proj"),
+            PathBuf::from("/proj/thetis.toml"),
+            toml::from_str(
+                r#"
+                [[providers]]
+                id = "vllm"
+                base_url = "http://gpu.internal:8000/v1"
+                api_key = "env:THETIS_TEST_PROVIDER_KEY"
+                "#,
+            )
+            .unwrap(),
+            Env::Process,
+        )
+        .unwrap();
+        std::env::remove_var("THETIS_TEST_PROVIDER_KEY");
+
+        assert_eq!(
+            cfg.provider("vllm").unwrap().api_key.as_ref().unwrap().expose(),
+            "sk-local-abc"
+        );
+    }
+
+    #[test]
+    fn an_unset_env_key_leaves_a_provider_unauthenticated_rather_than_failing() {
+        let cfg = from_toml(
+            r#"
+            [[providers]]
+            id = "local"
+            base_url = "http://127.0.0.1:8080/v1"
+            api_key = "env:DEFINITELY_NOT_SET_THETIS_TEST"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.provider("local").unwrap().api_key.is_none());
+    }
+
+    #[test]
+    fn extra_headers_are_carried_per_provider() {
+        let cfg = from_toml(
+            r#"
+            [[providers]]
+            id = "gw"
+            base_url = "http://gw.internal/v1"
+            headers = { "X-Org" = "acme" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.provider("gw").unwrap().headers,
+            vec![("X-Org".to_string(), "acme".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_model_naming_a_provider_that_does_not_exist_is_rejected_at_load() {
+        // Otherwise the mistake surfaces as a confusing 404 mid-conversation.
+        let err = from_toml(
+            r#"
+            [[models]]
+            id = "x"
+            provider = "typo"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("typo"), "{err}");
+    }
+
+    #[test]
+    fn a_default_provider_that_does_not_exist_is_rejected_at_load() {
+        let err = from_toml("[llm]\nprovider = \"nope\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn a_provider_named_openrouter_replaces_the_synthesized_one() {
+        // Overriding the built-in entry must not leave two under one id, where
+        // the second would be unreachable.
+        let cfg = from_toml(
+            r#"
+            [[providers]]
+            id = "openrouter"
+            base_url = "http://proxy.internal/v1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.fallback_provider().base_url(), "http://proxy.internal/v1");
+    }
+
+    #[test]
+    fn a_base_url_with_a_trailing_slash_does_not_double_it() {
+        let cfg = from_toml(
+            r#"
+            [[providers]]
+            id = "local"
+            base_url = "http://127.0.0.1:8080/v1/"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.provider("local").unwrap().url("chat/completions"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
     }
 
     #[test]

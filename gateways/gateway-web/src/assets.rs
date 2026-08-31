@@ -15,9 +15,6 @@ pub struct Asset {
 // Charset is spelled out on every one: a bare `text/javascript` lets the
 // browser guess, and a guess of latin-1 turns every em dash in a comment into
 // mojibake.
-// Charset is spelled out on every one: a bare `text/javascript` lets the
-// browser guess, and a guess of latin-1 turns every em dash in a comment into
-// mojibake.
 const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
@@ -38,11 +35,22 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/views/transcript.js", mime: JS, body: include_str!("ui/views/transcript.js") },
     Asset { path: "/views/composer.js", mime: JS, body: include_str!("ui/views/composer.js") },
     Asset { path: "/views/picker.js", mime: JS, body: include_str!("ui/views/picker.js") },
+    // @-mentions in the composer: the workspace index, the match menu, the
+    // highlight, and turning mentioned paths into attachments.
+    Asset { path: "/views/mentions.js", mime: JS, body: include_str!("ui/views/mentions.js") },
     Asset { path: "/views/panel.js", mime: JS, body: include_str!("ui/views/panel.js") },
     Asset { path: "/views/branch.js", mime: JS, body: include_str!("ui/views/branch.js") },
     Asset { path: "/views/workspace.js", mime: JS, body: include_str!("ui/views/workspace.js") },
     Asset { path: "/views/rail.js", mime: JS, body: include_str!("ui/views/rail.js") },
+    // The centre stage's tab strip: the conversation first and always, then a
+    // tab per sub-agent and per open file. Owns which pane is showing, the
+    // conversation's title and rename, and the file editors.
+    Asset { path: "/views/stage.js", mime: JS, body: include_str!("ui/views/stage.js") },
     Asset { path: "/views/context.js", mime: JS, body: include_str!("ui/views/context.js") },
+    // The portraits either side of the transcript, and the sidebar's avatar
+    // button. Not a rail tab: an avatar is not something you inspect, it is
+    // ambient identity, so it lives in the space beside the conversation.
+    Asset { path: "/views/avatars.js", mime: JS, body: include_str!("ui/views/avatars.js") },
     // The `ask_user` form. Lives in the transcript rather than the rail: the
     // questions are a message, and answering them is answering the agent.
     Asset { path: "/views/askuser.js", mime: JS, body: include_str!("ui/views/askuser.js") },

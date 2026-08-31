@@ -210,11 +210,31 @@ pub async fn call_session(
     method: &str,
     params: Value,
 ) -> Result<Value> {
-    let entry = ensure_worker(grip, router, session_id).await?;
+    let route = routing_key(grip, session_id);
+    let entry = ensure_worker(grip, router, &route).await?;
     if let Ok(mut stamp) = entry.last_activity.lock() {
         *stamp = Instant::now();
     }
     entry.peer.call_within(method, params, method_budget(method)).await
+}
+
+/// Which worker serves a session: itself, or its parent conversation's.
+///
+/// A sub-agent has its own session and its own event log, but no branch and no
+/// checkout of its own. It runs inside the worker of the conversation that
+/// spawned it, so parent and child see the same working tree — which is the
+/// whole reason delegation is useful for code work. Spawning a worker and a git
+/// worktree per child would also make a three-way fan-out cost three worktrees
+/// and three process startups.
+///
+/// Resolved from the registry, which only the gateway can read; a worker asking
+/// this of itself gets the id back unchanged, which is correct, because a
+/// worker only ever runs sessions already routed to it.
+fn routing_key(grip: &Arc<Grip>, session_id: &str) -> String {
+    match grip.local_store() {
+        Some(store) => crate::subagents::Subagents::new(store).root_of(session_id),
+        None => session_id.to_string(),
+    }
 }
 
 /// How long this method is allowed to take.
@@ -1019,6 +1039,11 @@ fn spawn_worker_process(
         // which serves an identical tree with no toolchain at all.
         .env("THETIS_LOCAL_CONFIG", cfg.local_overlay())
         .env("THETIS_TRUNK", trunk)
+        // The browser sidecar's token is deliberately NOT pinned here. A worker
+        // is spawned by whichever gateway is running, normally trunk's binary,
+        // so a branch adding an `.env()` call here would not affect its own
+        // workers at all. It travels through a file in the shared data
+        // directory instead. See `browser::token`.
         // A worker must never mistake itself for a supervised service: its
         // restart path is the gateway, not systemd.
         .env_remove("INVOCATION_ID")

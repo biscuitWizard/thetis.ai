@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 mod compaction;
 mod groups;
+mod plan;
 mod tools;
 mod workspace;
 
@@ -85,6 +86,12 @@ struct Turn {
     /// prompt, tool schemas and the whole history. This is what compaction
     /// triggers on - an estimate of one part of the request would not do.
     context_tokens: u32,
+    /// How many messages `context_tokens` accounts for. Everything from here on
+    /// was added since the last completion and has never been priced by a
+    /// provider, so the compaction check estimates it instead. Without this a
+    /// turn that piles up tool results looks exactly as large as it did before
+    /// the first one.
+    billed_to: usize,
     iterations: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -98,6 +105,10 @@ struct Turn {
     /// Nudge text seen at a checkpoint where a `user` message would not have
     /// been legal yet, waiting to be added by `flush_pending`.
     pending: Vec<String>,
+    /// Do not immediately retry a compaction that failed or made negligible
+    /// progress. The value is the context size that must be reached before the
+    /// next attempt; zero means no backoff.
+    compaction_backoff_until: u32,
     /// Whether the user has stopped this turn. Sticky: a stop stays stopped
     /// however many further checkpoints the loop passes through.
     cancelled: bool,
@@ -126,6 +137,7 @@ impl Turn {
             messages: Vec::new(),
             origins: Vec::new(),
             context_tokens: 0,
+            billed_to: 0,
             iterations: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -134,6 +146,7 @@ impl Turn {
             offered: (0, 0),
             stopped_by: "stop",
             pending: Vec::new(),
+            compaction_backoff_until: 0,
             cancelled: false,
         }
     }
@@ -147,21 +160,6 @@ impl Turn {
         // are the strongest evidence for which groups this conversation wants,
         // and they do not exist until the pin does.
         self.route_tools_once();
-        self.maybe_compact();
-
-        // A stop pressed during compaction should end the turn there, not after
-        // one more completion paid for at the full context size.
-        if self.stopped_before_starting() {
-            self.stopped_by = "cancelled";
-            return Ok(TurnStats {
-                iterations: 0,
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.completion_tokens,
-                cost_usd: self.cost_usd,
-                tools_used: self.tools_used,
-                stopped_by: self.stopped_by.to_string(),
-            });
-        }
 
         loop {
             if self.iterations >= self.max_iterations {
@@ -172,6 +170,33 @@ impl Turn {
                 ));
                 break;
             }
+
+            // Anything the user typed is folded in before the size is measured,
+            // so compaction sees the list the request will really carry — and so
+            // a nudge is never left queued behind a compaction it arrived
+            // before.
+            if matches!(self.flush_pending(), Interrupt::Cancelled) {
+                self.stopped_by = "cancelled";
+                break;
+            }
+
+            // Every completion, not just the turn's first. This is the fix for
+            // compaction only ever being triggered by a new user message: the
+            // context that overflows is usually built *inside* one long agentic
+            // turn, and a check that ran once at the top of the turn could not
+            // see any of it. Placed immediately before the request so the
+            // decision is made on the list that request will actually send.
+            self.maybe_compact();
+
+            // A stop pressed during compaction ends the turn here rather than
+            // after one more completion paid for at the full context size.
+            // Before the counter moves, so a turn stopped during its first
+            // compaction still reports zero iterations.
+            if matches!(self.drain_inbox(), Interrupt::Cancelled) {
+                self.stopped_by = "cancelled";
+                break;
+            }
+
             self.iterations += 1;
 
             let reply = match self.stream_completion() {
@@ -346,6 +371,12 @@ impl Turn {
     fn rehydrate(&mut self) {
         self.messages.clear();
         self.origins.clear();
+        // Both are rebuilt from the log below. Clearing them matters on a
+        // *re*hydration — the one just after a compaction — where a stale
+        // provider count left in place would describe the longer conversation
+        // that has only now been summarized.
+        self.context_tokens = 0;
+        self.billed_to = 0;
 
         self.push(
             json!({ "role": "system", "content": self.system_prompt() }),
@@ -357,8 +388,17 @@ impl Turn {
         // Which sequences a summary now stands for, and where each note goes.
         let mut covered: Vec<(u64, u64)> = Vec::new();
         let mut notes: Vec<(u64, Value)> = Vec::new();
+        // The newest compaction, and the newest completion that reported a
+        // context size. Compared below: a count taken before a compaction
+        // describes a conversation that no longer exists.
+        let mut last_compaction_seq = 0u64;
+        let mut last_usage_seq = 0u64;
         for record in &records {
+            if matches!(record.event, SessionEvent::AssistantMessage(ref m) if m.usage.is_some()) {
+                last_usage_seq = record.seq;
+            }
             if let SessionEvent::ContextCompacted(c) = &record.event {
+                last_compaction_seq = record.seq;
                 let (Some(first), Some(last)) = (c.spans.first(), c.spans.last()) else {
                     continue;
                 };
@@ -376,6 +416,13 @@ impl Turn {
                 ));
             }
         }
+
+        // A provider count only describes this message list if it was taken
+        // after the last compaction. One taken before it is a measurement of a
+        // conversation that has since been summarized away, and trusting it
+        // would re-trigger compaction on every check until a completion
+        // refreshed the figure — the compaction loop this guards against.
+        let usage_is_current = last_usage_seq > last_compaction_seq;
 
         for record in records {
             if let Some(i) = notes.iter().position(|(seq, _)| *seq == record.seq) {
@@ -398,9 +445,13 @@ impl Turn {
                 }
                 SessionEvent::AssistantMessage(msg) => {
                     // The last one wins: this ends up holding what the provider
-                    // charged for the most recent request.
+                    // charged for the most recent request, and the boundary it
+                    // was charged at.
                     if let Some(usage) = &msg.usage {
-                        self.context_tokens = usage.prompt_tokens;
+                        if usage_is_current {
+                            self.context_tokens = usage.prompt_tokens;
+                            self.billed_to = self.messages.len();
+                        }
                     }
                     let reply = Reply {
                         text: msg.content,
@@ -416,6 +467,9 @@ impl Turn {
                             "role": "tool",
                             "tool_call_id": out.call_id,
                             "content": out.content,
+                            // Host request preparation removes failed call/result
+                            // pairs before choosing prompt-cache checkpoints.
+                            "thetis_tool_ok": out.ok,
                         }),
                         seq,
                     );
@@ -448,12 +502,35 @@ impl Turn {
     /// Summarizes the oldest low-value stretch of the conversation when the
     /// context has grown past its threshold.
     ///
-    /// Runs before the turn rather than after it, so the turn about to happen is
-    /// the one that benefits. A failure is not fatal: the conversation simply
-    /// stays long, which is worse than compacting and better than not answering.
+    /// Called before *every* completion, not once at the head of the turn. The
+    /// head-of-turn-only version could only ever be triggered by a new user
+    /// message, which is the wrong trigger: a turn does not stay the size it
+    /// started at. An agentic turn is where context actually grows — twenty
+    /// iterations of file reads and command output — and that growth used to be
+    /// entirely invisible to the check, so a long turn could run the context
+    /// straight past the window and start failing requests, with the next user
+    /// message arriving too late to be the thing that saves it.
+    ///
+    /// A failure is not fatal: the conversation simply stays long, which is
+    /// worse than compacting and better than not answering.
     fn maybe_compact(&mut self) {
         let policy = compaction::Policy::load();
-        if !policy.should_compact(self.context_tokens) {
+        if !policy.enabled {
+            return;
+        }
+        // Queued nudge text is in the log already but not yet in `messages`.
+        // Compaction ends by rehydrating from the log, which would pick it up —
+        // and `flush_pending` would then add it a second time. Skipping here
+        // costs nothing: `pending` is emptied once the assistant turn it arrived
+        // during is on the list, and the next iteration checks again.
+        if !self.pending.is_empty() {
+            return;
+        }
+        let context_tokens = self.context_estimate();
+        if context_tokens < self.compaction_backoff_until {
+            return;
+        }
+        if !policy.should_compact(context_tokens) {
             return;
         }
 
@@ -461,9 +538,13 @@ impl Turn {
             &self.session_id,
             &self.messages,
             &self.origins,
-            self.context_tokens,
+            context_tokens,
             &policy,
         ) else {
+            // The protected head/tail can leave nothing eligible. Retrying the
+            // same selection before the context has grown materially is a hot
+            // loop with no possible different result.
+            self.compaction_backoff_until = context_tokens.saturating_add(context_tokens / 10);
             return;
         };
 
@@ -475,29 +556,37 @@ impl Turn {
         self.pending.extend(carried);
 
         let Some(record) = result else {
+            // Summary-provider failures used to be retried before every model
+            // completion, trapping a turn in compaction. Back off until the
+            // context grows by 25%; at that point the overflow risk justifies
+            // another attempt.
+            self.compaction_backoff_until = context_tokens.saturating_add(context_tokens / 4);
             return;
         };
 
         let replaced = record.messages_replaced;
         host::append(&self.session_id, &SessionEvent::ContextCompacted(record));
 
-        // Rebuild through the compaction just recorded.
+        // Rebuild through the compaction just recorded, then require real
+        // progress. A summary can itself be unexpectedly large; if it shed less
+        // than 10%, do not repeatedly summarize adjacent tiny spans.
         self.rehydrate();
+        let after = self.context_estimate();
+        if after >= context_tokens.saturating_sub(context_tokens / 10) {
+            self.compaction_backoff_until = context_tokens.saturating_add(context_tokens / 4);
+            sys::log(
+                LogLevel::Warn,
+                &format!(
+                    "compaction: negligible progress (~{context_tokens} to ~{after} tokens); backing off"
+                ),
+            );
+        } else {
+            self.compaction_backoff_until = 0;
+        }
         sys::log(
             LogLevel::Info,
             &format!("compaction: {replaced} messages replaced by a summary"),
         );
-    }
-
-    /// Whether the user stopped the turn before it got as far as its first
-    /// completion.
-    ///
-    /// Compaction is the only thing that runs before that point and the only
-    /// thing that takes long enough for a stop to land during it. Without this
-    /// the loop's first checkpoint is *after* a completion, so a turn stopped
-    /// during compaction still paid for a full model call before noticing.
-    fn stopped_before_starting(&mut self) -> bool {
-        matches!(self.drain_inbox(), Interrupt::Cancelled)
     }
 
     /// The base prompt, the mode's own instructions, and the skills this
@@ -562,12 +651,30 @@ impl Turn {
             );
             for card in extra {
                 prompt.push_str(&format!("\n- `{}` — {}", card.id, card.brief));
+                // A retired skill still ranks, because it documents a system
+                // that existed and someone arriving from old code needs it. But
+                // it must not be read as instruction, so mark it on the line
+                // where the decision to fetch gets made.
+                if card.status == "retired" {
+                    if card.superseded_by.is_empty() {
+                        prompt.push_str("\n  Retired: describes a system no longer in use.");
+                    } else {
+                        prompt.push_str(&format!(
+                            "\n  Retired: superseded by `{}` — prefer that unless you need the history.",
+                            card.superseded_by
+                        ));
+                    }
+                }
                 if !card.when_to_use.trim().is_empty() {
                     prompt.push_str(&format!("\n  Use when: {}", card.when_to_use.trim()));
                 }
                 if !card.children.is_empty() {
                     prompt.push_str(&format!("\n  Nested: {}", card.children.join(", ")));
                 }
+                if !card.related.is_empty() {
+                    prompt.push_str(&format!("\n  Related: {}", card.related.join(", ")));
+                }
+
             }
             prompt.push('\n');
         }
@@ -761,6 +868,13 @@ impl Turn {
                     host::emit_output(&self.session_id, &chunk);
                     reply.text.push_str(&chunk);
                 }
+                Ok(StreamChunk::Reasoning(thought)) => {
+                    // Shown as it arrives, but deliberately not appended to
+                    // `reply.text`: the thinking is not the answer, and must
+                    // not end up in the persisted message or be replayed to
+                    // the model on the next round.
+                    host::emit_reasoning(&self.session_id, &thought);
+                }
                 Ok(StreamChunk::ToolCalls(calls)) => reply.tool_calls = calls,
                 Ok(StreamChunk::Finished(info)) => {
                     reply.model = info.model;
@@ -810,6 +924,7 @@ impl Turn {
                 "role": "tool",
                 "tool_call_id": result.call_id,
                 "content": result.content,
+                "thetis_tool_ok": result.ok,
             }),
             seq,
         );
@@ -893,6 +1008,7 @@ impl Turn {
                     "role": "tool",
                     "tool_call_id": result.call_id,
                     "content": result.content,
+                    "thetis_tool_ok": false,
                 }),
                 seq,
             );
@@ -904,7 +1020,27 @@ impl Turn {
             self.prompt_tokens += u.prompt_tokens;
             self.completion_tokens += u.completion_tokens;
             self.cost_usd += u.cost_usd;
+            // What the provider just charged for is exactly the message list as
+            // it stood when the request went out — this is called before the
+            // reply is pushed, so `len()` is that boundary. Everything appended
+            // after it is unbilled and gets estimated instead.
+            self.context_tokens = u.prompt_tokens;
+            self.billed_to = self.messages.len();
         }
+    }
+
+    /// The size of the context as it stands right now.
+    ///
+    /// The provider's count for the last request, plus an estimate of
+    /// everything appended since. The second term is the whole reason
+    /// compaction can fire mid-turn: a turn's context growth is tool results,
+    /// and no request has been priced with them in it yet, so a check that
+    /// looked only at `context_tokens` saw the same number all turn and a turn
+    /// that ran away could sail past the window without ever compacting.
+    fn context_estimate(&self) -> u32 {
+        let billed_to = self.billed_to.min(self.messages.len());
+        self.context_tokens
+            .saturating_add(compaction::estimate(&self.messages[billed_to..]))
     }
 
     fn note(&self, text: &str) {
@@ -943,10 +1079,25 @@ struct Reply {
     usage: Option<TokenUsage>,
 }
 
+/// Largest single text attachment inlined into a user message, in characters.
+/// Past this the head is sent with a line saying what was cut, and the path is
+/// there to read the rest with.
+const MAX_INLINE_FILE_CHARS: usize = 96_000;
+/// Ceiling across every text attachment on one message, so a dozen files
+/// cannot quietly spend the whole context.
+const MAX_INLINE_TOTAL_CHARS: usize = 240_000;
+
 /// Builds the `content` field for a user message.
 ///
 /// Plain text stays a bare string, which every provider accepts; attachments
-/// promote it to the multi-part form with inline data URLs.
+/// promote it to the multi-part form.
+///
+/// Images go inline as data URLs. A **text** attachment is inlined as its
+/// actual contents, fenced and labelled with its path — the same thing an
+/// editor's `@file` mention does, and the reason it works: a path alone tells
+/// the model a file exists but leaves it to guess or to spend a tool call, and
+/// the point of attaching was that the sender already knew it was relevant.
+/// The path is still given, so a truncated or edited file can be read properly.
 fn user_content(msg: &UserMsg) -> Value {
     if msg.attachments.is_empty() {
         return json!(msg.text);
@@ -956,6 +1107,7 @@ fn user_content(msg: &UserMsg) -> Value {
     if !msg.text.trim().is_empty() {
         parts.push(json!({ "type": "text", "text": msg.text }));
     }
+    let mut budget = MAX_INLINE_TOTAL_CHARS;
     for attachment in &msg.attachments {
         if attachment.mime.starts_with("image/") {
             parts.push(json!({
@@ -964,16 +1116,93 @@ fn user_content(msg: &UserMsg) -> Value {
                     "url": format!("data:{};base64,{}", attachment.mime, attachment.data_base64)
                 }
             }));
-        } else {
-            // Nothing sensible to send inline, but the model should still know
-            // the file was there.
-            parts.push(json!({
+            continue;
+        }
+        match inline_text(attachment, &mut budget) {
+            Some(text) => parts.push(json!({ "type": "text", "text": text })),
+            // Binary, undecodable, or past the budget: the model should still
+            // know the file was there and how to reach it.
+            None => parts.push(json!({
                 "type": "text",
-                "text": format!("[attached file: {} ({})]", attachment.name, attachment.mime)
-            }));
+                "text": format!(
+                    "[attached file: {} ({}) — contents not inlined; read it with read_path if needed]",
+                    attachment.name, attachment.mime
+                )
+            })),
         }
     }
     json!(parts)
+}
+
+/// One text attachment as a labelled block, or `None` when it is not text.
+///
+/// `budget` is decremented by what this one spends, so the cap is across the
+/// whole message rather than per file.
+fn inline_text(
+    attachment: &crate::thetis::grip::types::Attachment,
+    budget: &mut usize,
+) -> Option<String> {
+    if *budget == 0 {
+        return None;
+    }
+    let bytes = base64_decode(&attachment.data_base64)?;
+    let body = String::from_utf8(bytes).ok()?;
+
+    let allowed = MAX_INLINE_FILE_CHARS.min(*budget);
+    let mut note = String::new();
+    let shown = if body.chars().count() > allowed {
+        let head: String = body.chars().take(allowed).collect();
+        note = format!(
+            "\n… truncated at {allowed} characters; read the rest with read_path {}\n",
+            attachment.name
+        );
+        head
+    } else {
+        body
+    };
+    *budget = budget.saturating_sub(shown.chars().count());
+
+    Some(format!(
+        "<attached-file path=\"{}\">\n{}{}\n</attached-file>",
+        attachment.name, shown, note
+    ))
+}
+
+/// Standard base64 with padding, which is what the wire carries. Hand-rolled
+/// rather than pulling a crate in for forty lines of table lookup.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u32> {
+        Some(match byte {
+            b'A'..=b'Z' => (byte - b'A') as u32,
+            b'a'..=b'z' => (byte - b'a') as u32 + 26,
+            b'0'..=b'9' => (byte - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        // Whitespace is ignored; '=' ends the data. Anything else is a
+        // malformed payload, and guessing at it would produce silent garbage.
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            break;
+        }
+        acc = (acc << 6) | value(byte)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 fn assistant_message(reply: &Reply) -> Value {
@@ -1064,6 +1293,151 @@ mod interrupt_tests {
             seen, Interrupt::Cancelled,
             "a stop seen mid-sequence must stick to the end"
         );
+    }
+}
+
+/// Tests for the attachment inlining, which is what makes an `@`-mentioned
+/// file actually reach the model. Pure functions over a value type, so they
+/// need no host.
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn attach(name: &str, mime: &str, body: &str) -> crate::thetis::grip::types::Attachment {
+        crate::thetis::grip::types::Attachment {
+            name: name.to_string(),
+            mime: mime.to_string(),
+            data_base64: encode(body.as_bytes()),
+        }
+    }
+
+    /// Test-side encoder, so a round trip proves the decoder against something
+    /// other than itself.
+    fn encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    #[test]
+    fn base64_round_trips_including_every_padding_case() {
+        for body in ["", "a", "ab", "abc", "abcd", "hello, world", "λ — ünïcode"] {
+            assert_eq!(
+                base64_decode(&encode(body.as_bytes())).unwrap(),
+                body.as_bytes(),
+                "round trip failed for {body:?}"
+            );
+        }
+        // Whitespace in the payload is ignored, as a wrapped payload carries.
+        assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello");
+        // Anything else is malformed, and guessing would inline silent garbage.
+        assert!(base64_decode("not*base64").is_none());
+    }
+
+    #[test]
+    fn a_text_attachment_is_inlined_with_its_path() {
+        let msg = UserMsg {
+            text: "what does this do? @workspace/moor/README.md".into(),
+            attachments: vec![attach("workspace/moor/README.md", "text/markdown", "# moor\nhi")],
+        };
+        let content = user_content(&msg);
+        let parts = content.as_array().expect("attachments promote to multi-part");
+        assert_eq!(parts.len(), 2, "the text, then the file");
+        assert_eq!(parts[0]["text"], json!(msg.text));
+
+        let inlined = parts[1]["text"].as_str().unwrap();
+        // The path is what makes a later read_path possible; the body is the
+        // whole point, and is what a path-only mention failed to give.
+        assert!(inlined.contains("path=\"workspace/moor/README.md\""), "{inlined}");
+        assert!(inlined.contains("# moor\nhi"), "{inlined}");
+    }
+
+    #[test]
+    fn an_image_still_goes_as_an_image() {
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![attach("shot.png", "image/png", "\u{89}PNG-ish")],
+        };
+        let parts = user_content(&msg);
+        assert_eq!(parts[0]["type"], json!("image_url"));
+        assert!(parts[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn binary_is_named_rather_than_inlined_as_mojibake() {
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![crate::thetis::grip::types::Attachment {
+                name: "workspace/data.bin".into(),
+                mime: "application/octet-stream".into(),
+                data_base64: encode(&[0u8, 159, 146, 150]),
+            }],
+        };
+        let parts = user_content(&msg);
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("workspace/data.bin"), "{text}");
+        assert!(text.contains("not inlined"), "{text}");
+        assert!(text.contains("read_path"), "the model needs a way to look");
+    }
+
+    #[test]
+    fn a_huge_file_is_truncated_and_says_so() {
+        let body = "x".repeat(MAX_INLINE_FILE_CHARS + 500);
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![attach("workspace/big.log", "text/plain", &body)],
+        };
+        let parts = user_content(&msg);
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("truncated at"), "{}", &text[text.len() - 200..]);
+        assert!(text.contains("read_path workspace/big.log"));
+        assert!(text.chars().count() < body.chars().count());
+    }
+
+    #[test]
+    fn the_budget_is_shared_across_attachments() {
+        // Three files that each fit on their own but not together: the last
+        // must be named rather than inlined, so a dozen mentions cannot quietly
+        // spend the whole context.
+        let chunk = "y".repeat(MAX_INLINE_FILE_CHARS);
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: (0..4)
+                .map(|i| attach(&format!("workspace/f{i}.txt"), "text/plain", &chunk))
+                .collect(),
+        };
+        let parts = user_content(&msg);
+        let total: usize = parts
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["text"].as_str().unwrap_or("").chars().count())
+            .sum();
+        assert!(
+            total < MAX_INLINE_TOTAL_CHARS + 4 * 200,
+            "inlined {total} characters, over the shared budget"
+        );
+        let last = parts[3]["text"].as_str().unwrap();
+        assert!(last.contains("not inlined"), "the last file must be named only: {last}");
+    }
+
+    #[test]
+    fn plain_text_stays_a_bare_string() {
+        // Every provider accepts a string; promoting to multi-part when there is
+        // nothing to promote would break the ones that do not.
+        let msg = UserMsg { text: "hello".into(), attachments: vec![] };
+        assert_eq!(user_content(&msg), json!("hello"));
     }
 }
 

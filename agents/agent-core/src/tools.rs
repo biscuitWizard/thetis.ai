@@ -6,13 +6,15 @@
 //! flip and the tools appear without the agent needing to change.
 
 use crate::thetis::grip::types::{
-    CompileReport, ConfigEntry, Dependency, EnvVar, ExecResult, FsEntry, LogLevel, ModTarget,
-    SshHostInfo, TerminalOpen, TerminalOutput, ToolManifest,
+    CompileReport, ConfigEntry, Dependency, EnvVar, EventRecord, ExecResult, FsEntry, LogLevel,
+    ModTarget, SessionEvent, SshHostInfo, TerminalOpen, TerminalOutput, ToolManifest,
 };
 use crate::thetis::grip::{
-    branch, configuration, control, devkit, hostfs, sandbox, skills, sys, terminal, tooling,
+    branch, configuration, control, delegation, devkit, hostfs, sandbox, skills, sys, terminal,
+    tooling,
 };
 use crate::groups;
+use crate::plan;
 use serde_json::{json, Value};
 
 /// The mode assumed when a session has not chosen one.
@@ -58,6 +60,16 @@ fn terminal_available() -> bool {
 
 fn restart_available() -> bool {
     control::available()
+}
+
+/// Whether this session may spawn sub-agents.
+///
+/// False in two cases the agent cannot tell apart, and should not need to:
+/// delegation is switched off in configuration, or this session *is* a
+/// sub-agent. The second is the one-level rule, and the host owns it — asking
+/// here keeps the guest from having to know its own parentage.
+fn delegation_available() -> bool {
+    delegation::available()
 }
 
 /// Whether a mode withholds tools that change things.
@@ -134,7 +146,51 @@ fn all_builtins() -> Vec<ToolDef> {
     if !(terminal_available() && terminal::ssh_available()) {
         tools.extend(ssh_host_tools());
     }
+    // A sub-agent is not offered these, but it can still name one — and the
+    // classification decides whether a read-only mode refuses it, so it has to
+    // be right even where the tool is withheld.
+    if !delegation_available() {
+        tools.extend(subagent_tools());
+    }
+    if !restart_available() {
+        tools.extend(restart_tools());
+    }
     tools
+}
+
+/// Restarting the runtime, which is how a change to the kernel or to a
+/// startup-only setting takes effect.
+///
+/// One tool, but still a named group rather than an inline block in
+/// `available`, for the reason given on every other group here: a tool defined
+/// inline cannot be added back by `all_builtins`, so in a deployment where the
+/// capability is off the name becomes unclassifiable — `is_mutating` falls
+/// through to the component path and guesses, and the group table reports the
+/// `selfmod` entry for it as a phantom.
+fn restart_tools() -> Vec<ToolDef> {
+    vec![ToolDef {
+        name: "restart_orchestrator",
+        description: "Restart this conversation's own runtime — no other conversation notices. \
+             Needed for changes to settings read only at startup, and for changes to \
+             the orchestrator's own source under crates/. Do NOT build the \
+             orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
+             this rebuilds it for you, in the background, and reports the result here. \
+             A build that fails restarts nothing and gives you the compiler error; a \
+             binary that will not start is probed and rejected before it is adopted. \
+             This turn continues afterwards unless you say otherwise; say why first, \
+             because the restart happens just after your turn ends.",
+        mutating: true,
+        parameters: obj(
+            json!({
+                "reason": string_prop("Why a restart is needed."),
+                "resume": {
+                    "type": "boolean",
+                    "description": "Carry this turn on once Thetis is back, which is the default. Set false only if the restart is the last thing you mean to do.",
+                },
+            }),
+            &["reason"],
+        ),
+    }]
 }
 
 /// The isolated per-session container: running a command and moving files in and
@@ -176,6 +232,113 @@ fn sandbox_tools() -> Vec<ToolDef> {
             description: "Read a file from the session's container workspace.",
             mutating: false,
             parameters: obj(json!({ "path": string_prop("Path inside the workspace.") }), &["path"]),
+        },
+    ]
+}
+
+/// Spawning and supervising sub-agents.
+///
+/// The descriptions carry more instruction than most, because delegation is the
+/// tool surface where a vague call is most expensive: a badly briefed child
+/// burns a whole conversation's worth of tokens before anyone finds out. The
+/// research on multi-agent systems is consistent on the point — the dominant
+/// failure is under-specification of the sub-task, not faulty execution of it —
+/// so `spawn_agent` demands the objective, the output format and the
+/// boundaries, and says why.
+fn subagent_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "spawn_agent",
+            description:
+                "Delegate a self-contained piece of work to a sub-agent: a fresh conversation \
+                 with its own context window, working in this same checkout, whose final answer \
+                 comes back to you. Returns as soon as the child has started, so call it \
+                 several times to fan out and then `wait`.\n\n\
+                 Delegate when the work would otherwise flood your own context — reading a \
+                 large body of code or documents to extract a little, exploring several \
+                 approaches, or a batch of similar independent jobs. Do NOT delegate work that \
+                 needs your conversation's history to make sense, work you could do in two tool \
+                 calls, or anything needing a decision from the user: a sub-agent cannot ask \
+                 questions and cannot delegate further.\n\n\
+                 `task` is the entire briefing. The child cannot see this conversation, so a \
+                 brief that assumes context produces confident, wrong work. Always state: the \
+                 objective; what to return and in what shape; which files, paths or sources to \
+                 use; and the boundaries — what it must not touch, and when to stop. Say what \
+                 you already know so it does not rediscover it. Prefer a handful of well-briefed \
+                 children over many thin ones.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "label": string_prop(
+                        "Two or three words naming this job, shown in the transcript and the \
+                         UI, e.g. 'audit auth paths'."
+                    ),
+                    "task": string_prop(
+                        "The complete brief: objective, deliverable and its format, where to \
+                         look, boundaries, and what you already know. Assume no shared context."
+                    ),
+                    "profile": string_prop(
+                        "Configured agent profile to run as, e.g. 'scout' or 'worker'. Omit for \
+                         the default. Call agent_profiles to see them."
+                    ),
+                    "model": string_prop(
+                        "Override the model, e.g. a cheaper one for bulk reading. Omit to \
+                         inherit from the profile."
+                    ),
+                    "mode": string_prop(
+                        "Override the mode. 'plan' gives a read-only child, which is the right \
+                         choice for anything that only needs to look."
+                    ),
+                }),
+                &["label", "task"],
+            ),
+        },
+        ToolDef {
+            name: "agent_status",
+            description:
+                "List your sub-agents with their state, answer so far, cost and elapsed time. \
+                 Free of side effects, but prefer `wait` when what you actually want is for one \
+                 of them to be finished.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
+        },
+        ToolDef {
+            name: "agent_transcript",
+            description:
+                "Read a sub-agent's own event log — what it did, not just what it concluded. \
+                 For diagnosing a child that failed or answered oddly; the answer in \
+                 agent_status is the normal way to collect work.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "child_id": string_prop("The sub-agent's id."),
+                    "from_seq": {
+                        "type": "integer",
+                        "description": "Skip events before this sequence number. Omit for all.",
+                    },
+                }),
+                &["child_id"],
+            ),
+        },
+        ToolDef {
+            name: "cancel_agent",
+            description:
+                "Stop a sub-agent that is no longer worth finishing — going the wrong way, or \
+                 made redundant by another child's answer. Whatever it had produced is kept.",
+            mutating: true,
+            parameters: obj(
+                json!({ "child_id": string_prop("The sub-agent's id.") }),
+                &["child_id"],
+            ),
+        },
+        ToolDef {
+            name: "agent_profiles",
+            description:
+                "List the configured sub-agent profiles — each a model, a mode and a standing \
+                 brief — and the delegation limits: how many children may run at once, the \
+                 longest a wait may block, and how much of an answer reaches you.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
         },
     ]
 }
@@ -350,6 +513,61 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
                 &["questions"],
             ),
         },
+        // --- waiting --------------------------------------------------------
+        //
+        // `wait` is core rather than part of the sub-agent group, because the
+        // reason to block is not always delegation. A sub-agent is refused the
+        // delegation tools entirely, and it is exactly the kind of session that
+        // gets handed a long build to babysit — so if `wait` travelled with
+        // that group, a child would have no way to sleep and would poll
+        // instead, burning an iteration and a slice of context each time.
+        //
+        // The predicates that name sub-agents simply have nothing to match for
+        // a session that has none; the host answers "no such sub-agents" and
+        // the tool says so. Only the 'time' predicate is universally useful,
+        // and it is the one every session can reach.
+        ToolDef {
+            name: "wait",
+            description:
+                "Block until something you are waiting on has happened, instead of polling in a \
+                 loop — each round of polling costs an iteration and a slice of context.\n\n\
+                 Predicates: 'time' — sleep for the timeout, for something outside this system, \
+                 like a long build or a deploy settling; 'all' — every sub-agent named (or every \
+                 one you have) has finished; 'any' — the first one finishes; 'first_failure' — \
+                 return early if one fails, for a batch where one bad result invalidates the \
+                 rest.\n\n\
+                 Always returns the current state of all your sub-agents, including their \
+                 answers, so a successful 'all' wait usually needs no follow-up call. A wait \
+                 always has a deadline and reports whether it timed out.",
+            // Waits, and cancels nothing. A read-only session still needs to be
+            // able to sleep, and one that spawned a read-only child still needs
+            // to be able to wait for it.
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "until": {
+                        "type": "string",
+                        "enum": ["all", "any", "first_failure", "time"],
+                        "description":
+                            "What to wait for. Defaults to 'all' when sub-agents are named or \
+                             running, and to 'time' otherwise.",
+                    },
+                    "children": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description":
+                            "Sub-agent ids to watch. Omit for all of yours.",
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description":
+                            "Deadline in seconds. Required for 'time'; otherwise a safety net \
+                             — pick a generous one, since returning early loses nothing.",
+                    },
+                }),
+                &[],
+            ),
+        },
         // --- skills ---------------------------------------------------------
         //
         // The system prompt names skills but never carries their instructions.
@@ -444,6 +662,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
     ];
 
+    // Offered in every mode, not only Plan. A plan written while reading is
+    // worth having in Agent mode too, and Agent mode is where it gets executed
+    // and ticked off — so gating these on the mode would mean the executing
+    // session could not record that a step was done.
+    tools.extend(plan_tools());
+
     if sandbox_available() {
         tools.extend(sandbox_tools());
     }
@@ -463,32 +687,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
             tools.extend(ssh_host_tools());
         }
     }
+    if delegation_available() {
+        tools.extend(subagent_tools());
+    }
     tools.extend(configuration_tools());
     if restart_available() {
-        tools.push(ToolDef {
-            name: "restart_orchestrator",
-            description:
-                "Restart this conversation's own runtime — no other conversation notices. \
-                 Needed for changes to settings read only at startup, and for changes to \
-                 the orchestrator's own source under crates/. Do NOT build the \
-                 orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
-                 this rebuilds it for you, in the background, and reports the result here. \
-                 A build that fails restarts nothing and gives you the compiler error; a \
-                 binary that will not start is probed and rejected before it is adopted. \
-                 This turn continues afterwards unless you say otherwise; say why first, \
-                 because the restart happens just after your turn ends.",
-            mutating: true,
-            parameters: obj(
-                json!({
-                    "reason": string_prop("Why a restart is needed."),
-                    "resume": {
-                        "type": "boolean",
-                        "description": "Carry this turn on once Thetis is back, which is the default. Set false only if the restart is the last thing you mean to do.",
-                    },
-                }),
-                &["reason"],
-            ),
-        });
+        tools.extend(restart_tools());
     }
 
     // In a read-only mode the tools that would change something are simply not
@@ -498,6 +702,84 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     }
 
     tools
+}
+
+/// The plan document: one editable artefact per conversation.
+///
+/// None of these is `mutating`, and that is the deliberate part. The mode filter
+/// asks "does this change something outside the conversation?", and a plan is
+/// this conversation's own notes — the same category as `remember`, which is
+/// declared the same way. Withholding them from Plan mode would leave the one
+/// mode whose entire output is a plan unable to write one down.
+///
+/// A named group rather than an inline block in `available`, so `all_builtins`
+/// can add them back for classification. See the note on `restart_tools`.
+fn plan_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "plan_write",
+            description:
+                "Create or replace this conversation's plan document. The plan opens in its own \
+                 tab, where the user can read it and press Execute to hand it to an agent — so \
+                 write it for that reader: numbered steps, the files each one touches, and the \
+                 decisions that are theirs to make. Prefer `plan_edit` for a revision; a whole \
+                 rewrite is how an approved section quietly disappears.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "body": string_prop(
+                        "The plan, in markdown. Headings and numbered steps render in the plan tab."
+                    ),
+                    "title": string_prop(
+                        "Short title for the tab. Omit to keep the existing one."
+                    ),
+                }),
+                &["body"],
+            ),
+        },
+        ToolDef {
+            name: "plan_edit",
+            description:
+                "Revise part of the plan by replacing an exact snippet — the same contract as \
+                 `edit_path`. Read the plan first: `old_text` must match byte for byte, \
+                 whitespace included, and an edit matching nothing or matching twice is refused \
+                 rather than guessed. This is the tool for reworking a step after the user \
+                 pushes back on it.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "old_text": string_prop(
+                        "Exact text to find in the plan; must appear once unless replace_all is set."
+                    ),
+                    "new_text": string_prop("What to put in its place. Empty deletes the snippet."),
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence instead of requiring a unique one.",
+                    },
+                }),
+                &["old_text", "new_text"],
+            ),
+        },
+        ToolDef {
+            name: "plan_append",
+            description:
+                "Add a section to the end of the plan, without restating the rest of it. Use \
+                 this while investigating, as each part of the shape becomes clear.",
+            mutating: false,
+            parameters: obj(
+                json!({ "text": string_prop("Markdown to add at the end.") }),
+                &["text"],
+            ),
+        },
+        ToolDef {
+            name: "plan_read",
+            description:
+                "Read this conversation's plan back, with its revision number. Do this before \
+                 editing: another turn may have revised it, and `plan_edit` matches exact text.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
+        },
+    ]
 }
 
 /// Reading and writing files on the machine Thetis is running on, confined to
@@ -568,7 +850,10 @@ fn filesystem_tools() -> Vec<ToolDef> {
             parameters: obj(
                 json!({
                     "pattern": string_prop("Regular expression, Rust regex syntax. Prefix with (?i) to ignore case."),
-                    "path": string_prop("Directory to search under. Omit for the project root."),
+                    "path": string_prop(
+                        "Where to search: a directory, or a single file to search just that one. \
+                         Omit for the project root.",
+                    ),
                     "glob": string_prop("Only search files whose name matches, e.g. '*.rs' or 'src/**/*.toml'."),
                     "mode": {
                         "type": "string",
@@ -595,7 +880,10 @@ fn filesystem_tools() -> Vec<ToolDef> {
             parameters: obj(
                 json!({
                     "glob": string_prop("Glob such as '*.rs', 'crates/**/*.toml', or 'Cargo.*'."),
-                    "path": string_prop("Directory to look under. Omit for the project root."),
+                    "path": string_prop(
+                        "Where to look: a directory, or a single file to test just that one. \
+                         Omit for the project root.",
+                    ),
                     "max_results": {
                         "type": "integer",
                         "description": "How many to return. Omit for a sensible bound.",
@@ -1326,6 +1614,76 @@ pub fn invoke(
             Ok(format_skill_diagnostics(&diags))
         }
 
+        "plan_write" => plan::write(
+            session_id,
+            args.get("title").and_then(Value::as_str).map(str::to_string),
+            &req_str(&args, "body")?,
+        )
+        .map(|p| {
+            format!(
+                "plan saved at revision {}. It is open in the Plan tab; the user can press \
+                 Execute there to hand it to an agent.\n\n{}",
+                p.revision,
+                plan::describe(&p)
+            )
+        }),
+        "plan_edit" => plan::edit(
+            session_id,
+            &req_str(&args, "old_text")?,
+            &req_str(&args, "new_text")?,
+            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+        )
+        .map(|e| {
+            format!(
+                "plan edited in {} place(s), now revision {}.\n\n{}",
+                e.replacements,
+                e.plan.revision,
+                plan::describe(&e.plan)
+            )
+        }),
+        "plan_append" => plan::append(session_id, &req_str(&args, "text")?)
+            .map(|p| format!("appended, now revision {}.\n\n{}", p.revision, plan::describe(&p))),
+        "plan_read" => {
+            let p = plan::load(session_id);
+            if p.body.trim().is_empty() {
+                Ok("no plan yet for this conversation. Write one with plan_write.".to_string())
+            } else {
+                Ok(plan::describe(&p))
+            }
+        }
+
+        // `wait` is not in this arm: it is a core tool, reachable by a
+        // sub-agent, and the host serves it whether or not the session may
+        // delegate. See the note beside its definition.
+        "wait" => wait_for(&args),
+
+        "spawn_agent" | "agent_status" | "agent_transcript" | "cancel_agent"
+        | "agent_profiles" => {
+            // The one-level rule, enforced a second time at the call. The
+            // withheld tool definition is the cheap enforcement; this is the
+            // one that holds when the model names a tool it saw earlier in the
+            // conversation, or in a skill body.
+            if !delegation_available() {
+                return Err(
+                    "delegation is not available in this session. A sub-agent cannot spawn \
+                     sub-agents: do the work yourself, or report back to your parent that it \
+                     needs splitting differently."
+                        .to_string(),
+                );
+            }
+            match name {
+                "spawn_agent" => spawn_agent(&args),
+                "agent_status" => Ok(format_children(&delegation::children())),
+                "agent_transcript" => agent_transcript(&args),
+                "cancel_agent" => delegation::cancel_child(&req_str(&args, "child_id")?)
+                    .map(|row| format!("cancelled\n\n{}", format_child(&row))),
+                _ => Ok(format_profiles(
+                    &delegation::profiles(),
+                    &delegation::limits(),
+                )),
+            }
+        }
+
         "exec" => {
             let command = req_str(&args, "command")?;
             let timeout = args
@@ -2047,7 +2405,310 @@ fn memory_keys(session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// --- delegation -------------------------------------------------------------
+
+/// Starts a sub-agent.
+///
+/// The brief is checked for length here rather than only host-side, because the
+/// failure a one-line brief causes is silent: the child does plausible work
+/// against the wrong objective and the cost is only visible at the end. A
+/// refusal that says what is missing is cheaper than a wasted conversation.
+/// The shortest brief worth sending.
+///
+/// A one-line brief is the commonest way delegation fails: the child cannot see
+/// the conversation, so "look into the auth bug" gives it nothing, and it burns
+/// a whole session working out what was meant. The number is a floor rather
+/// than a judgement of quality — it is enough to catch the reflexive one-liner.
+const MIN_BRIEF: usize = 40;
+// Measured in characters, not bytes, so the floor is the same in every script.
+
+/// Whether a brief is long enough to act on, as a message when it is not.
+/// Split from `spawn_agent` so it is testable off-wasm.
+fn check_brief(task: &str) -> Result<(), String> {
+    if task.trim().chars().count() >= MIN_BRIEF {
+        return Ok(());
+    }
+    Err(
+        "that brief is too short to act on. The sub-agent cannot see this conversation, so \
+         state the objective, what to return and in what shape, where to look, and the \
+         boundaries."
+            .to_string(),
+    )
+}
+
+fn spawn_agent(args: &Value) -> Result<String, String> {
+    let label = req_str(args, "label")?;
+    let task = req_str(args, "task")?;
+    check_brief(&task)?;
+
+    let row = delegation::spawn(&delegation::SpawnRequest {
+        label,
+        task,
+        profile: opt_str(args, "profile"),
+        model: opt_str(args, "model"),
+        mode: opt_str(args, "mode"),
+    })?;
+
+    Ok(format!(
+        "started sub-agent `{}` ({})\n\nIt runs while you carry on. Call `wait` when you need \
+         its answer; do not poll.",
+        row.label, row.id
+    ))
+}
+
+/// Blocks on a predicate.
+///
+/// Both arguments are optional and the default is chosen from the situation:
+/// with children to watch, "all" is what a parent nearly always means, and
+/// guessing right saves a refused call and a retry. With none, the only
+/// sensible reading is a plain sleep.
+fn wait_for(args: &Value) -> Result<String, String> {
+    let children: Vec<String> = args
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let limits = delegation::limits();
+    let mine = delegation::children();
+    let watching = !children.is_empty() || mine.iter().any(|c| c.state == "running");
+
+    let (until, timeout) = wait_plan(args, watching, limits.max_wait_secs)?;
+
+    let out = delegation::wait(&until, &children, timeout)?;
+
+    let mut text = if out.timed_out {
+        format!("waited {timeout}s and timed out — {}", out.reason)
+    } else {
+        format!("wait ended: {}", out.reason)
+    };
+    if out.children.is_empty() {
+        text.push_str("\n\nNo sub-agents.");
+    } else {
+        text.push_str("\n\n");
+        text.push_str(&format_children(&out.children));
+    }
+    Ok(text)
+}
+
+/// The part of `wait_for` that is a decision rather than a call: which
+/// predicate, and for how long. Split out so it can be tested on the host,
+/// where the delegation imports do not exist.
+///
+/// `watching` is whether there is anything to wait *for* — either children were
+/// named or some child of this session is still running.
+fn wait_plan(args: &Value, watching: bool, max_wait_secs: u64) -> Result<(String, u64), String> {
+    let until = match opt_arg(args, "until") {
+        Some(u) => u,
+        None if watching => "all".to_string(),
+        None => "time".to_string(),
+    };
+
+    let asked = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if asked == 0 && until == "time" {
+        return Err("a 'time' wait needs timeout_secs — it has nothing else to end it.".to_string());
+    }
+
+    // A wait with no deadline is indistinguishable from a hung turn, so one is
+    // always supplied. The host clamps it too; this just avoids asking for
+    // something that will be silently reduced.
+    let timeout = if asked == 0 {
+        max_wait_secs
+    } else {
+        asked.min(max_wait_secs)
+    };
+    Ok((until, timeout))
+}
+
+fn agent_transcript(args: &Value) -> Result<String, String> {
+    let events = delegation::child_transcript(
+        &req_str(args, "child_id")?,
+        args.get("from_seq").and_then(Value::as_u64).unwrap_or(0),
+    )?;
+    if events.is_empty() {
+        return Ok("no events".to_string());
+    }
+    Ok(format_transcript(&events))
+}
+
+/// A child's log, flattened to something readable.
+///
+/// Only the arms that say what the child *did* are rendered: messages, tool
+/// calls and their outcomes, notes and incidents. Stream deltas and turn
+/// bookkeeping are dropped, and tool output is truncated hard — this is read to
+/// diagnose a child, and pulling its whole transcript into the parent's context
+/// would undo the reason for delegating in the first place.
+fn format_transcript(events: &[EventRecord]) -> String {
+    /// Per-item ceiling. Generous enough for an error message, mean enough that
+    /// a hundred of them still fit.
+    const SNIP: usize = 600;
+
+    fn snip(text: &str) -> String {
+        let trimmed = text.trim();
+        match trimmed.char_indices().nth(SNIP) {
+            None => trimmed.to_string(),
+            Some((cut, _)) => format!("{}… [{} chars]", &trimmed[..cut], trimmed.len()),
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for record in events {
+        let line = match &record.event {
+            SessionEvent::UserMessage(msg) => format!("**brief:** {}", snip(&msg.text)),
+            SessionEvent::AssistantMessage(msg) => {
+                let mut parts: Vec<String> = Vec::new();
+                if !msg.content.trim().is_empty() {
+                    parts.push(snip(&msg.content));
+                }
+                for call in &msg.tool_calls {
+                    parts.push(format!("→ {}({})", call.name, snip(&call.arguments_json)));
+                }
+                if parts.is_empty() {
+                    continue;
+                }
+                parts.join("\n")
+            }
+            SessionEvent::ToolResult(out) => {
+                let tag = if out.ok { "ok" } else { "failed" };
+                format!("← {tag}: {}", snip(&out.content))
+            }
+            SessionEvent::SystemNote(text) => format!("_note:_ {}", snip(text)),
+            SessionEvent::Incident(text) => format!("**incident:** {}", snip(text)),
+            SessionEvent::TurnFinished(stats) => {
+                format!(
+                    "_turn ended ({}), {} iterations, ${:.4}_",
+                    stats.stopped_by, stats.iterations, stats.cost_usd
+                )
+            }
+            // Deltas, turn starts, compaction and branch bookkeeping say
+            // nothing about the work.
+            _ => continue,
+        };
+        out.push(format!("[{}] {line}", record.seq));
+    }
+
+    if out.is_empty() {
+        return "nothing but bookkeeping in that range".to_string();
+    }
+    out.join("\n\n")
+}
+
 // --- formatting -------------------------------------------------------------
+
+/// One sub-agent, as prose the model reads.
+///
+/// The answer is included in full whenever there is one: the point of
+/// delegation is that the answer arrives without the work behind it, so making
+/// the parent take a second call to read it would defeat the mechanism.
+fn format_child(row: &delegation::SubagentInfo) -> String {
+    let mut out = format!("### {} — {}\n`{}`\n", row.label, row.state, row.id);
+
+    let mut facts: Vec<String> = Vec::new();
+    if !row.profile.is_empty() {
+        facts.push(format!("profile {}", row.profile));
+    }
+    if !row.model.is_empty() {
+        facts.push(row.model.clone());
+    }
+    if !row.mode.is_empty() && row.mode != DEFAULT_MODE {
+        facts.push(format!("{} mode", row.mode));
+    }
+    if row.finished_ms > row.created_ms {
+        facts.push(format!(
+            "{}s",
+            (row.finished_ms - row.created_ms).div_ceil(1000)
+        ));
+    }
+    if row.cost_usd > 0.0 {
+        facts.push(format!("${:.4}", row.cost_usd));
+    }
+    if !facts.is_empty() {
+        out.push_str(&facts.join(" · "));
+        out.push('\n');
+    }
+
+    if !row.detail.is_empty() {
+        out.push_str(&format!("\n{}\n", row.detail));
+    }
+    if !row.answer.is_empty() {
+        out.push_str(&format!("\n{}\n", row.answer));
+    } else if row.state == "running" {
+        out.push_str("\nStill working.\n");
+    }
+    out
+}
+
+fn format_children(rows: &[delegation::SubagentInfo]) -> String {
+    if rows.is_empty() {
+        return "You have not spawned any sub-agents.".to_string();
+    }
+    let running = rows.iter().filter(|r| r.state == "running").count();
+    let failed = rows
+        .iter()
+        .filter(|r| r.state == "failed" || r.state == "cancelled")
+        .count();
+    let total: f64 = rows.iter().map(|r| r.cost_usd).sum();
+
+    let mut head = format!("{} sub-agent(s)", rows.len());
+    if running > 0 {
+        head.push_str(&format!(", {running} running"));
+    }
+    if failed > 0 {
+        head.push_str(&format!(", {failed} not completed"));
+    }
+    if total > 0.0 {
+        head.push_str(&format!(", ${total:.4} so far"));
+    }
+
+    let body: Vec<String> = rows.iter().map(format_child).collect();
+    format!("{head}\n\n{}", body.join("\n"))
+}
+
+fn format_profiles(
+    profiles: &[delegation::AgentProfileInfo],
+    limits: &delegation::DelegationLimits,
+) -> String {
+    let mut out = String::new();
+    if profiles.is_empty() {
+        out.push_str(
+            "No profiles are configured, so a sub-agent runs with this conversation's own \
+             model and the default mode. You can still override either on the spawn.\n",
+        );
+    } else {
+        out.push_str("Profiles:\n");
+        for p in profiles {
+            out.push_str(&format!("\n- **{}** — {}", p.id, p.label));
+            let mut how: Vec<String> = Vec::new();
+            if !p.model.is_empty() {
+                how.push(p.model.clone());
+            }
+            if !p.mode.is_empty() {
+                how.push(format!("{} mode", p.mode));
+            }
+            if !how.is_empty() {
+                out.push_str(&format!(" ({})", how.join(", ")));
+            }
+            if !p.description.is_empty() {
+                out.push_str(&format!("\n  {}", p.description));
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\nLimits: {} running at once, waits capped at {}s, answers clamped to {} bytes.\n",
+        limits.max_children, limits.max_wait_secs, limits.max_result_bytes
+    ));
+    out
+}
 
 /// An optional string argument, absent becoming empty.
 ///
@@ -2082,8 +2743,21 @@ fn opt_arg(args: &Value, key: &str) -> Option<String> {
 fn format_skill_body(body: skills::SkillBody) -> String {
     let mut out = String::new();
 
+    // A well-formed body opens with its own `# Title`, so synthesising another
+    // one here printed the heading twice. When the body brings a title, this
+    // contributes only the locator; when it does not, it supplies both.
+    let body_has_title = body
+        .content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim_start().starts_with("# "));
+
     if body.file.is_empty() {
-        out.push_str(&format!("# {} ({})\n", body.name, body.id));
+        if body_has_title {
+            out.push_str(&format!("`{}`\n", body.id));
+        } else {
+            out.push_str(&format!("# {} ({})\n", body.name, body.id));
+        }
     } else {
         out.push_str(&format!("# {} — {}\n", body.id, body.file));
     }
@@ -2128,12 +2802,21 @@ fn format_skill_cards(cards: &[skills::SkillCard]) -> String {
         if card.universal {
             out.push_str(" [universal]");
         }
+        if card.status == "retired" {
+            out.push_str(" [retired]");
+        }
         out.push_str(&format!("\n  {}", card.brief));
+        if card.status == "retired" && !card.superseded_by.is_empty() {
+            out.push_str(&format!("\n  Superseded by `{}`.", card.superseded_by));
+        }
         if !card.when_to_use.trim().is_empty() {
             out.push_str(&format!("\n  Use when: {}", card.when_to_use.trim()));
         }
         if !card.children.is_empty() {
             out.push_str(&format!("\n  Nested: {}", card.children.join(", ")));
+        }
+        if !card.related.is_empty() {
+            out.push_str(&format!("\n  Related: {}", card.related.join(", ")));
         }
         if !card.resources.is_empty() {
             out.push_str(&format!("\n  Files: {}", card.resources.join(", ")));
@@ -2386,6 +3069,311 @@ fn format_exec(result: ExecResult) -> String {
         out.push_str("[no output]");
     }
     out
+}
+
+/// Tests for the delegation tools' own logic: the brief-length gate, the wait
+/// plan, and the formatters a parent reads its children through.
+#[cfg(test)]
+mod delegation_tests {
+    use super::{check_brief, format_child, format_children, format_profiles, wait_plan, MIN_BRIEF};
+    use crate::thetis::grip::delegation;
+    use serde_json::json;
+
+    /// A finished child, for the formatters to render.
+    fn child(id: &str, state: &str, answer: &str) -> delegation::SubagentInfo {
+        delegation::SubagentInfo {
+            id: id.to_string(),
+            label: format!("{id}-label"),
+            task: "a brief long enough to be accepted by the length check".to_string(),
+            profile: String::new(),
+            model: String::new(),
+            mode: String::new(),
+            state: state.to_string(),
+            answer: answer.to_string(),
+            detail: String::new(),
+            cost_usd: 0.0,
+            created_ms: 1_000,
+            finished_ms: 0,
+        }
+    }
+
+    // --- the brief ---------------------------------------------------------
+
+    #[test]
+    fn a_one_line_brief_is_refused() {
+        let err = check_brief("look into the auth bug").expect_err("a one-liner must be refused");
+        assert!(
+            err.contains("cannot see this conversation"),
+            "the refusal has to explain *why* more detail is needed, or the model \
+             will simply pad the string to length: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_does_not_pad_a_brief_to_length() {
+        assert!(
+            check_brief(&format!("{}{}", " ".repeat(200), "too short")).is_err(),
+            "the check must trim first, or indentation alone satisfies it"
+        );
+    }
+
+    #[test]
+    fn a_real_brief_is_accepted() {
+        assert!(check_brief(
+            "Find every call site of `commit_worktree` under crates/ and report each as \
+             path:line with one line of why it is there. Do not change any file."
+        )
+        .is_ok());
+    }
+
+    // A short brief in a multi-byte script must be measured the same way as an
+    // English one: counting bytes would let ASCII through at 40 characters
+    // while demanding only 13 of Japanese.
+    #[test]
+    fn the_floor_counts_characters_not_bytes() {
+        let short = "調査".repeat(MIN_BRIEF / 2 - 1);
+        assert!(short.len() > MIN_BRIEF, "the test string must be byte-long");
+        assert!(
+            check_brief(&short).is_err(),
+            "{} chars ({} bytes) is under the floor and must be refused",
+            short.chars().count(),
+            short.len()
+        );
+    }
+
+    // --- the wait plan -----------------------------------------------------
+
+    #[test]
+    fn with_children_running_a_bare_wait_means_all_of_them() {
+        let (until, _) = wait_plan(&json!({}), true, 1800).expect("a bare wait must be allowed");
+        assert_eq!(
+            until, "all",
+            "`wait` with no arguments is what a parent writes after fanning out, and \
+             refusing it costs a round trip"
+        );
+    }
+
+    #[test]
+    fn with_nothing_running_a_bare_wait_is_a_sleep_and_needs_a_duration() {
+        let err = wait_plan(&json!({}), false, 1800)
+            .expect_err("a sleep with no duration has nothing to end it");
+        assert!(err.contains("timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn a_sleep_with_a_duration_is_fine() {
+        let (until, secs) = wait_plan(&json!({"timeout_secs": 30}), false, 1800).unwrap();
+        assert_eq!((until.as_str(), secs), ("time", 30));
+    }
+
+    #[test]
+    fn an_explicit_predicate_beats_the_default() {
+        let (until, _) = wait_plan(&json!({"until": "first_failure"}), true, 1800).unwrap();
+        assert_eq!(until, "first_failure");
+    }
+
+    #[test]
+    fn a_predicate_wait_gets_the_cap_as_its_deadline_when_none_is_asked() {
+        let (_, secs) = wait_plan(&json!({"until": "all"}), true, 900).unwrap();
+        assert_eq!(
+            secs, 900,
+            "a wait with no deadline cannot be distinguished from a hung turn"
+        );
+    }
+
+    #[test]
+    fn an_over_long_request_is_clamped_rather_than_refused() {
+        let (_, secs) = wait_plan(&json!({"until": "all", "timeout_secs": 99_999}), true, 900)
+            .expect("asking for too long is a mistake to correct, not to fail on");
+        assert_eq!(secs, 900);
+    }
+
+    // --- what the parent reads --------------------------------------------
+
+    // The whole point of delegating is that the answer arrives without the work
+    // behind it. If the answer needed a second call to read, the parent would
+    // pay a round trip for every child.
+    #[test]
+    fn a_finished_child_shows_its_answer_inline() {
+        let out = format_child(&child("c1", "done", "the answer is 12"));
+        assert!(out.contains("the answer is 12"), "{out}");
+    }
+
+    #[test]
+    fn a_running_child_says_so_instead_of_showing_nothing() {
+        let out = format_child(&child("c1", "running", ""));
+        assert!(out.contains("Still working"), "{out}");
+    }
+
+    #[test]
+    fn a_failure_reason_is_not_swallowed() {
+        let mut row = child("c1", "failed", "");
+        row.detail = "ran out of iterations".to_string();
+        let out = format_child(&row);
+        assert!(out.contains("ran out of iterations"), "{out}");
+        assert!(out.contains("failed"), "the state must be visible too: {out}");
+    }
+
+    // The header is what the model reads first and often all it reads, so the
+    // counts that change a decision — is anything still running, did anything
+    // fail — have to be in it.
+    #[test]
+    fn the_summary_line_counts_running_and_failed() {
+        let rows = vec![
+            child("a", "done", "A"),
+            child("b", "running", ""),
+            child("c", "failed", ""),
+            child("d", "cancelled", ""),
+        ];
+        let head = format_children(&rows).lines().next().unwrap().to_string();
+        assert!(head.contains("4 sub-agent"), "{head}");
+        assert!(head.contains("1 running"), "{head}");
+        assert!(
+            head.contains("2 not completed"),
+            "cancelled counts with failed — neither produced an answer: {head}"
+        );
+    }
+
+    #[test]
+    fn no_children_reads_as_a_sentence_not_an_empty_string() {
+        assert!(format_children(&[]).contains("not spawned"));
+    }
+
+    #[test]
+    fn every_child_appears_in_the_listing() {
+        let rows = vec![child("a", "done", "A answer"), child("b", "done", "B answer")];
+        let out = format_children(&rows);
+        assert!(out.contains("A answer") && out.contains("B answer"), "{out}");
+    }
+
+    // A deployment with no profiles still delegates, so the empty case must
+    // read as an explanation rather than a blank.
+    #[test]
+    fn no_profiles_explains_what_happens_anyway() {
+        let limits = delegation::DelegationLimits {
+            max_children: 8,
+            max_wait_secs: 1800,
+            max_result_bytes: 24_576,
+        };
+        let out = format_profiles(&[], &limits);
+        assert!(out.contains("No profiles"), "{out}");
+        assert!(
+            out.contains("8 running at once"),
+            "the limits are what stop a model fanning out past the cap: {out}"
+        );
+    }
+
+    #[test]
+    fn a_profile_shows_how_it_differs() {
+        let limits = delegation::DelegationLimits {
+            max_children: 4,
+            max_wait_secs: 60,
+            max_result_bytes: 1_024,
+        };
+        let out = format_profiles(
+            &[delegation::AgentProfileInfo {
+                id: "scout".to_string(),
+                label: "Scout".to_string(),
+                description: "Reads and reports.".to_string(),
+                model: "anthropic/claude-sonnet-5".to_string(),
+                mode: "plan".to_string(),
+            }],
+            &limits,
+        );
+        assert!(out.contains("scout"), "{out}");
+        assert!(out.contains("claude-sonnet-5"), "{out}");
+        assert!(
+            out.contains("plan mode"),
+            "a read-only profile must be recognisable as one: {out}"
+        );
+    }
+}
+
+/// Tests for the classification invariant that `all_builtins` exists to keep.
+///
+/// Neither `available` nor `all_builtins` can be called here: both probe host
+/// capabilities, and a host import traps outside wasm. But the group functions
+/// they are assembled from are pure, so the invariant can be checked against
+/// those — which is also where it breaks, since the failure mode is a tool
+/// defined inline in `available` rather than in a named function.
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// Every capability-gated tool set, as `all_builtins` sees them. A new
+    /// group must be added here and to `all_builtins` together.
+    fn gated() -> Vec<ToolDef> {
+        let mut all = Vec::new();
+        all.extend(sandbox_tools());
+        all.extend(devkit_tools());
+        all.extend(filesystem_tools());
+        all.extend(terminal_tools());
+        all.extend(git_tools());
+        all.extend(ssh_host_tools());
+        all.extend(subagent_tools());
+        all.extend(restart_tools());
+        all
+    }
+
+    /// A capability-gated tool must live in a named function, because that is
+    /// the only kind `all_builtins` can add back when the capability is off.
+    ///
+    /// This is the bug that hid in `restart_orchestrator`: defined inline under
+    /// `if restart_available()`, it silently left the builtin list in any
+    /// deployment without the control capability. Nothing failed loudly — the
+    /// name merely became unclassifiable, so `is_mutating` fell through to the
+    /// component path and guessed, and the group table reported the `selfmod`
+    /// entry for it as naming a tool that does not exist.
+    ///
+    /// Asserted from the group table's side, so it holds for tools not yet
+    /// written: every member of a group whose tools are capability-gated has to
+    /// be reachable without any capability being live.
+    #[test]
+    fn every_gated_group_member_is_reachable_without_its_capability() {
+        let reachable: Vec<&str> = gated().iter().map(|t| t.name).collect();
+        // The groups whose members are all capability-gated. `core`, `skills`,
+        // `files` and `config` are unconditional, and the rest are hot-loaded
+        // components with no members in the table.
+        for id in ["sandbox", "shell", "ssh", "selfmod", "branch", "subagents"] {
+            let group = crate::groups::all()
+                .iter()
+                .find(|g| g.id == id)
+                .unwrap_or_else(|| panic!("no `{id}` group"));
+            for member in group.members {
+                assert!(
+                    reachable.contains(member),
+                    "`{member}` is in the `{id}` group but no named group function \
+                     yields it, so `all_builtins` cannot classify it when the \
+                     capability is off. Move it out of the inline block in \
+                     `available` into a named function, and add that function to \
+                     both `available` and `all_builtins`."
+                );
+            }
+        }
+    }
+
+    /// `restart_orchestrator` mutates, and a read-only mode must withhold it.
+    /// It is the tool whose flag matters most: it is how a kernel change goes
+    /// live.
+    #[test]
+    fn restarting_is_classified_as_mutating() {
+        let restart = restart_tools();
+        assert_eq!(restart.len(), 1);
+        assert_eq!(restart[0].name, "restart_orchestrator");
+        assert!(restart[0].mutating);
+    }
+
+    /// No name may be yielded by two group functions, or `group_of` and the
+    /// mutating flag both become order-dependent.
+    #[test]
+    fn no_gated_tool_is_defined_twice() {
+        let all = gated();
+        for (i, tool) in all.iter().enumerate() {
+            if let Some(dup) = all[..i].iter().find(|t| t.name == tool.name) {
+                panic!("`{}` is defined twice", dup.name);
+            }
+        }
+    }
 }
 
 /// Tests for the parts of `ask_user` the turn loop depends on.

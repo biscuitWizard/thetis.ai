@@ -6,7 +6,7 @@
 use crate::thetis::grip::session as host;
 use crate::thetis::grip::skills_view as view;
 use crate::thetis::grip::sys;
-use crate::thetis::grip::types::Attachment;
+use crate::thetis::grip::types::{Attachment, SessionEvent};
 use crate::render;
 use crate::{GatewayAction, OutboundEvent};
 use serde_json::{json, Value};
@@ -26,7 +26,7 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
     let previous = frame.get("previous").and_then(Value::as_str);
 
     match kind {
-        "hello" => vec![catalog(), sessions()],
+        "hello" => vec![catalog(), sessions(), user_avatar()],
         "list" => vec![sessions()],
         "catalog" => vec![catalog()],
 
@@ -113,6 +113,28 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
         // instead, which means a slug typed here is selectable in the same
         // breath - and `set-session-model` accepts any slug, so it works.
         "models" => vec![catalog()],
+
+        // The user's own avatar, shown beside the conversation. Kept in the KV
+        // store rather than config for the same reason the model overlay is:
+        // `thetis.toml` is read only at startup, so a picture chosen here could
+        // not appear until a restart. The agent's avatar is the opposite case —
+        // it is identity, set by whoever configures the installation, and is
+        // substituted into the markup at serve time.
+        "user-avatar" => vec![user_avatar()],
+        "user-avatar-set" => set_user_avatar(frame, id),
+
+        // The plan document. `plan-read` is what the plan tab draws from;
+        // `plan-execute` is the Execute button, which is a mode switch, an
+        // optional model switch and a submit in one click.
+        "plan" => match id {
+            Some(session) => vec![plan(session)],
+            None => vec![error("plan requires an id")],
+        },
+        "plan-execute" => match id {
+            Some(session) => execute_plan(session, frame),
+            None => vec![error("plan-execute requires an id")],
+        },
+
         "model-save" => save_model(frame, id),
         "model-remove" => remove_model(frame, id),
         "model-restore" => restore_model(frame, id),
@@ -431,6 +453,68 @@ fn restore_model(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
     catalog_replies(session)
 }
 
+// --- the user's avatar ------------------------------------------------------
+
+/// Where the user's picture is kept. Global scope: it is the person using the
+/// installation, not a property of one conversation.
+const USER_AVATAR_KEY: &str = "gateway.web.user_avatar";
+
+/// Ceiling on the stored value, in characters. A `data:` URI is base64, so this
+/// is roughly a 1.5 MB image — generous for a portrait, and far enough under the
+/// 16 MiB websocket cap that the frame carrying it can never be the thing that
+/// trips it. The client downscales before uploading; this is the backstop.
+const MAX_AVATAR_CHARS: usize = 2_000_000;
+
+/// The stored picture, or an empty string when there is none. Empty is a real
+/// answer rather than a missing one: it selects the drawn fallback mark.
+pub fn user_avatar() -> GatewayAction {
+    reply(json!({
+        "type": "user-avatar",
+        "avatar": sys::kv_get("global", USER_AVATAR_KEY).unwrap_or_default(),
+    }))
+}
+
+/// Stores a new picture, or clears it when `avatar` is empty.
+///
+/// Replies with the whole `user-avatar` frame, and broadcasts it to every tab on
+/// the open conversation, so a second window is not left showing the old face.
+fn set_user_avatar(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
+    let raw = frame
+        .get("avatar")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+
+    if raw.chars().count() > MAX_AVATAR_CHARS {
+        return vec![error(
+            "that image is too large — pick one under about 1.5 MB",
+        )];
+    }
+    // Only a `data:` image or an http(s) URL. Anything else — `javascript:`
+    // above all — would end up in a `src` attribute, so it is refused here
+    // rather than trusted to the client's own escaping.
+    let allowed = raw.is_empty()
+        || raw.starts_with("data:image/")
+        || raw.starts_with("https://")
+        || raw.starts_with("http://");
+    if !allowed {
+        return vec![error("an avatar must be an image file or an http(s) URL")];
+    }
+
+    sys::kv_put("global", USER_AVATAR_KEY, raw);
+
+    let mut actions = vec![user_avatar()];
+    if let Some(session) = session {
+        if let GatewayAction::Reply(frame) = user_avatar() {
+            actions.push(GatewayAction::Broadcast(crate::BroadcastFrame {
+                session_id: session.to_string(),
+                frame,
+            }));
+        }
+    }
+    actions
+}
+
 // --- frames -----------------------------------------------------------------
 
 /// What the pickers offer, and what the models inspector shows.
@@ -608,9 +692,13 @@ fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
             return if known(id) { id } else { ungrouped }.to_string();
         }
     }
+    // Order matters: the first match wins, so `web-browser-` must precede
+    // `web-`, or the browser tools would be filed under web search. Kept in
+    // step with PREFIX_RULES in agents/agent-core/src/groups.rs.
     for (prefix, id) in [
         ("bq-", "bigquery"),
         ("notion-", "notion"),
+        ("web-browser-", "browser"),
         ("web-", "web"),
         ("git-", "github"),
     ] {
@@ -802,6 +890,165 @@ fn reset_tool_groups(session_id: &str) -> Vec<GatewayAction> {
     vec![tools(session_id)]
 }
 
+// --- the plan document ------------------------------------------------------
+//
+// The agent writes the plan into its session KV scope; this reads it out for the
+// plan tab. Read straight from the store rather than asked of the agent, for the
+// same reason the tool-group panel is: asking the agent needs a live worker, and
+// the plan tab must draw on a reload of a conversation that is sitting idle.
+//
+// `PLAN_KEY` is duplicated from `agents/agent-core/src/plan.rs` — separate
+// components cannot share a constant. Grep for the literal if you change it.
+const PLAN_KEY: &str = "__plan";
+
+
+/// The plan as the tab needs it: the document, plus enough for the tab to say
+/// whether what it is showing is current.
+fn plan(session_id: &str) -> GatewayAction {
+    let stored = sys::kv_get(session_id, PLAN_KEY)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+
+    let field = |key: &str| {
+        stored
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let body = field("body");
+
+    reply(json!({
+        "type": "plan",
+        "session": session_id,
+        "title": field("title"),
+        "body": body,
+        "revision": stored.get("revision").and_then(Value::as_u64).unwrap_or(0),
+        "updated_ms": stored.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
+        // The modes the Execute dropdown may switch into, and the models it may
+        // pick. Sent with the plan so the tab needs no second round trip, and so
+        // it can never offer a mode that would refuse to carry the plan out.
+        "modes": executable_modes(),
+        "models": model_options(),
+        "has_plan": !body.trim().is_empty(),
+    }))
+}
+
+/// Modes that can actually execute: the ones that are not read-only.
+///
+/// Asked of the host rather than hardcoded, because a mode is a configuration
+/// entry and this gateway must not have its own list. If configuration somehow
+/// has no writable mode, the list comes back empty and the tab says so — better
+/// than offering a button that would hand the plan to a mode unable to act.
+fn executable_modes() -> Vec<Value> {
+    sys::list_modes()
+        .into_iter()
+        .filter(|m| !m.read_only)
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "label": if m.label.trim().is_empty() { m.id.clone() } else { m.label.clone() },
+            })
+        })
+        .collect()
+}
+
+/// The model picker's options for the Execute dropdown, from the same merged
+/// catalogue the composer's picker uses, so the two never disagree.
+fn model_options() -> Vec<Value> {
+    merged_models()
+        .into_iter()
+        .filter(|m| !m.hidden)
+        .map(|m| json!({ "id": m.id, "label": m.label }))
+        .collect()
+}
+
+/// The Execute button: switch mode, optionally switch model, then submit.
+///
+/// The submitted message names the plan and tells the agent to read it with
+/// `plan_read` rather than carrying a copy of the body. That matters: the plan
+/// may be long, it is already addressable, and a pasted copy would be a second
+/// version of the document that starts going stale the moment a step is revised.
+/// Which mode a click on Execute should switch the conversation into.
+///
+/// Split out from `execute_plan` and given `(id, read_only)` pairs rather than
+/// the host's own type so it can be tested: this is the one branchy part of the
+/// path, and every branch of it is a refusal the user sees on the tab.
+///
+/// An unknown mode is refused rather than passed through. `set-session-mode`
+/// accepts anything, and the agent then treats an unrecognised mode as writable
+/// — a fail-open worth one check to avoid, since the click means "go and do
+/// this". An empty request means the tab offered no choice, which is the
+/// first-load case, so the first writable mode stands in.
+fn choose_mode(modes: &[(String, bool)], requested: &str) -> Result<String, String> {
+    if requested.is_empty() {
+        return modes
+            .iter()
+            .find(|(_, read_only)| !read_only)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| "no writable mode is configured".to_string());
+    }
+    match modes.iter().find(|(id, _)| id == requested) {
+        Some((id, false)) => Ok(id.clone()),
+        Some((id, true)) => Err(format!(
+            "mode '{id}' is read-only, so it cannot carry a plan out"
+        )),
+        None => Err(format!("unknown mode '{requested}'")),
+    }
+}
+
+fn execute_plan(session_id: &str, frame: &Value) -> Vec<GatewayAction> {
+    let stored = sys::kv_get(session_id, PLAN_KEY)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let body = stored
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if body.trim().is_empty() {
+        return vec![error("there is no plan to execute yet")];
+    }
+
+    let requested = frame.get("mode").and_then(Value::as_str).unwrap_or("");
+    let modes: Vec<(String, bool)> = sys::list_modes()
+        .into_iter()
+        .map(|m| (m.id, m.read_only))
+        .collect();
+    let mode = match choose_mode(&modes, requested) {
+        Ok(mode) => mode,
+        Err(message) => return vec![error(message)],
+    };
+
+    host::set_session_mode(session_id, &mode);
+    if let Some(model) = slug_of(frame, "model") {
+        host::set_session_model(session_id, &model);
+    }
+
+    let note = frame
+        .get("note")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut message = String::from(
+        "Execute the plan. Read it with `plan_read` first — it is the authority, not this \
+         message, and it may have been revised since it was written. Work through it in order. \
+         As each step lands, mark it done in the plan with `plan_edit` so the plan tab shows \
+         where you are; if a step turns out to be wrong, revise it there and say why rather \
+         than quietly doing something else.",
+    );
+    if !note.is_empty() {
+        message.push_str("\n\nFrom the user, alongside the plan:\n");
+        message.push_str(note);
+    }
+
+    host::submit(session_id, &message, &[]);
+    vec![
+        session_settings(session_id),
+        sessions(),
+        reply(json!({ "type": "accepted", "session": session_id })),
+    ]
+}
+
 fn session_settings(session_id: &str) -> GatewayAction {
     let meta = host::get_session(session_id);
     reply(json!({
@@ -812,9 +1059,47 @@ fn session_settings(session_id: &str) -> GatewayAction {
     }))
 }
 
+/// Prefix of the system note the host writes when an agent spawns a sub-agent.
+/// The remainder is the child's session id, a space, then its label. Defined in
+/// `crates/thetis/src/delegation.rs` as `SPAWN_NOTE`; the two must agree.
+const SPAWN_NOTE: &str = "subagent:spawned ";
+
+/// Replays a conversation, sub-agents included.
+///
+/// A sub-agent is a session of its own, so its turns are in its own log and not
+/// in the parent's. Live, that does not matter: the worker re-addresses a
+/// child's frames to the conversation the user is watching and tags them, so
+/// they arrive as they happen. But a reload asks only for the parent's events,
+/// and without this the sub-agent blocks would silently disappear from a
+/// transcript that had them a moment earlier — the reader would be left unable
+/// to tell whether work had happened at all.
+///
+/// The parent's log names its children in a spawn note, so that note is the
+/// index: for each one, the child's own events are read, tagged the way the
+/// live path tags them, and merged in. The merge is by timestamp, because two
+/// logs have unrelated sequence numbers and interleaving by time is what puts a
+/// child's work where the reader saw it happen.
 fn history(session_id: &str) -> GatewayAction {
     let meta = host::get_session(session_id);
-    let events: Vec<Value> = host::events(session_id, 0)
+    let own = host::events(session_id, 0);
+
+    // (child id, label), in spawn order.
+    let children: Vec<(String, String)> = own
+        .iter()
+        .filter_map(|record| match &record.event {
+            SessionEvent::SystemNote(text) => text.strip_prefix(SPAWN_NOTE),
+            _ => None,
+        })
+        .map(|rest| match rest.split_once(' ') {
+            Some((id, label)) => (id.to_string(), label.to_string()),
+            None => (rest.to_string(), String::new()),
+        })
+        .collect();
+
+    // Timestamp first so the merge is by time; the parent's own events sort
+    // ahead of a child's at the same millisecond, which keeps a spawn note
+    // above the block it opened.
+    let mut rows: Vec<(u64, u8, Value)> = own
         .iter()
         .filter_map(|record| {
             render::event(&OutboundEvent {
@@ -823,8 +1108,31 @@ fn history(session_id: &str) -> GatewayAction {
                 ts_ms: record.ts_ms,
                 event: record.event.clone(),
             })
+            .map(|frame| (record.ts_ms, 0u8, frame))
         })
         .collect();
+
+    for (child_id, label) in &children {
+        for record in host::events(child_id, 0) {
+            let Some(mut frame) = render::event(&OutboundEvent {
+                session_id: session_id.to_string(),
+                seq: Some(record.seq),
+                ts_ms: record.ts_ms,
+                event: record.event.clone(),
+            }) else {
+                continue;
+            };
+            if let Some(obj) = frame.as_object_mut() {
+                obj.insert("agent".into(), json!(child_id));
+                obj.insert("agent_label".into(), json!(label));
+                obj.insert("agent_parent".into(), json!(session_id));
+            }
+            rows.push((record.ts_ms, 1u8, frame));
+        }
+    }
+
+    rows.sort_by_key(|(ts, tier, _)| (*ts, *tier));
+    let events: Vec<Value> = rows.into_iter().map(|(_, _, frame)| frame).collect();
 
     reply(json!({
         "type": "history",
@@ -905,4 +1213,80 @@ fn parse_attachments(frame: &Value) -> Vec<Attachment> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Tests for the parts of this module that are pure. Most of it talks to the
+/// host and cannot run here, but the plan's mode choice is exactly the kind of
+/// branching that is worth pinning: every arm of it is a refusal the user reads
+/// on the plan tab, and `cargo test` in this directory runs natively.
+#[cfg(test)]
+mod tests {
+    use super::choose_mode;
+
+    fn modes() -> Vec<(String, bool)> {
+        vec![
+            ("agent".into(), false),
+            ("plan".into(), true),
+            ("chat".into(), true),
+        ]
+    }
+
+    #[test]
+    fn a_writable_mode_is_taken_as_asked() {
+        assert_eq!(choose_mode(&modes(), "agent").unwrap(), "agent");
+    }
+
+    /// Executing *into* plan mode would withhold every tool that could carry the
+    /// plan out, so the click has to be refused rather than half-honoured.
+    #[test]
+    fn a_read_only_mode_is_refused_by_name() {
+        let err = choose_mode(&modes(), "plan").unwrap_err();
+        assert!(err.contains("plan"), "{err}");
+        assert!(err.contains("read-only"), "{err}");
+    }
+
+    /// The fail-open this check exists to prevent: the host accepts any mode
+    /// string, and the agent treats one it does not recognise as writable.
+    #[test]
+    fn an_unknown_mode_is_refused_rather_than_passed_through() {
+        let err = choose_mode(&modes(), "wishful").unwrap_err();
+        assert!(err.contains("unknown mode"), "{err}");
+        assert!(err.contains("wishful"), "{err}");
+    }
+
+    /// No choice offered — the first-load case, before a `plan` frame has told
+    /// the tab which modes exist.
+    #[test]
+    fn no_request_falls_back_to_the_first_writable_mode() {
+        assert_eq!(choose_mode(&modes(), "").unwrap(), "agent");
+    }
+
+    /// Order matters for that fallback: it must skip read-only modes rather
+    /// than taking whatever is listed first.
+    #[test]
+    fn the_fallback_skips_a_read_only_mode_listed_first() {
+        let ordered = vec![
+            ("plan".into(), true),
+            ("chat".into(), true),
+            ("wild".into(), false),
+        ];
+        assert_eq!(choose_mode(&ordered, "").unwrap(), "wild");
+    }
+
+    /// Configuration with nothing writable in it. The tab disables Execute for
+    /// this case, but the handler must not rely on the client to do so.
+    #[test]
+    fn with_no_writable_mode_at_all_it_refuses() {
+        let all_read_only = vec![("plan".into(), true), ("chat".into(), true)];
+        assert!(choose_mode(&all_read_only, "").is_err());
+        assert!(choose_mode(&all_read_only, "plan").is_err());
+    }
+
+    /// An empty mode list is what a host that failed to load configuration
+    /// returns. It must be a refusal, not a panic on `[0]`.
+    #[test]
+    fn an_empty_mode_list_refuses_instead_of_panicking() {
+        assert!(choose_mode(&[], "").is_err());
+        assert!(choose_mode(&[], "agent").is_err());
+    }
 }

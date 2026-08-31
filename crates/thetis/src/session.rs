@@ -383,16 +383,38 @@ async fn actor(
             }
         };
 
+        // Is this session a sub-agent? Read once here and used twice below: a
+        // child does not checkpoint the worktree, and a child's ending has to
+        // be reported to its parent.
+        let subagent = grip.persist.get_subagent(&session_id).await.ok().flatten();
+
         // Terminal commands and host filesystem writes bypass the build
         // pipeline's checkpoints; this sweep makes sure a turn can never end
         // with work that exists only in the working tree. Before the
         // turn-finished event on purpose: anything reacting to "the turn is
         // over" may rely on the branch log being current.
-        let _ = grip.commit_worktree("checkpoint: end of turn").await;
+        //
+        // Skipped for a sub-agent. Parent and children share one worktree, so a
+        // child committing at the end of its turn would sweep up whatever the
+        // parent and its siblings had half-written and label it as the child's
+        // work. The parent's own checkpoint collects all of it, correctly
+        // attributed, when the parent's turn ends.
+        if subagent.is_none() {
+            let _ = grip.commit_worktree("checkpoint: end of turn").await;
+        }
 
         // Whether the user stopped this turn. Read before the next turn can
         // bump the generation, and used below to tell a stop apart from a fault.
         let stopped = cancel.raised();
+
+        // How this turn ended, in the same vocabulary the ledger uses. Taken
+        // before the match, which consumes `outcome`, so a sub-agent can be
+        // settled with the real reason rather than a guess.
+        let ended_as = match &outcome {
+            Ok(stats) => stats.stopped_by.clone(),
+            Err(_) if stopped => "cancelled".to_string(),
+            Err(_) => "error".to_string(),
+        };
 
         match outcome {
             Ok(stats) => {
@@ -463,6 +485,63 @@ async fn actor(
                     }
                 }
             }
+        }
+
+        // A parent that was stopped takes its children with it. Without this a
+        // stop looks like it worked — the spinner clears, the turn ends — while
+        // three sub-agents keep calling the model behind a conversation the user
+        // has already walked away from. Only on a stop: a turn that merely
+        // finished may well have left children running on purpose, and the
+        // parent can wait for them on its next turn.
+        if stopped && subagent.is_none() {
+            crate::delegation::cancel_all_children(&grip, &session_id).await;
+        }
+
+        // A sub-agent's turn ending is the event its parent is waiting for.
+        // After the terminator, so a parent woken by the bell and reading the
+        // child's log finds a complete one.
+        //
+        // A child does not settle on a *nudge-driven* follow-up turn — but it
+        // has none: nothing submits to a child except the spawn itself, and the
+        // parent nudges nobody. So one turn is one child's life, and this is
+        // where it is recorded.
+        if let Some(row) = &subagent {
+            let answer = crate::delegation::final_answer(&grip, &session_id).await;
+            let cost = stats_from_log(&grip, &session_id, since_seq, &ended_as)
+                .await
+                .cost_usd;
+            match grip
+                .persist
+                .settle_subagent(&row.child_id, &answer, cost, &ended_as)
+                .await
+            {
+                Ok(settled) => {
+                    // The parent's transcript gets the outcome, so a fan-out is
+                    // legible in the log without opening every child.
+                    let _ = grip
+                        .append_event(
+                            &row.parent_id,
+                            SessionEvent::SystemNote(format!(
+                                "sub-agent `{}` {}{}",
+                                settled.label,
+                                settled.state.as_str(),
+                                if settled.detail.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(": {}", settled.detail)
+                                }
+                            )),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(child = %row.child_id, error = %e, "could not settle the sub-agent");
+                }
+            }
+            // Last, and unconditionally: a parent asleep on this bell must wake
+            // even if settling failed, or it waits out its whole deadline over
+            // a database hiccup.
+            grip.settle_bell.ring();
         }
 
         // Anything the agent never picked up becomes the seed of the next turn.

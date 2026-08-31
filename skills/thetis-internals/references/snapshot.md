@@ -54,7 +54,9 @@ Values at the time of the snapshot, grouped. All are marked `[needs restart]`.
 | `llm.base_url` | `https://openrouter.ai/api/v1` |
 | `llm.max_retries` | 3 |
 | `llm.model` | `anthropic/claude-opus-5` |
+| `llm.provider` | empty, so the `[llm]` section itself, registered as `openrouter` |
 | `llm.request_timeout_secs` | 180 |
+| `providers` | none, so OpenRouter alone |
 | `paths.agent` | `agents/agent-core` |
 | `paths.artifacts` | `artifacts` |
 | `paths.data` | `data` |

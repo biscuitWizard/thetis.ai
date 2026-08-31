@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
 use crate::ipc::Peer;
 use crate::store::Store;
+use crate::subagents::SubagentRow;
 
 #[derive(Clone)]
 pub enum Persist {
@@ -167,6 +168,24 @@ impl Persist {
         )
     }
 
+    /// Writes a key only if it currently holds `expected`, reporting whether it
+    /// did. One serialized transaction in the store, so a caller can use it to
+    /// claim a state transition exactly once. See [`Store::kv_swap`].
+    pub async fn kv_swap(
+        &self,
+        scope: &str,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> Result<bool> {
+        delegate!(
+            self,
+            "store.kv_swap",
+            |s| s.kv_swap(scope, key, expected, value),
+            json!({ "scope": scope, "key": key, "expected": expected, "value": value })
+        )
+    }
+
     pub async fn get_spend(&self, session_id: &str) -> Result<f64> {
         delegate!(
             self,
@@ -182,6 +201,97 @@ impl Persist {
             "store.add_spend",
             |s| s.add_spend(session_id, usd),
             json!({ "session": session_id, "usd": usd })
+        )
+    }
+
+    // --- sub-agents -----------------------------------------------------------
+
+    pub async fn register_subagent(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+        label: &str,
+        task: &str,
+        agent_aspect: &str,
+        model: &str,
+        mode: &str,
+        max_children: usize,
+    ) -> Result<SubagentRow> {
+        delegate!(
+            self,
+            "store.register_subagent",
+            |s| crate::subagents::Subagents::new(s).register(
+                parent_id,
+                child_id,
+                label,
+                task,
+                agent_aspect,
+                model,
+                mode,
+                max_children
+            ),
+            json!({
+                "session": parent_id,
+                "child": child_id,
+                "label": label,
+                "task": task,
+                "agent": agent_aspect,
+                "model": model,
+                "mode": mode,
+                "max_children": max_children,
+            })
+        )
+    }
+
+    pub async fn get_subagent(&self, child_id: &str) -> Result<Option<SubagentRow>> {
+        delegate!(
+            self,
+            "store.get_subagent",
+            |s| s.get_subagent(child_id),
+            json!({ "child": child_id })
+        )
+    }
+
+    pub async fn subagents_of(&self, parent_id: &str) -> Result<Vec<SubagentRow>> {
+        delegate!(
+            self,
+            "store.subagents_of",
+            |s| s.subagents_of(parent_id),
+            json!({ "session": parent_id })
+        )
+    }
+
+    pub async fn settle_subagent(
+        &self,
+        child_id: &str,
+        result: &str,
+        cost_usd: f64,
+        stopped_by: &str,
+    ) -> Result<SubagentRow> {
+        delegate!(
+            self,
+            "store.settle_subagent",
+            |s| crate::subagents::Subagents::new(s).settle(
+                child_id,
+                result,
+                cost_usd,
+                stopped_by
+            ),
+            json!({
+                "child": child_id,
+                "result": result,
+                "cost_usd": cost_usd,
+                "stopped_by": stopped_by,
+            })
+        )
+    }
+
+    pub async fn cancel_subagent(&self, child_id: &str) -> Result<SubagentRow> {
+        delegate!(
+            self,
+            "store.cancel_subagent",
+            |s| crate::subagents::Subagents::new(s).mark_cancelled(child_id),
+            json!({ "child": child_id })
         )
     }
 
@@ -264,25 +374,40 @@ fn serve_store_call_inner(
         Ok(serde_json::to_value(value)?)
     }
     // The session-private methods: their `session` argument must be the
-    // caller's own. An empty `caller_session` means the call did not come from
-    // a session-bound worker (the local test grip), so the check is skipped.
-    fn own_session<'v>(params: &'v Value, caller: &str) -> Result<&'v str> {
+    // caller's own, or one of the sub-agents the caller spawned. An empty
+    // `caller_session` means the call did not come from a session-bound worker
+    // (the local test grip), so the check is skipped.
+    //
+    // Children are admitted because a sub-agent runs *inside* its parent's
+    // worker: that worker legitimately appends to the child's log, reads it
+    // back, and accounts for its spend. The boundary the check exists to
+    // defend — one worker cannot touch an unrelated conversation — is
+    // unchanged, because a child's root is resolved from the registry here on
+    // the gateway rather than from anything the worker says.
+    fn own_session<'v>(store: &Store, params: &'v Value, caller: &str) -> Result<&'v str> {
         let session = get_str(params, "session")?;
-        if !caller.is_empty() && session != caller {
-            anyhow::bail!("a worker may only act on its own session");
+        if caller.is_empty() || session == caller {
+            return Ok(session);
         }
-        Ok(session)
+        // A sub-agent of this caller. `root_id` comes from the gateway's own
+        // registry, so a worker cannot claim kinship it does not have.
+        if let Ok(Some(row)) = store.get_subagent(session) {
+            if row.root_id == caller {
+                return Ok(session);
+            }
+        }
+        anyhow::bail!("a worker may only act on its own session or one of its sub-agents")
     }
 
     match method {
         "store.append_event" => {
-            let session = own_session(&params, caller_session)?;
+            let session = own_session(store, &params, caller_session)?;
             let event: SessionEvent =
                 serde_json::from_value(params.get("event").cloned().unwrap_or(Value::Null))?;
             to_value(store.append_event(session, event)?)
         }
         "store.events" => {
-            let session = own_session(&params, caller_session)?;
+            let session = own_session(store, &params, caller_session)?;
             let from = params.get("from_seq").and_then(Value::as_u64).unwrap_or(0);
             to_value(store.events(session, from)?)
         }
@@ -318,17 +443,17 @@ fn serve_store_call_inner(
             store.set_model(get_str(&params, "id")?, get_str(&params, "model")?)?,
         ),
         "store.clear_resume_attempts" => {
-            to_value(store.clear_resume_attempts(own_session(&params, caller_session)?)?)
+            to_value(store.clear_resume_attempts(own_session(store, &params, caller_session)?)?)
         }
         "store.expect_restart" => {
-            to_value(store.expect_restart(own_session(&params, caller_session)?)?)
+            to_value(store.expect_restart(own_session(store, &params, caller_session)?)?)
         }
         "store.set_no_resume" => {
             let flag = params
                 .get("no_resume")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            to_value(store.set_no_resume(own_session(&params, caller_session)?, flag)?)
+            to_value(store.set_no_resume(own_session(store, &params, caller_session)?, flag)?)
         }
         "store.kv_get" => to_value(
             store.kv_get(get_str(&params, "scope")?, get_str(&params, "key")?)?,
@@ -338,11 +463,57 @@ fn serve_store_call_inner(
             get_str(&params, "key")?,
             get_str(&params, "value")?,
         )?),
-        "store.get_spend" => to_value(store.get_spend(own_session(&params, caller_session)?)?),
+        "store.kv_swap" => to_value(store.kv_swap(
+            get_str(&params, "scope")?,
+            get_str(&params, "key")?,
+            get_str(&params, "expected")?,
+            get_str(&params, "value")?,
+        )?),
+        "store.get_spend" => to_value(store.get_spend(own_session(store, &params, caller_session)?)?),
         "store.add_spend" => {
             let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
-            to_value(store.add_spend(own_session(&params, caller_session)?, usd)?)
+            to_value(store.add_spend(own_session(store, &params, caller_session)?, usd)?)
         }
+        // Sub-agents. The parent is pinned to the caller on register, so a
+        // worker cannot graft a child onto somebody else's conversation; the
+        // rest key off a child id that only exists because a register call
+        // already passed that check.
+        "store.register_subagent" => {
+            let parent = own_session(store, &params, caller_session)?;
+            let max = params
+                .get("max_children")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            to_value(crate::subagents::Subagents::new(store).register(
+                parent,
+                get_str(&params, "child")?,
+                params.get("label").and_then(Value::as_str).unwrap_or(""),
+                params.get("task").and_then(Value::as_str).unwrap_or(""),
+                params.get("agent").and_then(Value::as_str).unwrap_or(""),
+                params.get("model").and_then(Value::as_str).unwrap_or(""),
+                params.get("mode").and_then(Value::as_str).unwrap_or("agent"),
+                max,
+            )?)
+        }
+        "store.get_subagent" => to_value(store.get_subagent(get_str(&params, "child")?)?),
+        "store.subagents_of" => {
+            to_value(store.subagents_of(own_session(store, &params, caller_session)?)?)
+        }
+        "store.settle_subagent" => {
+            let cost = params.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+            to_value(crate::subagents::Subagents::new(store).settle(
+                get_str(&params, "child")?,
+                params.get("result").and_then(Value::as_str).unwrap_or(""),
+                cost,
+                params
+                    .get("stopped_by")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stop"),
+            )?)
+        }
+        "store.cancel_subagent" => to_value(
+            crate::subagents::Subagents::new(store).mark_cancelled(get_str(&params, "child")?)?,
+        ),
         "store.skill_vector" => to_value(store.skill_vector(get_str(&params, "key")?)),
         "store.put_skill_vector" => {
             let vector: Vec<u8> =

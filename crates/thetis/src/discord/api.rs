@@ -176,6 +176,20 @@ pub fn fatal_advice(code: u16) -> &'static str {
     }
 }
 
+/// The names of commands Discord stored with no interaction contexts.
+///
+/// Such a command is registered as far as the API is concerned — it comes back
+/// in the 200 response and can be fetched later — but the client never offers
+/// it in the picker, so it can never be invoked. Pure, so the check that turns
+/// a silent registration failure into a warning does not need a live API.
+fn commands_without_contexts(stored: &[Value]) -> Vec<&str> {
+    stored
+        .iter()
+        .filter(|c| c.get("contexts").map(Value::is_null).unwrap_or(true))
+        .filter_map(|c| c.get("name").and_then(Value::as_str))
+        .collect()
+}
+
 fn parse_message(d: &Value) -> Option<Incoming> {
     let author = d.get("author")?;
     // Webhook messages have no real author id; skip rather than guess.
@@ -731,6 +745,15 @@ impl Rest {
     /// in the picker. Global commands can take up to an hour to appear in a
     /// guild that was already joined, which is worth saying out loud rather
     /// than leaving someone to wonder.
+    ///
+    /// The response is checked rather than merely counted. A registration that
+    /// stores `contexts: null` is accepted with a 200 and every command echoed
+    /// back, and then never appears in anyone's picker — so counting the array
+    /// reports success for a command set that cannot be invoked. That is the
+    /// exact shape of the bug that made every slash command dead on a guild,
+    /// and it survived because the only evidence was a cheerful log line. The
+    /// count returned now excludes anything Discord stored in that state, so a
+    /// silent failure shows up as a warning and a short count.
     pub async fn register_commands(
         &self,
         application_id: &str,
@@ -739,7 +762,18 @@ impl Rest {
         let registered = self
             .put(&format!("/applications/{application_id}/commands"), commands)
             .await?;
-        Ok(registered.as_array().map(Vec::len).unwrap_or(0))
+        let stored = registered.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let limbo = commands_without_contexts(stored);
+        if !limbo.is_empty() {
+            tracing::warn!(
+                commands = %limbo.join(", "),
+                "Discord stored these slash commands with no interaction contexts. \
+                 They will not appear in the command picker and no interaction will \
+                 ever arrive for them, even though the registration returned 200. \
+                 The registration payload must name `contexts` explicitly"
+            );
+        }
+        Ok(stored.len() - limbo.len())
     }
 
     /// Answers an interaction: Discord shows "the application did not respond"
@@ -1011,8 +1045,14 @@ impl Rest {
 
 /// Discord rejects a message body over 2000 characters.
 ///
-/// Splitting into several messages would be better for long answers; this keeps
-/// the tail, which is where a conclusion usually is, and marks the cut.
+/// This is a **backstop**, not the way long replies are handled. An agent reply
+/// is laid out across several messages by `split::paginate` before it reaches
+/// here, so a body arriving overlong means a caller that did not paginate — an
+/// ephemeral command reply, or a bug. Losing text is worse than a rejected
+/// request only just, so the cut keeps the tail, where a conclusion usually is,
+/// and says it happened.
+///
+/// If you find yourself widening this, paginate at the call site instead.
 pub fn truncate(content: &str) -> String {
     const LIMIT: usize = 2000;
     if content.chars().count() <= LIMIT {
@@ -1064,6 +1104,28 @@ mod tests {
         assert!(!is_fatal_close(4000));
         assert!(!is_fatal_close(1006));
         assert!(!is_fatal_close(4009));
+    }
+
+    #[test]
+    fn a_command_stored_without_contexts_is_reported_as_unusable() {
+        // This is the exact response shape that hid the bug: a 200, every
+        // command echoed back, and `contexts: null` on each one. Counting the
+        // array called that a success while the picker offered nothing.
+        let stored = vec![
+            json!({ "name": "new", "contexts": Value::Null }),
+            json!({ "name": "help", "contexts": [0, 1] }),
+            json!({ "name": "status" }),
+        ];
+        assert_eq!(commands_without_contexts(&stored), vec!["new", "status"]);
+    }
+
+    #[test]
+    fn a_fully_registered_set_reports_nothing_wrong() {
+        let stored = vec![
+            json!({ "name": "new", "contexts": [0, 1] }),
+            json!({ "name": "help", "contexts": [0] }),
+        ];
+        assert!(commands_without_contexts(&stored).is_empty());
     }
 
     #[test]

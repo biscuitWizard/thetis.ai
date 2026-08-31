@@ -369,6 +369,79 @@ body { display: flex; flex-direction: column; }
 }
 .session-empty { padding: 10px 11px; font-size: var(--text-xs); color: var(--text-faint); }
 
+/* --- sub-agent rows ---
+ *
+ * Indented under the conversation that owns them, with a rail down the left so
+ * the ownership reads at a glance rather than from the indent alone. Sized down
+ * from a conversation row on purpose: a sub-agent is work inside a
+ * conversation, and giving it equal weight in the list would misrepresent it as
+ * a peer. */
+.session-agent {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  width: calc(100% - 12px);
+  margin: 0 0 2px 12px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: none;
+  font: inherit;
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--fast) var(--ease);
+}
+.session-agent::before {
+  content: "";
+  position: absolute;
+  left: -6px; top: -2px; bottom: 50%;
+  width: 1px;
+  background: var(--hairline);
+}
+.session-agent::after {
+  content: "";
+  position: absolute;
+  left: -6px; top: 50%;
+  width: 5px; height: 1px;
+  background: var(--hairline);
+}
+.session-agent:hover { background: var(--surface-2); }
+
+.session-agent-dot {
+  flex: none;
+  width: 5px; height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--text-faint);
+}
+.session-agent.is-running .session-agent-dot {
+  background: var(--accent);
+  animation: agent-pulse 1.6s var(--ease) infinite;
+}
+.session-agent.is-bad .session-agent-dot { background: var(--err); }
+
+.session-agent-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+}
+.session-agent.is-running .session-agent-label { color: var(--text); }
+
+.session-agent-state {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.session-agent.is-bad .session-agent-state { color: var(--err); }
+
+/* The jump target, briefly, so a click that scrolls a long way is visibly the
+ * thing that just happened. */
+.agent.is-flashed { border-left-color: var(--accent); background: var(--accent-wash); }
+
 .session-archived > summary { list-style: none; cursor: pointer; }
 .session-archived > summary::-webkit-details-marker { display: none; }
 .session-archived > summary .session-group::before {
@@ -427,40 +500,287 @@ body { display: flex; flex-direction: column; }
   position: relative;
 }
 
-.chat-head {
+/* --- the centre stage ------------------------------------------------------
+ *
+ * A tab strip where the chat header used to be. The conversation is the first
+ * tab and carries the title; sub-agents and open files add their own after it.
+ * The strip scrolls sideways rather than wrapping: it must stay one row tall,
+ * because the stage below it is the tallest thing on screen and a second row
+ * would shorten every pane by as much again.
+ */
+
+.stage-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: var(--gap-2) var(--gap-3) 0;
+  border-bottom: 1px solid var(--hairline);
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* The strip's own scrollbar would sit between the tabs and their panes and
+     read as a second hairline. Kept thin and only drawn when hovered. */
+  scrollbar-width: none;
+}
+.stage-tabs::-webkit-scrollbar { height: 0; }
+
+.stage-tab {
+  /* The floor matters more than it looks. With `min-width: 0` a dozen tabs
+     shrink until every label is nought pixels wide and the strip is a row of
+     identical close buttons — measured, not imagined. A floor makes the tabs
+     overflow instead, which `overflow-x: auto` above turns into a scroll. */
+  flex: 0 1 auto;
+  min-width: 7.5rem;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--gap-3);
-  padding: var(--gap-3) var(--gap-5);
-  border-bottom: 1px solid var(--hairline);
+  gap: var(--gap-2);
+  max-width: 15rem;
+  padding: 7px var(--gap-3);
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  cursor: pointer;
+  /* The active tab's border overlaps the strip's own hairline, so the pane
+     below reads as continuous with it rather than as a box under a box. */
+  margin-bottom: -1px;
+  transition: color var(--fast) var(--ease), background-color var(--fast) var(--ease);
 }
-.chat-title-wrap { min-width: 0; display: flex; align-items: center; gap: var(--gap-3); overflow: hidden; }
-.chat-title {
-  margin: 0;
-  font-size: var(--text-lg);
-  font-weight: 600;
-  letter-spacing: -.01em;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  min-width: 4rem;
-  cursor: text;
+.stage-tab:hover { color: var(--text); background: var(--surface-1); }
+/* The accent wash marks the active tab — one of exactly two things it fills. */
+.stage-tab.is-active {
+  color: var(--text);
+  background: var(--accent-wash);
+  border-color: var(--hairline);
+  border-bottom: 1px solid var(--bg);
+}
+.stage-tab.is-chat.is-active { font-weight: 600; }
+.stage-tab.is-chat.is-active:hover .stage-tab-label { color: var(--accent-hot); }
+
+.stage-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stage-tab.is-file .stage-tab-label { font-family: var(--mono); font-size: var(--text-xs); }
+.stage-tab.is-agent .stage-tab-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--accent); }
+.stage-tab-icon { flex: none; display: flex; color: var(--text-faint); }
+.stage-tab-note { flex: none; font-family: var(--mono); font-size: var(--text-xs); color: var(--text-faint); }
+
+/* An unsaved draft is the one thing about a tab worth shouting slightly: a dot
+   before the name, in the warn hue, and nothing else changes. */
+.stage-tab.is-dirty .stage-tab-label::before {
+  content: "\2022 ";
+  color: var(--warn);
+}
+
+.stage-tab-close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 1px;
   border-radius: var(--r-sm);
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity var(--fast) var(--ease), color var(--fast) var(--ease);
 }
-.chat-title:hover { color: var(--accent-hot); }
-.chat-title-input {
+.stage-tab:hover .stage-tab-close,
+.stage-tab.is-active .stage-tab-close { opacity: 1; }
+.stage-tab-close:hover { color: var(--err); background: var(--err-wash); }
+
+/* The dot on a sub-agent's tab, mirroring the block's: pulsing while it works,
+   flat when done, red if it ended badly. */
+.stage-dot {
+  width: 6px; height: 6px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--text-faint);
+}
+.stage-dot.is-running { background: var(--accent); animation: agent-pulse 1.6s var(--ease) infinite; }
+.stage-dot.is-done { background: var(--ok); }
+.stage-dot.is-bad { background: var(--err); }
+@media (prefers-reduced-motion: reduce) {
+  .stage-dot.is-running { animation: none; }
+}
+
+.stage-title-input {
   font: inherit;
-  font-size: var(--text-lg);
   font-weight: 600;
-  min-width: 16rem;
-  padding: 1px 8px;
+  min-width: 12rem;
+  padding: 0 6px;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--accent-edge);
   border-radius: var(--r-sm);
   outline: none;
 }
+
+/* The panes. Exactly one is not `hidden`; each fills the stage and manages its
+   own scrolling, so switching tabs never moves the strip or the drawer. */
+.stage { flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; }
+.stage-pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The bar at the head of a pane: what this tab is about, and the actions that
+   belong to it. Same height and hairline as the chat pane's own bar, so the
+   panes do not jump as tabs are switched. */
+.stage-bar,
+.chat-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-5);
+  border-bottom: 1px solid var(--hairline);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow: hidden;
+}
+.stage-bar-gap, .chat-bar-gap { flex: 1 1 auto; }
+.stage-bar-name {
+  font-family: var(--mono);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.stage-bar-state { flex: none; white-space: nowrap; }
+
+.stage-body { flex: 1 1 auto; min-height: 0; display: flex; overflow: auto; }
+.stage-body.is-preview {
+  align-items: flex-start;
+  justify-content: center;
+  padding: var(--gap-5);
+}
+.file-preview { max-width: 100%; max-height: 100%; border-radius: var(--r-md); }
+.file-audio { width: min(100%, 30rem); align-self: center; }
+
+/* A file editor fills its pane. Monospace, no border of its own — the pane's
+   hairlines already bound it, and a box inside a box wastes the width that
+   opening a file in the stage was for. */
+.file-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  padding: var(--gap-4) var(--gap-5);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg);
+  border: none;
+  outline: none;
+  resize: none;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+
+/* Where the composer sits on the chat tab, a file tab puts its own actions. */
+.file-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-5);
+  border-top: 1px solid var(--hairline);
+}
+.file-status { font-size: var(--text-xs); color: var(--text-faint); }
+.file-status.is-error { color: var(--err); }
+
+/* The plan tab.
+ *
+ * Reads as a document, not as a form: the body is prose at the same measure the
+ * transcript uses, so a plan and the conversation about it look like the same
+ * kind of thing. The two pieces of chrome earn their place — the action bar,
+ * because approving a plan is the one moment a reader wants a button, and the
+ * note strip, because that is the moment they want to add a caveat. */
+.plan-body {
+  display: block;
+  padding: var(--gap-5);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+  color: var(--text);
+}
+.plan-body > * { max-width: var(--measure); margin-inline: auto; }
+
+/* Execute and its two pickers travel together at the right of the bar, so the
+   mode and the model read as arguments to the button rather than as standing
+   settings of the pane. */
+/* The plan's bar carries pickers whose menus have to escape it, so it cannot
+   inherit `.stage-bar`'s overflow clip — that clip exists to keep a long file
+   path from spilling, and this bar has no long path in it. `position: relative`
+   plus a z-index above the body keeps the escaped menu painted over the
+   document rather than under it. */
+.stage-bar.is-plan {
+  overflow: visible;
+  position: relative;
+  z-index: 2;
+}
+
+/* `flex-wrap` rather than `flex: none`: the group is two pickers plus Execute,
+   which is wider than a narrow pane, and with the bar no longer clipping its
+   overflow an unshrinkable group would hang visibly over the edge instead of
+   being quietly cut. Wrapping keeps every control on screen and reachable,
+   which is the property that matters for the button that runs the plan. */
+.plan-exec {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.plan-exec .picker { flex: none; }
+
+.plan-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: var(--gap-2) var(--gap-5);
+  border-top: 1px solid var(--hairline);
+}
+/* Two rows tall and no taller: an invitation to add a sentence, not a second
+   composer. Anything longer belongs in the conversation. */
+.plan-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--gap-2);
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  resize: none;
+  outline: none;
+}
+.plan-note:focus { border-color: var(--accent); }
+.plan-note::placeholder { color: var(--text-faint); }
+
+/* A sub-agent's tab is its stream at full width, so the block's own framing —
+   the border, the fold, the accent stripe — is dropped and only the rules that
+   make a child's rows read as a child's remain. */
+.agent-stage { flex: 1 1 auto; min-height: 0; overflow-y: auto; scroll-behavior: smooth; }
+.agent-body.is-stage {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: var(--gap-5) var(--gap-4);
+  border-top: none;
+  font-size: var(--text-md);
+}
+
 .chat-sub { font-size: var(--text-xs); color: var(--text-faint); white-space: nowrap; }
-.chat-actions { display: flex; align-items: center; gap: var(--gap-2); flex: 0 0 auto; }
 
 /* Header chips: quiet, factual, clickable — each opens the tab that owns it. */
 .chat-chip { flex: 0 0 auto; }
@@ -479,18 +799,112 @@ body { display: flex; flex-direction: column; }
 /* Still climbing: the figure includes a turn that has not finished paying. */
 .chip-quiet.is-live { color: var(--warn); }
 
+/* --- turn avatars -----------------------------------------------------------
+   A face per turn, in a gutter beside the conversation — outside the text
+   column, not inside the byline. There is a gutter on each side: the agent's
+   face sits in the left one, yours in the right, so a glance at which margin
+   holds a picture says whose turn it is before any text is read.
+
+   How the gutters are made: --avatar-gutter is added to the left *and* right
+   padding of the scroll container, and each avatar is absolutely positioned
+   into its side. Every centred child of the transcript is
+   `max-width: --measure; margin: 0 auto`, so shrinking the content box moves
+   all of them together — rows, tool cards, meta lines, ask forms and the
+   compaction card stay on one axis with no per-element change. The composer
+   wrap takes the same padding, which is what keeps the composer aligned with
+   the text above it.
+
+   Symmetry is also why the text column reads as centred: with a gutter on one
+   side only, the conversation sat off-centre in the window by half a gutter.
+
+   Padding rather than margin is the point: margin is slack that vanishes when
+   the window narrows, and an avatar in vanished slack overlaps the sidebar or
+   the rail. Reserved padding shrinks the text column instead, which is
+   recoverable and never overlaps.
+
+   The avatar is out of flow, so the byline's flex row is untouched and the name
+   still sits at its own edge of the text column. */
+.turn-avatar {
+  position: absolute;
+  /* Pulled to the inner edge of the gutter, so the picture hugs the text it
+     belongs to rather than drifting outward as the gutter changes. */
+  right: calc(100% + var(--gap-3));
+  top: 0;
+  width: var(--avatar-lg);
+  height: var(--avatar-lg);
+}
+/* Yours mirrors into the right-hand gutter. `right: auto` is required: the base
+   rule's `right` would otherwise win alongside `left` and stretch the tile
+   across the whole row. */
+.turn-avatar.is-user {
+  right: auto;
+  left: calc(100% + var(--gap-3));
+}
+.turn-img,
+.turn-mark {
+  width: 100%;
+  height: 100%;
+  /* Square, not a portrait crop: squares line up down the transcript's edge, and
+     `cover` from the top keeps a face in frame whatever the source ratio. */
+  object-fit: cover;
+  object-position: top center;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+/* The drawn fallback keeps the tile but insets a glyph, rather than scaling a
+   two-path SVG to fill it. */
+.turn-mark {
+  padding: 22%;
+  color: var(--hairline-strong);
+}
+
+/* --- the sidebar's avatar button ------------------------------------------- */
+
+.user-avatar-btn {
+  flex: none;
+  width: 22px; height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: color var(--fast) var(--ease), box-shadow var(--fast) var(--ease);
+}
+.user-avatar-btn:hover { color: var(--text); }
+.user-avatar-btn:hover .user-avatar-img,
+.user-avatar-btn:hover .user-avatar-mark { box-shadow: inset 0 0 0 1px var(--accent-edge); }
+.user-avatar-img,
+.user-avatar-mark {
+  width: 22px; height: 22px;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.user-avatar-mark { padding: 2px; }
+
 /* --- transcript ----------------------------------------------------------- */
 
 .transcript {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--gap-6) var(--gap-5) var(--gap-4);
+  /* The extra padding on each side is the avatar gutter. Because every child
+     centres itself in the content box, this one declaration narrows the whole
+     conversation and makes room either side of it — see .turn-avatar. */
+  padding: var(--gap-6) calc(var(--gap-5) + var(--avatar-gutter)) var(--gap-4);
   outline: none;
   scroll-behavior: smooth;
 }
 
-.row { max-width: var(--measure); margin: 0 auto var(--gap-5); }
+/* position: relative so an avatar can be positioned out of the row's flow while
+   still being anchored to it. */
+.row { max-width: var(--measure); margin: 0 auto var(--gap-5); position: relative; }
 .row:last-child { margin-bottom: var(--gap-3); }
 
 .row-head {
@@ -504,7 +918,13 @@ body { display: flex; flex-direction: column; }
   text-transform: uppercase;
   color: var(--text-faint);
 }
-.row.user .row-head { color: var(--accent); }
+/* Your byline sits at the right edge, under your avatar, so the name and the
+   face it names read as one unit. The row-head is already a flex row, so
+   justify-content also carries the "sending" flag along with the name. */
+.row.user .row-head {
+  color: var(--accent);
+  justify-content: flex-end;
+}
 .row.assistant .row-head { color: var(--ok); }
 
 .bubble-text {
@@ -529,6 +949,160 @@ body { display: flex; flex-direction: column; }
   animation: blink 1.1s steps(2, start) infinite;
 }
 @keyframes blink { to { opacity: 0; } }
+
+/* Reasoning: a model's thinking, which is not its answer. Deliberately quieter
+ * than the reply — dim, smaller, monospaced — so a long think reads as
+ * machinery rather than as content. Open while it streams, folded once the
+ * answer arrives. */
+.reasoning {
+  border-left: 2px solid var(--hairline-strong);
+  padding-left: 10px;
+  margin: 2px 0;
+}
+.reasoning > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  list-style: none;
+  user-select: none;
+}
+.reasoning > summary::-webkit-details-marker { display: none; }
+.reasoning > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 1em;
+  transition: transform 120ms ease;
+}
+.reasoning[open] > summary::before { transform: rotate(90deg); }
+.reasoning > summary:hover { color: var(--text-dim); }
+.reasoning-text {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  /* A very long think should not push the answer off-screen. */
+  max-height: 14em;
+  overflow-y: auto;
+}
+
+/* --- sub-agents -------------------------------------------------------------
+ *
+ * A sub-agent's work is another agent's conversation happening inside this one,
+ * and the reader must never mistake one for the other. Three devices say so,
+ * and none of them is a new colour:
+ *
+ *  - the whole block is inset and carries a continuous accent rail down its
+ *    left edge, so every row inside it is visibly *within* something;
+ *  - it sits on --surface-1, one step up from the conversation's own ground,
+ *    the same way every other nested surface in the app does;
+ *  - its rows are scaled down slightly, which is what makes a wall of a
+ *    child's tool calls read as subordinate rather than as competing.
+ *
+ * Folded by default once finished. The whole point of delegating is not having
+ * to read the middle of it; the answer is quoted into the parent transcript.
+ */
+.agent {
+  max-width: var(--measure);
+  margin: 0 auto var(--gap-4);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-left: 2px solid var(--accent-edge);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.agent > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.agent > summary::-webkit-details-marker { display: none; }
+.agent > summary:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+
+/* The disclosure arrow, on the far side from the reasoning block's, because
+ * this one is a container the reader opens rather than an aside they peek at. */
+.agent > summary::after {
+  content: "\25B8";
+  margin-left: auto;
+  color: var(--text-faint);
+  transition: transform var(--fast) var(--ease);
+}
+.agent[open] > summary::after { transform: rotate(90deg); }
+
+/* A running child pulses; a finished one is a flat dot. Motion is the only
+   honest way to say "still going" in a block that is otherwise static. */
+.agent-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--text-faint);
+}
+.agent.is-running > summary > .agent-dot {
+  background: var(--accent);
+  animation: agent-pulse 1.6s var(--ease) infinite;
+}
+.agent.is-bad > summary > .agent-dot { background: var(--err); }
+@keyframes agent-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent.is-running > summary > .agent-dot,
+  .session-agent.is-running .session-agent-dot { animation: none; }
+}
+
+.agent-label {
+  font-family: var(--mono);
+  color: var(--accent);
+  letter-spacing: .01em;
+}
+.agent.is-bad > summary > .agent-label { color: var(--err); }
+.agent-state { color: var(--text-faint); }
+.agent.is-bad > summary > .agent-state { color: var(--err); }
+.agent-meta {
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+
+/* Inside the block the conversation's own gutters do not apply. Every row here
+   belongs to the one agent named in the summary, so the avatar column has
+   nothing to distinguish and is dropped: the tile is positioned into the
+   scroll container's reserved gutter, which is outside this block entirely, so
+   leaving it visible would have it clipped by the block's own overflow.
+   Reclaiming that space is also what stops a nested transcript from being a
+   thin ribbon down the middle of an already-narrow column. */
+.agent-body {
+  padding: var(--gap-3);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--text-sm);
+}
+.agent-body .row,
+.agent-body .meta,
+.agent-body .tool,
+.agent-body .compacting {
+  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
+}
+.agent-body .row { margin-bottom: var(--gap-3); }
+.agent-body .turn-avatar { display: none; }
+/* A child's own user row is its brief, not something the user typed. Left
+   aligned like everything else in the block, so it does not masquerade as a
+   message from the person reading. */
+.agent-body .row.user .row-head { justify-content: flex-start; }
+.agent-body > :last-child { margin-bottom: 0; }
 
 /* A message the host has not acknowledged yet: present and readable, but
  * visibly not yet part of the record. Dimming the whole row is the point —
@@ -579,6 +1153,31 @@ body { display: flex; flex-direction: column; }
   background: var(--surface-2);
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Non-image attachments on a sent message. Labelled, because the contents went
+ * to the model and nothing else on the row would say so. */
+.attached-files {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  width: 100%;
+}
+.attached-label { font-size: var(--text-xs); color: var(--text-faint); }
+
+/* A mention in a sent message: the same link-like treatment the composer gives
+ * it while typing, so the message reads as it was written. */
+.mention-ref {
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--accent-wash);
+  box-shadow: 0 1px 0 var(--accent-edge);
+  color: var(--accent);
 }
 
 /* --- meta lines ----------------------------------------------------------- */
@@ -917,7 +1516,13 @@ body { display: flex; flex-direction: column; }
 
 /* --- composer ------------------------------------------------------------- */
 
-.composer-wrap { padding: 0 var(--gap-5) var(--gap-3); flex: 0 0 auto; }
+/* The side padding matches the transcript's, both gutters included, so the
+   composer sits on the same axis as the text it will join rather than being
+   centred on the zone and looking off by half a gutter. */
+.composer-wrap {
+  padding: 0 calc(var(--gap-5) + var(--avatar-gutter)) var(--gap-3);
+  flex: 0 0 auto;
+}
 
 .composer {
   max-width: var(--measure);
@@ -939,18 +1544,108 @@ body { display: flex; flex-direction: column; }
 .composer.is-locked .composer-input { color: var(--text-dim); cursor: default; }
 .composer.is-locked .composer-tools { opacity: .5; pointer-events: none; }
 
-.composer-input {
+/* The input and its highlight mirror share one stacking context. `position:
+ * relative` is also what anchors the @-mention menu. */
+.composer-field { position: relative; }
+
+.composer-input,
+.composer-mirror {
+  /* Every property that affects wrapping must be identical in both, or the
+   * highlight rectangles drift from the glyphs they are meant to sit under. */
   display: block;
   width: 100%;
-  max-height: 40vh;
   padding: 6px 4px;
-  background: transparent;
   border: 0;
+  font: inherit;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  tab-size: 4;
+}
+
+.composer-input {
+  position: relative;
+  max-height: 40vh;
+  background: transparent;
   outline: none;
   resize: none;
-  line-height: 1.55;
 }
 .composer-input::placeholder { color: var(--text-faint); }
+
+/* Behind the text, sized by the textarea rather than by its own content: it is
+ * absolutely positioned over the same box, so it cannot change the layout even
+ * if a paint goes wrong. Transparent glyphs, visible backgrounds. */
+.composer-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* A mentioned path reads as a link, because that is what it is: a reference the
+ * message carries rather than words the reader typed. Tinted text and a
+ * hairline underline, no fill — the accent stays reserved. */
+.mention-hit {
+  border-radius: 3px;
+  background: var(--accent-wash);
+  box-shadow: 0 1px 0 var(--accent-edge);
+  color: transparent;
+}
+.mention-hit.is-dir { background: var(--warn-wash); box-shadow: 0 1px 0 var(--warn); }
+
+/* --- @-mention menu ------------------------------------------------------- */
+
+/* Floats above the composer rather than below it: the composer already sits at
+ * the foot of the viewport, so a menu underneath would be off screen. */
+.mention-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + var(--gap-2));
+  z-index: 40;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: var(--gap-1);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+}
+
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  width: 100%;
+  padding: 5px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+.mention-item.is-active { background: var(--accent-wash); color: var(--text); }
+.mention-icon { flex: 0 0 auto; display: grid; place-items: center; color: var(--text-faint); }
+.mention-item.is-active .mention-icon { color: var(--accent); }
+.mention-name { flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* The tail of a path identifies it; the head is the part worth losing. */
+  direction: rtl;
+}
+.mention-note { padding: 8px 10px; font-size: var(--text-xs); color: var(--text-faint); }
 
 .composer-bar {
   display: flex;
@@ -1088,6 +1783,17 @@ body { display: flex; flex-direction: column; }
   animation: rise var(--med) var(--ease);
 }
 @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+
+/* A picker in a bar at the *top* of a pane, rather than in the composer at the
+   foot of the screen. Without this the menu is positioned above a pill that is
+   already near y=0, so it lands off the top of the viewport with every option
+   unclickable — measured, not guessed. */
+.picker-menu.drops-down {
+  bottom: auto;
+  top: calc(100% + 6px);
+  animation: fall var(--med) var(--ease);
+}
+@keyframes fall { from { opacity: 0; transform: translateY(-4px); } }
 
 .picker-item {
   display: block;
@@ -1549,7 +2255,7 @@ body { display: flex; flex-direction: column; }
 .popover-actions { display: flex; gap: var(--gap-2); justify-content: flex-end; margin-top: 2px; }
 
 @media (max-width: 860px) {
-  .chat-actions .ghost-btn { padding: 5px 7px; }
+  .chat-bar .ghost-btn { padding: 5px 7px; }
 }
 
 /* --- drop veil ------------------------------------------------------------ */
@@ -1861,10 +2567,36 @@ body { display: flex; flex-direction: column; }
 }
 
 @media (max-width: 860px) {
-  :root { --sidebar-w: 210px; }
-  .transcript { padding: var(--gap-4) var(--gap-3) var(--gap-3); }
-  .composer-wrap { padding: 0 var(--gap-3) var(--gap-2); }
-  .chat-head { padding: var(--gap-3); }
+  :root {
+    --sidebar-w: 210px;
+    /* The avatar shrinks rather than going away: at this width a 56px gutter is
+       a seventh of the text column, but the face is still the fastest way to
+       tell whose turn a row is. Both tokens move together so the gutter stays
+       proportional to what sits in it — and the padding rules below are written
+       in terms of the gutter, so they follow automatically. Dropping the gutter
+       here instead would leave the avatar positioned outside the row, over the
+       sidebar. */
+    --avatar-lg: 30px;
+    /* Avatar + --gap-3, the offset .turn-avatar uses. Less than that and the
+       tile hangs out of the padding box over the sidebar. */
+    --avatar-gutter: 42px;
+  }
+  .transcript {
+    padding: var(--gap-4) calc(var(--gap-3) + var(--avatar-gutter)) var(--gap-3);
+  }
+  .composer-wrap {
+    padding: 0 calc(var(--gap-3) + var(--avatar-gutter)) var(--gap-2);
+  }
+  .stage-tabs { padding: var(--gap-2) var(--gap-2) 0; }
+  /* Narrow: the tab is a name, not a name plus its accounting. */
+  .stage-tab { max-width: 10rem; }
+  .stage-tab-note { display: none; }
+  .chat-bar, .stage-bar, .file-foot, .plan-foot { padding: var(--gap-2) var(--gap-3); }
+  .plan-body { padding: var(--gap-3); }
+  /* The action bar wraps rather than squeezing Execute off the edge: on a narrow
+     screen the button is the one thing on this pane that must stay reachable. */
+  .stage-bar.is-plan { flex-wrap: wrap; }
+  .file-editor { padding: var(--gap-3); }
   .composer-hint { display: none; }
   .branch-actions .ghost-btn { padding: 3px 6px; }
 }

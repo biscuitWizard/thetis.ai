@@ -4,15 +4,16 @@
  * user does is submitted to the host and comes back as an event, so several
  * tabs on one conversation stay in step with no client-side reconciliation.
  *
- * The shell is three zones. The sidebar is navigation only; the middle is the
- * conversation; every inspector — Branch, Files, Context, Skills, Tools,
- * Models — is a tab in the persistent rail on the right, which docks beside
- * the chat instead of covering it.
+ * The shell is three zones. The sidebar is navigation only; the middle is a
+ * tabbed stage whose first tab is always the conversation, with a tab per
+ * sub-agent and per open file after it; every inspector — Branch, Files,
+ * Context, Skills, Tools, Models — is a tab in the persistent rail on the
+ * right, which docks beside the stage instead of covering it.
  *
  * This file only wires pieces together. Behaviour lives in views/ and lib/.
  */
 
-import { $, clear, el } from "./lib/dom.js";
+import { $, clear, el, setHidden } from "./lib/dom.js";
 import { Connection } from "./lib/socket.js";
 import { store } from "./lib/store.js";
 import { toast, popover } from "./lib/toast.js";
@@ -22,9 +23,11 @@ import { mountSessions } from "./views/sessions.js";
 import * as workspace from "./views/workspace.js";
 import * as panel from "./views/panel.js";
 import * as rail from "./views/rail.js";
+import * as stage from "./views/stage.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
 import * as transcript from "./views/transcript.js";
+import * as avatars from "./views/avatars.js";
 import { mountTerminals } from "./views/terminal.js";
 
 // --- status -----------------------------------------------------------------
@@ -57,13 +60,20 @@ store.watch("pending", (pending) => {
 // at something that is not an image. The brand is the first thing on screen and
 // must not degrade to a broken-image glyph: fall back to the built-in mark,
 // which is always in the markup for exactly this reason.
+//
+// Two bugs were in here, both of the silent kind. The ids were "#"-prefixed
+// but `$` is getElementById, so the lookup found nothing and the function
+// returned before registering anything. And the mark is an <svg>, which does
+// not inherit the `hidden` IDL attribute — `mark.hidden = false` would have set
+// a dead JS property, leaving the mark hidden even once it was needed. Hence
+// setHidden, which goes through the attribute.
 function wireAvatar() {
-  const img = $("#brand-avatar");
-  const mark = $("#brand-mark");
+  const img = $("brand-avatar");
+  const mark = $("brand-mark");
   if (!img || !mark) return;
   img.addEventListener("error", () => {
-    img.hidden = true;
-    mark.hidden = false;
+    setHidden(img, true);
+    setHidden(mark, false);
   });
 }
 wireAvatar();
@@ -78,9 +88,21 @@ const connection = new Connection({
   },
 });
 
+// The turn avatars and the sidebar's avatar button. Mounted before the frame
+// handlers, which route `user-avatar` into it, and before the transcript, which
+// asks it for a tile per turn.
+// `id` is the open conversation on every frame on this socket, and the host
+// needs it to fan a change out to the other tabs watching this conversation —
+// so it is added here rather than made the view's business.
+avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame }));
+
 connection.onOpen(() => {
   connection.send({ type: "hello" });
   if (store.current) connection.send({ type: "open", id: store.current });
+  // `hello` already replies with the stored avatar, but it is asked for
+  // explicitly too: another tab can have changed it while this socket was down,
+  // and a broadcast sent then reached nobody here.
+  avatars.request();
 });
 
 // Mounted before the frame handlers below, which refer to it. The drawer asks
@@ -93,6 +115,38 @@ const terminals = mountTerminals({
   onKill: (terminal) =>
     connection.send({ type: "terminal-close", id: store.current, terminal }),
 });
+
+/* The centre stage's tab strip. Mounted before the transcript, which opens a
+ * pane for every sub-agent on its first frame, and before the frame handlers,
+ * which route `workspace-file` into the editor tabs. */
+const centre = stage.mountStage({
+  sendFrame: (frame) => connection.send(frame),
+  onRename: (title) => {
+    connection.send({ type: "rename", id: store.current, title });
+    store.set({ title });
+    setHeader();
+  },
+  onRevealInline: (id) => revealInlineAgent(id),
+});
+
+/* Shows a sub-agent's work in the conversation itself, rather than in its tab.
+ *
+ * Goes through the transcript instead of querying the DOM for the block: the
+ * inline copy's rows are built lazily, and `revealAgent` materialises them
+ * before anything measures where to scroll. Both callers — the sidebar row when
+ * the tab has gone, and the "Show in conversation" button on a sub-agent tab —
+ * need identical behaviour, so it lives here once. */
+function revealInlineAgent(id) {
+  centre.show("chat");
+  const block = transcript.revealAgent(id);
+  if (!block) {
+    toast("That sub-agent's output is no longer on screen.", { tone: "error" });
+    return;
+  }
+  block.scrollIntoView({ behavior: "smooth", block: "center" });
+  block.classList.add("is-flashed");
+  setTimeout(() => block.classList.remove("is-flashed"), 1200);
+}
 
 // A reconnect replays `open` for the same conversation, which `setSession`
 // short-circuits — so the drawer would keep whatever it had from before the
@@ -174,6 +228,10 @@ connection
     // The drawer belongs to the conversation, so it drops the previous one's
     // emulators and asks for this one's shells.
     terminals.setSession(frame.session);
+    // And whether this conversation has a plan. Asked on every open rather than
+    // only when a tab is showing, because the plan's tab existing *is* how the
+    // user finds out there is one.
+    connection.send({ type: "plan", id: frame.session });
   })
 
   .on("settings", (frame) => {
@@ -181,6 +239,11 @@ connection
     store.set({ mode: frame.mode || "agent", model: frame.model || "" });
     setHeader();
   })
+
+  // The plan document. Owned by the stage, which opens or closes its tab from
+  // this frame — so a conversation with a plan shows it on reload, and one
+  // without never carries the previous conversation's tab over.
+  .on("plan", stage.onPlan)
 
   .on("opened", (frame) => store.set({ current: frame.session }))
 
@@ -220,11 +283,21 @@ connection
     if (frame.kind === "branch-op" || frame.kind === "turn-finished" || frame.kind === "modification") {
       connection.send({ type: "branch-status", id: store.current });
     }
+    // A plan tool that ran means the document moved. Keyed off the tool's name
+    // rather than off `turn-finished` so the tab tracks a plan being built up
+    // step by step during a long turn, which is exactly when the user is
+    // watching it.
+    if (frame.kind === "tool-result" && PLAN_TOOLS.includes(frame.name)) {
+      connection.send({ type: "plan", id: store.current });
+    }
     transcript.applyEvent(frame);
     invalidate(frame.kind);
   })
 
   .on("system-status", statusbar.onFrame)
+
+  // The user's stored picture, on `hello` and after any tab changes it.
+  .on("user-avatar", avatars.onFrame)
 
   .on("skills", (frame) => {
     if (frame.session !== store.current) return;
@@ -274,9 +347,30 @@ connection
     if (rail.isOpen("branch") && store.branchView === "history") drawBranchHistory();
   })
 
-  .on("workspace-list", workspace.onList)
-  .on("workspace-file", workspace.onFile)
-  .on("workspace-result", workspace.onResult)
+  /* Workspace frames feed two surfaces: the Files tab, and the composer's
+   * @-mention index. Both get every frame rather than one claiming it — the
+   * explorer ignores listings for a directory it is not showing, and the
+   * mention index is crawling directories the explorer knows nothing about, so
+   * routing by path would need a registry neither of them wants to keep. */
+  .on("workspace-list", (frame) => {
+    workspace.onList(frame);
+    composer.mentions.onList(frame);
+  })
+  // Fuzzy path search for the composer's `@` menu. Answered host-side from a
+  // cached walk: the shared workspace is far too large to index in a browser.
+  .on("workspace-find", (frame) => composer.mentions.onFind(frame))
+  // Read replies feed the rail's preview and any editor tab on the stage. The
+  // stage ignores a path it did not ask for, so a single click in Files cannot
+  // stamp over an open editor's draft.
+  .on("workspace-file", (frame) => {
+    workspace.onFile(frame);
+    stage.onFile(frame);
+  })
+  .on("workspace-result", (frame) => {
+    workspace.onResult(frame);
+    stage.onResult(frame);
+    composer.mentions.onResult(frame);
+  })
 
   .on("debug-request", context.onFrame)
 
@@ -338,7 +432,12 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-)/.test(frame.message || "")) return;
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan)/.test(frame.message || "")) return;
+    // A refusal from Execute belongs on the plan tab, beside the button that
+    // caused it, rather than in a toast that outlives the view it refers to.
+    if (frame.replying_to === "plan-execute" && stage.onPlanError(frame.message || "That was refused.")) {
+      return;
+    }
     // An error naming the frame it answers is that frame's verdict. A `send`
     // that reached the host and then failed — a worker that will not start,
     // say — arrives exactly this way, and the composer is locked behind an
@@ -481,10 +580,23 @@ const INVALIDATED_BY = {
   skills: ["modification", "turn-finished"],
 };
 
+/** Tools whose result means the plan document has changed. Kept in step with
+ *  the `plan_*` family in `agents/agent-core/src/tools.rs`. */
+const PLAN_TOOLS = ["plan_write", "plan_edit", "plan_append"];
+
+/** Event kinds after which the composer's @-mention index cannot be trusted. */
+const MENTION_STALED_BY = ["tool-result", "modification", "turn-finished"];
+
 const INVALIDATE_COALESCE_MS = 500;
 let invalidateTimer = null;
 
 function invalidate(kind) {
+  /* The @-mention index is a derived view too (rule 8), but it is not a rail
+   * tab and it must not be refreshed on a timer: it is only read when someone
+   * types `@`. So it is marked stale here and re-crawled on demand, whichever
+   * tab is open — otherwise the menu would offer files a turn ago deleted. */
+  if (MENTION_STALED_BY.includes(kind)) composer.mentions.invalidate();
+
   if (!INVALIDATED_BY[rail.activeTab()]?.includes(kind)) return;
   clearTimeout(invalidateTimer);
   invalidateTimer = setTimeout(() => {
@@ -1111,8 +1223,10 @@ function refreshOpenTab() {
 
 // --- header -----------------------------------------------------------------
 
+/* The conversation's title lives on its tab now, and the chips it used to sit
+ * beside live in the chat pane's own bar. */
 function setHeader() {
-  $("chat-title").textContent = store.title || "—";
+  centre.setChatTitle(store.title);
   $("chat-sub").textContent = store.mode && store.mode !== "agent" ? store.modeLabel() : "";
 
   const model = $("chip-model");
@@ -1164,38 +1278,9 @@ $("chip-model").addEventListener("click", openModels);
 $("chip-branch").addEventListener("click", showBranchTab);
 $("chip-spend").addEventListener("click", () => context.openTab("usage"));
 
-// The title renames in place: click it, type, Enter. Blur cancels — commits
-// belong to an explicit keypress, not to focus wandering off.
-$("chat-title").addEventListener("click", () => {
-  if (!store.current) return;
-  const title = $("chat-title");
-  const input = el("input", { class: "chat-title-input", type: "text", value: store.title });
-  title.replaceWith(input);
-  input.focus();
-  input.select();
-
-  // Enter restores explicitly and the input's blur fires right after — the
-  // second call must be a no-op, not a DOM exception.
-  let restored = false;
-  const restore = () => {
-    if (restored) return;
-    restored = true;
-    input.replaceWith(title);
-  };
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      const next = input.value.trim();
-      if (next && next !== store.title) {
-        connection.send({ type: "rename", id: store.current, title: next });
-        store.set({ title: next });
-        title.textContent = next;
-      }
-      restore();
-    }
-    if (event.key === "Escape") restore();
-  });
-  input.addEventListener("blur", restore);
-});
+// Renaming moved onto the conversation's own tab: click the active chat tab a
+// second time and the label becomes an input. views/stage.js owns that, and
+// calls back through `onRename` above.
 
 $("archive-chat").addEventListener("click", (event) => {
   if (!store.current) return;
@@ -1247,6 +1332,16 @@ mountSessions({
     connection.send({ type: "unarchive", id });
     toast("Conversation restored.");
   },
+  /* Brings a sub-agent's own tab forward.
+   *
+   * No host round trip: the child's stream is already rendered into its tab, so
+   * the sidebar row is a jump link. Falls back to the inline block in the
+   * conversation if the tab has gone — which happens only for a child whose
+   * conversation is no longer open. */
+  onRevealAgent: (id) => {
+    if (centre.focusAgent(id)) return;
+    revealInlineAgent(id);
+  },
 });
 
 transcript.mountTranscript({
@@ -1283,6 +1378,9 @@ const composer = mountComposer({
   onStop: () => {
     if (store.current) connection.send({ type: "turn-cancel", id: store.current });
   },
+  // The @-mention index is built from `workspace-list` frames, which the host
+  // answers directly — so mentions need the raw socket, not the send path.
+  sendFrame: (frame) => connection.send(frame),
 });
 
 // The status bar polls the host, so it needs a live socket: it asks on every

@@ -394,6 +394,12 @@ fn build_linker(engine: &Engine, caps: Caps) -> Result<Linker<HostState>> {
             bindings::terminal::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
             bindings::control::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
             bindings::configuration::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
+            // Delegation: only the agent may spawn agents. Registered here
+            // before `world agent` imports it, which is what lets the contract
+            // change land on a host that already answers. Registering an
+            // import no guest asks for is harmless — an unused entry in the
+            // linker's table.
+            bindings::delegation::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
         }
         Caps::Gateway => {
             bindings::session::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;

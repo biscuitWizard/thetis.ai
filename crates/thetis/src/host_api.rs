@@ -31,8 +31,8 @@ use crate::bindings::types::{
     ToolManifest,
 };
 use crate::bindings::{
-    branch, configuration, control, devkit, hostfs, llm, sandbox, session, sys, terminal,
-    tooling,
+    branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, sys,
+    terminal, tooling,
 };
 use crate::grip::Grip;
 use crate::runtime::HostState;
@@ -290,6 +290,21 @@ impl session::Host for HostState {
         Ok(())
     }
 
+    /// A reasoning fragment, transient like a token delta.
+    ///
+    /// Separate from `emit_output` because reasoning is not the answer: a
+    /// local DeepSeek-style model can spend forty chunks thinking before two
+    /// chunks of reply, and splicing that into the transcript would corrupt
+    /// the assistant message. The surface shows it as its own collapsible
+    /// element, and nothing persists it — only the answer is durable.
+    async fn emit_reasoning(&mut self, session_id: String, chunk: String) -> Result<()> {
+        self.budget.entered_host("emit_reasoning");
+        self.scope_ok(&session_id)?;
+        self.grip()
+            .publish_transient(&session_id, SessionEvent::ReasoningDelta(chunk));
+        Ok(())
+    }
+
     /// Compaction progress, transient like a token delta.
     ///
     /// Not persisted: the log already records the outcome as
@@ -348,6 +363,20 @@ impl session::Host for HostState {
 
     async fn create_session(&mut self, title: Option<String>) -> Result<String> {
         self.budget.entered_host("create_session");
+        // Creating conversations is a gateway's job. An agent turn asking for
+        // one is the first half of a delegation bypass: a session minted this
+        // way is in nobody's sub-agent registry, so it has no parent, does not
+        // count against the fan-out cap, never settles a result back, is not
+        // hidden from the sidebar, and — because the one-level rule is decided
+        // by registry membership — could itself spawn children. `submit` below
+        // refuses to drive somebody else's session, which breaks the second
+        // half, but a capability that has no legitimate caller is better
+        // refused outright than left as half an exploit.
+        if self.session_id.is_some() {
+            return Err(err(
+                "an agent cannot create conversations; use spawn_agent to delegate",
+            ));
+        }
         let mode = self.grip().cfg.default_mode.clone();
         self.grip()
             .persist
@@ -359,12 +388,14 @@ impl session::Host for HostState {
 
     async fn rename_session(&mut self, session_id: String, title: String) -> Result<()> {
         self.budget.entered_host("rename_session");
+        self.scope_ok(&session_id)?;
         self.grip().persist.rename_session(&session_id, &title).await.wt()?;
         Ok(())
     }
 
     async fn archive_session(&mut self, session_id: String, archived: bool) -> Result<()> {
         self.budget.entered_host("archive_session");
+        self.scope_ok(&session_id)?;
         self.grip().persist.archive_session(&session_id, archived).await.wt()?;
         // An archived conversation's worker has nothing left to do, and its
         // checkout is disposable — the branch and every commit stay. All
@@ -404,6 +435,12 @@ impl session::Host for HostState {
         attachments: Vec<Attachment>,
     ) -> Result<()> {
         self.budget.entered_host("submit");
+        // Scoped like `append` and `events`: a turn may only drive its own
+        // session. Without this an agent could start turns in any conversation,
+        // which is both a way round the sub-agent registry and a way to talk
+        // into somebody else's chat. Delegation is the sanctioned path, and it
+        // routes through `spawn`, which registers what it starts.
+        self.scope_ok(&session_id)?;
         let grip = self.grip.clone();
         grip.submit(&session_id, message, attachments).await.wt()?;
         // Submitting can materialize a branch worker — worktree, spawn, aspect
@@ -414,6 +451,7 @@ impl session::Host for HostState {
 
     async fn set_session_mode(&mut self, session_id: String, mode: String) -> Result<()> {
         self.budget.entered_host("set_session_mode");
+        self.scope_ok(&session_id)?;
         // Only offered modes are accepted, so a guest cannot invent one the
         // agent has no handling for.
         let known = self.grip().cfg.mode(&mode).is_some();
@@ -434,6 +472,7 @@ impl session::Host for HostState {
 
     async fn set_session_model(&mut self, session_id: String, model: String) -> Result<()> {
         self.budget.entered_host("set_session_model");
+        self.scope_ok(&session_id)?;
         // Any model id is accepted. The configured list is what the picker
         // offers, not what the provider supports, so checking against it meant a
         // model had to be added to the config - and the process restarted -
@@ -946,6 +985,223 @@ impl branch::Host for HostState {
     }
 }
 
+// --- delegation --------------------------------------------------------------
+//
+// The agent's view of sub-agents. Every function here is scoped to the session
+// whose turn is running: a guest cannot spawn a child for somebody else, cannot
+// read another conversation's children, and cannot cancel a child that is not
+// its own. `delegation::spawn` and `cancel_child` enforce the last two; this
+// layer's job is to refuse a call that has no session at all, and to keep what
+// crosses back into the guest small.
+
+impl HostState {
+    /// Delegation acts on behalf of the conversation this turn belongs to. A
+    /// probe context has none, and a tool-listing probe must not be able to
+    /// spawn anything.
+    fn delegating_session(&self) -> Result<String> {
+        self.session_id
+            .clone()
+            .ok_or_else(|| err("delegation needs a session"))
+    }
+}
+
+impl delegation::Host for HostState {
+    async fn available(&mut self) -> Result<bool> {
+        self.budget.entered_host("available");
+        let cfg = &self.grip().cfg;
+        if !cfg.subagents.enabled {
+            return Ok(false);
+        }
+        // A sub-agent is told delegation is unavailable, not merely refused it
+        // at dispatch. Both are enforced, but this is the one that keeps the
+        // tools out of its prompt in the first place — the cheaper refusal,
+        // because a capability never offered is never attempted.
+        //
+        // With no session this is a probe — the chat surface asking what the
+        // tool surface looks like — and the honest answer is the configured
+        // one. Answering `false` here would hide delegation from the tool panel
+        // of a deployment that has it switched on.
+        let Some(session) = self.session_id.clone() else {
+            return Ok(true);
+        };
+        let grip = self.grip.clone();
+        let is_child = grip
+            .persist
+            .get_subagent(&session)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        self.yielded();
+        Ok(!is_child)
+    }
+
+    async fn profiles(&mut self) -> Result<Vec<delegation::AgentProfileInfo>> {
+        self.budget.entered_host("profiles");
+        Ok(self
+            .grip()
+            .cfg
+            .subagents
+            .profiles
+            .iter()
+            .map(|p| delegation::AgentProfileInfo {
+                id: p.id.clone(),
+                label: p.label.clone(),
+                description: p.description.clone(),
+                model: p.model.clone(),
+                mode: p.mode.clone(),
+            })
+            .collect())
+    }
+
+    async fn limits(&mut self) -> Result<delegation::DelegationLimits> {
+        self.budget.entered_host("limits");
+        let cfg = &self.grip().cfg;
+        Ok(delegation::DelegationLimits {
+            max_children: cfg.subagents.max_children as u32,
+            max_wait_secs: cfg.subagents.max_wait_secs,
+            max_result_bytes: cfg.subagents.max_result_bytes as u32,
+        })
+    }
+
+    async fn spawn(
+        &mut self,
+        req: delegation::SpawnRequest,
+    ) -> Result<std::result::Result<delegation::SubagentInfo, String>> {
+        self.budget.entered_host("spawn");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let out = crate::delegation::spawn(
+            &grip,
+            &parent,
+            crate::delegation::SpawnRequest {
+                label: req.label,
+                task: req.task,
+                profile: req.profile,
+                model: req.model,
+                mode: req.mode,
+            },
+        )
+        .await
+        .map(|row| info_from_row(&row, grip.cfg.subagents.max_result_bytes))
+        .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn children(&mut self) -> Result<Vec<delegation::SubagentInfo>> {
+        self.budget.entered_host("children");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let rows = grip.persist.subagents_of(&parent).await.unwrap_or_default();
+        let cap = grip.cfg.subagents.max_result_bytes;
+        self.yielded();
+        Ok(rows.iter().map(|r| info_from_row(r, cap)).collect())
+    }
+
+    /// Blocks the parent's turn until a predicate holds or the deadline passes.
+    ///
+    /// Returns the whole child list rather than only what the predicate
+    /// matched, because a parent that has just been woken almost always wants
+    /// to know the state of everything it started, and a second call to get it
+    /// would be a wasted round trip through the guest boundary.
+    async fn wait(
+        &mut self,
+        until: String,
+        children: Vec<String>,
+        timeout_secs: u64,
+    ) -> Result<std::result::Result<delegation::WaitResult, String>> {
+        self.budget.entered_host("wait");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let cap = grip.cfg.subagents.max_result_bytes;
+
+        let predicate = match crate::delegation::WaitFor::parse(&until, children) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(format!("{e:#}"))),
+        };
+        let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+
+        // Deliberately *not* wrapped in `interruptible`: `delegation::wait`
+        // races the stop signal itself, and needs to, because it must be able
+        // to report a partial result rather than have the wait abandoned from
+        // outside with nothing to say.
+        let out = crate::delegation::wait(&grip, &parent, &predicate, timeout)
+            .await
+            .map(|o| delegation::WaitResult {
+                reason: o.reason,
+                timed_out: o.timed_out,
+                children: o.children.iter().map(|r| info_from_row(r, cap)).collect(),
+            })
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn cancel_child(
+        &mut self,
+        child_id: String,
+    ) -> Result<std::result::Result<delegation::SubagentInfo, String>> {
+        self.budget.entered_host("cancel_child");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let out = crate::delegation::cancel_child(&grip, &parent, &child_id)
+            .await
+            .map(|row| info_from_row(&row, grip.cfg.subagents.max_result_bytes))
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    /// A child's transcript, for the rare case where the parent needs more than
+    /// the final answer — a failure it wants to diagnose, usually.
+    ///
+    /// Scoped to this session's own children on purpose: without the check this
+    /// would be a way to read any conversation in the database by id.
+    async fn child_transcript(
+        &mut self,
+        child_id: String,
+        from_seq: u64,
+    ) -> Result<std::result::Result<Vec<EventRecord>, String>> {
+        self.budget.entered_host("child_transcript");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let row = grip.persist.get_subagent(&child_id).await.ok().flatten();
+        let out = match row {
+            Some(row) if row.parent_id == parent => grip
+                .persist
+                .events(&child_id, from_seq)
+                .await
+                .map_err(|e| format!("{e:#}")),
+            _ => Err(format!("`{child_id}` is not one of this session's sub-agents")),
+        };
+        self.yielded();
+        Ok(out)
+    }
+}
+
+/// Wire form of a registry row, with the answer clamped to what the parent's
+/// context should carry.
+fn info_from_row(
+    row: &crate::subagents::SubagentRow,
+    max_result_bytes: usize,
+) -> delegation::SubagentInfo {
+    delegation::SubagentInfo {
+        id: row.child_id.clone(),
+        label: row.label.clone(),
+        task: row.task.clone(),
+        profile: row.agent_aspect.clone(),
+        model: row.model.clone(),
+        mode: row.mode.clone(),
+        state: row.state.as_str().to_string(),
+        answer: crate::delegation::clamp_result(&row.result, max_result_bytes),
+        detail: row.detail.clone(),
+        cost_usd: row.cost_usd,
+        created_ms: row.created_ms,
+        finished_ms: row.finished_ms,
+    }
+}
+
 // --- host filesystem --------------------------------------------------------
 
 // Every direct call below is synchronous filesystem work on whatever runtime
@@ -1404,6 +1660,9 @@ fn card(c: sm::Card) -> SkillCard {
         children: c.children,
         universal: c.universal,
         resources: c.resources,
+        related: c.related,
+        status: c.status,
+        superseded_by: c.superseded_by,
         score: c.score,
         how: c.how,
     }
@@ -1619,5 +1878,88 @@ impl skills_view::Host for HostState {
         let out = diags(mgr.lint(""));
         self.yielded();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every function on the `session` interface that names a session and can
+    /// change it must call `scope_ok`, so an agent turn cannot reach into a
+    /// conversation that is not its own.
+    ///
+    /// Checked by reading this file rather than by calling the functions:
+    /// `scope_ok` needs a whole `HostState`, which owns a WASI context, a grip,
+    /// a store and a budget, and standing one up would test the fixture more
+    /// than the rule. The rule is textual anyway — the bug it guards against is
+    /// a new method written without the line, and that is exactly what a source
+    /// check catches.
+    ///
+    /// Why it matters beyond privacy: an unscoped `submit` is half of a
+    /// delegation bypass. A session an agent creates itself is in no sub-agent
+    /// registry, so it has no parent, escapes the fan-out cap, and — since the
+    /// one-level rule is decided by registry membership — could delegate
+    /// further. `create_session` refuses an agent outright for the same reason,
+    /// and is checked here too.
+    #[test]
+    fn every_session_mutator_is_scoped_to_its_own_session() {
+        let src = include_str!("host_api.rs");
+        let session_impl = src
+            .split("impl session::Host for HostState {")
+            .nth(1)
+            .expect("the session host impl moved or was renamed");
+
+        // Functions that take a session id and mutate something. Read-only
+        // lookups are deliberately absent: `get_session` and `list_sessions`
+        // are how a conversation is named in a picker, and `available_tools`
+        // answers for whichever session the UI is showing.
+        for method in [
+            "async fn append(",
+            "async fn emit_output(",
+            "async fn emit_reasoning(",
+            "async fn emit_compaction_progress(",
+            "async fn poll_inbox(",
+            "async fn events(",
+            "async fn submit(",
+            "async fn rename_session(",
+            "async fn archive_session(",
+            "async fn set_session_mode(",
+            "async fn set_session_model(",
+        ] {
+            let body = session_impl
+                .split(method)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{method}` is gone from the session impl"));
+            // Up to the next method, so a later `scope_ok` cannot satisfy this.
+            let body = body.split("    async fn ").next().unwrap_or(body);
+            assert!(
+                body.contains("self.scope_ok(&session_id)?"),
+                "`{method}` does not call scope_ok, so an agent turn can use it \
+                 on another conversation's session. Add \
+                 `self.scope_ok(&session_id)?;` after the budget line, or — if \
+                 it genuinely must be unscoped — say why in a comment and \
+                 remove it from this list."
+            );
+        }
+    }
+
+    /// An agent must not be able to mint a conversation. `spawn_agent` is the
+    /// sanctioned path, and it registers what it starts.
+    #[test]
+    fn an_agent_cannot_create_a_conversation() {
+        let src = include_str!("host_api.rs");
+        let body = src
+            .split("async fn create_session(")
+            .nth(1)
+            .expect("create_session moved")
+            .split("    async fn ")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            body.contains("self.session_id.is_some()"),
+            "create_session no longer refuses an agent turn: a session made \
+             this way is in no sub-agent registry, so it has no parent, dodges \
+             the fan-out cap, and could itself delegate"
+        );
     }
 }

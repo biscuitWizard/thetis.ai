@@ -153,13 +153,35 @@ pub fn all() -> &'static [ToolGroup] {
     &[
         ToolGroup {
             id: "core",
-            brief: "Memory and asking the user questions.",
+            brief: "Memory, waiting, and asking the user questions.",
             tags: &[],
             always_on: true,
             // `tool_search` lives here because it is the route by which every
             // withheld group is recovered. Putting it in a scopable group would
             // make the escape hatch itself losable.
-            members: &["remember", "recall", "ask_user", "tool_search"],
+            //
+            // `wait` lives here rather than with the sub-agent tools because
+            // blocking is not only for delegation, and because a sub-agent is
+            // refused that group outright — it would otherwise be the one kind
+            // of session that cannot sleep, despite being the kind most often
+            // handed a long build to babysit.
+            //
+            // The `plan_*` tools live here for the same reason `remember` does:
+            // a plan is this conversation's own artefact, and Plan mode — whose
+            // whole output is a plan — must never find them missing. They are
+            // also what Agent mode ticks off while executing, so there is no
+            // task shape that should scope them away.
+            members: &[
+                "remember",
+                "recall",
+                "ask_user",
+                "tool_search",
+                "wait",
+                "plan_write",
+                "plan_edit",
+                "plan_append",
+                "plan_read",
+            ],
         },
         ToolGroup {
             id: "skills",
@@ -287,6 +309,35 @@ pub fn all() -> &'static [ToolGroup] {
             members: &["list_config", "read_config", "set_config"],
         },
         ToolGroup {
+            id: "subagents",
+
+            brief: "Spawning sub-agents, inspecting them and cancelling them.",
+            // "wait" is deliberately *not* a member: it is a core tool, always
+            // present, because blocking is not only for delegation and a
+            // sub-agent — which is refused this whole group — still needs to be
+            // able to sleep. It is not a tag either, since a conversation that
+            // says "wait" almost never means delegation. The tags are the words
+            // that only show up when the work really is being split up.
+            //
+            // Not always-on, and the loss is small: a model that has been told
+            // to parallelise will call `tool_search`, and the group table is in
+            // the system prompt either way. Being on by default would push six
+            // long tool descriptions into every conversation, including the
+            // ones where delegation would be the wrong idea.
+            tags: &[
+                "subagent", "subagents", "delegate", "delegation", "spawn", "concurrently",
+                "parallel", "parallelise", "parallelize", "fan-out", "background",
+            ],
+            always_on: false,
+            members: &[
+                "spawn_agent",
+                "agent_status",
+                "agent_transcript",
+                "cancel_agent",
+                "agent_profiles",
+            ],
+        },
+        ToolGroup {
             id: "sandbox",
             brief: "The isolated sandbox: running a command, reading and writing its files.",
             // Kept narrow on purpose: these three tools shadow the host
@@ -334,6 +385,22 @@ pub fn all() -> &'static [ToolGroup] {
             members: &[],
         },
         ToolGroup {
+            id: "browser",
+            brief: "A real headless browser: navigate, read the page, click, type, screenshot.",
+            // "browser" and "page" are dropped deliberately: in this repo a
+            // browser is usually the thing a gateway is served to, and a page is
+            // as often a Notion one. The tags left are the ones that only occur
+            // when someone wants a page actually driven — and the skill edge
+            // from `web-ui-design/verifying-on-a-branch` is the better signal
+            // anyway, since verifying a UI change is the main use.
+            tags: &[
+                "playwright", "headless", "click", "screenshot", "dom", "css",
+                "viewport", "responsive", "render", "frontend",
+            ],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
             id: "github",
             brief: "The GitHub API: reading and committing files, repos, branches, PRs.",
             // "commit" is a `branch` tag and means the local branch more often;
@@ -368,9 +435,14 @@ pub fn all_ids() -> Vec<String> {
 /// A stopgap by design: a component *should* say `group:<id>` in its
 /// capabilities. Until it does, the naming convention already in use carries
 /// the same information and costs nothing to read.
+/// Order matters: the first match wins. `web-browser-` must precede `web-`, or
+/// the whole browser family lands in the `web` group — which is not merely
+/// untidy, it would attach a headless browser to every conversation that
+/// mentioned an article.
 const PREFIX_RULES: &[(&str, &str)] = &[
     ("bq-", "bigquery"),
     ("notion-", "notion"),
+    ("web-browser-", "browser"),
     ("web-", "web"),
     ("git-", "github"),
 ];
@@ -516,9 +588,31 @@ pub fn score(group: &ToolGroup, query_tokens: &[String]) -> f64 {
     let matches = group
         .tags
         .iter()
-        .filter(|tag| query_tokens.iter().any(|t| t == *tag))
+        .filter(|tag| tag_present(tag, query_tokens))
         .count() as f64;
     matches / (matches + 1.0)
+}
+
+/// Whether a single tag occurs in the tokenised query.
+///
+/// A tag is tokenised the same way the query is, and a multi-token tag must
+/// appear as consecutive tokens. Without this, any tag containing a hyphen or a
+/// space is silently dead: "fan-out" is never equal to a token, because
+/// `tokens` splits on the hyphen and would have to produce "fan-out" as one
+/// run to match — which it never does. A dead tag is the worst kind of bug
+/// here, because the group simply fails to be offered and nothing complains.
+///
+/// Requiring adjacency rather than mere presence matters for a tag like
+/// "fan out", whose second word is common enough on its own to fire constantly.
+fn tag_present(tag: &str, query_tokens: &[String]) -> bool {
+    let parts = tokens(tag);
+    match parts.len() {
+        0 => false,
+        1 => query_tokens.iter().any(|t| *t == parts[0]),
+        n => query_tokens
+            .windows(n)
+            .any(|window| window.iter().zip(&parts).all(|(a, b)| a == b)),
+    }
 }
 
 /// Group ids a set of skill cards points at, via their `tool-group:` tags.
@@ -862,4 +956,99 @@ pub fn rank(query: &str) -> Vec<(&'static ToolGroup, f64)> {
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.id.cmp(b.0.id)));
     scored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(id: &str) -> &'static ToolGroup {
+        all().iter().find(|g| g.id == id).expect("group exists")
+    }
+
+    /// The placement that the comment beside `wait` argues for, asserted so a
+    /// later tidy-up cannot quietly move it back. A sub-agent is refused the
+    /// `subagents` group entirely; if `wait` travelled with that group, a child
+    /// asked to babysit a long build would have to poll instead of sleeping.
+    #[test]
+    fn wait_is_core_and_not_a_sub_agent_tool() {
+        assert!(group("core").members.contains(&"wait"));
+        assert!(group("core").always_on);
+        assert!(!group("subagents").members.contains(&"wait"));
+    }
+
+    /// Every tool belongs to exactly one group. Two groups claiming the same
+    /// name makes `group_of` depend on table order, which nothing guarantees.
+    #[test]
+    fn no_tool_is_claimed_by_two_groups() {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for g in all() {
+            for m in g.members {
+                if let Some((_, other)) = seen.iter().find(|(name, _)| name == m) {
+                    panic!("`{m}` is claimed by both `{other}` and `{}`", g.id);
+                }
+                seen.push((m, g.id));
+            }
+        }
+    }
+
+    /// Delegation is discoverable by the words a user actually uses when they
+    /// ask for concurrency, since the group is not on by default and routing is
+    /// the only thing that brings it in without an explicit `tool_search`.
+    ///
+    /// Asserted as a score, not as a rank: admission is per-group against a
+    /// threshold, so it does not matter that "run these jobs" also pulls in
+    /// `shell` and may outrank delegation. One distinct tag match scores 0.5,
+    /// which clears any sane threshold.
+    #[test]
+    fn asking_to_parallelise_admits_the_sub_agent_group() {
+        for query in [
+            "run these three jobs in parallel",
+            "spawn a subagent to read the logs",
+            "can you fan out this work",
+            "do this in the background while we carry on",
+        ] {
+            let s = score(group("subagents"), &tokens(query));
+            assert!(s >= 0.5, "query: {query} scored {s}");
+        }
+    }
+
+    /// "wait" must not drag the delegation group in: it is the ordinary English
+    /// word for pausing, and a conversation full of it would otherwise carry six
+    /// long tool descriptions it has no use for.
+    #[test]
+    fn the_word_wait_alone_does_not_route_to_delegation() {
+        assert_eq!(score(group("subagents"), &tokens("wait for the build")), 0.0);
+    }
+
+    /// A tag containing a hyphen or a space used to be unmatchable, because
+    /// `tokens` splits the query on exactly the characters the tag contains. The
+    /// failure was silent — the group just never got offered.
+    #[test]
+    fn a_multi_word_tag_matches_the_words_it_is_made_of() {
+        assert!(tag_present("fan-out", &tokens("please fan out the reading")));
+        assert!(tag_present("fan out", &tokens("fan-out across four agents")));
+        // Adjacency is required, or a tag's commonest word fires on its own.
+        assert!(!tag_present("fan-out", &tokens("out of the fan")));
+        assert!(!tag_present("fan-out", &tokens("switch the fan off and head out")));
+        // The single-token path is unaffected.
+        assert!(tag_present("spawn", &tokens("spawn a helper")));
+        assert!(!tag_present("spawn", &tokens("spawning a helper")));
+    }
+
+    /// Every tag in the table is reachable by some query. This is the general
+    /// form of the bug above: a tag that cannot match is dead weight that looks
+    /// like coverage.
+    #[test]
+    fn every_tag_in_the_table_can_match_something() {
+        for g in all() {
+            for tag in g.tags {
+                assert!(
+                    tag_present(tag, &tokens(tag)),
+                    "tag `{tag}` in group `{}` can never match",
+                    g.id
+                );
+            }
+        }
+    }
 }

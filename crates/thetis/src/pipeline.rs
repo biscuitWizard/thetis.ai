@@ -44,11 +44,238 @@ pub const CACHE_ARTIFACT: &str = "component.wasm";
 /// in copy of the contract is the identity that matters, so it keys the cache.
 pub fn kernel_wit_fingerprint() -> &'static str {
     static FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    FP.get_or_init(|| {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(include_str!("../../../wit/thetis.wit").as_bytes());
-        hex::encode(&digest[..8])
-    })
+    FP.get_or_init(|| wit_fingerprint(include_str!("../../../wit/thetis.wit")))
+}
+
+/// The contract a checkout's guests will bind against.
+///
+/// Every guest crate generates its bindings from the `wit/` directory beside
+/// it (`path: "../../wit"`), so for a worker this is the *worktree's* copy,
+/// not trunk's and not the kernel's. That distinction is the whole point: a
+/// branch that has not merged a trunk WIT change still holds the old contract,
+/// and every component built there imports it.
+pub fn checkout_wit_fingerprint(cfg: &Config) -> Option<String> {
+    std::fs::read_to_string(cfg.paths.wit.join("thetis.wit"))
+        .ok()
+        .map(|text| wit_fingerprint(&text))
+}
+
+/// Shared so the two fingerprints are always comparable: hashing the kernel's
+/// copy one way and a checkout's another would make every comparison a lie.
+fn wit_fingerprint(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Where a checkout's WIT contract stands against the kernel that has to load
+/// the guests built from it.
+#[derive(Debug, Clone)]
+pub enum ContractCheck {
+    /// The checkout binds against the contract this kernel speaks.
+    Match,
+    /// The checkout was behind and has been brought up to trunk.
+    Repaired { from: String, to: String, commits: u64 },
+    /// The checkout disagrees and trunk cannot settle it, because trunk does
+    /// not match the kernel either. The binary is the stale one, so nothing
+    /// was moved — moving would not have helped.
+    KernelStale {
+        kernel: String,
+        checkout: String,
+        trunk: String,
+    },
+    /// The checkout disagrees, trunk holds the fix, but it would not merge.
+    /// The branch is left exactly as it was found.
+    Unrepaired {
+        kernel: String,
+        checkout: String,
+        detail: String,
+    },
+    /// The checkout disagrees and this role has no git to settle it with. The
+    /// gateway is the case that matters: it holds no `GitCtl` at all, and the
+    /// checkout it reads is trunk itself — so a mismatch here is never a stale
+    /// branch, it is a stale binary, and rebuilding is the only way out.
+    Unrepairable { kernel: String, checkout: String },
+    /// Nothing to check: no `wit/thetis.wit` to read.
+    Unknown,
+}
+
+/// Brings a checkout's WIT contract into line with the kernel, before anything
+/// is built against it.
+///
+/// The kernel's contract is compiled in; a guest's comes from the `wit/`
+/// directory of whatever checkout it is built in. Those are two different
+/// places, and a trunk WIT change moves only one of them — so every branch
+/// that has not merged it goes on building guests against the old variant, and
+/// wasmtime refuses them at instantiation ("expected variant of 15 cases,
+/// found 14").
+///
+/// Nothing downstream can recover from that, which is why the check belongs
+/// here rather than in the error paths. The build itself succeeds, so the
+/// compiler raises nothing. The smoke test does reject the artifact, correctly.
+/// But the fallback then searches *branch* history for a green build, and that
+/// is the one axis guaranteed to be equally stale — every artifact it can find
+/// binds the same old contract. The branch has no way back on its own, and the
+/// worker comes up with no agent at all.
+///
+/// Trunk is the only place the new contract exists, so merging trunk is the
+/// repair — applied once, before the first wasted compile.
+pub async fn reconcile_wit_contract(grip: &Arc<Grip>) -> ContractCheck {
+    reconcile_against(
+        kernel_wit_fingerprint(),
+        checkout_wit_fingerprint(&grip.cfg).as_deref(),
+        grip.git.as_ref(),
+    )
+    .await
+}
+
+/// The decision itself, over the three things it actually depends on: what the
+/// kernel speaks, what the checkout holds, and whether this role has git to
+/// settle a disagreement with. Taking them as arguments rather than reaching
+/// into a `Grip` is what lets the gateway's case — `git` absent — be tested at
+/// all; it is the one that previously fell through to silence.
+async fn reconcile_against(
+    kernel: &str,
+    checkout: Option<&str>,
+    git: Option<&crate::gitctl::GitCtl>,
+) -> ContractCheck {
+    let kernel = kernel.to_string();
+    let Some(checkout) = checkout.map(str::to_string) else {
+        return ContractCheck::Unknown;
+    };
+    if checkout == kernel {
+        return ContractCheck::Match;
+    }
+    let Some(git) = git else {
+        return ContractCheck::Unrepairable { kernel, checkout };
+    };
+
+    // Does trunk even hold what the kernel speaks? If it does not, the
+    // checkout is not the thing that is behind — the binary is — and a merge
+    // would shuffle a branch around to no effect while hiding the real cause.
+    let trunk = crate::branchops::trunk_ref();
+    let trunk_fp = match git
+        .run_raw(&["show", &format!("{trunk}:wit/thetis.wit")])
+        .await
+    {
+        Ok(out) if out.status.success() => wit_fingerprint(&String::from_utf8_lossy(&out.stdout)),
+        _ => String::new(),
+    };
+    if trunk_fp != kernel {
+        return ContractCheck::KernelStale {
+            kernel,
+            checkout,
+            trunk: trunk_fp,
+        };
+    }
+
+    match update_to_trunk(git, &trunk).await {
+        Ok(commits) => ContractCheck::Repaired {
+            from: checkout,
+            to: kernel,
+            commits,
+        },
+        Err(e) => ContractCheck::Unrepaired {
+            kernel,
+            checkout,
+            detail: format!("{e:#}"),
+        },
+    }
+}
+
+/// Moves this checkout onto trunk, by the most lossless route available.
+///
+/// A branch that has committed nothing of its own — the common case for one
+/// that has merely gone stale — fast-forwards, which cannot conflict and
+/// cannot lose work. A branch carrying its own commits needs a real merge, and
+/// a conflicting one is abandoned rather than left half-resolved: a worker
+/// coming up is the worst possible moment to hand somebody a conflicted tree,
+/// and the branch is far more useful untouched and reported than wedged.
+async fn update_to_trunk(git: &crate::gitctl::GitCtl, trunk: &str) -> Result<u64> {
+    if git.merge_in_progress().await? {
+        anyhow::bail!("a merge is already in progress in this checkout");
+    }
+    let (_, behind) = git.ahead_behind("HEAD", trunk).await?;
+
+    // Uncommitted work would block the merge outright. Checkpointing it is
+    // what an interactive update from trunk does for the same reason, and it
+    // leaves the edits recoverable instead of in the way.
+    if git.is_dirty().await.unwrap_or(false) {
+        git.add_all_and_commit("checkpoint: before the WIT contract update")
+            .await?;
+    }
+
+    if git.merge_ff_only(trunk).await.is_ok() {
+        return Ok(behind);
+    }
+    match git.merge(trunk, "update from trunk (WIT contract)").await? {
+        crate::gitctl::MergeOutcome::Clean { .. } => Ok(behind),
+        crate::gitctl::MergeOutcome::Conflict { paths } => {
+            // Put the tree back before reporting; a conflicted checkout would
+            // fail every later git operation this worker attempts.
+            git.merge_abort().await.ok();
+            anyhow::bail!(
+                "merging trunk conflicts in {} file(s): {}",
+                paths.len(),
+                paths.join(", ")
+            )
+        }
+    }
+}
+
+impl ContractCheck {
+    /// Says what was found, at the severity it deserves.
+    ///
+    /// Logged once at startup and deliberately explicit: a mismatch here is
+    /// the cause of every smoke-test failure that follows, and the old
+    /// behaviour made a reader infer that from a wall of variant-arity errors.
+    pub fn report(&self) {
+        match self {
+            ContractCheck::Match => tracing::debug!(
+                contract = kernel_wit_fingerprint(),
+                "WIT contract matches the kernel"
+            ),
+            ContractCheck::Repaired { from, to, commits } => tracing::warn!(
+                %from, %to, commits,
+                "this checkout held an older WIT contract than the kernel; \
+                 updated from trunk before building anything against it"
+            ),
+            ContractCheck::KernelStale {
+                kernel,
+                checkout,
+                trunk,
+            } => tracing::error!(
+                %kernel, %checkout, %trunk,
+                "the kernel binary is older than the WIT in this checkout; guests built here \
+                 cannot load until it is rebuilt and restarted (scripts/rebuild-kernel.sh)"
+            ),
+            ContractCheck::Unrepaired {
+                kernel,
+                checkout,
+                detail,
+            } => tracing::error!(
+                %kernel, %checkout, %detail,
+                "this checkout's WIT contract does not match the kernel and trunk would not merge in; \
+                 guests built here will fail their smoke test until this is resolved"
+            ),
+            ContractCheck::Unrepairable { kernel, checkout } => tracing::error!(
+                %kernel, %checkout,
+                "the running kernel binary was built against a different WIT contract than this \
+                 checkout holds; every guest built from it will be refused at instantiation until \
+                 the kernel is rebuilt and restarted (scripts/rebuild-kernel.sh)"
+            ),
+            ContractCheck::Unknown => {}
+        }
+    }
+
+    /// Whether guests built in this checkout can be expected to load at all.
+    /// A caller that is about to explain a failure uses this to say *why*.
+    pub fn is_sound(&self) -> bool {
+        matches!(
+            self,
+            ContractCheck::Match | ContractCheck::Repaired { .. } | ContractCheck::Unknown
+        )
+    }
 }
 
 /// The cache key for an aspect's build as of `rev`: the tree that is the
@@ -218,6 +445,55 @@ impl Outcome {
             detail: detail.into(),
             pending_swap: false,
         }
+    }
+}
+
+/// Files a smoke-passing artifact in the build cache under the tree that
+/// produced it, so every branch holding that tree — and the merge gate — can
+/// recognise it as green without a toolchain.
+///
+/// Called from both green exits of the pipeline: the one where the component
+/// changed, and the one where cargo produced bytes identical to what is already
+/// serving. The second is easy to overlook and was the source of a merge
+/// deadlock, so the two paths share this function rather than each remembering
+/// to cache.
+///
+/// Keyed off `HEAD`, so it must be called *after* the source has been
+/// committed: the key names the committed tree, and caching against a tree that
+/// does not exist yet would file the artifact where nothing will look for it.
+async fn cache_green(
+    grip: &Arc<Grip>,
+    aspect: &Aspect,
+    wasm: &std::path::Path,
+    artifact_sha256: &str,
+    source_commit: Option<String>,
+    note: &str,
+    origin: Origin,
+) {
+    let Some(key) = aspect_cache_key(grip, "HEAD", aspect).await else {
+        return;
+    };
+    let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg.aspect_source_rel(aspect)) {
+        (Some(git), Some(rel)) => (
+            git.tree_oid("HEAD", &rel).await.ok().flatten().unwrap_or_default(),
+            git.tree_oid("HEAD", "wit").await.ok().flatten().unwrap_or_default(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let meta = BuildMeta {
+        aspect: aspect.key(),
+        key,
+        artifact_sha256: artifact_sha256.to_string(),
+        smoke: SmokeVerdict::Pass,
+        source_commit: source_commit.unwrap_or_default(),
+        aspect_tree,
+        wit_tree,
+        created_ms: crate::buildcache::now_ms(),
+        note: format!("{}: {note}", origin.label()),
+    };
+    if let Err(e) = grip.buildcache.store(wasm, CACHE_ARTIFACT, &meta) {
+        // A cache miss later costs a rebuild, not correctness.
+        tracing::warn!(%aspect, error = %e, "could not cache the artifact");
     }
 }
 
@@ -411,9 +687,31 @@ pub async fn build_and_activate_with(
         .get(aspect)
         .is_some_and(|loaded| loaded.artifact_sha256 == fresh_hash);
     if already_serving {
-        let _ = grip
+        let commit = grip
             .commit_worktree(&format!("{}: {note} ({aspect})", origin.label()))
-            .await;
+            .await
+            .ok()
+            .flatten();
+        // File the artifact under the tree that just got committed, exactly as
+        // a changed build would.
+        //
+        // Skipping this was a real bug, not an optimisation. The merge gate
+        // recognises a green build by *tree identity*, so a commit with no
+        // cache entry is indistinguishable from one that was never built — and
+        // this path is reached precisely by the edits that do not alter the
+        // compiled output: a reworded comment, whitespace, or a rebuild after
+        // `update_from_trunk` brought in changes to other aspects only. Every
+        // such commit moved the tree, cached nothing, and left the branch
+        // permanently unmergeable with "its latest state has no green build".
+        // Rebuilding could never clear it: the second attempt is byte-identical
+        // too, so it landed here again.
+        //
+        // Claiming `Pass` without re-running the smoke test is sound here and
+        // only here: these bytes are byte-identical to what the loader is
+        // serving, and a component only becomes live by passing the smoke test
+        // under a cache key carrying *this* kernel's contract fingerprint. Same
+        // bytes, same kernel, same verdict.
+        cache_green(grip, aspect, &wasm, &fresh_hash, commit, note, origin).await;
         return Ok(Outcome {
             success: true,
             aspect: aspect.key(),
@@ -456,30 +754,7 @@ pub async fn build_and_activate_with(
         .flatten();
     let key = aspect_cache_key(grip, "HEAD", aspect).await;
     let revision = key.as_deref().map(key_revision).unwrap_or(0);
-    if let Some(key) = &key {
-        let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg.aspect_source_rel(aspect)) {
-            (Some(git), Some(rel)) => (
-                git.tree_oid("HEAD", &rel).await.ok().flatten().unwrap_or_default(),
-                git.tree_oid("HEAD", "wit").await.ok().flatten().unwrap_or_default(),
-            ),
-            _ => (String::new(), String::new()),
-        };
-        let meta = BuildMeta {
-            aspect: aspect.key(),
-            key: key.clone(),
-            artifact_sha256: fresh_hash.clone(),
-            smoke: SmokeVerdict::Pass,
-            source_commit: commit.unwrap_or_default(),
-            aspect_tree,
-            wit_tree,
-            created_ms: crate::buildcache::now_ms(),
-            note: format!("{}: {note}", origin.label()),
-        };
-        if let Err(e) = grip.buildcache.store(&wasm, CACHE_ARTIFACT, &meta) {
-            // A cache miss later costs a rebuild, not correctness.
-            tracing::warn!(%aspect, error = %e, "could not cache the artifact");
-        }
-    }
+    cache_green(grip, aspect, &wasm, &fresh_hash, commit, note, origin).await;
 
     // 8. Live. Installing through the grip keeps the tool registry in step.
     let component = Arc::new(crate::loader::LoadedComponent {
@@ -635,8 +910,27 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
             break;
         }
     }
-    let (commit, key) = target
-        .ok_or_else(|| anyhow!("{aspect} has no green build in recent branch history"))?;
+    // Nothing green in this branch's history has two very different causes,
+    // and saying only the first one sent the last diagnosis of this down the
+    // wrong path entirely. A contract mismatch guarantees the search fails —
+    // every artifact this branch can offer binds the old WIT — so the reset is
+    // not the thing that is broken, and reporting it as such buries the cause.
+    let (commit, key) = match target {
+        Some(found) => found,
+        None => {
+            let contract = checkout_wit_fingerprint(&grip.cfg);
+            let kernel = kernel_wit_fingerprint();
+            if contract.as_deref().is_some_and(|fp| fp != kernel) {
+                return Err(anyhow!(
+                    "{aspect} has no green build this kernel can load: the checkout's WIT contract \
+                     ({}) is not the kernel's ({kernel}), so every artifact in this branch's history \
+                     binds the wrong one. Update from trunk rather than resetting.",
+                    contract.unwrap_or_default()
+                ));
+            }
+            return Err(anyhow!("{aspect} has no green build in recent branch history"));
+        }
+    };
 
     // The watcher would read the restore as a fresh edit and rebuild over it.
     grip.suppress_watch(aspect, grip.cfg.watchdog.watch_suppression);
@@ -775,5 +1069,180 @@ mod fingerprint_tests {
             Some(after_fix.as_str()),
             "a fixed tree must not be suppressed"
         );
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A repo on `main` holding a `wit/thetis.wit`, plus a branch cut from it.
+    /// Mirrors the real shape: trunk moves the contract, a conversation branch
+    /// is left behind holding the old one.
+    async fn trunk_and_branch(branch: &str) -> (TempDir, crate::gitctl::GitCtl) {
+        let tmp = TempDir::new().unwrap();
+        let git = crate::gitctl::GitCtl::new(tmp.path());
+        git.run_raw(&["init", "-b", "main"]).await.unwrap();
+        git.run_raw(&["config", "user.name", "test"]).await.unwrap();
+        git.run_raw(&["config", "user.email", "test@example.com"])
+            .await
+            .unwrap();
+        fs::create_dir_all(tmp.path().join("wit")).unwrap();
+        fs::write(tmp.path().join("wit/thetis.wit"), "variant e { a, b }\n").unwrap();
+        git.add_all_and_commit("base").await.unwrap().unwrap();
+
+        // The branch is cut here, before the contract moves.
+        git.run_raw(&["branch", branch]).await.unwrap();
+
+        // Trunk gains a case, exactly as the reasoning-delta commit did.
+        fs::write(tmp.path().join("wit/thetis.wit"), "variant e { a, b, c }\n").unwrap();
+        git.add_all_and_commit("add a case").await.unwrap().unwrap();
+
+        git.run_raw(&["checkout", branch]).await.unwrap();
+        (tmp, git)
+    }
+
+    fn contract_of(dir: &std::path::Path) -> String {
+        wit_fingerprint(&fs::read_to_string(dir.join("wit/thetis.wit")).unwrap())
+    }
+
+    /// The two fingerprints must be computed identically or every comparison
+    /// between them is meaningless.
+    #[test]
+    fn the_kernels_fingerprint_and_a_checkouts_use_one_algorithm() {
+        let tmp = TempDir::new().unwrap();
+        let wit = tmp.path().join("wit");
+        fs::create_dir_all(&wit).unwrap();
+        let body = "package thetis:grip;\n";
+        fs::write(wit.join("thetis.wit"), body).unwrap();
+
+        let mut cfg = Config::load().unwrap();
+        cfg.paths.wit = wit;
+        assert_eq!(
+            checkout_wit_fingerprint(&cfg).unwrap(),
+            wit_fingerprint(body),
+            "a checkout's contract must hash the way the kernel's does"
+        );
+    }
+
+    /// The case that broke: a branch with nothing of its own, left behind by a
+    /// trunk WIT change. It must come forward, and losslessly.
+    #[tokio::test]
+    async fn a_stale_branch_is_fast_forwarded_onto_trunk() {
+        let (tmp, git) = trunk_and_branch("conv/stale").await;
+        let before = contract_of(tmp.path());
+
+        let behind = update_to_trunk(&git, "main").await.unwrap();
+
+        assert_eq!(behind, 1, "one commit behind trunk");
+        assert_ne!(contract_of(tmp.path()), before, "the contract must have moved");
+        assert_eq!(
+            contract_of(tmp.path()),
+            wit_fingerprint("variant e { a, b, c }\n"),
+            "and it must be trunk's"
+        );
+        // A fast-forward, so the branch carries no merge commit of its own.
+        let (ahead, behind) = git.ahead_behind("HEAD", "main").await.unwrap();
+        assert_eq!((ahead, behind), (0, 0), "branch is exactly trunk");
+    }
+
+    /// A branch with its own work cannot fast-forward. It still has to come
+    /// forward, and its work has to survive.
+    #[tokio::test]
+    async fn a_branch_with_its_own_commits_merges_and_keeps_them() {
+        let (tmp, git) = trunk_and_branch("conv/busy").await;
+        fs::write(tmp.path().join("mine.txt"), "my work\n").unwrap();
+        git.add_all_and_commit("my work").await.unwrap().unwrap();
+
+        update_to_trunk(&git, "main").await.unwrap();
+
+        assert_eq!(
+            contract_of(tmp.path()),
+            wit_fingerprint("variant e { a, b, c }\n"),
+            "the contract came forward"
+        );
+        assert!(tmp.path().join("mine.txt").is_file(), "and the work survived");
+    }
+
+    /// Uncommitted edits would block the merge outright. They are checkpointed,
+    /// not discarded — a worker starting up must never eat someone's work.
+    #[tokio::test]
+    async fn uncommitted_work_is_checkpointed_rather_than_blocking_or_lost() {
+        let (tmp, git) = trunk_and_branch("conv/dirty").await;
+        fs::write(tmp.path().join("scratch.txt"), "unsaved\n").unwrap();
+
+        update_to_trunk(&git, "main").await.unwrap();
+
+        assert!(!git.is_dirty().await.unwrap(), "the tree is clean afterwards");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("scratch.txt")).unwrap(),
+            "unsaved\n",
+            "the edit is still there, committed rather than dropped"
+        );
+    }
+
+    /// A conflict at worker startup is the worst moment to hand somebody a
+    /// half-merged tree. It must back out cleanly and say so.
+    #[tokio::test]
+    async fn a_conflicting_merge_is_abandoned_and_leaves_the_branch_usable() {
+        let (tmp, git) = trunk_and_branch("conv/conflict").await;
+        // Same file, different content: guaranteed to conflict with trunk.
+        fs::write(tmp.path().join("wit/thetis.wit"), "variant e { a, b, z }\n").unwrap();
+        git.add_all_and_commit("my own contract").await.unwrap().unwrap();
+        let head_before = git.head().await.unwrap();
+
+        let err = update_to_trunk(&git, "main").await.unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("conflict"),
+            "the caller must be told why: {err:#}"
+        );
+        assert!(
+            !git.merge_in_progress().await.unwrap(),
+            "no merge may be left in progress"
+        );
+        assert_eq!(
+            git.head().await.unwrap(),
+            head_before,
+            "the branch is exactly where it was found"
+        );
+        assert!(!git.is_dirty().await.unwrap(), "and its tree is clean");
+    }
+
+    /// The gateway case, and the whole point of the fix: a role with no git
+    /// still has to *say* the contract disagrees. It used to fall through to
+    /// `Unknown`, whose report is silent — so the one process positioned to
+    /// announce a stale binary at startup announced nothing.
+    #[tokio::test]
+    async fn a_role_without_git_reports_the_mismatch_instead_of_going_quiet() {
+        let check = reconcile_against("aaaaaaaaaaaaaaaa", Some("bbbbbbbbbbbbbbbb"), None).await;
+
+        assert!(
+            matches!(check, ContractCheck::Unrepairable { .. }),
+            "a mismatch with no git is unrepairable, not unknown: {check:?}"
+        );
+        assert!(!check.is_sound(), "and nothing built against it can load");
+    }
+
+    /// The same role, agreeing: no git must not turn a healthy startup into a
+    /// scary log line.
+    #[tokio::test]
+    async fn a_role_without_git_stays_quiet_when_the_contract_agrees() {
+        let check = reconcile_against("aaaaaaaaaaaaaaaa", Some("aaaaaaaaaaaaaaaa"), None).await;
+
+        assert!(matches!(check, ContractCheck::Match), "{check:?}");
+        assert!(check.is_sound());
+    }
+
+    /// No `wit/thetis.wit` at all is genuinely nothing to check, and stays
+    /// distinct from a mismatch nobody can repair.
+    #[tokio::test]
+    async fn an_unreadable_contract_is_unknown_and_not_treated_as_a_mismatch() {
+        let check = reconcile_against("aaaaaaaaaaaaaaaa", None, None).await;
+
+        assert!(matches!(check, ContractCheck::Unknown), "{check:?}");
+        assert!(check.is_sound(), "unknown must not blame later failures");
     }
 }

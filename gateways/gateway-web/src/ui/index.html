@@ -65,18 +65,76 @@
     <footer class="sidebar-foot">
       <span id="status" class="status is-offline">connecting</span>
       <a href="/admin" target="_blank" rel="noopener" class="quiet-link">admin</a>
+      <!-- Your own face, and the way to change it. Sits beside `admin` because
+           this is the footer's "who and what am I" corner, and because an
+           avatar is settings rather than navigation — it must not be a row in
+           the conversation list. The <img> and the drawn mark work the same way
+           as the brand's: exactly one shown, so a bad URL degrades to the mark.
+           app.js wires the click; the file input never appears. -->
+      <button type="button" id="user-avatar-btn" class="user-avatar-btn"
+              title="Your avatar — click to upload a new one" aria-label="Change your avatar">
+        <img id="user-avatar-img" class="user-avatar-img" alt="" decoding="async" hidden>
+        <svg id="user-avatar-mark" class="user-avatar-mark" viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="7.2" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M4.4 16.4a5.7 5.7 0 0 1 11.2 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <input type="file" id="user-avatar-input" accept="image/*" hidden>
     </footer>
   </aside>
 
   <main class="main">
-    <header class="chat-head">
-      <div class="chat-title-wrap">
-        <h1 id="chat-title" class="chat-title" title="Click to rename">—</h1>
+    <!-- The tab strip over the centre stage. The first tab is always the
+         conversation and cannot be closed; sub-agents and file editors add
+         their own after it. views/stage.js fills this and owns which pane is
+         showing. The conversation's own title lives on its tab, which is why
+         there is no chat header here any more: the chips and the archive
+         button moved into the chat pane's own toolbar below. -->
+    <nav id="stage-tabs" class="stage-tabs" aria-label="Open tabs"></nav>
+
+    <!-- The agent's avatar, parked out of flow. Every assistant row's byline
+         clones this, so the serve-time substitution happens once and the
+         transcript never has to know whether a picture is configured. -->
+    <template id="agent-avatar-template">
+      <span class="turn-avatar">
+        <!-- Same two-element trick as the brand: exactly one is shown, chosen
+             at serve time, so a broken URL can fall back to the mark at runtime
+             rather than to a broken-image glyph. -->
+        <img class="turn-img" src="{agent_avatar}" alt="" decoding="async" {agent_avatar_hidden}>
+        <svg class="turn-mark" viewBox="0 0 32 32" aria-hidden="true" {agent_mark_hidden}>
+          <circle cx="16" cy="16" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+          <circle cx="16" cy="16" r="3" fill="currentColor"/>
+        </svg>
+      </span>
+    </template>
+
+    <!-- Yours, likewise. No serve-time substitution: the picture lives in the
+         host KV store and arrives over the wire, so avatars.js fills in every
+         clone — including the ones already on screen — when it lands. -->
+    <template id="user-avatar-template">
+      <span class="turn-avatar is-user">
+        <img class="turn-img" alt="" decoding="async" hidden>
+        <svg class="turn-mark" viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="7" r="3.2" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M4.2 16.2a5.8 5.8 0 0 1 11.6 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+      </span>
+    </template>
+
+    <!-- The panes the tab strip switches between. Exactly one is visible; the
+         rest keep their DOM so a sub-agent's output and a half-typed file edit
+         survive being switched away from. views/stage.js hides and shows these
+         through the `hidden` attribute. -->
+    <div id="stage" class="stage">
+
+    <section id="pane-chat" class="stage-pane" data-pane="chat">
+      <!-- What used to sit in the chat header. It belongs to the conversation,
+           not to the stage, so it lives inside the conversation's own pane. -->
+      <div class="chat-bar">
         <span id="chat-sub" class="chat-sub"></span>
         <button id="chip-model" class="picker-btn chat-chip" title="Model for this conversation — open the catalogue" hidden></button>
         <button id="chip-branch" class="picker-btn chat-chip" title="This conversation's sandbox branch — open the Branch tab" hidden></button>
-      </div>
-      <div class="chat-actions">
+        <span class="chat-bar-gap"></span>
         <button id="chip-terminals" class="chip-quiet term-chip" title="Show the shells this conversation has open" hidden></button>
         <button id="chip-spend" class="chip-quiet" title="What this conversation has cost — open Usage" hidden></button>
         <button id="archive-chat" class="icon-btn" title="Archive this chat" aria-label="Archive this chat">
@@ -86,52 +144,65 @@
           </svg>
         </button>
       </div>
-    </header>
 
-    <div id="transcript" class="transcript" tabindex="0"></div>
+      <div id="transcript" class="transcript" tabindex="0"></div>
 
-    <div class="composer-wrap">
-      <form id="composer" class="composer" autocomplete="off">
-        <div id="attachments" class="attachments" hidden></div>
+      <div class="composer-wrap">
+        <form id="composer" class="composer" autocomplete="off">
+          <div id="attachments" class="attachments" hidden></div>
 
-        <!-- Substituted at serve time so the first paint already carries the
-             agent's name; drawLock in composer.js keeps it in step after that. -->
-        <textarea id="input" class="composer-input" rows="1"
-                  placeholder="Message {agent_name}…"
-                  aria-label="Message"></textarea>
-
-        <div class="composer-bar">
-          <div class="composer-tools">
-            <button type="button" id="attach" class="icon-btn sm" title="Attach an image" aria-label="Attach an image">
-              <svg viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M13.5 7.5 8.7 12.3a2 2 0 0 0 2.8 2.8l5.2-5.2a3.6 3.6 0 0 0-5-5L5.6 10a5.2 5.2 0 0 0 7.4 7.4l4.2-4.2"
-                      fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
-            <input type="file" id="file-input" accept="image/*" multiple hidden>
-
-            <div id="mode-picker" class="picker"></div>
-            <div id="model-picker" class="picker"></div>
-            <div id="revision-picker" class="picker"></div>
+          <!-- The input and its highlight mirror, stacked. The mirror sits
+               behind the textarea with identical font, padding and width so it
+               wraps the same way; its own glyphs are transparent and only the
+               @-mention rectangles show through, which leaves the caret,
+               selection and spellcheck native to the textarea.
+               views/mentions.js paints it, and also appends its suggestion
+               menu to this wrapper. -->
+          <div id="input-wrap" class="composer-field">
+            <div id="input-mirror" class="composer-mirror" aria-hidden="true"></div>
+            <!-- Substituted at serve time so the first paint already carries the
+                 agent's name; drawLock in composer.js keeps it in step after that. -->
+            <textarea id="input" class="composer-input" rows="1"
+                      placeholder="Message {agent_name}…"
+                      aria-label="Message"></textarea>
           </div>
 
-          <div class="composer-run">
-            <button type="button" id="stop" class="stop-btn" title="Stop the running turn" hidden>
-              <svg viewBox="0 0 20 20" aria-hidden="true">
-                <rect x="6" y="6" width="8" height="8" rx="1.5" fill="currentColor"/>
-              </svg>
-              <span>Stop</span>
-            </button>
-            <button id="send" type="submit" class="send-btn" title="Send" aria-label="Send">
-              <svg viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M4 10h11M10.5 5.5 15 10l-4.5 4.5" fill="none" stroke="currentColor"
-                      stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
+          <div class="composer-bar">
+            <div class="composer-tools">
+              <button type="button" id="attach" class="icon-btn sm" title="Attach an image" aria-label="Attach an image">
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M13.5 7.5 8.7 12.3a2 2 0 0 0 2.8 2.8l5.2-5.2a3.6 3.6 0 0 0-5-5L5.6 10a5.2 5.2 0 0 0 7.4 7.4l4.2-4.2"
+                        fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+              <input type="file" id="file-input" accept="image/*" multiple hidden>
+
+              <div id="mode-picker" class="picker"></div>
+              <div id="model-picker" class="picker"></div>
+              <div id="revision-picker" class="picker"></div>
+            </div>
+
+            <div class="composer-run">
+              <button type="button" id="stop" class="stop-btn" title="Stop the running turn" hidden>
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <rect x="6" y="6" width="8" height="8" rx="1.5" fill="currentColor"/>
+                </svg>
+                <span>Stop</span>
+              </button>
+              <button id="send" type="submit" class="send-btn" title="Send" aria-label="Send">
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M4 10h11M10.5 5.5 15 10l-4.5 4.5" fill="none" stroke="currentColor"
+                        stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
           </div>
-        </div>
-      </form>
-      <p class="composer-hint">Enter to send · Shift+Enter for a newline · sending mid-turn nudges the running turn</p>
+        </form>
+        <p class="composer-hint">Enter to send · Shift+Enter for a newline · @ to attach a workspace file · sending mid-turn nudges the running turn</p>
+      </div>
+    </section>
+
+      <!-- Sub-agent and file-editor panes are appended here by views/stage.js. -->
     </div>
 
     <!-- The terminal drawer: the shells this conversation's agent has open,

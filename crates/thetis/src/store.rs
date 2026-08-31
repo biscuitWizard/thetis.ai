@@ -11,6 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::branches::BranchRow;
+use crate::subagents::SubagentRow;
 use crate::bindings::types::{
     EventRecord, SessionEvent, SessionMeta, ToolCall, ToolOutcome, TurnStats, UserMsg,
 };
@@ -53,6 +54,13 @@ pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("
 const SKILL_VECTORS: TableDefinition<&str, &[u8]> = TableDefinition::new("skill_vectors");
 /// session id -> BranchRow (json): the sandbox branch backing a conversation
 const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
+/// child session id -> SubagentRow (json): a session spawned by another agent.
+///
+/// Parentage lives in its own table rather than as a field on `SessionMeta`,
+/// because `SessionMeta` is a WIT record shared with every guest and widening
+/// it breaks them at instantiation. A row here is also the authority on whether
+/// a session is a sub-agent at all, which is what the depth guard reads.
+const SUBAGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("subagents");
 
 /// The title a conversation starts with, and the only one auto-titling will
 /// overwrite.
@@ -90,6 +98,7 @@ impl Store {
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(SKILL_VECTORS)?;
             txn.open_table(BRANCHES)?;
+            txn.open_table(SUBAGENTS)?;
         }
         txn.commit()?;
 
@@ -228,12 +237,23 @@ impl Store {
         }
     }
 
+    /// Top-level conversations, most recently active first.
+    ///
+    /// A sub-agent has a session of its own but is not a conversation: it
+    /// belongs to the turn that spawned it and is shown nested inside its
+    /// parent's transcript. Listing it beside real conversations would fill the
+    /// sidebar with rows nobody started, so children are filtered out here —
+    /// one place, so every surface that lists sessions agrees.
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionMeta>> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(SESSIONS)?;
+        let children = txn.open_table(SUBAGENTS)?;
         let mut out = Vec::new();
         for row in t.iter()? {
-            let (_, v) = row?;
+            let (id, v) = row?;
+            if children.get(id.value())?.is_some() {
+                continue;
+            }
             let meta: SessionMeta = serde_json::from_slice(v.value())?;
             if include_archived || !meta.archived {
                 out.push(meta);
@@ -242,6 +262,79 @@ impl Store {
         // Most recently active first — the order the sidebar wants.
         out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
         Ok(out)
+    }
+
+    // --- sub-agents ---------------------------------------------------------
+
+    pub fn put_subagent(&self, row: &SubagentRow) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut t = txn.open_table(SUBAGENTS)?;
+            t.insert(row.child_id.as_str(), serde_json::to_vec(row)?.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_subagent(&self, child_id: &str) -> Result<Option<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        match t.get(child_id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every sub-agent spawned by one session, oldest first.
+    pub fn subagents_of(&self, parent_id: &str) -> Result<Vec<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (_, v) = entry?;
+            let row: SubagentRow = serde_json::from_slice(v.value())?;
+            if row.parent_id == parent_id {
+                out.push(row);
+            }
+        }
+        out.sort_by_key(|r| r.created_ms);
+        Ok(out)
+    }
+
+    /// Every sub-agent under one root conversation, whatever its depth.
+    pub fn subagents_under(&self, root_id: &str) -> Result<Vec<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (_, v) = entry?;
+            let row: SubagentRow = serde_json::from_slice(v.value())?;
+            if row.root_id == root_id {
+                out.push(row);
+            }
+        }
+        out.sort_by_key(|r| r.created_ms);
+        Ok(out)
+    }
+
+    /// Applies `f` to a sub-agent row in one transaction.
+    pub fn update_subagent<F>(&self, child_id: &str, f: F) -> Result<SubagentRow>
+    where
+        F: FnOnce(&mut SubagentRow),
+    {
+        let txn = self.db.begin_write()?;
+        let row = {
+            let mut t = txn.open_table(SUBAGENTS)?;
+            let mut row: SubagentRow = match t.get(child_id)? {
+                Some(v) => serde_json::from_slice(v.value())?,
+                None => return Err(anyhow!("no such sub-agent: {child_id}")),
+            };
+            f(&mut row);
+            t.insert(child_id, serde_json::to_vec(&row)?.as_slice())?;
+            row
+        };
+        txn.commit()?;
+        Ok(row)
     }
 
     fn update_meta<F>(&self, id: &str, f: F) -> Result<SessionMeta>
@@ -552,6 +645,37 @@ impl Store {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Writes `value` only if the key currently holds `expected`. Reports
+    /// whether it did.
+    ///
+    /// The read and the write share one write transaction, and redb serializes
+    /// those, so two callers racing on the same key cannot both win. That is
+    /// what lets a caller own a state transition rather than merely perform
+    /// one: a read-modify-write through [`Self::kv_get`] and [`Self::kv_put`]
+    /// lets both racers load the same state and both save a successor, and the
+    /// loser's write silently wins.
+    ///
+    /// An absent key and an empty value are the same `""`, because there is no
+    /// delete: clearing a key writes empty, and a caller that wants "create
+    /// only if nothing is there" must be able to say so.
+    pub fn kv_swap(&self, scope: &str, key: &str, expected: &str, value: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let swapped = {
+            let mut t = txn.open_table(KV)?;
+            let current = t.get((scope, key))?.map(|v| v.value().to_string());
+            if current.unwrap_or_default() == expected {
+                t.insert((scope, key), value)?;
+                true
+            } else {
+                false
+            }
+        };
+        // Committed either way: an abort would be equivalent here, but a commit
+        // keeps the failure path from depending on redb's rollback behaviour.
+        txn.commit()?;
+        Ok(swapped)
     }
 
     // --- spend accounting --------------------------------------------------
@@ -1277,6 +1401,84 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("g"));
         assert_eq!(store.kv_get("sess-1", "k").unwrap().as_deref(), Some("s"));
         assert_eq!(store.kv_get("other", "k").unwrap(), None);
+    }
+
+    #[test]
+    fn kv_swap_writes_only_when_the_current_value_matches() {
+        let (store, _d) = temp_store();
+        // An absent key reads as empty, which is how "create if nothing is
+        // there" is expressed — there is no delete, so empty and absent are one.
+        assert!(store.kv_swap("global", "k", "", "first").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("first"));
+
+        // The same claim a second time loses: this is what stops two readers of
+        // one ask_user call from both posting a form.
+        assert!(!store.kv_swap("global", "k", "", "second").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("first"));
+
+        // A transition from the value actually held succeeds.
+        assert!(store.kv_swap("global", "k", "first", "next").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("next"));
+        // And the same transition replayed does not, so a duplicated click
+        // cannot apply an answer twice.
+        assert!(!store.kv_swap("global", "k", "first", "next").unwrap());
+    }
+
+    #[test]
+    fn kv_swap_can_clear_a_key_and_only_the_first_caller_wins() {
+        let (store, _d) = temp_store();
+        store.kv_put("global", "form", "state").unwrap();
+        // Clearing through the swap is what makes "this click finished the form"
+        // observable by exactly one caller, and therefore what stops two
+        // callers from both submitting the answers.
+        assert!(store.kv_swap("global", "form", "state", "").unwrap());
+        assert!(!store.kv_swap("global", "form", "state", "").unwrap());
+        assert_eq!(store.kv_get("global", "form").unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn kv_swap_is_scoped_like_the_rest_of_the_table() {
+        let (store, _d) = temp_store();
+        assert!(store.kv_swap("global", "k", "", "g").unwrap());
+        // A different scope is a different key, so claiming in one does not
+        // block the other.
+        assert!(store.kv_swap("sess-1", "k", "", "s").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("g"));
+        assert_eq!(store.kv_get("sess-1", "k").unwrap().as_deref(), Some("s"));
+    }
+
+    /// The property the fix rests on: under real concurrency exactly one
+    /// claimant wins. A read-then-write through `kv_get`/`kv_put` would let
+    /// several threads all see empty and all write, which is the bug.
+    #[test]
+    fn concurrent_claims_on_one_key_produce_exactly_one_winner() {
+        let (store, _d) = temp_store();
+        let store = std::sync::Arc::new(store);
+        let wins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let wins = wins.clone();
+                std::thread::spawn(move || {
+                    if store
+                        .kv_swap("global", "call", "", &format!("form-{i}"))
+                        .unwrap()
+                    {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(
+            wins.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one claimant may win, or one question gets two forms"
+        );
     }
 
     #[test]

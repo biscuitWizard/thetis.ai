@@ -1,5 +1,11 @@
 //! Session events to wire frames.
 //!
+//! Sub-agent frames pass through here unchanged: a child's events render
+//! exactly as a parent's do, and the `agent` / `agent_label` / `agent_parent`
+//! tags that tell the transcript whose they are are added outside this module —
+//! natively in the worker for a live frame, and in `handlers::history` for a
+//! replay. Neither of those has anything this renderer needs to know about.
+//!
 //! Written out explicitly rather than derived from the WIT variant, so the
 //! protocol the browser sees stays readable and can evolve independently of the
 //! event schema. Each arm produces the `kind` the transcript view switches on.
@@ -40,6 +46,8 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
 
         SessionEvent::StreamDelta(chunk) => json!({ "kind": "delta", "text": chunk }),
 
+        SessionEvent::ReasoningDelta(chunk) => json!({ "kind": "reasoning", "text": chunk }),
+
         SessionEvent::ToolInvocation(call) => json!({
             "kind": "tool-call",
             "id": call.id,
@@ -47,6 +55,8 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "arguments": call.arguments_json,
         }),
 
+        // `name` on both arms is what lets the transcript special-case a tool
+        // whose call renders as a form rather than a row.
         SessionEvent::ToolResult(out) => json!({
             "kind": "tool-result",
             "id": out.call_id,
@@ -55,10 +65,6 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "content": out.content,
         }),
 
-        // `name` on both arms is what lets the transcript special-case a tool
-        // whose call renders as a form rather than a row.
-        // `name` on both arms is what lets the transcript special-case a tool
-        // whose call renders as a form rather than a row.
         SessionEvent::Nudge(text) => json!({ "kind": "nudge", "text": text }),
         SessionEvent::SystemNote(text) => json!({ "kind": "note", "text": text }),
         SessionEvent::Incident(text) => json!({ "kind": "incident", "text": text }),

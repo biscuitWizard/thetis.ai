@@ -276,11 +276,29 @@ pub async fn run(
     let runtime = Runtime::new(cfg.clone())?;
     let grip = Grip::worker(cfg.clone(), runtime, peer.clone())?;
 
+    // Before a single aspect is built: does this checkout's WIT agree with the
+    // kernel that has to load what it produces? A branch that has not merged a
+    // trunk WIT change builds guests wasmtime will refuse, and no later gate
+    // can recover from it — the smoke test rejects the artifact and the green
+    // fallback searches the same stale branch. Settling it here, by merging
+    // trunk, is what keeps that from becoming an unloadable worker.
+    let contract = pipeline::reconcile_wit_contract(&grip).await;
+    contract.report();
+
     // Bring every aspect up. An aspect that will not start leaves the rest
     // running; the gateway's /admin stays available for a manual rollback.
     for aspect in pipeline::discover_aspects(&grip.cfg) {
         if let Err(e) = bring_up(&grip, &aspect).await {
-            tracing::error!(%aspect, error = %e, "aspect failed to start");
+            match contract.is_sound() {
+                true => tracing::error!(%aspect, error = %e, "aspect failed to start"),
+                // Not a fault in this aspect's source: nothing built in this
+                // checkout can load until the contract is settled.
+                false => tracing::error!(
+                    %aspect, error = %e,
+                    "aspect failed to start, and this checkout's WIT contract does not match \
+                     the kernel — that is the cause, not this aspect's source"
+                ),
+            }
         }
     }
 
@@ -355,6 +373,31 @@ fn spawn_orphan_watch() {
     });
 }
 
+/// Stamps parentage onto an already-rendered frame.
+///
+/// Done here rather than in the gateway guest deliberately. The guest renders
+/// one `session-event` at a time and has no way to ask whose child a session is
+/// — the contract does not tell it, and widening `outbound-event` to carry
+/// parentage would change a record every guest is matched against at
+/// instantiation. Adding two fields to the JSON afterwards is additive on the
+/// wire, so an older UI ignores them and a newer one nests.
+///
+/// `agent` is the routing key the frame *came* from, so the UI can group
+/// several children's interleaved frames correctly even though they all arrive
+/// addressed to the parent.
+fn tag_frame(frame: String, tag: &crate::delegation::ChildTag) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(&frame) else {
+        return frame;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return frame;
+    };
+    obj.insert("agent".into(), json!(tag.child_id));
+    obj.insert("agent_label".into(), json!(tag.label));
+    obj.insert("agent_parent".into(), json!(tag.parent_id));
+    serde_json::to_string(&value).unwrap_or(frame)
+}
+
 fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
     tokio::spawn(async move {
         let mut events = grip.events_tx.subscribe();
@@ -368,8 +411,20 @@ fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
                         peer.notify("event", raw).await;
                     }
                     let session_id = event.session_id.clone();
+                    // A sub-agent's events are rendered exactly like anyone
+                    // else's — it is a session and the gateway guest need not
+                    // know it is a child — and then re-addressed to the
+                    // conversation the user is actually watching, carrying the
+                    // parentage the UI nests them under. Delivering them to the
+                    // child's own id instead would put every sub-agent's work
+                    // somewhere nobody has open.
+                    let tag = crate::delegation::frame_tag(&grip, &session_id).await;
                     if let Some(frame) = renderer.render(event).await {
-                        peer.notify("frame", json!({ "session": session_id, "frame": frame }))
+                        let (route, frame) = match &tag {
+                            Some(tag) => (tag.root_id.clone(), tag_frame(frame, tag)),
+                            None => (session_id, frame),
+                        };
+                        peer.notify("frame", json!({ "session": route, "frame": frame }))
                             .await;
                     }
                 }

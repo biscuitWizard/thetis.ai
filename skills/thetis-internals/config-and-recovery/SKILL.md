@@ -1,11 +1,11 @@
 ---
 name = "Configuration, restart and recovery"
-brief = "The three config layers, which settings need a restart, modes and models, prompt caching, and the safety nets that make a bad change recoverable."
-when_to_use = "Use when you must change a setting, add a mode or model, understand why a change did not take effect, restart this conversation's runtime, or recover from a bad change: the validation gate, the epoch watchdog, the circuit breaker, branch resets and /admin. Not for the step-by-step procedure of editing code, which is in careful-surgery."
+brief = "The three config layers, which settings need a restart, modes, models and providers, prompt caching, and the safety nets that make a bad change recoverable."
+when_to_use = "Use when you must change a setting, add a mode/model/provider, understand why a change did not take effect, restart this conversation's runtime, or recover from a bad change. Not for the step-by-step procedure of editing code, which is careful-surgery."
 universal = false
-tags = ["config", "thetis.toml", "restart", "rollback", "branch", "watchdog", "recovery", "modes", "prompt cache", "admin", "tool-group:config", "tool-group:branch", "tool-group:selfmod"]
+tags = ["config", "thetis.toml", "restart", "rollback", "branch", "watchdog", "recovery", "modes", "models", "providers", "openrouter", "llama.cpp", "vllm", "local model", "prompt cache", "admin", "validation gate", "epoch watchdog", "circuit breaker", "branch resets", "tool-group:config", "tool-group:branch", "tool-group:selfmod"]
 related = ["careful-surgery"]
-version = 2
+version = 5
 ---
 
 # Configuration, restart and recovery
@@ -68,6 +68,94 @@ instead. That is what the `prompt` field is for.
 
 A **model** is a per-conversation override, chosen from `[[models]]` or
 `THETIS_MODELS`. Empty means the grip default.
+
+## Providers
+
+Thetis speaks to any number of OpenAI-compatible endpoints: OpenRouter, a local
+llama.cpp or vLLM server, a company gateway. `[llm]` is *always* registered as a
+provider under the id `openrouter`, so `[[providers]]` is purely additive and a
+config that lists none behaves as it always did. An entry whose id **is**
+`openrouter` replaces that synthesized one rather than sitting unreachable
+behind it.
+
+`Config::resolve_model` decides which endpoint serves a request, in this order:
+
+1. a matching `[[models]]` entry that names a `provider`;
+2. a provider-id prefix on the model id — `local/qwen3` reaches the provider
+   called `local` asking for `qwen3`, with no `[[models]]` entry needed;
+3. `llm.provider`, defaulting to `openrouter`.
+
+A prefix that is not a configured provider id is left alone, so an OpenRouter id
+like `anthropic/claude-opus-5` is never mistaken for routing. Do not give a
+provider the same id as an OpenRouter vendor.
+
+`wire_model` on a `[[models]]` entry separates the id Thetis uses everywhere —
+picker, session record, `THETIS_MODEL` — from the name the endpoint knows the
+model by. A local server usually wants a bare name where the picker wants
+something namespaced.
+
+### Scaling a provider
+
+A provider takes either `base_url` (one endpoint) or `base_urls` (several
+interchangeable ones, normalized to the same list internally — `base_url()`
+returns the first). Requests rotate over the list via a process-wide counter,
+and **each retry advances to the next endpoint**, so a dead or overloaded
+replica is stepped over rather than retried in place.
+
+The entries must serve the same model: this is replication, not model routing.
+Scaling this way leaves every model id unchanged, which is the point — capacity
+is not a picker concern. Note that one `llama-server --parallel N` already
+serves N concurrent slots on a single port, so `base_urls` is for separate
+processes or machines.
+
+Two behaviours worth knowing:
+
+- **No key means no header.** A provider with no `api_key` sends no
+  `Authorization` at all, because an empty bearer token is rejected outright by
+  some servers. Only an OpenRouter-hosted provider fails fast on a missing key.
+  `api_key = "env:NAME"` reads it from the environment, and an unset variable
+  leaves the provider unauthenticated rather than failing.
+- **Errors name the provider.** A provider error detail is prefixed `[<id>]`,
+  because "404 model not found" reads very differently against a local server
+  than against OpenRouter.
+
+Embeddings route the same way, either by the id in `skills.embedding_model` or
+by naming `skills.embedding_provider` outright.
+
+### Timeouts are about silence, not length
+
+`llm.request_timeout_secs` is a **read** timeout for a streaming completion: it
+resets whenever bytes arrive, so a slow local model may generate for as long as
+it likes provided it keeps sending, and only a genuine stall trips it. For a
+non-streaming call it is the total deadline for the whole request.
+
+Do not "simplify" this back to reqwest's `ClientBuilder::timeout`. That is a
+deadline on the whole request *including the body*, which for a stream is a cap
+on total generation time — it severs a long answer mid-body, and the user sees
+`transport error: error decoding response body`. A test in `llm.rs` drives a
+real socket that trickles past the timeout and fails if this regresses.
+
+### A broken stream keeps what arrived
+
+Once response headers are in, a mid-body failure is not treated as a failed
+turn. `SsePump::abort` checks whether anything usable arrived — answer text
+already shown, or accumulated tool calls — and if so closes the stream as
+`Finished` with reason `error` rather than as `Err`. The user keeps the partial
+answer, completed tool calls still run, and the transcript stays true.
+
+Tool calls whose accumulated arguments are not valid JSON on their own are
+dropped, because dispatching half-parsed arguments is worse than dropping the
+call. Reasoning does not count as salvageable: it is never persisted, so a break
+during the thinking phase still surfaces as an error. With nothing to salvage
+the error propagates unchanged, since hiding it behind an empty `Finished` would
+turn a failure into a silent no-op.
+
+A model or `llm.provider` naming a provider that does not exist is rejected at
+startup — otherwise the mistake surfaces as a confusing 404 mid-conversation.
+
+**A local model must support tool calling.** Thetis is useless without it.
+llama.cpp's server needs `--jinja` or it does not apply the model's chat
+template and no tool call is ever produced.
 
 ## Prompt caching
 
@@ -184,6 +272,8 @@ usable locally, and the publish machinery filters them from anything pushed.
 | Symptom | Cause | Action |
 |---|---|---|
 | A setting change did nothing | Configuration is read at startup | `restart_orchestrator`. |
+| `transport error: error decoding response body` | A stream was cut off mid-body. Usually the timeout shape; otherwise the server or a proxy dropped the connection. | Check `llm.rs` still uses `read_timeout`, not `timeout`. The message now carries reqwest's source chain, so read past the first clause. |
+| A long answer stops part-way and the turn ends with reason `error` | A mid-stream break that was salvaged rather than failed | Expected behaviour, not a bug. The endpoint dropped the connection; check the server's own log. |
 | `set_config` was refused | The result would not load | Read the message. Fix the value. |
 | A build succeeded but the aspect still traps | The failure is at instantiation, not at compile time. Usually a contract mismatch. | `reset_branch`, then read `careful-surgery/contract-changes`. |
 | A component reset by itself | The circuit breaker fired | Read the incident in the conversation. Find the trap before you try the change again. |

@@ -4,7 +4,7 @@ brief = "How the Discord bot connector works, and why its read-only guarantee re
 when_to_use = "Use when changing the Discord connector, adding another messaging surface (Slack, Telegram), or reasoning about what a chat surface is allowed to do. Also read it before exposing any new command over chat, because some commands would break the safety property."
 tags = ["discord", "gateway", "security", "modes", "kernel", "tool-group:selfmod", "tool-group:config"]
 children = "auto"
-version = 3
+version = 4
 ---
 
 # Discord connector
@@ -70,10 +70,35 @@ stale entry in the picker. Details that matter:
   picker. Say the propagation delay out loud — otherwise it reads as a bug.
 - **Register once per process, not per reconnect.** A reconnect does not clear
   commands, and the endpoint is globally rate-limited.
-- **Do not name `integration_types` or `contexts`.** Omitted, each command
-  inherits the application's configured installation contexts. Asking for the
-  user-install context on an app that only has guild install makes Discord
-  answer "Unknown integration" and fails the whole registration.
+- **Always name `integration_types` and `contexts`.** This is the opposite of
+  what this file said until a `/help` that had never worked was traced to it,
+  and it is the whole reason slash commands can be registered yet unusable.
+  Omitting them does *not* inherit the application's contexts: Discord stores
+  `contexts: null`, which is not the documented "all contexts" default but a
+  limbo state the client's picker never offers. The registration returns 200,
+  `GET /applications/{app}/commands` lists all of them, the journal logs a
+  cheerful count — and typing `/` in a guild shows nothing, so no
+  `INTERACTION_CREATE` is ever sent and no error appears anywhere. Discord's own
+  tracker carries this as discord-api-docs #7108, #6744 and #7396; the fixes
+  applied to newly created commands and never backfilled existing ones.
+  Send `"integration_types": [0]` (guild install) and `"contexts": [0, 1]`
+  (guild, bot DM). Verified live: Discord echoes both fields back on all eight.
+  - **`[0]`, not `[0, 1]`, for `integration_types`** — deliberately. User
+    install would let this privileged agent be invoked in any server or DM the
+    installing user can reach, outside the channel authorization in `policy.rs`.
+  - **Context 2 (private channel) is not requested,** for the same reason, and a
+    test pins that.
+  - The "Unknown integration" failure that motivated the old advice happens only
+    when a command asks for an installation context the *application* does not
+    have enabled. Guild install is always available, so naming `[0]` is safe.
+  - **The guild-scoped endpoint stores `contexts: null` no matter what you
+    send.** Proven live against both guilds. It is moot under the global-only
+    design, but do not use guild scope to work around a contexts problem.
+  - **A 200 is not evidence of success here.** `api::register_commands`
+    therefore inspects the response, warns naming any command that came back
+    without contexts, and returns only the count of *usable* ones, so an
+    all-limbo registration logs an error instead of "registered 8 commands".
+    `commands_without_contexts` is pure and unit-tested on that exact shape.
 - **The bot needs the `applications.commands` OAuth scope** in its invite URL. It
   comes free with the `bot` scope, so an ordinary invite already has it, but a
   bot invited with a hand-built URL may not.
@@ -111,7 +136,7 @@ interaction type, and the parsers are disjoint so a payload can never match both
 Types 3 and 5 exist to serve the `ask_user` question flow — buttons, select
 menus and modals. The same re-authorization rule applies to them and matters
 more, because a component sits in a channel where anyone can click it: see
-`asking-the-user` for that flow and its invariants.
+[asking-the-user](skill:asking-the-user) for that flow and its invariants.
 
 ## Archiving is the cross-surface "start over"
 
@@ -135,8 +160,76 @@ the end-to-end behaviour. Reverting `may_reuse_session` to `existing.is_some()`
 makes those integration tests fail with the same id on both sides of the
 assertion, which is what the bug looked like.
 
+## Streaming a reply: two pieces, not one
+
+`stream_reply` in `mod.rs` keeps **`settled`** (the text of assistant steps that
+have finished) apart from **`buffer`** (the current step's deltas), and `visible()`
+joins them for every write. That split is forced by the events disagreeing about
+what they carry:
+
+| Event | Means |
+|---|---|
+| `StreamDelta` | *append* this fragment to the step in flight |
+| `AssistantMessage` | the step's **whole** final text |
+
+Held in one string, `AssistantMessage` overwrites everything the deltas built, so
+a turn that narrates, calls a tool, then narrates again loses its opening
+paragraph from the channel. Only the *last* step would survive.
+
+Two rules keep the message honest on a long turn:
+
+- **Flush when a step ends,** in the `AssistantMessage` arm, not only on the
+  interval and at `TurnFinished`. Deltas flush on a timer, so the text arriving
+  between the last tick and the model turning to a tool call is still unsent —
+  and a turn that then spends ten minutes in tools leaves a **half-finished
+  sentence** on screen for all of it. That is what "streaming broke" looks like
+  from the outside, and it needs no error to happen. The step's text is final, so
+  there is nothing to wait for; the interval still bounds the streaming case, so
+  it costs at most one extra edit per step.
+- **Text already said is never replaced by a progress note** — but it must still
+  be *joined* by one. The message has three parts, not two, and the third is the
+  only retractable one:
+
+  | Part | Meaning | Retracted? |
+  |---|---|---|
+  | `settled` | steps that have finished | never |
+  | `buffer` | the step in flight, appended by deltas | folded into `settled` |
+  | `activity` | the tool now running, as a trailing `_… name_` | yes, always |
+
+  `compose(settled, buffer, activity)` renders the three; `visible()` renders the
+  first two and is what `TurnFinished` and `Incident` use, which is how a
+  finished reply never ends on a stale `_… web_search_`.
+
+  Showing the note **only when nothing had been said yet** was a real bug, not a
+  safe conservatism. After the first sentence every tool call became invisible,
+  so a turn that spoke one line and then worked for eighteen minutes left that
+  line frozen with no edits, no typing indicator and no error. Measured live: one
+  message, 146 characters, three sentences, a single edit in eighteen minutes.
+  Clear `activity` on `StreamDelta`, `AssistantMessage`, `Incident` and the
+  `ask_user` arm — anywhere real text supersedes it.
+
+- **Typing must be driven by an interval owned outside the `select!`,** never a
+  `sleep` arm inside it. A future built in a `select!` arm is recreated on every
+  iteration, so each event resets it; during a busy turn events arrive every two
+  or three seconds and an 8s `sleep` therefore *never* elapses — the indicator
+  starves exactly when it is wanted and only appears when idle. A standalone
+  probe scores this 0 firings against 2 for `tokio::time::interval`. Call
+  `tick()` once before the loop, since the first tick resolves immediately.
+
+`Incident` appends to `settled` and clears `buffer` for the same reason: it
+belongs to no step, so the next `AssistantMessage` must not overwrite it.
+
+`visible()` is pure and unit-tested (`discord::tests`), which is the only part of
+the streaming path testable without a token — the edit cadence is not.
+
 ## Things learned the hard way
 
+- **A stalled-looking reply is usually not a transport fault.** A truncated
+  message that never updates means unflushed buffer plus a turn still working,
+  not a broken socket. Check whether the worker is still burning tokens
+  (`journalctl -u thetis | grep "token usage"`) before touching the stream code:
+  a live worker and no `could not edit a Discord reply` warning rules out the
+  edit path entirely.
 - **Fatal close codes must not be retried.** 4004 (bad token) and 4013/4014
   (missing privileged intents) never succeed, and reconnecting in a loop is how
   an address gets rate-limited. `api::is_fatal_close` stops the connector and
@@ -157,6 +250,61 @@ assertion, which is what the bug looked like.
 - **Heartbeat shares the read task** via `select!`, because the socket is not
   `Sync` and a mutex between two tasks would be worse. A message is handled on
   its own spawned task, since a turn far outlasts the heartbeat interval.
+
+## A reply is several messages, and the split is stateful
+
+Discord rejects a body over 2000 characters. Meeting that by truncating throws
+away the **start** of every long answer, which is where the reasoning is — the
+symptom is a reply beginning `… (truncated)`. `split::paginate` lays a long reply
+out across as many messages as it needs; `api::truncate` survives only as a
+backstop for callers that do not paginate, such as ephemeral command replies.
+
+Three properties make it work, and each is load-bearing:
+
+- **Markup state crosses the break.** A page that ends inside a fenced block
+  must close the fence and the next must reopen it *with the same info string*,
+  or Discord renders the continuation as prose — and an unclosed fence swallows
+  the rest of its own message. Same for an odd inline backtick. `Pager` carries
+  `open: Option<String>` and `inline: bool` for exactly this.
+- **Pagination is prefix-stable.** Pages are packed greedily from the start, so
+  appending text can only change the *last* page. This is what lets a streaming
+  reply repaginate on every tick without rewriting messages the reader has
+  already scrolled past. Break it and every tick edits every message.
+- **`split::plan` diffs pages against what was sent** and emits only
+  `Edit`/`Send`/`Delete` for what actually differs, deletes descending so
+  earlier indices stay valid. A `Send` failure must stop the loop — posting page
+  N+1 after N failed shows the answer out of order with an invisible hole.
+
+Do **not** "repair" unbalanced markup in a reply that fits in one message. Mid-
+stream text is legitimately unbalanced and resolves itself as more arrives;
+normalising it makes fences flicker on every tick. Balance is a property of pages
+*this splitter created*, not of the model's text.
+
+## Reading the channel is the fastest diagnosis
+
+A stalled reply is diagnosed in one call, not by reasoning about the code. Fetch
+the channel with the bot's own token (see
+[live-probing](skill:discord-connector/live-probing)) and look at
+`edited_timestamp` and `len` on the bot's message:
+
+- **Sent, one edit, hours old, short** → the loop is alive but suppressing
+  updates. A content bug, as above.
+- **Sent, never edited** → `flush` is failing; check for `could not edit a
+  Discord reply` warnings.
+- **Never sent** → the events are not reaching `stream_reply`; check the
+  `session_id` filter and the worker's `event` forwarding.
+
+The message body itself tells you which arm ran: three short sentences and no
+progress notes means `AssistantMessage` fired three times and every
+`ToolInvocation` was dropped.
+
+Verify the pagination against the real API, not just as strings — a 2000-char
+body is refused with a 400 and the reply disappears with only a log line. The
+`#[ignore]`d `dump_pages_for_a_live_probe` in `split.rs` writes the real
+paginator's output to `/tmp/pages.json`, and `/workspace/zero-discord-probe`
+posts it, edits the tail as a delta would, reads it back and deletes it. Six
+pages of 1951–1991 chars: every `POST 200`, the tail `PATCH 200`, every page read
+back balanced. That is the evidence to cite, not the unit tests alone.
 
 ## Testing without a token
 
@@ -183,9 +331,20 @@ curl -X POST -H 'Content-Type: application/json' -d '{"type":4,"data":{}}' \
 `401` on the first proves the path is right and only the credential is wrong.
 `404 Unknown interaction` rather than `401` on the second is the evidence that
 the callback wants no Authorization header. `cargo test -p thetis --test
-discord_schema -- --nocapture` prints the exact registration payload. Everything past authentication — streaming edit cadence, `/pair`
-round trip, threads — is unproven until a real token exists. Say so rather than
-implying it works.
+discord_schema -- --nocapture` prints the exact registration payload.
+
+But do not stop there and call the rest unverifiable: **the token is on this
+box**, so what the command set actually looks like to Discord is one call away.
+See [live-probing](skill:discord-connector/live-probing). The check that
+matters after touching
+`schema()` is `GET /applications/{app}/commands` with the real token, reading
+`contexts` and `integration_types` off every entry — that is the only thing that
+distinguishes a registration Discord accepted from one a user can invoke, and it
+is what the 200 hides. What genuinely needs a human at a client is the last hop:
+that typing `/help` in a guild produces an `INTERACTION_CREATE`. Its absence in
+the journal (`grep -iE "refused a slash command|failed to handle a Discord slash
+command"` finding nothing over days, while ordinary chat worked) is what proved
+the commands were never reaching the handler in the first place.
 
 ## Kernel builds
 
