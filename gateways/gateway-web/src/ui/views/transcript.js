@@ -29,6 +29,7 @@ import * as stage from "./stage.js";
 
 /** The tool whose call renders as a form instead of a tool row. */
 const ASK_TOOL = "ask_user";
+const TODO_TOOLS = new Set(["todo_write", "todo_add", "todo_update", "todo_read"]);
 
 let root = null; // the scroll container
 // Where rows are appended. Normally `root`, but a sub-agent's frames go into
@@ -836,6 +837,23 @@ const RENDERERS = {
     // The form stands in for the tool row entirely. Showing both would put the
     // same questions on screen twice, once as JSON.
     if (ev.name === ASK_TOOL && askRow(ev)) return;
+    if (TODO_TOOLS.has(ev.name)) {
+      let args = {};
+      try { args = JSON.parse(ev.arguments || "{}"); } catch {}
+      let text = "todos: read current list";
+      if (ev.name === "todo_write") text = `todos: ${(args.todos || []).length} items planned`;
+      if (ev.name === "todo_add") {
+        const names = (args.todos || []).map((item) => `'${cut(item.content, 50)}'`).join(", ");
+        text = `todos: added ${names || "items"}`;
+      }
+      if (ev.name === "todo_update") {
+        const updates = args.updates || [];
+        const verbs = { in_progress: "started", completed: "completed", cancelled: "cancelled", pending: "reopened" };
+        text = `todos: ${updates.map((u) => `${verbs[u.status] || "updated"} ${u.id || `#${u.index}`}`).join(", ") || "updated"}`;
+      }
+      meta(text);
+      return;
+    }
     open.set(ev.id, toolRow(ev));
   },
 
@@ -843,6 +861,7 @@ const RENDERERS = {
     // The result of an ask is only the note telling the model to stop and wait.
     // The form above says all of that to the reader already.
     if (ev.name === ASK_TOOL && !open.has(ev.id)) return;
+    if (TODO_TOOLS.has(ev.name) && !open.has(ev.id)) return;
     completeToolRow(ev);
   },
 

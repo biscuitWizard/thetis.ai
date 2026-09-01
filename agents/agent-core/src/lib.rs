@@ -29,8 +29,13 @@ use serde_json::{json, Value};
 mod compaction;
 mod groups;
 mod plan;
+mod todos;
 mod tools;
 mod workspace;
+
+// A reminder must be bounded: an agent that cannot or will not finish a list
+// must still be able to end its turn rather than spin forever.
+const MAX_TODO_NUDGES: u32 = 2;
 
 struct Component;
 
@@ -112,6 +117,11 @@ struct Turn {
     /// Whether the user has stopped this turn. Sticky: a stop stays stopped
     /// however many further checkpoints the loop passes through.
     cancelled: bool,
+    /// Bounded automatic reminders issued after a clean STOP with open work.
+    /// Sub-agents use the same loop and their own KV scope, so they get the same
+    /// protection without sharing their parent's list.
+    todo_nudges: u32,
+    todo_fingerprint: String,
 }
 
 impl Turn {
@@ -148,6 +158,8 @@ impl Turn {
             pending: Vec::new(),
             compaction_backoff_until: 0,
             cancelled: false,
+            todo_nudges: 0,
+            todo_fingerprint: String::new(),
         }
     }
 
@@ -239,6 +251,22 @@ impl Turn {
                 // an answer later than the user expects.
                 match interrupted.or(self.flush_pending()) {
                     Interrupt::None => {
+                        if let Some((text, fingerprint)) = todos::stop_nudge(
+                            &self.session_id,
+                            self.todo_nudges,
+                            &self.todo_fingerprint,
+                            MAX_TODO_NUDGES,
+                        ) {
+                            let seq = self.note(&text);
+                            self.push(
+                                json!({ "role": "user", "content": format!("[system note] {text}") }),
+                                seq,
+                            );
+                            self.todo_nudges += 1;
+                            self.todo_fingerprint = fingerprint;
+                            sys::log(LogLevel::Info, &format!("todo stop-nudge {} of {MAX_TODO_NUDGES}", self.todo_nudges));
+                            continue;
+                        }
                         self.stopped_by = "stop";
                         break;
                     }
@@ -1043,8 +1071,8 @@ impl Turn {
             .saturating_add(compaction::estimate(&self.messages[billed_to..]))
     }
 
-    fn note(&self, text: &str) {
-        host::append(&self.session_id, &SessionEvent::SystemNote(text.to_string()));
+    fn note(&self, text: &str) -> u64 {
+        host::append(&self.session_id, &SessionEvent::SystemNote(text.to_string()))
     }
 }
 

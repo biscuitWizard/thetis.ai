@@ -166,11 +166,10 @@ pub fn all() -> &'static [ToolGroup] {
             // of session that cannot sleep, despite being the kind most often
             // handed a long build to babysit.
             //
-            // The `plan_*` tools live here for the same reason `remember` does:
-            // a plan is this conversation's own artefact, and Plan mode — whose
-            // whole output is a plan — must never find them missing. They are
-            // also what Agent mode ticks off while executing, so there is no
-            // task shape that should scope them away.
+            // The plan and todo tools live here for the same reason `remember`
+            // does: they are conversation-local artefacts. Plan mode must be
+            // able to write them, and the stop-nudge reads todos regardless of
+            // task shape, so neither family may be scoped away.
             members: &[
                 "remember",
                 "recall",
@@ -181,6 +180,10 @@ pub fn all() -> &'static [ToolGroup] {
                 "plan_edit",
                 "plan_append",
                 "plan_read",
+                "todo_write",
+                "todo_add",
+                "todo_update",
+                "todo_read",
             ],
         },
         ToolGroup {
