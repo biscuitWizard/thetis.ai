@@ -30,6 +30,9 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/lib/socket.js", mime: JS, body: include_str!("ui/lib/socket.js") },
     Asset { path: "/lib/store.js", mime: JS, body: include_str!("ui/lib/store.js") },
     Asset { path: "/lib/markdown.js", mime: JS, body: include_str!("ui/lib/markdown.js") },
+    // Mermaid diagrams from a ```mermaid fence. Separate from markdown.js
+    // because it is async and owns the vendored library's lifecycle.
+    Asset { path: "/lib/mermaid.js", mime: JS, body: include_str!("ui/lib/mermaid.js") },
     Asset { path: "/lib/toast.js", mime: JS, body: include_str!("ui/lib/toast.js") },
     Asset { path: "/views/sessions.js", mime: JS, body: include_str!("ui/views/sessions.js") },
     Asset { path: "/views/transcript.js", mime: JS, body: include_str!("ui/views/transcript.js") },
@@ -42,6 +45,7 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/views/branch.js", mime: JS, body: include_str!("ui/views/branch.js") },
     Asset { path: "/views/workspace.js", mime: JS, body: include_str!("ui/views/workspace.js") },
     Asset { path: "/views/rail.js", mime: JS, body: include_str!("ui/views/rail.js") },
+    Asset { path: "/views/todo.js", mime: JS, body: include_str!("ui/views/todo.js") },
     // The centre stage's tab strip: the conversation first and always, then a
     // tab per sub-agent and per open file. Owns which pane is showing, the
     // conversation's title and rename, and the file editors.
@@ -76,6 +80,13 @@ pub const ASSETS: &[Asset] = &[
         mime: JS,
         body: include_str!("ui/vendor/xterm-addon-fit.js"),
     },
+    // mermaid 11.17.2, vendored — the second exception to "no dependencies",
+    // approved for the same reason as xterm: diagram layout is a pile of graph
+    // algorithms not worth reimplementing. lib/mermaid.js builds this URL
+    // relative to its own module URL so it resolves under /preview/<session>/,
+    // and loads it only when a diagram actually appears — it is 3.5 MB, which
+    // is most of this guest's size and must not be on the startup path.
+    Asset { path: "/vendor/mermaid.js", mime: JS, body: include_str!("ui/vendor/mermaid.js") },
 ];
 
 /// Looks an asset up by request path. Linear over a table of a couple of dozen
