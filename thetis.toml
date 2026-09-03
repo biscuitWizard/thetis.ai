@@ -15,6 +15,36 @@ primary_gateway = "web"
 # The host-rendered recovery console. Keep it on: it is the control surface
 # that still works when every WebAssembly guest is broken.
 admin_enabled = true
+# Required when auth.mode = "users" and bind is not loopback. TLS belongs at
+# a reverse proxy; Thetis does not trust X-Forwarded-* headers.
+# public_origin = "https://thetis.example.com"
+
+[auth]
+# "local" preserves the single implicit administrator and loopback-only access.
+# "users" requires [[roles]] and [[users]] (put password hashes in
+# thetis.local.toml; generate one with `thetis hash-password --stdin`).
+mode = "local"
+session_ttl_hours = 720
+lockout_after = 5
+lockout_secs = 60
+# In users mode these must name a configured user and role respectively.
+claim_unowned = ""
+discord_role = ""
+
+# Example role and user (normally place the user in thetis.local.toml):
+# [[roles]]
+# id = "admin"
+# admin = true
+#
+# [[users]]
+# id = "alice"
+# name = "Alice"
+# role = "admin"
+# password_hash = "$argon2id$..."
+#
+# Capability denials are hard host boundaries. `deny_tools` is hard for
+# component tools but only advisory for agent-internal built-ins; deny the
+# corresponding capability to make that restriction authoritative.
 
 [paths]
 # All relative paths are resolved against the project root (the directory

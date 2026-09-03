@@ -85,6 +85,35 @@ fn read_only(mode: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this account's policy denies a built-in or hot-loaded tool by name.
+///
+/// This is the *soft* half of tool-name denial: `deny_tools` lives in the
+/// host's account policy and is surfaced here as a comma-joined config value,
+/// the same way every other per-account answer reaches the agent
+/// (`devkit_available`, `read_only`, and so on). It is soft because agent-core
+/// is exactly the component a conversation running on its own branch can
+/// rewrite — the hard boundary for anything that matters is the host import
+/// underneath the tool, gated by the account's policy on the far side of the
+/// WIT contract. Denying `terminal_run` here while `terminal::open` stays
+/// reachable would be no denial at all, so this is meant only for tools whose
+/// underlying capability is not otherwise deniable at that granularity (a
+/// single built-in inside an available capability, e.g. `delete_path` but not
+/// the rest of the filesystem tools).
+///
+/// A pattern ending in `*` matches by prefix; anything else must match the
+/// whole name. Empty or absent config denies nothing, which is the same as
+/// today for every account until a deployment sets `deny_tools`.
+fn policy_denies(name: &str) -> bool {
+    let raw = sys::config_get("policy_deny_tools").unwrap_or_default();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .any(|pat| match pat.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == pat,
+        })
+}
+
 /// Whether a tool name changes something outside the conversation.
 ///
 /// Built-ins are checked against their own declarations; anything else is a
@@ -869,6 +898,10 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     if read_only(mode) {
         tools.retain(|t| !t.mutating);
     }
+
+    // Soft, per-account tool-name denial. See `policy_denies` for why this is
+    // never the hard boundary.
+    tools.retain(|t| !policy_denies(t.name));
 
     tools
 }
@@ -1688,6 +1721,9 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
             continue;
         }
+        if policy_denies(&manifest.name) {
+            continue;
+        }
         manifest.capabilities.push("component".to_string());
         out.push(manifest);
     }
@@ -1729,6 +1765,9 @@ pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
 
     for manifest in tooling::registry() {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
+            continue;
+        }
+        if policy_denies(&manifest.name) {
             continue;
         }
         // The manifest is already in hand, so its group is read from it rather
@@ -1776,6 +1815,15 @@ pub fn invoke(
     if read_only(mode) && is_mutating(name) {
         return Err(format!(
             "'{name}' changes things, and this conversation is in {mode} mode. Switch to agent mode to run it."
+        ));
+    }
+
+    // Soft, per-account denial, checked at the same place the mode is: a model
+    // that already knows the tool's name must still be refused here, not only
+    // withheld from the definitions it is offered.
+    if policy_denies(name) {
+        return Err(format!(
+            "'{name}' is not available to this account."
         ));
     }
 
@@ -4162,6 +4210,57 @@ mod delegation_tests {
 /// they are assembled from are pure, so the invariant can be checked against
 /// those — which is also where it breaks, since the failure mode is a tool
 /// defined inline in `available` rather than in a named function.
+/// `policy_denies` reads `sys::config_get`, a host import that does not exist
+/// outside wasm, so it cannot be exercised directly from a native test the way
+/// the rest of this module's pure helpers are. What is tested here instead is
+/// the pattern-matching rule in isolation, factored out so a native test can
+/// call it without touching the host.
+#[cfg(test)]
+fn pattern_denies(patterns: &str, name: &str) -> bool {
+    patterns
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .any(|pat| match pat.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == pat,
+        })
+}
+
+#[cfg(test)]
+mod policy_denies_tests {
+    use super::pattern_denies;
+
+    #[test]
+    fn exact_name_matches_only_itself() {
+        assert!(pattern_denies("delete_path", "delete_path"));
+        assert!(!pattern_denies("delete_path", "delete_paths"));
+        assert!(!pattern_denies("delete_path", "read_path"));
+    }
+
+    #[test]
+    fn trailing_star_matches_by_prefix() {
+        assert!(pattern_denies("moo-*", "moo-eval"));
+        assert!(pattern_denies("moo-*", "moo-"));
+        assert!(!pattern_denies("moo-*", "moon-eval"));
+    }
+
+    #[test]
+    fn comma_joined_list_is_an_or() {
+        let patterns = "moo-*, bq-*, delete_path";
+        assert!(pattern_denies(patterns, "moo-eval"));
+        assert!(pattern_denies(patterns, "bq-query"));
+        assert!(pattern_denies(patterns, "delete_path"));
+        assert!(!pattern_denies(patterns, "read_path"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_denies_nothing() {
+        assert!(!pattern_denies("", "terminal_run"));
+        assert!(!pattern_denies("   ,  ,", "terminal_run"));
+    }
+}
+
 #[cfg(test)]
 mod coverage_tests {
     use super::*;

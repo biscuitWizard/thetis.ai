@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-use crate::config::Config;
 use crate::aspect::Aspect;
+use crate::config::Config;
 
 #[derive(Debug, Clone)]
 pub struct BuildOutcome {

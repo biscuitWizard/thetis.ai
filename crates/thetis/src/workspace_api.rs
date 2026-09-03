@@ -27,8 +27,8 @@
 //! security boundary: normalise away `..`, join to the workspace root, then
 //! confirm the result is still inside it *after* symlinks are followed.
 
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -320,8 +320,7 @@ fn find(cfg: &Config, query_raw: &str, dir: &str) -> Result<Value> {
 /// The shared workspace directory: the first WASI preopen, which is what every
 /// guest sees as `/workspace`.
 pub fn root(cfg: &Config) -> Result<PathBuf> {
-    cfg
-        .wasi
+    cfg.wasi
         .dirs
         .first()
         .cloned()
@@ -521,10 +520,7 @@ fn list(cfg: &Config, rel_request: &str) -> Result<Value> {
         // A folder the agents deleted under an open explorer. Say so plainly
         // rather than returning an empty listing that looks like an empty
         // folder.
-        return Err(anyhow!(
-            "'{}' no longer exists",
-            relative(&root, &dir)
-        ));
+        return Err(anyhow!("'{}' no longer exists", relative(&root, &dir)));
     }
     if !dir.is_dir() {
         return Err(anyhow!("'{}' is a file", relative(&root, &dir)));
@@ -619,8 +615,8 @@ fn read(cfg: &Config, rel_request: &str) -> Result<Value> {
         "url": raw_url(&rel),
     });
 
-    let inline_candidate = meta.len() <= MAX_TEXT_BYTES
-        && matches!(kind, "text" | "code" | "data" | "file");
+    let inline_candidate =
+        meta.len() <= MAX_TEXT_BYTES && matches!(kind, "text" | "code" | "data" | "file");
     if !inline_candidate {
         frame["text_available"] = json!(false);
         return Ok(frame);
@@ -694,7 +690,9 @@ fn delete(cfg: &Config, rel_request: &str, recursive: bool) -> Result<String> {
     if path.is_dir() {
         let count = std::fs::read_dir(&path).map(|e| e.count()).unwrap_or(0);
         if count > 0 && !recursive {
-            return Err(anyhow!("'{rel}' holds {count} entries; confirm to delete it"));
+            return Err(anyhow!(
+                "'{rel}' holds {count} entries; confirm to delete it"
+            ));
         }
         std::fs::remove_dir_all(&path).with_context(|| format!("cannot delete {rel}"))?;
         Ok(format!("deleted {rel}/"))
@@ -794,14 +792,16 @@ pub async fn handle(cfg: &Config, frame: &Value) -> Vec<String> {
     // websocket frame. Inline it holds a runtime thread for its duration.
     match crate::offload::blocking(|| dispatch(cfg, &frame_type, frame)) {
         Ok(replies) => replies,
-        Err(e) => vec![json!({
-            "type": "workspace-result",
-            "op": frame_type.trim_start_matches("workspace-"),
-            "ok": false,
-            "path": frame.get("path").and_then(Value::as_str).unwrap_or_default(),
-            "message": format!("{e:#}"),
-        })
-        .to_string()],
+        Err(e) => vec![
+            json!({
+                "type": "workspace-result",
+                "op": frame_type.trim_start_matches("workspace-"),
+                "ok": false,
+                "path": frame.get("path").and_then(Value::as_str).unwrap_or_default(),
+                "message": format!("{e:#}"),
+            })
+            .to_string(),
+        ],
     }
 }
 
@@ -862,24 +862,21 @@ fn dispatch(cfg: &Config, frame_type: &str, frame: &Value) -> Result<Vec<String>
 }
 
 /// The result frame, plus a relisting of the affected directory.
-fn mutation_replies(
-    cfg: &Config,
-    op: &str,
-    path: &str,
-    message: &str,
-) -> Vec<String> {
+fn mutation_replies(cfg: &Config, op: &str, path: &str, message: &str) -> Vec<String> {
     // The tree just changed, so the cached path index is a liar. Cheaper to
     // drop it than to work out what moved.
     invalidate_index();
 
-    let mut replies = vec![json!({
-        "type": "workspace-result",
-        "op": op,
-        "ok": true,
-        "path": path,
-        "message": message,
-    })
-    .to_string()];
+    let mut replies = vec![
+        json!({
+            "type": "workspace-result",
+            "op": op,
+            "ok": true,
+            "path": path,
+            "message": message,
+        })
+        .to_string(),
+    ];
 
     // The directory to redraw is the parent of whatever was touched — except
     // for a delete of a directory, whose parent is also its own parent.
@@ -916,7 +913,10 @@ mod tests {
         assert_eq!(resolve(&cfg, "").unwrap(), root);
         assert_eq!(resolve(&cfg, "/").unwrap(), root);
         assert_eq!(resolve(&cfg, "workspace").unwrap(), root);
-        assert_eq!(resolve(&cfg, "notes/todo.md").unwrap(), root.join("notes/todo.md"));
+        assert_eq!(
+            resolve(&cfg, "notes/todo.md").unwrap(),
+            root.join("notes/todo.md")
+        );
         // The UI spells the root as "workspace/…"; that round-trips.
         assert_eq!(
             resolve(&cfg, "workspace/notes/todo.md").unwrap(),
@@ -936,10 +936,7 @@ mod tests {
         ] {
             let err = resolve(&cfg, bad).unwrap_err();
             let text = format!("{err:#}");
-            assert!(
-                text.contains("workspace"),
-                "{bad} gave: {text}"
-            );
+            assert!(text.contains("workspace"), "{bad} gave: {text}");
         }
     }
 
@@ -952,7 +949,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
         let err = resolve(&cfg, "escape").unwrap_err();
-        assert!(format!("{err:#}").contains("outside the workspace"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("outside the workspace"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1029,21 +1029,41 @@ mod tests {
         assert!(format!("{:#}", delete(&cfg, "notes", false).unwrap_err()).contains("confirm"));
         // Clobbering by rename.
         write(&cfg, "other.md", "x").unwrap();
-        assert!(format!("{:#}", rename(&cfg, "other.md", "notes/todo.md").unwrap_err())
-            .contains("already exists"));
+        assert!(
+            format!(
+                "{:#}",
+                rename(&cfg, "other.md", "notes/todo.md").unwrap_err()
+            )
+            .contains("already exists")
+        );
         // A folder into itself.
-        assert!(format!("{:#}", rename(&cfg, "notes", "notes/inner").unwrap_err())
-            .contains("inside itself"));
+        assert!(
+            format!("{:#}", rename(&cfg, "notes", "notes/inner").unwrap_err())
+                .contains("inside itself")
+        );
         // An existing directory as a new folder.
         assert!(format!("{:#}", mkdir(&cfg, "notes").unwrap_err()).contains("already exists"));
     }
 
     #[test]
     fn active_content_is_flagged_for_forced_download() {
-        for name in ["evil.html", "page.HTM", "vector.svg", "doc.xhtml", "data.xml"] {
+        for name in [
+            "evil.html",
+            "page.HTM",
+            "vector.svg",
+            "doc.xhtml",
+            "data.xml",
+        ] {
             assert!(is_active_content(name), "{name} must be treated as active");
         }
-        for name in ["notes.md", "photo.png", "data.json", "script.js", "plain.txt", "noext"] {
+        for name in [
+            "notes.md",
+            "photo.png",
+            "data.json",
+            "script.js",
+            "plain.txt",
+            "noext",
+        ] {
             assert!(!is_active_content(name), "{name} may preview inline");
         }
     }
@@ -1090,8 +1110,10 @@ mod tests {
         assert!(paths(&find(&cfg, "debug", "").unwrap()).is_empty());
 
         // A subsequence over the whole path: "mckvm" for moor/crates/kernel/…
-        assert!(paths(&find(&cfg, "mckvm", "").unwrap())
-            .contains(&"moor/crates/kernel/src/vm.rs".to_string()));
+        assert!(
+            paths(&find(&cfg, "mckvm", "").unwrap())
+                .contains(&"moor/crates/kernel/src/vm.rs".to_string())
+        );
 
         // A directory prefix narrows the search to inside it.
         let inside = find(&cfg, "md", "moor").unwrap();

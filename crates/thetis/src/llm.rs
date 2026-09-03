@@ -163,7 +163,10 @@ impl LlmClient {
 
     /// The most recent streaming request body, for the caller to persist.
     pub fn last_request(&self) -> Option<StoredRequest> {
-        self.last_request.lock().ok().and_then(|aspect| aspect.clone())
+        self.last_request
+            .lock()
+            .ok()
+            .and_then(|aspect| aspect.clone())
     }
 
     /// Applies grip defaults to a guest-supplied request body, and works out
@@ -498,7 +501,10 @@ impl LlmClient {
             pump.finish().await;
         });
 
-        Ok(StreamHandle { rx, finished: false })
+        Ok(StreamHandle {
+            rx,
+            finished: false,
+        })
     }
 }
 
@@ -1183,13 +1189,18 @@ mod tests {
         let client = LlmClient::new(Arc::new(cfg)).unwrap();
 
         let mut stream = client
-            .open_stream(r#"{"model":"local/deepseek","messages":[{"role":"user","content":"hi"}]}"#)
+            .open_stream(
+                r#"{"model":"local/deepseek","messages":[{"role":"user","content":"hi"}]}"#,
+            )
             .await
             .expect("the local provider answers");
 
         // The stream still parses, so nothing about routing disturbed the SSE path.
         let first = stream.next().await.unwrap();
-        assert!(matches!(first, StreamChunk::Delta(ref d) if d == "hi"), "{first:?}");
+        assert!(
+            matches!(first, StreamChunk::Delta(ref d) if d == "hi"),
+            "{first:?}"
+        );
 
         let request = server.await.unwrap();
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
@@ -1376,11 +1387,18 @@ mod tests {
             .await
             .expect("the live replica answers after the dead one fails");
         let first = stream.next().await.unwrap();
-        assert!(matches!(first, StreamChunk::Delta(ref d) if d == "hi"), "{first:?}");
+        assert!(
+            matches!(first, StreamChunk::Delta(ref d) if d == "hi"),
+            "{first:?}"
+        );
 
         // The live server really was the one that served it.
         let request = server.await.unwrap();
-        assert!(request.to_ascii_lowercase().starts_with("post /v1/chat/completions"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .starts_with("post /v1/chat/completions")
+        );
     }
 
     #[test]
@@ -1402,7 +1420,10 @@ mod tests {
     fn an_openrouter_model_is_unaffected_by_the_extra_provider() {
         let client = two_provider_client();
         let (body, provider) = client
-            .prepare_body(r#"{"model":"anthropic/claude-opus-4.1","messages":[]}"#, false)
+            .prepare_body(
+                r#"{"model":"anthropic/claude-opus-4.1","messages":[]}"#,
+                false,
+            )
             .unwrap();
         assert_eq!(provider, "openrouter");
         assert_eq!(body["model"], "anthropic/claude-opus-4.1");
@@ -1483,7 +1504,10 @@ mod tests {
     fn a_request_without_a_session_gains_no_routing_fields() {
         let client = two_provider_client();
         let (body, _) = client
-            .prepare_body(r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#, true)
+            .prepare_body(
+                r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#,
+                true,
+            )
             .unwrap();
         assert!(body.get("session_id").is_none());
         assert!(body.get("user").is_none());
@@ -1516,7 +1540,10 @@ mod tests {
             ["system", "user", "assistant", "user", "user"]
         );
         // The text is untouched; only where it is allowed to sit changed.
-        assert_eq!(body["messages"][3]["content"], "Interrupted: Thetis restarted.");
+        assert_eq!(
+            body["messages"][3]["content"],
+            "Interrupted: Thetis restarted."
+        );
     }
 
     #[test]
@@ -1532,7 +1559,10 @@ mod tests {
         ]});
 
         assert_eq!(normalize_system_roles(&mut body), 0);
-        assert_eq!(roles(&body), ["system", "user", "system", "assistant", "system"]);
+        assert_eq!(
+            roles(&body),
+            ["system", "user", "system", "assistant", "system"]
+        );
     }
 
     #[test]
@@ -1723,9 +1753,11 @@ mod tests {
             "data: [DONE]\n\n",
         ))
         .await;
-        assert!(!chunks
-            .iter()
-            .any(|c| matches!(c, StreamChunk::Reasoning(_))));
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::Reasoning(_)))
+        );
     }
 
     /// A slow reasoning model can stream for longer than the timeout while
@@ -1939,7 +1971,9 @@ mod tests {
         )
         .await;
         assert!(
-            items.iter().any(|i| matches!(i, Err(LlmError::Transport(_)))),
+            items
+                .iter()
+                .any(|i| matches!(i, Err(LlmError::Transport(_)))),
             "{items:?}"
         );
     }
@@ -1963,7 +1997,10 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert!(calls.is_empty(), "truncated arguments must not survive: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "truncated arguments must not survive: {calls:?}"
+        );
     }
 
     /// A complete tool call that happens to be followed by a broken connection
@@ -2103,9 +2140,11 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
                    data: [DONE]\n";
         let chunks = drain(sse).await;
-        assert!(chunks
-            .iter()
-            .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok")));
+        assert!(
+            chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok"))
+        );
     }
 
     #[test]

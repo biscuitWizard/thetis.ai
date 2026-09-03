@@ -12,7 +12,7 @@
 //! worker, all bounded by a timeout so a wedged worker degrades to "unknown"
 //! instead of hanging the frame.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 

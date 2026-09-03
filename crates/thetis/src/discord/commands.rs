@@ -12,14 +12,14 @@
 //! guarantee rests on the mode, so letting chat change it would defeat the whole
 //! arrangement; `/model` changes only which model answers.
 
-use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::config::DiscordSettings;
 use crate::grip::Grip;
 
-use super::{issue_code, paired_users, session_for, PAIR_SCOPE};
+use super::{PAIR_SCOPE, issue_code, paired_users, session_for};
 
 /// Who invoked a command, independent of whether it came as a message or an
 /// interaction. Only the identity and the privacy of the channel matter.
@@ -189,9 +189,10 @@ pub async fn run(
 
         "new" => {
             let kv_key = format!("discord.session.{key}");
+            let owner = format!("discord:{key}");
             let meta = grip
                 .persist
-                .create_session(Some(format!("Discord {key}")), &cfg.mode)
+                .create_session(Some(format!("Discord {key}")), &cfg.mode, &owner)
                 .await?;
             grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
             "Started a fresh conversation. I have forgotten what came before.".to_string()
@@ -332,7 +333,10 @@ mod tests {
         for command in commands {
             let name = command["name"].as_str().unwrap();
             // Lowercase, 1-32 characters, and no spaces.
-            assert!((1..=32).contains(&name.chars().count()), "{name} is the wrong length");
+            assert!(
+                (1..=32).contains(&name.chars().count()),
+                "{name} is the wrong length"
+            );
             assert_eq!(name, name.to_lowercase(), "{name} must be lowercase");
             assert!(!name.contains(' '), "{name} must not contain a space");
             // Descriptions are required for CHAT_INPUT and capped at 100.

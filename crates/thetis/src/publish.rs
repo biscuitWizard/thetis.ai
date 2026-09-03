@@ -129,12 +129,18 @@ pub async fn export_public(git: &GitCtl) -> Result<Export> {
             .unwrap_or_else(|| "export".to_string());
 
         let new_commit = match &parent {
-            Some(parent_rev) => git
-                .run_raw(&["commit-tree", &filtered, "-p", parent_rev, "-m", &subject])
-                .await? ,
-            None => git.run_raw(&["commit-tree", &filtered, "-m", &subject]).await?,
+            Some(parent_rev) => {
+                git.run_raw(&["commit-tree", &filtered, "-p", parent_rev, "-m", &subject])
+                    .await?
+            }
+            None => {
+                git.run_raw(&["commit-tree", &filtered, "-m", &subject])
+                    .await?
+            }
         };
-        let new_commit = String::from_utf8_lossy(&new_commit.stdout).trim().to_string();
+        let new_commit = String::from_utf8_lossy(&new_commit.stdout)
+            .trim()
+            .to_string();
         parent = Some(new_commit);
         exported += 1;
     }
@@ -295,9 +301,9 @@ pub async fn push_public(git: &GitCtl) -> Result<()> {
             }
             format!("--force-with-lease={REMOTE_BRANCH}:{remote}")
         }
-        (Some(_), None) => anyhow::bail!(
-            "there is nothing exported to publish; export the public history first."
-        ),
+        (Some(_), None) => {
+            anyhow::bail!("there is nothing exported to publish; export the public history first.")
+        }
     };
 
     let refspec = format!("public:{REMOTE_BRANCH}");
@@ -575,9 +581,7 @@ pub async fn apply_pull(git: &GitCtl, plan: PullPlan) -> Result<Pulled> {
 /// first if that is a possibility.
 pub async fn adopt_remote(git: &GitCtl) -> Result<String> {
     let Some(remote) = fetch_remote(git).await? else {
-        anyhow::bail!(
-            "there is nothing published on origin/{REMOTE_BRANCH} to adopt as a base."
-        );
+        anyhow::bail!("there is nothing published on origin/{REMOTE_BRANCH} to adopt as a base.");
     };
     git.update_ref(REMOTE_SYNC_REF, &remote).await?;
     Ok(remote)
@@ -590,12 +594,7 @@ pub async fn adopt_remote(git: &GitCtl) -> Result<String> {
 /// and where trunk itself forks from the remote, which is the one that answers
 /// for a checkout cloned from the published repository — its trunk *is* the
 /// remote's history, while its export is a fresh chain that shares nothing.
-async fn pick_base(
-    git: &GitCtl,
-    ours: &str,
-    remote: &str,
-    trunk: &str,
-) -> Result<Option<String>> {
+async fn pick_base(git: &GitCtl, ours: &str, remote: &str, trunk: &str) -> Result<Option<String>> {
     let mut candidates = Vec::new();
     if let Some(sync) = git.rev_parse(REMOTE_SYNC_REF).await? {
         candidates.push(sync);
@@ -835,7 +834,10 @@ mod tests {
             .run_raw(&["clone", bare.dir().to_str().unwrap(), "."])
             .await
             .unwrap();
-        other.run_raw(&["config", "user.name", "other"]).await.unwrap();
+        other
+            .run_raw(&["config", "user.name", "other"])
+            .await
+            .unwrap();
         other
             .run_raw(&["config", "user.email", "o@example.com"])
             .await
@@ -926,9 +928,13 @@ mod tests {
         std::fs::write(tmp.path().join("open.txt"), "ours\n").unwrap();
         git.add_all_and_commit("ours").await.unwrap();
         export_public(&git).await.unwrap();
-        git.run_raw(&["config", "remote.origin.fetch", "+refs/heads/nothing:refs/remotes/origin/nothing"])
-            .await
-            .unwrap();
+        git.run_raw(&[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/nothing:refs/remotes/origin/nothing",
+        ])
+        .await
+        .unwrap();
 
         let err = push_public(&git).await.unwrap_err().to_string();
         assert!(
@@ -1067,11 +1073,16 @@ mod tests {
 
         // The other checkout has no such marker — it never saw the directory
         // at all — and publishes something at the same path.
-        another_checkout_publishes(&tmp, &bare, "write into a directory we keep private", |dir| {
-            std::fs::create_dir_all(dir.join("skills/company-lore")).unwrap();
-            std::fs::write(dir.join("skills/company-lore/SKILL.md"), "theirs\n").unwrap();
-            std::fs::write(dir.join("open2.txt"), "theirs\n").unwrap();
-        })
+        another_checkout_publishes(
+            &tmp,
+            &bare,
+            "write into a directory we keep private",
+            |dir| {
+                std::fs::create_dir_all(dir.join("skills/company-lore")).unwrap();
+                std::fs::write(dir.join("skills/company-lore/SKILL.md"), "theirs\n").unwrap();
+                std::fs::write(dir.join("open2.txt"), "theirs\n").unwrap();
+            },
+        )
         .await;
 
         let Pull::Ready(plan) = plan_pull(&git).await.unwrap() else {
@@ -1110,7 +1121,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let other = GitCtl::new(&dir);
         other.run_raw(&["init", "-b", "main"]).await.unwrap();
-        other.run_raw(&["config", "user.name", "other"]).await.unwrap();
+        other
+            .run_raw(&["config", "user.name", "other"])
+            .await
+            .unwrap();
         other
             .run_raw(&["config", "user.email", "o@example.com"])
             .await
@@ -1201,7 +1215,9 @@ mod tests {
         std::fs::write(secret.join("lib.rs"), "private\n").unwrap();
         std::fs::write(secret.join(LEGACY_PRIVATE_MARKER), "").unwrap();
         std::fs::write(tmp.path().join("open.txt"), "public\n").unwrap();
-        git.add_all_and_commit("with a pre-rename marker").await.unwrap();
+        git.add_all_and_commit("with a pre-rename marker")
+            .await
+            .unwrap();
 
         export_public(&git).await.unwrap();
         let files = git.tree_files(PUBLIC_REF).await.unwrap();
@@ -1268,11 +1284,12 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), "v1 was public\n").unwrap();
         git.add_all_and_commit("public at first").await.unwrap();
         export_public(&git).await.unwrap();
-        assert!(git
-            .tree_files("public")
-            .await
-            .unwrap()
-            .contains(&"skills/notes/SKILL.md".to_string()));
+        assert!(
+            git.tree_files("public")
+                .await
+                .unwrap()
+                .contains(&"skills/notes/SKILL.md".to_string())
+        );
 
         // Now mark it private and change it.
         std::fs::write(dir.join(PRIVATE_MARKER), "").unwrap();

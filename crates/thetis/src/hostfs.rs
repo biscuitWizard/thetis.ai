@@ -10,7 +10,7 @@
 //! it stops the system from deleting its own database by accident, and is not
 //! a security control, because a terminal session can reach those paths anyway.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::{Component, Path, PathBuf};
 
 use crate::bindings::types::FsEntry;
@@ -22,9 +22,7 @@ use crate::config::Config;
 /// path semantics identical everywhere.
 pub(crate) fn has_drive_prefix(path: &str) -> bool {
     let first = path.split(['/', '\\']).next().unwrap_or("");
-    first.len() == 2
-        && first.as_bytes()[1] == b':'
-        && first.as_bytes()[0].is_ascii_alphabetic()
+    first.len() == 2 && first.as_bytes()[1] == b':' && first.as_bytes()[0].is_ascii_alphabetic()
 }
 
 /// Maps a guest-facing preopen path (`/workspace/...`) onto the real directory
@@ -231,8 +229,7 @@ pub fn read_file(cfg: &Config, raw: &str) -> Result<String> {
         ));
     }
 
-    std::fs::read_to_string(&path)
-        .map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))
+    std::fs::read_to_string(&path).map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))
 }
 
 pub fn write_file(cfg: &Config, raw: &str, contents: &str) -> Result<String> {
@@ -289,7 +286,9 @@ pub fn list_dir(cfg: &Config, raw: &str) -> Result<Vec<FsEntry>> {
 pub fn delete_path(cfg: &Config, raw: &str, recursive: bool) -> Result<String> {
     require_enabled(cfg)?;
     if !cfg.filesystem.allow_delete {
-        return Err(anyhow!("deleting is off; set filesystem.allow_delete to turn it on"));
+        return Err(anyhow!(
+            "deleting is off; set filesystem.allow_delete to turn it on"
+        ));
     }
 
     let path = resolve(cfg, raw)?;
@@ -297,7 +296,12 @@ pub fn delete_path(cfg: &Config, raw: &str, recursive: bool) -> Result<String> {
         return Err(anyhow!("{name} is protected and cannot be deleted"));
     }
     // Deleting a root would take the workspace with it.
-    if cfg.filesystem.roots.iter().any(|r| canonical(r) == canonical(&path)) {
+    if cfg
+        .filesystem
+        .roots
+        .iter()
+        .any(|r| canonical(r) == canonical(&path))
+    {
         return Err(anyhow!("refusing to delete a configured root"));
     }
     if !path.exists() {
@@ -564,7 +568,8 @@ pub fn read_file_range(cfg: &Config, raw: &str, offset: u32, limit: u32) -> Resu
     require_enabled(cfg)?;
     let path = resolve(cfg, raw)?;
 
-    let bytes = std::fs::read(&path).map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))?;
     if looks_binary(&bytes) {
         return Err(anyhow!(
             "{} looks like a binary file, not text",
@@ -623,10 +628,14 @@ pub fn edit_file(
         return Err(anyhow!("{name} is protected and cannot be written"));
     }
     if old_text.is_empty() {
-        return Err(anyhow!("old_text is empty; use write_path to create a file"));
+        return Err(anyhow!(
+            "old_text is empty; use write_path to create a file"
+        ));
     }
     if old_text == new_text {
-        return Err(anyhow!("old_text and new_text are identical, so there is nothing to change"));
+        return Err(anyhow!(
+            "old_text and new_text are identical, so there is nothing to change"
+        ));
     }
 
     let text = std::fs::read_to_string(&path)
@@ -713,7 +722,11 @@ pub fn search_files(
         .build()
         .map_err(|e| anyhow!("bad pattern `{pattern}`: {e}"))?;
     let glob_re = glob.map(glob_to_regex).transpose()?;
-    let cap = if max_results == 0 { 100 } else { max_results as usize };
+    let cap = if max_results == 0 {
+        100
+    } else {
+        max_results as usize
+    };
 
     let mut lines: Vec<String> = Vec::new();
     let mut files_with_matches = 0usize;
@@ -819,7 +832,11 @@ pub fn find_files(
     require_enabled(cfg)?;
     let root = walk_root(cfg, path)?;
     let re = glob_to_regex(glob)?;
-    let cap = if max_results == 0 { 200 } else { max_results as usize };
+    let cap = if max_results == 0 {
+        200
+    } else {
+        max_results as usize
+    };
 
     let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
     let complete = root.walk(|file| {
@@ -963,7 +980,10 @@ mod tests {
         assert!(globbed.unwrap().contains("src/lib.rs"), "glob should match");
 
         let missed = search_files(&cfg, "parse", Some("README.md"), Some("*.rs"), "files", 0);
-        assert!(missed.unwrap().starts_with("no matches"), "glob should filter");
+        assert!(
+            missed.unwrap().starts_with("no matches"),
+            "glob should filter"
+        );
     }
 
     #[test]
@@ -1071,7 +1091,10 @@ mod tests {
     fn editing_a_snippet_that_is_not_there_explains_why() {
         let (cfg, _d) = fixture();
         let err = edit_file(&cfg, "src/main.rs", "fn nope()", "fn yes()", false).unwrap_err();
-        assert!(format!("{err:#}").contains("Read the file first"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("Read the file first"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1129,9 +1152,17 @@ mod tests {
         cfg.filesystem.roots.push(ws.clone());
 
         assert_eq!(resolve(&cfg, "/shared-ws").unwrap(), ws);
-        assert_eq!(resolve(&cfg, "/shared-ws/note.md").unwrap(), ws.join("note.md"));
+        assert_eq!(
+            resolve(&cfg, "/shared-ws/note.md").unwrap(),
+            ws.join("note.md")
+        );
         assert_eq!(read_file(&cfg, "/shared-ws/note.md").unwrap(), "shared");
-        assert!(list_dir(&cfg, "/shared-ws").unwrap().iter().any(|e| e.name == "note.md"));
+        assert!(
+            list_dir(&cfg, "/shared-ws")
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "note.md")
+        );
     }
 
     /// Whatever a listing or a search result calls a file, feeding that name
@@ -1185,7 +1216,10 @@ mod tests {
     fn traversal_that_stays_inside_is_allowed() {
         let (cfg, _d) = fixture();
         // Normalises to src/main.rs, which is within the root.
-        assert_eq!(read_file(&cfg, "src/../src/main.rs").unwrap(), "fn main() {}");
+        assert_eq!(
+            read_file(&cfg, "src/../src/main.rs").unwrap(),
+            "fn main() {}"
+        );
     }
 
     #[test]

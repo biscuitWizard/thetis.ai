@@ -5,22 +5,32 @@
 //! instances stay disposable: a crash, a hot swap, or an orchestrator restart
 //! loses nothing.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::branches::BranchRow;
-use crate::subagents::SubagentRow;
 use crate::bindings::types::{
     EventRecord, SessionEvent, SessionMeta, ToolCall, ToolOutcome, TurnStats, UserMsg,
 };
+use crate::branches::BranchRow;
+use crate::subagents::SubagentRow;
 
 /// A session whose turn was cut short, and whether it should carry on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Interrupted {
     pub session_id: String,
     pub resume: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct LoginRow {
+    pub user_id: String,
+    pub created_ms: u64,
+    pub last_seen_ms: u64,
+    pub expires_ms: u64,
+    pub user_agent: String,
 }
 
 /// How far a session has got, read while its turn is still running.
@@ -60,9 +70,14 @@ const EVENTS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("events
 const KV: TableDefinition<(&str, &str), &str> = TableDefinition::new("kv");
 /// session id -> cumulative USD spend
 const SPEND: TableDefinition<&str, f64> = TableDefinition::new("spend");
+/// top-level session id -> owning principal id
+const OWNERS: TableDefinition<&str, &str> = TableDefinition::new("owners");
+/// sha256(login token) -> LoginRow JSON
+const LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("logins");
+/// principal id -> cumulative USD spend
+const USER_SPEND: TableDefinition<&str, f64> = TableDefinition::new("user_spend");
 /// (aspect key, revision) -> RevisionRow (json)
-pub(crate) const REVISIONS: TableDefinition<(&str, u64), &[u8]> =
-    TableDefinition::new("revisions");
+pub(crate) const REVISIONS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("revisions");
 /// snapshot id -> SystemSnapshot (json)
 pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("snapshots");
 /// "model|dims|content hash" -> little-endian f32 embedding of a skill card
@@ -109,6 +124,9 @@ impl Store {
             txn.open_table(EVENTS)?;
             txn.open_table(KV)?;
             txn.open_table(SPEND)?;
+            txn.open_table(OWNERS)?;
+            txn.open_table(LOGINS)?;
+            txn.open_table(USER_SPEND)?;
             txn.open_table(REVISIONS)?;
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(SKILL_VECTORS)?;
@@ -221,7 +239,12 @@ impl Store {
 
     // --- sessions ----------------------------------------------------------
 
-    pub fn create_session(&self, title: Option<String>, mode: &str) -> Result<SessionMeta> {
+    pub fn create_session(
+        &self,
+        title: Option<String>,
+        mode: &str,
+        owner: &str,
+    ) -> Result<SessionMeta> {
         let now = now_ms();
         let meta = SessionMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -238,9 +261,177 @@ impl Store {
         {
             let mut t = txn.open_table(SESSIONS)?;
             t.insert(meta.id.as_str(), serde_json::to_vec(&meta)?.as_slice())?;
+            txn.open_table(OWNERS)?.insert(meta.id.as_str(), owner)?;
         }
         txn.commit()?;
         Ok(meta)
+    }
+
+    pub fn owner_of(&self, id: &str) -> Result<Option<String>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(OWNERS)?;
+        Ok(table.get(id)?.map(|v| v.value().to_owned()))
+    }
+
+    pub fn owner_of_root(&self, id: &str) -> Result<Option<String>> {
+        let mut root = id.to_owned();
+        while let Some(row) = self.get_subagent(&root)? {
+            root = row.parent_id;
+        }
+        self.owner_of(&root)
+    }
+
+    pub fn set_owner(&self, id: &str, owner: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(OWNERS)?.insert(id, owner)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn owners_map(&self) -> Result<HashMap<String, String>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(OWNERS)?;
+        let mut out = HashMap::new();
+        for row in table.iter()? {
+            let (k, v) = row?;
+            out.insert(k.value().to_owned(), v.value().to_owned());
+        }
+        Ok(out)
+    }
+
+    pub fn unowned_sessions(&self) -> Result<Vec<String>> {
+        let tx = self.db.begin_read()?;
+        let sessions = tx.open_table(SESSIONS)?;
+        let children = tx.open_table(SUBAGENTS)?;
+        let owners = tx.open_table(OWNERS)?;
+        let mut out = Vec::new();
+        for row in sessions.iter()? {
+            let (id, _) = row?;
+            if children.get(id.value())?.is_none() && owners.get(id.value())?.is_none() {
+                out.push(id.value().to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_sessions_owned(
+        &self,
+        owner: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<SessionMeta>> {
+        let tx = self.db.begin_read()?;
+        let sessions = tx.open_table(SESSIONS)?;
+        let children = tx.open_table(SUBAGENTS)?;
+        let owners = tx.open_table(OWNERS)?;
+        let mut out = Vec::new();
+        for row in sessions.iter()? {
+            let (id, v) = row?;
+            if children.get(id.value())?.is_some() {
+                continue;
+            }
+            if let Some(want) = owner {
+                if owners.get(id.value())?.as_ref().map(|v| v.value()) != Some(want) {
+                    continue;
+                }
+            }
+            let meta: SessionMeta = serde_json::from_slice(v.value())?;
+            if include_archived || !meta.archived {
+                out.push(meta);
+            }
+        }
+        out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
+        Ok(out)
+    }
+
+    pub fn put_login(&self, hash: &str, row: &LoginRow) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(LOGINS)?
+                .insert(hash, serde_json::to_vec(row)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn get_login(&self, hash: &str) -> Result<Option<LoginRow>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LOGINS)?;
+        Ok(t.get(hash)?
+            .map(|v| serde_json::from_slice(v.value()))
+            .transpose()?)
+    }
+    pub fn remove_login(&self, hash: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(LOGINS)?.remove(hash)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn touch_login(&self, hash: &str, now: u64, expires: u64) -> Result<()> {
+        if let Some(mut r) = self.get_login(hash)? {
+            r.last_seen_ms = now;
+            r.expires_ms = expires;
+            self.put_login(hash, &r)?;
+        }
+        Ok(())
+    }
+    pub fn remove_logins_for(&self, user: &str) -> Result<usize> {
+        let tx = self.db.begin_write()?;
+        let mut n = 0;
+        {
+            let mut t = tx.open_table(LOGINS)?;
+            let mut keys = Vec::new();
+            for row in t.iter()? {
+                let (k, v) = row?;
+                let r: LoginRow = serde_json::from_slice(v.value())?;
+                if r.user_id == user {
+                    keys.push(k.value().to_owned());
+                }
+            }
+            for k in keys {
+                t.remove(k.as_str())?;
+                n += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+    pub fn prune_expired_logins(&self, now: u64) -> Result<usize> {
+        let tx = self.db.begin_write()?;
+        let mut n = 0;
+        {
+            let mut t = tx.open_table(LOGINS)?;
+            let mut keys = Vec::new();
+            for row in t.iter()? {
+                let (k, v) = row?;
+                let r: LoginRow = serde_json::from_slice(v.value())?;
+                if r.expires_ms <= now {
+                    keys.push(k.value().to_owned());
+                }
+            }
+            for k in keys {
+                t.remove(k.as_str())?;
+                n += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+    pub fn get_user_spend(&self, user: &str) -> Result<f64> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(USER_SPEND)?;
+        Ok(t.get(user)?.map(|v| v.value()).unwrap_or(0.0))
+    }
+    pub fn add_user_spend(&self, user: &str, usd: f64) -> Result<f64> {
+        let total = self.get_user_spend(user)? + usd;
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(USER_SPEND)?.insert(user, total)?;
+        }
+        tx.commit()?;
+        Ok(total)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
@@ -496,12 +687,13 @@ impl Store {
                 }
             }
 
-            let record = EventRecord { seq, ts_ms: ts, event };
+            let record = EventRecord {
+                seq,
+                ts_ms: ts,
+                event,
+            };
             let mut events = txn.open_table(EVENTS)?;
-            events.insert(
-                (session_id, seq),
-                serde_json::to_vec(&record)?.as_slice(),
-            )?;
+            events.insert((session_id, seq), serde_json::to_vec(&record)?.as_slice())?;
             sessions.insert(session_id, serde_json::to_vec(&meta)?.as_slice())?;
             record
         };
@@ -593,7 +785,10 @@ impl Store {
                 SessionEvent::Incident(_) => !expected,
                 _ => false,
             });
-            if !matches!(last_marker.map(|r| &r.event), Some(SessionEvent::TurnStarted)) {
+            if !matches!(
+                last_marker.map(|r| &r.event),
+                Some(SessionEvent::TurnStarted)
+            ) {
                 continue;
             }
 
@@ -807,7 +1002,12 @@ impl Store {
         Ok(rows.last().map(|r| r.revision).unwrap_or(0) + 1)
     }
 
-    pub fn put_revision<T: serde::Serialize>(&self, aspect_key: &str, revision: u64, row: &T) -> Result<()> {
+    pub fn put_revision<T: serde::Serialize>(
+        &self,
+        aspect_key: &str,
+        revision: u64,
+        row: &T,
+    ) -> Result<()> {
         let txn = self.db.begin_write()?;
         {
             let mut t = txn.open_table(REVISIONS)?;
@@ -830,7 +1030,10 @@ impl Store {
         }
     }
 
-    pub fn list_revisions<T: serde::de::DeserializeOwned>(&self, aspect_key: &str) -> Result<Vec<T>> {
+    pub fn list_revisions<T: serde::de::DeserializeOwned>(
+        &self,
+        aspect_key: &str,
+    ) -> Result<Vec<T>> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(REVISIONS)?;
         let mut out = Vec::new();
@@ -972,7 +1175,7 @@ fn preview_of(event: &SessionEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
+    use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
 
     fn user(text: &str) -> SessionEvent {
         SessionEvent::UserMessage(UserMsg {
@@ -994,7 +1197,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         // chat surface carry on in an archived conversation. Anything reusing a
         // session id has to read `archived`.
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "chat").unwrap();
+        let s = store.create_session(None, &"chat", "local").unwrap();
         assert!(!s.archived);
 
         store.archive_session(&s.id, true).unwrap();
@@ -1002,11 +1205,19 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let found = store.get_session(&s.id).unwrap().expect("still present");
         assert!(found.archived, "archiving must set the flag");
         assert!(
-            !store.list_sessions(false).unwrap().iter().any(|m| m.id == s.id),
+            !store
+                .list_sessions(false)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == s.id),
             "an archived session is hidden from the default listing"
         );
         assert!(
-            store.list_sessions(true).unwrap().iter().any(|m| m.id == s.id),
+            store
+                .list_sessions(true)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == s.id),
             "and still available when archived ones are asked for"
         );
     }
@@ -1014,7 +1225,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn events_are_sequential_and_readable_from_offset() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
 
         for i in 0..5 {
             let rec = store
@@ -1035,15 +1246,15 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn events_are_isolated_per_session() {
         let (store, _d) = temp_store();
-        let a = store.create_session(Some("a".into()), "agent").unwrap();
-        let b = store.create_session(Some("b".into()), "agent").unwrap();
+        let a = store
+            .create_session(Some("a".into()), &"agent", "local")
+            .unwrap();
+        let b = store
+            .create_session(Some("b".into()), &"agent", "local")
+            .unwrap();
 
-        store
-            .append_event(&a.id, user("in a"))
-            .unwrap();
-        store
-            .append_event(&b.id, user("in b"))
-            .unwrap();
+        store.append_event(&a.id, user("in a")).unwrap();
+        store.append_event(&b.id, user("in b")).unwrap();
 
         assert_eq!(store.events(&a.id, 0).unwrap().len(), 1);
         assert_eq!(store.events(&b.id, 0).unwrap().len(), 1);
@@ -1052,11 +1263,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn preview_tracks_conversation_not_bookkeeping() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
 
-        store
-            .append_event(&s.id, user("hello there"))
-            .unwrap();
+        store.append_event(&s.id, user("hello there")).unwrap();
         store
             .append_event(&s.id, SessionEvent::TurnStarted)
             .unwrap();
@@ -1083,7 +1292,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn first_message_names_the_conversation() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
         assert_eq!(s.title, DEFAULT_TITLE);
 
         store
@@ -1103,7 +1312,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn auto_titles_are_shortened_on_a_word_boundary() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
 
         store
             .append_event(
@@ -1115,25 +1324,36 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let title = store.get_session(&s.id).unwrap().unwrap().title;
         assert!(title.ends_with('…'), "{title}");
         assert!(title.chars().count() <= 49, "{title}");
-        assert!(!title.contains("  "), "newlines and runs of spaces collapse");
+        assert!(
+            !title.contains("  "),
+            "newlines and runs of spaces collapse"
+        );
         // The cut lands between words, not inside one.
-        assert!(title.starts_with("please explain in detail how the revision"), "{title}");
+        assert!(
+            title.starts_with("please explain in detail how the revision"),
+            "{title}"
+        );
     }
 
     #[test]
     fn a_renamed_conversation_is_never_auto_titled() {
         let (store, _d) = temp_store();
-        let s = store.create_session(Some("Budget review".into()), "agent").unwrap();
+        let s = store
+            .create_session(Some("Budget review".into()), &"agent", "local")
+            .unwrap();
 
         store.append_event(&s.id, user("hello there")).unwrap();
 
-        assert_eq!(store.get_session(&s.id).unwrap().unwrap().title, "Budget review");
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().title,
+            "Budget review"
+        );
     }
 
     #[test]
     fn image_only_conversations_are_named_after_the_file() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
 
         store
             .append_event(
@@ -1149,13 +1369,16 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
             )
             .unwrap();
 
-        assert_eq!(store.get_session(&s.id).unwrap().unwrap().title, "receipt.png");
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().title,
+            "receipt.png"
+        );
     }
 
     #[test]
     fn session_mode_and_model_round_trip() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
         assert_eq!(s.mode, "agent");
         assert_eq!(s.model, "", "no override until one is chosen");
 
@@ -1174,7 +1397,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn image_only_messages_get_a_readable_preview() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
 
         let image = Attachment {
             name: "chart.png".into(),
@@ -1190,7 +1413,10 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
                 }),
             )
             .unwrap();
-        assert_eq!(store.get_session(&s.id).unwrap().unwrap().preview, "[chart.png]");
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().preview,
+            "[chart.png]"
+        );
 
         store
             .append_event(
@@ -1210,9 +1436,13 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     /// Builds a session sitting mid-turn, optionally with a tool call that
     /// never got its result.
     fn mid_turn(store: &Store, title: &str, pending_call: Option<&str>) -> String {
-        let s = store.create_session(Some(title.into()), "agent").unwrap();
+        let s = store
+            .create_session(Some(title.into()), &"agent", "local")
+            .unwrap();
         store.append_event(&s.id, user("do the thing")).unwrap();
-        store.append_event(&s.id, SessionEvent::TurnStarted).unwrap();
+        store
+            .append_event(&s.id, SessionEvent::TurnStarted)
+            .unwrap();
 
         if let Some(call_id) = pending_call {
             store
@@ -1258,7 +1488,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         finish_turn(&store, &done);
         let cut_short = mid_turn(&store, "interrupted", None);
 
-        let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+        let found = store
+            .reconcile_interrupted_turns("restarted", &[], None)
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, cut_short);
         assert!(found[0].resume, "an interrupted turn resumes by default");
@@ -1276,7 +1508,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let (store, _d) = temp_store();
         let id = mid_turn(&store, "mid tool call", Some("call_abc"));
 
-        store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+        store
+            .reconcile_interrupted_turns("restarted", &[], None)
+            .unwrap();
 
         // Providers reject a request whose tool calls have no matching results,
         // so the turn could not be resumed without this.
@@ -1313,7 +1547,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
             )
             .unwrap();
 
-        store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+        store
+            .reconcile_interrupted_turns("restarted", &[], None)
+            .unwrap();
 
         let results = store
             .events(&id, 0)
@@ -1330,7 +1566,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let id = mid_turn(&store, "one-way", None);
         store.set_no_resume(&id, true).unwrap();
 
-        let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+        let found = store
+            .reconcile_interrupted_turns("restarted", &[], None)
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert!(!found[0].resume);
 
@@ -1342,7 +1580,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
 
         // The preference is spent, so a later interruption resumes normally.
         store.append_event(&id, SessionEvent::TurnStarted).unwrap();
-        let again = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+        let again = store
+            .reconcile_interrupted_turns("restarted", &[], None)
+            .unwrap();
         assert!(again[0].resume);
     }
 
@@ -1353,16 +1593,18 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
 
         // Each pass ends mid-turn again, as it would if resuming crashed.
         for expected in [true, true, false] {
-            let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+            let found = store
+                .reconcile_interrupted_turns("restarted", &[], None)
+                .unwrap();
             assert_eq!(found[0].resume, expected, "attempt outcome");
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
         }
 
-        assert!(store
-            .events(&id, 0)
-            .unwrap()
-            .iter()
-            .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))));
+        assert!(
+            store.events(&id, 0).unwrap().iter().any(
+                |r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))
+            )
+        );
     }
 
     #[test]
@@ -1394,11 +1636,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
         }
         assert!(
-            !store
-                .events(&id, 0)
-                .unwrap()
-                .iter()
-                .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))),
+            !store.events(&id, 0).unwrap().iter().any(
+                |r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))
+            ),
             "a turn making progress must never be abandoned"
         );
     }
@@ -1521,11 +1761,9 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
         }
         assert!(
-            !store
-                .events(&id, 0)
-                .unwrap()
-                .iter()
-                .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))),
+            !store.events(&id, 0).unwrap().iter().any(
+                |r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))
+            ),
             "an expected restart must never exhaust the budget"
         );
 
@@ -1570,13 +1808,17 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let (store, _d) = temp_store();
         let id = mid_turn(&store, "recovers", None);
 
-        store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+        store
+            .reconcile_interrupted_turns("restarted", &[], None)
+            .unwrap();
         store.clear_resume_attempts(&id).unwrap();
 
         // Back to a clean slate: the cap starts counting from zero again.
         for _ in 0..2 {
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
-            let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
+            let found = store
+                .reconcile_interrupted_turns("restarted", &[], None)
+                .unwrap();
             assert!(found[0].resume);
         }
     }
@@ -1584,7 +1826,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn spend_accumulates() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
         assert_eq!(store.get_spend(&s.id).unwrap(), 0.0);
         store.add_spend(&s.id, 0.25).unwrap();
         let total = store.add_spend(&s.id, 0.5).unwrap();
@@ -1597,14 +1839,16 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn progress_is_readable_before_a_session_has_finished_anything() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
 
         let fresh = store.session_progress(&s.id).unwrap();
         assert_eq!(fresh.cost_usd, 0.0);
         assert_eq!(fresh.events, 0);
 
         store.add_spend(&s.id, 1.25).unwrap();
-        store.append_event(&s.id, SessionEvent::TurnStarted).unwrap();
+        store
+            .append_event(&s.id, SessionEvent::TurnStarted)
+            .unwrap();
         store
             .append_event(&s.id, SessionEvent::SystemNote("working".into()))
             .unwrap();
@@ -1638,16 +1882,25 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         // An absent key reads as empty, which is how "create if nothing is
         // there" is expressed — there is no delete, so empty and absent are one.
         assert!(store.kv_swap("global", "k", "", "first").unwrap());
-        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("first"));
+        assert_eq!(
+            store.kv_get("global", "k").unwrap().as_deref(),
+            Some("first")
+        );
 
         // The same claim a second time loses: this is what stops two readers of
         // one ask_user call from both posting a form.
         assert!(!store.kv_swap("global", "k", "", "second").unwrap());
-        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("first"));
+        assert_eq!(
+            store.kv_get("global", "k").unwrap().as_deref(),
+            Some("first")
+        );
 
         // A transition from the value actually held succeeds.
         assert!(store.kv_swap("global", "k", "first", "next").unwrap());
-        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("next"));
+        assert_eq!(
+            store.kv_get("global", "k").unwrap().as_deref(),
+            Some("next")
+        );
         // And the same transition replayed does not, so a duplicated click
         // cannot apply an answer twice.
         assert!(!store.kv_swap("global", "k", "first", "next").unwrap());
@@ -1713,8 +1966,12 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     #[test]
     fn archived_sessions_are_filtered() {
         let (store, _d) = temp_store();
-        let s = store.create_session(Some("keep".into()), "agent").unwrap();
-        let g = store.create_session(Some("gone".into()), "agent").unwrap();
+        let s = store
+            .create_session(Some("keep".into()), &"agent", "local")
+            .unwrap();
+        let g = store
+            .create_session(Some("gone".into()), &"agent", "local")
+            .unwrap();
         store.archive_session(&g.id, true).unwrap();
 
         let visible = store.list_sessions(false).unwrap();

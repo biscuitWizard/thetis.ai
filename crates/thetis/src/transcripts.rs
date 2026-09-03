@@ -32,7 +32,7 @@
 //! place decides what an event *says*, and read and search cannot disagree
 //! about it.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
@@ -106,7 +106,9 @@ impl ConversationSummary {
             parent_id: row.map(|r| r.parent_id.clone()).unwrap_or_default(),
             root_id: row.map(|r| r.root_id.clone()).unwrap_or_default(),
             label: row.map(|r| r.label.clone()).unwrap_or_default(),
-            state: row.map(|r| r.state.as_str().to_string()).unwrap_or_default(),
+            state: row
+                .map(|r| r.state.as_str().to_string())
+                .unwrap_or_default(),
             task: row.map(|r| r.task.clone()).unwrap_or_default(),
         }
     }
@@ -211,11 +213,24 @@ pub struct SearchQuery {
 #[derive(Clone, Copy)]
 pub struct Transcripts<'a> {
     store: &'a Store,
+    owner: Option<&'a str>,
 }
 
 impl<'a> Transcripts<'a> {
     pub fn new(store: &'a Store) -> Self {
-        Self { store }
+        Self { store, owner: None }
+    }
+
+    /// Restricts every catalogue/read/search operation to one owner's roots.
+    pub fn owned(store: &'a Store, owner: Option<&'a str>) -> Self {
+        Self { store, owner }
+    }
+
+    fn mine(&self, session_id: &str) -> Result<bool> {
+        Ok(match self.owner {
+            None => true,
+            Some(owner) => self.store.owner_of_root(session_id)?.as_deref() == Some(owner),
+        })
     }
 
     /// Every conversation, most recently active first.
@@ -233,6 +248,7 @@ impl<'a> Transcripts<'a> {
             .store
             .sessions_with_subagent_rows(include_archived)?
             .into_iter()
+            .filter(|(meta, _)| self.mine(&meta.id).unwrap_or(false))
             .filter(|(_, row)| include_subagents || row.is_none())
             .map(|(meta, row)| ConversationSummary::from_meta(meta, row.as_ref()))
             .collect();
@@ -245,6 +261,9 @@ impl<'a> Transcripts<'a> {
 
     /// One conversation's own summary, sub-agent or not.
     pub fn conversation(&self, session_id: &str) -> Result<ConversationSummary> {
+        if !self.mine(session_id)? {
+            return Err(anyhow!("no conversation with id `{session_id}`"));
+        }
         let meta = self
             .store
             .get_session(session_id)?
@@ -259,6 +278,9 @@ impl<'a> Transcripts<'a> {
     /// than only the caller's own, and it keys off `root_id`, so it reports a
     /// whole tree rather than one generation.
     pub fn subagents(&self, root_id: &str) -> Result<Vec<ConversationSummary>> {
+        if !self.mine(root_id)? {
+            return Err(anyhow!("no conversation with id `{root_id}`"));
+        }
         let mut out = Vec::new();
         for row in self.store.subagents_under(root_id)? {
             // A registry row whose session is gone is skipped rather than
@@ -284,9 +306,8 @@ impl<'a> Transcripts<'a> {
         limit: usize,
         max_chars: usize,
     ) -> Result<Vec<TranscriptEntry>> {
-        // Confirm the session exists, so an unknown id is an error rather than
-        // an empty transcript that reads as "nothing happened there".
-        if self.store.get_session(session_id)?.is_none() {
+        // Confirm the session exists and belongs to this catalogue.
+        if !self.mine(session_id)? || self.store.get_session(session_id)?.is_none() {
             return Err(anyhow!("no conversation with id `{session_id}`"));
         }
         let limit = clamp(limit, DEFAULT_READ_LIMIT, READ_LIMIT_CAP);
@@ -500,7 +521,10 @@ pub fn entries_of(event: &SessionEvent, include_tool_output: bool) -> Vec<(&'sta
         )],
         SessionEvent::ContextCompacted(c) => vec![(
             kind::COMPACTED,
-            format!("[{} messages summarised] {}", c.messages_replaced, c.summary),
+            format!(
+                "[{} messages summarised] {}",
+                c.messages_replaced, c.summary
+            ),
         )],
         // Nothing to say, or never persisted.
         SessionEvent::TurnStarted
@@ -531,11 +555,7 @@ fn clip(text: &str, max_chars: usize) -> (String, u64) {
 
 /// `0` means "the default", and anything above the cap becomes the cap.
 fn clamp(asked: usize, default: usize, cap: usize) -> usize {
-    if asked == 0 {
-        default
-    } else {
-        asked.min(cap)
-    }
+    if asked == 0 { default } else { asked.min(cap) }
 }
 
 /// Whether a projection of `records` is what a reader would call empty.
@@ -597,12 +617,22 @@ mod tests {
         // The whole point of the feature: recall across conversations the
         // asking session did not write.
         let (store, _d) = temp_store();
-        let a = store.create_session(Some("first".into()), "agent").unwrap();
-        let b = store.create_session(Some("second".into()), "agent").unwrap();
-        store.append_event(&a.id, user("the redb lock was the problem")).unwrap();
-        store.append_event(&b.id, user("something else entirely")).unwrap();
+        let a = store
+            .create_session(Some("first".into()), &"agent", "local")
+            .unwrap();
+        let b = store
+            .create_session(Some("second".into()), &"agent", "local")
+            .unwrap();
+        store
+            .append_event(&a.id, user("the redb lock was the problem"))
+            .unwrap();
+        store
+            .append_event(&b.id, user("something else entirely"))
+            .unwrap();
 
-        let report = Transcripts::new(&store).search(&query("redb lock")).unwrap();
+        let report = Transcripts::new(&store)
+            .search(&query("redb lock"))
+            .unwrap();
         assert_eq!(report.total_matches, 1);
         assert_eq!(report.matched_conversations, 1);
         assert_eq!(report.hits[0].session_id, a.id);
@@ -615,12 +645,15 @@ mod tests {
         // The asymmetry is deliberate and is the one thing about this surface a
         // reader is likeliest to think is a bug, so it is pinned.
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
         store
             .append_event(&s.id, tool_result("read_path", true, "fn widget() {}"))
             .unwrap();
         store
-            .append_event(&s.id, tool_result("terminal_run", false, "widget: no such target"))
+            .append_event(
+                &s.id,
+                tool_result("terminal_run", false, "widget: no such target"),
+            )
             .unwrap();
 
         let t = Transcripts::new(&store);
@@ -641,10 +674,21 @@ mod tests {
     #[test]
     fn a_sub_agents_log_is_searchable_and_attributed() {
         let (store, _d) = temp_store();
-        let parent = store.create_session(Some("parent".into()), "agent").unwrap();
-        let child = store.create_session(None, "agent").unwrap();
+        let parent = store
+            .create_session(Some("parent".into()), &"agent", "local")
+            .unwrap();
+        let child = store.create_session(None, &"agent", "local").unwrap();
         crate::subagents::Subagents::new(&store)
-            .register(&parent.id, &child.id, "scout", "go and look", "", "", "agent", 0)
+            .register(
+                &parent.id,
+                &child.id,
+                "scout",
+                "go and look",
+                "",
+                "",
+                "agent",
+                0,
+            )
             .unwrap();
         store
             .append_event(&child.id, assistant("the answer is fourteen"))
@@ -672,8 +716,8 @@ mod tests {
     #[test]
     fn subagents_lists_a_whole_tree_for_any_conversation() {
         let (store, _d) = temp_store();
-        let parent = store.create_session(None, "agent").unwrap();
-        let child = store.create_session(None, "agent").unwrap();
+        let parent = store.create_session(None, &"agent", "local").unwrap();
+        let child = store.create_session(None, &"agent", "local").unwrap();
         crate::subagents::Subagents::new(&store)
             .register(&parent.id, &child.id, "scout", "look", "", "", "plan", 0)
             .unwrap();
@@ -689,7 +733,7 @@ mod tests {
     #[test]
     fn a_read_pages_by_seq_and_reports_what_it_clipped() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
         store.append_event(&s.id, user("first")).unwrap();
         store.append_event(&s.id, user(&"x".repeat(50))).unwrap();
 
@@ -716,7 +760,10 @@ mod tests {
             SessionEvent::ReasoningDelta("hmm".into()),
             SessionEvent::TurnStarted,
         ] {
-            assert!(entries_of(&event, true).is_empty(), "{event:?} should be silent");
+            assert!(
+                entries_of(&event, true).is_empty(),
+                "{event:?} should be silent"
+            );
         }
         // ...whereas a finished turn carries the stop reason, which is worth
         // grepping for.
@@ -746,7 +793,11 @@ mod tests {
             usage: None,
         });
         let entries = entries_of(&event, true);
-        assert_eq!(entries.len(), 2, "the message and the call are separate lines");
+        assert_eq!(
+            entries.len(),
+            2,
+            "the message and the call are separate lines"
+        );
         assert_eq!(entries[1].0, kind::TOOL_CALL);
         assert!(entries[1].1.contains("search_files"));
         assert!(entries[1].1.contains("scope_ok"));
@@ -773,7 +824,7 @@ mod tests {
     #[test]
     fn the_hit_cap_is_reported_rather_than_hidden() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent").unwrap();
+        let s = store.create_session(None, &"agent", "local").unwrap();
         for _ in 0..10 {
             store.append_event(&s.id, user("needle")).unwrap();
         }
@@ -804,14 +855,24 @@ mod tests {
         let (store, _d) = temp_store();
         let t = Transcripts::new(&store);
         assert!(t.read("no-such-id", 0, 0, 0).is_err());
-        assert!(t.search(&SearchQuery { session_id: "no-such-id".into(), ..query("x") }).is_err());
+        assert!(
+            t.search(&SearchQuery {
+                session_id: "no-such-id".into(),
+                ..query("x")
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn conversations_are_newest_first_and_archived_ones_are_opt_in() {
         let (store, _d) = temp_store();
-        let kept = store.create_session(Some("kept".into()), "agent").unwrap();
-        let filed = store.create_session(Some("filed".into()), "agent").unwrap();
+        let kept = store
+            .create_session(Some("kept".into()), &"agent", "local")
+            .unwrap();
+        let filed = store
+            .create_session(Some("filed".into()), &"agent", "local")
+            .unwrap();
         store.append_event(&filed.id, user("a")).unwrap();
         store.append_event(&kept.id, user("b")).unwrap();
         store.archive_session(&filed.id, true).unwrap();
@@ -840,7 +901,7 @@ mod tests {
     fn a_limit_of_zero_means_everything() {
         let (store, _d) = temp_store();
         for _ in 0..3 {
-            store.create_session(None, "agent").unwrap();
+            store.create_session(None, &"agent", "local").unwrap();
         }
         let t = Transcripts::new(&store);
         assert_eq!(t.conversations(false, false, 0).unwrap().len(), 3);

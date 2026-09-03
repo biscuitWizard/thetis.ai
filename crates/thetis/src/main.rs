@@ -36,13 +36,21 @@ async fn main() -> Result<()> {
             if probe {
                 // The gateway's pre-adoption check on a branch-built kernel:
                 // does the binary start and speak the current IPC protocol?
-                println!(
-                    "thetis-worker-probe-ok {}",
-                    thetis::ipc::PROTOCOL_VERSION
-                );
+                println!("thetis-worker-probe-ok {}", thetis::ipc::PROTOCOL_VERSION);
                 return Ok(());
             }
             thetis::roles::worker::run(session, worktree).await
+        }
+        Some("hash-password") => {
+            let password = if args.next().as_deref() == Some("--stdin") {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s.trim_end().to_string()
+            } else {
+                return Err(anyhow::anyhow!("hash-password requires --stdin"));
+            };
+            println!("{}", thetis::auth::hash_password(&password)?);
+            Ok(())
         }
         _ => thetis::roles::gateway::run().await,
     }

@@ -8,17 +8,16 @@
 use anyhow::{Context, Result};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-
+use crate::aspect::Aspect;
 use crate::config::Config;
 use crate::grip::Grip;
 use crate::pipeline;
 use crate::revisions::Origin;
-use crate::aspect::Aspect;
 
 pub type WatchHandle = Debouncer<notify::RecommendedWatcher, RecommendedCache>;
 
@@ -103,8 +102,7 @@ async fn rebuild(grip: &Arc<Grip>, aspect: &Aspect) {
     // The note says what is true of this build. It deliberately does not claim
     // the commit holds only this aspect: a checkpoint sweeps the whole worktree,
     // so the file that changed and the aspect that rebuilt need not match.
-    match pipeline::build_and_activate(grip, aspect, origin, "rebuilt after a change on disk")
-        .await
+    match pipeline::build_and_activate(grip, aspect, origin, "rebuilt after a change on disk").await
     {
         Ok(outcome) if outcome.success => {
             tracing::info!(
@@ -237,7 +235,11 @@ fn source_roots(cfg: &Config) -> [(&Path, &String, fn(&str) -> Aspect); 2] {
     }
 
     [
-        (cfg.paths.gateways.as_path(), &cfg.paths.gateway_prefix, gateway),
+        (
+            cfg.paths.gateways.as_path(),
+            &cfg.paths.gateway_prefix,
+            gateway,
+        ),
         (cfg.paths.tools.as_path(), &cfg.paths.tool_prefix, tool),
     ]
 }
@@ -289,7 +291,10 @@ mod tests {
             vec![Aspect::Agent]
         );
         assert_eq!(
-            aspects_for_path(&cfg, Path::new("C:/proj/gateways/gateway-web/src/ui/app.js")),
+            aspects_for_path(
+                &cfg,
+                Path::new("C:/proj/gateways/gateway-web/src/ui/app.js")
+            ),
             vec![Aspect::gateway("web")]
         );
         assert_eq!(
@@ -300,11 +305,14 @@ mod tests {
 
     #[test]
     fn ignores_reads_so_a_build_cannot_retrigger_itself() {
-        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, MetadataKind,
-                            RemoveKind};
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind,
+        };
 
         // What cargo generates just by reading the sources it compiles.
-        assert!(!is_source_change(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
+        assert!(!is_source_change(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
         assert!(!is_source_change(&EventKind::Access(AccessKind::Read)));
         // A restore touches files; that is not an edit.
         assert!(!is_source_change(&EventKind::Modify(ModifyKind::Metadata(
@@ -312,7 +320,9 @@ mod tests {
         ))));
 
         // Real edits still rebuild.
-        assert!(is_source_change(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(is_source_change(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
         assert!(is_source_change(&EventKind::Create(CreateKind::File)));
         assert!(is_source_change(&EventKind::Remove(RemoveKind::File)));
         assert!(is_source_change(&EventKind::Any));
