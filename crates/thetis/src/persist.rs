@@ -167,6 +167,24 @@ impl Persist {
         )
     }
 
+    /// Writes a key only if it currently holds `expected`, reporting whether it
+    /// did. One serialized transaction in the store, so a caller can use it to
+    /// claim a state transition exactly once. See [`Store::kv_swap`].
+    pub async fn kv_swap(
+        &self,
+        scope: &str,
+        key: &str,
+        expected: &str,
+        value: &str,
+    ) -> Result<bool> {
+        delegate!(
+            self,
+            "store.kv_swap",
+            |s| s.kv_swap(scope, key, expected, value),
+            json!({ "scope": scope, "key": key, "expected": expected, "value": value })
+        )
+    }
+
     pub async fn get_spend(&self, session_id: &str) -> Result<f64> {
         delegate!(
             self,
@@ -336,6 +354,12 @@ fn serve_store_call_inner(
         "store.kv_put" => to_value(store.kv_put(
             get_str(&params, "scope")?,
             get_str(&params, "key")?,
+            get_str(&params, "value")?,
+        )?),
+        "store.kv_swap" => to_value(store.kv_swap(
+            get_str(&params, "scope")?,
+            get_str(&params, "key")?,
+            get_str(&params, "expected")?,
             get_str(&params, "value")?,
         )?),
         "store.get_spend" => to_value(store.get_spend(own_session(&params, caller_session)?)?),
