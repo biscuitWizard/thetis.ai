@@ -55,17 +55,6 @@ pub enum MergeOutcome {
     Conflict { paths: Vec<String> },
 }
 
-/// The result of a merge computed entirely in the object store.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeTree {
-    /// Merged cleanly; the id of the resulting tree.
-    Merged { tree: String },
-    /// Git could not merge these paths on its own. The tree it produced
-    /// carries conflict markers, so it is deliberately not offered here:
-    /// nothing in Thetis publishes a tree no one has looked at.
-    Conflict { paths: Vec<String> },
-}
-
 /// One lock per checkout, serializing the git commands that write.
 ///
 /// Git protects its index with `index.lock` and simply *fails* when it is
@@ -243,27 +232,6 @@ impl GitCtl {
             );
         }
         Ok(out)
-    }
-
-    /// As `run_hooked`, but a non-zero exit is returned rather than raised.
-    ///
-    /// Publishing needs this: git's own wording for a refused push says
-    /// nothing about which of its several causes applies, and the caller can
-    /// only translate stderr it is still holding. Callers must check
-    /// `out.status` themselves — nothing else here reports failure.
-    pub async fn run_hooked_status(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {
-        let _guard = self.write_lock().lock_owned().await;
-        let mut cmd = self.base_cmd(true);
-        cmd.args(args);
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        crate::control::run_child(
-            cmd,
-            GIT_TIMEOUT,
-            &format!("git {} in {}", args.join(" "), self.dir.display()),
-        )
-        .await
     }
 
     /// As `run_raw`, with extra environment — the temp-index plumbing the
@@ -522,30 +490,6 @@ impl GitCtl {
         Ok(commits)
     }
 
-    /// `git diff --stat` between two revisions, capped to `max_lines` so a
-    /// sprawling branch cannot flood a caller (or a model prompt). The final
-    /// summary line is always kept, because it carries the totals.
-    pub async fn diff_stat(&self, from: &str, to: &str, max_lines: usize) -> Result<String> {
-        let range = format!("{from}..{to}");
-        let out = self
-            .run(&["diff", "--stat=140,100", "--no-color", &range])
-            .await?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() <= max_lines {
-            return Ok(lines.join("\n"));
-        }
-        let mut kept: Vec<String> = lines[..max_lines.saturating_sub(1)]
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
-        kept.push(format!("… {} more files", lines.len() - max_lines));
-        if let Some(totals) = lines.last() {
-            kept.push(totals.to_string());
-        }
-        Ok(kept.join("\n"))
-    }
-
     /// The common ancestor of two revisions — where a branch forked.
     pub async fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
         let out = self.run_ok(&["merge-base", a, b]).await?;
@@ -619,53 +563,6 @@ impl GitCtl {
             );
         }
         Ok(MergeOutcome::Conflict { paths: conflicts })
-    }
-
-    /// Three-way merge two commits in the object store alone: no working
-    /// tree, no index, no branch moved.
-    ///
-    /// This is how publishing reconciles with the remote. The checkout is a
-    /// live conversation's trunk and cannot be borrowed for a merge that may
-    /// stop halfway on conflicts, and the two sides being merged are exported
-    /// histories that are never checked out at all.
-    ///
-    /// The merge base is whatever git finds between `ours` and `theirs`, so
-    /// callers with unrelated histories graft both sides onto a base commit
-    /// first — `--merge-base` only arrived in git 2.40 and this has to work on
-    /// older ones.
-    pub async fn merge_tree(&self, ours: &str, theirs: &str) -> Result<MergeTree> {
-        let out = self
-            .run_ok(&["merge-tree", "--write-tree", "-z", "--name-only", ours, theirs])
-            .await?;
-        // `<tree>NUL` on success; on a conflict the tree is followed by one
-        // NUL-terminated path per conflicted file, then an empty field, then
-        // git's own messages.
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut fields = text.split('\0');
-        let tree = fields.next().unwrap_or_default().trim().to_string();
-        if out.status.success() {
-            if tree.is_empty() {
-                bail!(
-                    "git merge-tree wrote no tree: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            return Ok(MergeTree::Merged { tree });
-        }
-        let paths: Vec<String> = fields
-            .take_while(|f| !f.is_empty())
-            .map(str::to_string)
-            .collect();
-        if paths.is_empty() {
-            // Exit 1 with nothing named is not a conflict but a refusal —
-            // unrelated histories, a bad revision — and must not be reported
-            // as one.
-            bail!(
-                "git merge-tree {ours} {theirs} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(MergeTree::Conflict { paths })
     }
 
     pub async fn merge_abort(&self) -> Result<()> {

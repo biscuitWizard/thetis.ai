@@ -36,13 +36,7 @@ export is `handle-turn(session-id)`.
 6. Return `TurnStats`: iterations, tokens, cost, the tools used, and
    `stopped_by`.
 
-`stopped_by` is one of `stop`, `asked`, `max-iterations`, `cancelled`, or
-`llm-error`.
-
-`asked` means the turn ended because `ask_user` succeeded: the loop stops itself
-so the model cannot talk past its own questions. It is a normal ending, so a
-surface reporting turns should treat it like `stop` and not badge it as a fault.
-See the `asking-the-user` skill.
+`stopped_by` is one of `stop`, `max-iterations`, `cancelled`, or `llm-error`.
 
 Note: `max_iterations` in the `Turn` struct is set to `u32::MAX`, so the
 iteration ceiling in the config is not applied by the current loop code. Verify

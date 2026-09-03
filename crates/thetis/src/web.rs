@@ -27,11 +27,6 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         .route("/ws", get(ws_upgrade))
         .route("/admin", get(admin_page))
         .route("/admin/waits", get(admin_waits))
-        // One conversation's own UI build, so an agent working on the
-        // interface can see its work without launching a second orchestrator.
-        .route("/preview/{session}", get(preview_root))
-        .route("/preview/{session}/", get(preview_root))
-        .route("/preview/{session}/{*path}", get(preview_asset))
         .route("/admin/branch", post(admin_branch))
         .route("/admin/rollback", post(admin_rollback_legacy))
         // Raw workspace bytes. Separate from the frame protocol because these
@@ -402,7 +397,7 @@ async fn admin_branch_action(
                 "released the checkout for {target}; its branch and commits remain"
             ))
         }
-        // Publishing: derive the filtered history, then (separately)
+        // Publishing: derive the filtered public branch, then (separately)
         // push it. Two explicit human actions, never automatic.
         "export-public" => {
             let root = branches.root_git();
@@ -416,86 +411,10 @@ async fn admin_branch_action(
                 None => "nothing to export yet".to_string(),
             })
         }
-        // The other direction: take in what another checkout published, so
-        // that publishing from here adds to it rather than replacing it.
-        "pull-public" => {
-            let root = branches.root_git();
-            let before = root.head().await?;
-            match crate::publish::plan_pull(root).await? {
-                crate::publish::Pull::NothingPublished => Ok(format!(
-                    "nothing has been published to origin/{} yet, so there is nothing to pull",
-                    crate::publish::REMOTE_BRANCH
-                )),
-                crate::publish::Pull::UpToDate => Ok(format!(
-                    "already up to date with origin/{}",
-                    crate::publish::REMOTE_BRANCH
-                )),
-                crate::publish::Pull::Ready(plan) => {
-                    let count = plan.subjects.len();
-                    let pulled = crate::publish::apply_pull(root, plan).await?;
-                    let Some(commit) = pulled.trunk_commit else {
-                        return Ok(format!(
-                            "origin/{} held nothing this checkout was missing; its history is \
-                             now part of ours, so publishing from here no longer replaces it",
-                            crate::publish::REMOTE_BRANCH
-                        ));
-                    };
-                    // Everyone's page is served from trunk's build, and trunk
-                    // just moved.
-                    crate::roles::gateway::load_ui_gateway(grip).await;
-                    let mut msg = format!(
-                        "pulled {count} commit(s) from origin/{}; trunk is at {}",
-                        crate::publish::REMOTE_BRANCH,
-                        &commit[..12.min(commit.len())]
-                    );
-                    // The guest aspects hot-swap; the kernel does not, and
-                    // nothing here rebuilds it — say so rather than leave the
-                    // operator running a binary older than trunk unawares.
-                    if crate::control::kernel_source_moved(root, &before, "HEAD").await {
-                        msg.push_str(
-                            ". This moved the orchestrator's own source, so trunk's binary is \
-                             now older than trunk — rebuild and restart to run it",
-                        );
-                    }
-                    Ok(msg)
-                }
-            }
-        }
-        // A claim about the past only the operator can make: what is published
-        // now is where this checkout and the remote last agreed.
-        "adopt-remote" => {
-            let root = branches.root_git();
-            let remote = crate::publish::adopt_remote(root).await?;
-            Ok(format!(
-                "adopted origin/{} at {} as the base this checkout last agreed with; pull now \
-                 to join the two histories",
-                crate::publish::REMOTE_BRANCH,
-                &remote[..12.min(remote.len())]
-            ))
-        }
         "push-public" => {
             let root = branches.root_git();
-            // Export first. Pushing meant "publish where trunk is now", but the
-            // button only pushed whatever `public` already pointed at — and on
-            // a checkout that had never exported there was no such ref at all,
-            // so it failed with git's `src refspec public does not match any`,
-            // which says nothing about what to do. Exporting is idempotent, so
-            // doing it here costs nothing when the branch is already current.
-            let export = crate::publish::export_public(root).await?;
-            let Some(head) = export.public_head else {
-                anyhow::bail!(
-                    "there is nothing to publish yet: trunk has no commits that survive \
-                     the private-path filter, so nothing was exported."
-                );
-            };
-
-            crate::publish::push_public(root).await?;
-            Ok(format!(
-                "exported {} commit(s) and published {} as '{}' on origin",
-                export.commits,
-                &head[..12.min(head.len())],
-                crate::publish::REMOTE_BRANCH
-            ))
+            root.run_hooked(&["push", "origin", "public"], &[]).await?;
+            Ok("pushed the public branch to origin".to_string())
         }
         other => anyhow::bail!("unknown action '{other}'"),
     }
@@ -672,21 +591,11 @@ machine: a filtered <code>public</code> branch mirrors trunk without them, and a
 hook refuses everything else. Currently private: {private_list}.</p>
 <form method=post action="/admin/branch">
   <input type=hidden name=action value="export-public">
-  <button>export public history</button></form>
+  <button>export public branch</button></form>
 <form method=post action="/admin/branch"
-      onsubmit="return confirm('Publish to origin/main? This replaces the remote\'s main with the filtered export of trunk.')">
+      onsubmit="return confirm('Push the public branch to origin?')">
   <input type=hidden name=action value="push-public">
-  <button>publish to origin/main</button></form>
-<p class=note>When another checkout publishes too, pull before publishing: it merges what
-they published into trunk here, so the next publish carries both instead of being refused
-for replacing their work. Only paths that leave this machine are touched.</p>
-<form method=post action="/admin/branch">
-  <input type=hidden name=action value="pull-public">
-  <button>pull from origin/main</button></form>
-<form method=post action="/admin/branch"
-      onsubmit="return confirm('Adopt origin/main as the base? Only if what is published there is work this checkout already has — anything on it that is new here would be treated as already-had and dropped from the next publish.')">
-  <input type=hidden name=action value="adopt-remote">
-  <button>adopt origin/main as base</button></form>
+  <button>push public to origin</button></form>
 <p class=note>{sessions} session(s) on record.</p>
 <p><a href="/">&larr; back to chat</a></p>"#,
         banner = banner,
@@ -754,115 +663,6 @@ async fn admin_waits(State(grip): State<Arc<Grip>>) -> Response {
         serde_json::to_string_pretty(&body).unwrap_or_default(),
     )
         .into_response()
-}
-
-/// Serves `/` from a conversation's own gateway build.
-async fn preview_root(
-    State(grip): State<Arc<Grip>>,
-    Path(session): Path<String>,
-) -> Response {
-    preview_response(&grip, &session, "/").await
-}
-
-async fn preview_asset(
-    State(grip): State<Arc<Grip>>,
-    Path((session, path)): Path<(String, String)>,
-) -> Response {
-    preview_response(&grip, &session, &format!("/{path}")).await
-}
-
-/// The UI a browser normally loads is trunk's, on purpose. This serves a
-/// single conversation's instead, read from the shared build cache.
-///
-/// Assets only: the websocket, the workspace routes and everything else stay
-/// on the real system, so the previewed interface drives the running Thetis
-/// rather than a copy of it. That is the point — an agent wants to see its
-/// interface against real conversations, which is exactly what a second
-/// orchestrator on another port could not give it.
-async fn preview_response(grip: &Arc<Grip>, session: &str, path: &str) -> Response {
-    let loaded = match gateway::preview_component(grip, session).await {
-        Ok(loaded) => loaded,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Html(fallback_page(&format!("{e:#}"))),
-            )
-                .into_response()
-        }
-    };
-    match gateway::serve_preview_asset(grip, loaded, path).await {
-        Ok(Some(mut asset)) => {
-            if asset.mime.starts_with("text/html") {
-                asset.bytes = rewrite_preview_html(&asset.bytes, session);
-            }
-            (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, asset.mime),
-                // A preview is a moving target; a cached copy of yesterday's
-                // build is the one thing it must never show.
-                (header::CACHE_CONTROL, "no-store".to_string()),
-            ],
-            asset.bytes,
-        )
-            .into_response()
-        }
-        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
-        Err(e) => {
-            let detail = format!("{e:#}");
-            tracing::warn!(error = %detail, path, session, "preview asset request failed");
-            (StatusCode::SERVICE_UNAVAILABLE, Html(fallback_page(&detail))).into_response()
-        }
-    }
-}
-
-/// Points the previewed page's own assets at the preview, and leaves
-/// everything else pointing at the real system.
-///
-/// The UI asks for `/app.js` absolutely, so without this a preview would serve
-/// the branch's HTML and then trunk's script and stylesheet — the confusing
-/// half-and-half that is worse than not working. Only references that name a
-/// file are rewritten: `/admin`, `/ws` and the workspace routes are host
-/// routes, and the preview is meant to drive the running system through them.
-/// The scripts themselves import relatively (`./lib/dom.js`), so once the
-/// entry point is under the prefix the rest follows on its own.
-fn rewrite_preview_html(bytes: &[u8], session: &str) -> Vec<u8> {
-    let Ok(html) = std::str::from_utf8(bytes) else {
-        return bytes.to_vec();
-    };
-    let prefix = format!("/preview/{session}");
-    let mut out = String::with_capacity(html.len() + 128);
-    let mut rest = html;
-    loop {
-        let Some((at, pat)) = ["src=\"/", "href=\"/"]
-            .iter()
-            .filter_map(|pat| rest.find(pat).map(|i| (i, *pat)))
-            .min_by_key(|(i, _)| *i)
-        else {
-            break;
-        };
-        // Everything up to and including the opening quote.
-        let attr_end = at + pat.len() - 1;
-        out.push_str(&rest[..attr_end]);
-
-        let tail = &rest[attr_end..];
-        let Some(end) = tail.find('"') else {
-            out.push_str(tail);
-            return out.into_bytes();
-        };
-        let url = &tail[..end];
-        // A path whose last segment has an extension is an asset this gateway
-        // serves; anything else is a route on the host.
-        let is_asset = url.rsplit('/').next().is_some_and(|last| last.contains('.'));
-        if is_asset {
-            out.push_str(&prefix);
-        }
-        out.push_str(url);
-        out.push('"');
-        rest = &tail[end + 1..];
-    }
-    out.push_str(rest);
-    out.into_bytes()
 }
 
 async fn ws_upgrade(ws: WebSocketUpgrade, State(grip): State<Arc<Grip>>) -> Response {
@@ -1085,45 +885,6 @@ fn inbound_type(text: &str) -> Option<String> {
         .get("type")?
         .as_str()
         .map(str::to_string)
-}
-
-#[cfg(test)]
-mod preview_tests {
-    use super::rewrite_preview_html;
-
-    fn rewrite(html: &str) -> String {
-        String::from_utf8(rewrite_preview_html(html.as_bytes(), "abc123")).unwrap()
-    }
-
-    #[test]
-    fn the_pages_own_assets_are_pointed_at_the_preview() {
-        // Without this the preview serves the branch's HTML and then trunk's
-        // script — the half-and-half that is worse than not working at all.
-        let out = rewrite(r#"<link href="/app.css"><script src="/app.js"></script>"#);
-        assert!(out.contains(r#"href="/preview/abc123/app.css""#), "{out}");
-        assert!(out.contains(r#"src="/preview/abc123/app.js""#), "{out}");
-    }
-
-    #[test]
-    fn host_routes_are_left_alone() {
-        // `/admin` and `/ws` are the real system's, and the whole point of a
-        // preview is that it drives the real system.
-        let out = rewrite(r#"<a href="/admin">admin</a><a href="/">home</a>"#);
-        assert!(out.contains(r#"href="/admin""#), "{out}");
-        assert!(!out.contains("/preview/abc123/admin"), "{out}");
-    }
-
-    #[test]
-    fn inline_data_urls_and_relative_paths_are_untouched() {
-        let html = r#"<link href="data:image/svg+xml,<svg/>"><script src="./lib/dom.js">"#;
-        assert_eq!(rewrite(html), html);
-    }
-
-    #[test]
-    fn a_page_with_nothing_to_rewrite_survives_intact() {
-        let html = "<html><body>hello</body></html>";
-        assert_eq!(rewrite(html), html);
-    }
 }
 
 #[cfg(test)]

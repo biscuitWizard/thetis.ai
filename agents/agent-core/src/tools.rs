@@ -123,7 +123,6 @@ fn all_builtins() -> Vec<ToolDef> {
     }
     if !terminal_available() {
         tools.extend(terminal_tools());
-        tools.extend(git_tools());
     }
     tools
 }
@@ -196,71 +195,6 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
             parameters: obj(
                 json!({ "key": string_prop("The note to read; omit to list all keys.") }),
                 &[],
-            ),
-        },
-        // --- asking the user ------------------------------------------------
-        //
-        // Deliberately not mutating: it changes nothing outside the
-        // conversation, and a read-only mode is exactly where asking a
-        // question matters most — it is the only thing such a session can do
-        // besides read. That is also what lets Discord use it.
-        ToolDef {
-            name: ASK_USER,
-            description:
-                "Ask the user one or more questions and have them answered in the interface \
-                 rather than in prose. Each question is either multiple choice or open ended; \
-                 every choice question also offers a free-text answer of the user's own, and \
-                 every question can be skipped. Use this whenever you need input to go on — a \
-                 decision between options, a missing detail, a preference — and prefer it to \
-                 writing questions into your reply, because the user gets something to click \
-                 and the answers come back labelled. All the questions are presented at once. \
-                 Calling this ends your turn: the answers arrive as the user's next message, so \
-                 ask as soon as you need input rather than guessing and pressing on.",
-            mutating: false,
-            parameters: obj(
-                json!({
-                    "intro": string_prop(
-                        "One line of context shown above the questions, e.g. why you are \
-                         asking. Optional."
-                    ),
-                    "questions": {
-                        "type": "array",
-                        "description": "The questions, in the order they should be answered. At least one.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": string_prop(
-                                    "Short key naming this question, used to label the answer \
-                                     when it comes back, e.g. 'colour'. Optional."
-                                ),
-                                "question": string_prop("The question, worded as you would say it."),
-                                "type": {
-                                    "type": "string",
-                                    "enum": ["choice", "open"],
-                                    "description":
-                                        "'choice' for multiple choice, 'open' for free text. \
-                                         Defaults to 'choice' when options are given, 'open' \
-                                         otherwise.",
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description":
-                                        "The choices, for a choice question. A free-text \
-                                         'something else' box and a skip control are added for \
-                                         you — do not put them in this list.",
-                                },
-                                "allow_multiple": {
-                                    "type": "boolean",
-                                    "description": "Let the user pick more than one option. Defaults to false.",
-                                },
-                            },
-                            "required": ["question"],
-                            "additionalProperties": false,
-                        },
-                    },
-                }),
-                &["questions"],
             ),
         },
         // --- skills ---------------------------------------------------------
@@ -398,9 +332,6 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     }
     if terminal_available() {
         tools.extend(terminal_tools());
-        // git_clone runs the credential script in a shell, so it is offered on
-        // the same condition as the terminal itself.
-        tools.extend(git_tools());
     }
     tools.extend(configuration_tools());
     if restart_available() {
@@ -408,14 +339,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
             name: "restart_orchestrator",
             description:
                 "Restart this conversation's own runtime — no other conversation notices. \
-                 Needed for changes to settings read only at startup, and for changes to \
-                 the orchestrator's own source under crates/. Do NOT build the \
-                 orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
-                 this rebuilds it for you, in the background, and reports the result here. \
-                 A build that fails restarts nothing and gives you the compiler error; a \
-                 binary that will not start is probed and rejected before it is adopted. \
-                 This turn continues afterwards unless you say otherwise; say why first, \
-                 because the restart happens just after your turn ends.",
+                 Needed for changes to settings read only at startup, or to run a kernel \
+                 you rebuilt in this branch (build it first with \
+                 `cargo build --release -p thetis` in a terminal; the new binary is \
+                 probed before it is adopted, and a broken one falls back). This turn \
+                 continues afterwards unless you say otherwise; say why first, because \
+                 the restart happens just after your turn ends.",
             mutating: true,
             parameters: obj(
                 json!({
@@ -653,68 +582,13 @@ fn terminal_tools() -> Vec<ToolDef> {
     ]
 }
 
-/// Where a clone lands unless the caller names somewhere else.
-///
-/// `workspace/` is gitignored, so a clone does not show up as untracked cruft
-/// in the conversation's own worktree — which is what would happen if a repo of
-/// any size were dropped at the root.
-const CLONE_ROOT: &str = "workspace";
-
-/// A real working tree, for the jobs the GitHub REST API cannot do.
-///
-/// The `git-*` tools cover reads, commits and PRs without a clone, and that
-/// stays the better path. This is for a rebase, a bisect, or running a test
-/// suite — anything that needs files and a `.git`. It shells out to
-/// `scripts/github-app-git.sh`, which mints an installation token from the same
-/// `[tools.git]` credential the tools use, so a clone authenticates and commits
-/// as the app's own `[bot]` identity with no token left on disk.
-///
-/// Offered only when the terminal is, since that is how it runs.
-fn git_tools() -> Vec<ToolDef> {
-    vec![ToolDef {
-        name: "git_clone",
-        description:
-            "Clone a GitHub repository into a real working tree, authenticated as the app's \
-             GitHub App identity. Use this when you need actual files and a .git — a rebase, a \
-             bisect, running a test suite, or a commit series with exact parentage; the git-* \
-             tools read and write through the API without cloning, which is cheaper and is \
-             still the right default. Lands in workspace/<name> unless you say otherwise, and \
-             workspace/ is gitignored, so the clone does not pollute your own checkout. The \
-             clone's remote is left tokenless and user.name/user.email are set to the [bot] \
-             identity; to push later, run: eval \"$(scripts/github-app-git.sh env)\" in a \
-             terminal session first, because the installation token lasts an hour.",
-        mutating: true,
-        parameters: obj(
-            json!({
-                "repo": string_prop("Repository as `owner/repo`, or its URL."),
-                "dir": string_prop(
-                    "Where to put it, relative to your checkout. Defaults to \
-                     workspace/<repo-name>."),
-                "ref": string_prop(
-                    "Branch, tag or commit to check out after cloning. Defaults to the \
-                     repository's default branch."),
-                "depth": {
-                    "type": "integer",
-                    "description": "Truncate history to this many commits. Omit for the full \
-                                    history, which is what a rebase or a bisect needs.",
-                },
-            }),
-            &["repo"],
-        ),
-    }]
-}
-
 /// Tools that edit the running system. Every mutating one rebuilds immediately
 /// and returns the compiler's verdict in its result.
 fn devkit_tools() -> Vec<ToolDef> {
     let target_prop = json!({
         "type": "string",
         "description": "What to edit: 'self' for your own loop, 'gateway:<name>' for a chat \
-                        interface, or 'tool:<name>' for one of your tools. Editing a gateway \
-                        changes only YOUR copy: the interface every browser loads is trunk's \
-                        until your work is merged. To see your own version, open \
-                        /preview/<this session id>/ — it serves your build against the real \
-                        running system. Never start a second Thetis to look at a UI change.",
+                        interface, or 'tool:<name>' for one of your tools.",
     });
 
     vec![
@@ -987,7 +861,6 @@ pub fn invoke(
     match name {
         "remember" => remember(session_id, &args),
         "recall" => recall(session_id, &args),
-        ASK_USER => ask_user(&args),
 
         "skill_fetch" => skills::fetch(
             &req_str(&args, "id")?,
@@ -1161,8 +1034,6 @@ pub fn invoke(
             args.get("recursive").and_then(Value::as_bool).unwrap_or(false),
         ),
 
-        "git_clone" => git_clone(&args),
-
         "terminal_open" => terminal::open(args.get("cwd").and_then(Value::as_str)),
         "terminal_run" => terminal::run(
             &req_str(&args, "id")?,
@@ -1229,255 +1100,6 @@ pub fn invoke(
         // Anything else must be a hot-loaded tool component.
         other => tooling::invoke(other, session_id, args_json),
     }
-}
-
-// --- asking the user --------------------------------------------------------
-//
-// One call presents a whole form. See `ask_user` for why it does not block.
-
-/// The largest number of questions one call may present.
-///
-/// A form long enough to scroll past is a form nobody finishes, and Discord
-/// allows only five component rows per message, so this is both a UX limit and
-/// a wire limit.
-const MAX_QUESTIONS: usize = 5;
-
-/// The tool's name, in one place because the turn loop matches on it to end
-/// the turn after a question is asked. A literal in both spots could drift
-/// apart, and the failure would be silent: the pause would stop happening.
-pub const ASK_USER: &str = "ask_user";
-
-/// Choices per question. Discord's select menu allows 25 options, and one is
-/// spent on "something else", so 24 is the real ceiling.
-const MAX_OPTIONS: usize = 24;
-
-/// Presents questions to the user and returns immediately.
-///
-/// The tool does not wait for an answer, and cannot: a turn is a single pass
-/// and the user's reply arrives as their next message, which starts the turn
-/// after this one. So the work here is validation and normalisation — the tool
-/// call event is what the surfaces render, and both the browser and Discord
-/// read the normalised form out of `arguments_json`. Rejecting a malformed
-/// question here rather than in a renderer means one error message instead of
-/// two silently different behaviours.
-fn ask_user(args: &Value) -> Result<String, String> {
-    let raw = args
-        .get("questions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "missing required argument 'questions' (an array)".to_string())?;
-
-    if raw.is_empty() {
-        return Err("'questions' was empty; ask at least one question".to_string());
-    }
-    if raw.len() > MAX_QUESTIONS {
-        return Err(format!(
-            "{} questions is too many to answer at once; ask at most {MAX_QUESTIONS} and follow \
-             up next turn",
-            raw.len()
-        ));
-    }
-
-    let mut summary = Vec::new();
-    for (index, item) in raw.iter().enumerate() {
-        let position = index + 1;
-        let question = item
-            .get("question")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-            .ok_or_else(|| format!("question {position} has no 'question' text"))?;
-
-        let options: Vec<&str> = item
-            .get("options")
-            .and_then(Value::as_array)
-            .map(|opts| {
-                opts.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|o| !o.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // The kind is inferred when it is not stated, because a model that
-        // supplies options plainly means a choice question, and refusing on a
-        // missing field it did not need would be pedantry.
-        let kind = match item.get("type").and_then(Value::as_str) {
-            Some("choice") => "choice",
-            Some("open") => "open",
-            Some(other) => {
-                return Err(format!(
-                    "question {position} has type '{other}'; use 'choice' or 'open'"
-                ))
-            }
-            None if options.is_empty() => "open",
-            None => "choice",
-        };
-
-        if kind == "choice" {
-            if options.is_empty() {
-                return Err(format!(
-                    "question {position} is multiple choice but lists no options; give some \
-                     options, or use type 'open'"
-                ));
-            }
-            if options.len() > MAX_OPTIONS {
-                return Err(format!(
-                    "question {position} has {} options; at most {MAX_OPTIONS} can be shown",
-                    options.len()
-                ));
-            }
-        }
-
-        summary.push(match kind {
-            "choice" => format!(
-                "  {position}. {question}\n     options: {}",
-                options.join(" / ")
-            ),
-            _ => format!("  {position}. {question}\n     open ended"),
-        });
-    }
-
-    // Said back plainly, because this string is what the model reads next. It
-    // no longer has to *ask* for the turn to end — the loop ends it as soon as
-    // this call succeeds — but it still has to stop the model from restating
-    // the questions in prose, since whatever it writes next is the last thing
-    // the user reads before the form.
-    Ok(format!(
-        "Put {} question(s) to the user:\n{}\n\nEvery choice question also offers a free-text \
-         answer, and every question can be skipped. This turn now ends automatically and the \
-         answers arrive as the user's next message, so do not ask these again in your reply and \
-         do not attempt further work: anything you plan to do with the answers belongs in the \
-         next turn. A brief sign-off is fine.",
-        raw.len(),
-        summary.join("\n")
-    ))
-}
-
-// --- git ---------------------------------------------------------------------
-
-/// Wraps a value in single quotes so the shell takes it literally.
-///
-/// Every argument here comes from the model, and one of them is a path. Quoting
-/// is what stops a repo name containing `;` from being a second command.
-fn shell_quote(raw: &str) -> String {
-    format!("'{}'", raw.replace('\'', r"'\''"))
-}
-
-/// `owner/repo`, from either that or a URL, rejecting anything else.
-///
-/// Validated rather than passed through: a bad name should be a clear error
-/// here, not a confusing git failure three commands later.
-fn parse_repo(raw: &str) -> Result<String, String> {
-    let slug = raw
-        .trim()
-        .trim_end_matches('/')
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("github.com/")
-        .trim_start_matches("git@github.com:")
-        .trim_end_matches(".git");
-
-    let mut parts = slug.split('/');
-    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(format!(
-            "'{raw}' is not a repository; give 'owner/repo' or a GitHub URL"
-        ));
-    };
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    };
-    if !ok(owner) || !ok(name) {
-        return Err(format!(
-            "'{raw}' is not a repository; give 'owner/repo' or a GitHub URL"
-        ));
-    }
-    Ok(format!("{owner}/{name}"))
-}
-
-/// Clone a repository into a real working tree.
-///
-/// The token never reaches the command line or `.git/config`: the credential
-/// script's `env` output installs a `url.insteadOf` rewrite, so git substitutes
-/// the credential itself and the stored remote stays tokenless. That matters
-/// because an installation token expires in an hour — a copy written to disk
-/// would be both a leaked secret and a stale one.
-fn git_clone(args: &Value) -> Result<String, String> {
-    let repo = parse_repo(&req_str(args, "repo")?)?;
-    let name = repo.split('/').nth(1).unwrap_or("repo").to_string();
-
-    let dir = match opt_arg(args, "dir") {
-        Some(dir) => {
-            let dir = dir.trim().trim_start_matches("./").to_string();
-            if dir.starts_with('/') || dir.split('/').any(|p| p == "..") {
-                return Err(
-                    "dir must be a relative path inside your checkout, with no '..'".to_string(),
-                );
-            }
-            dir
-        }
-        None => format!("{CLONE_ROOT}/{name}"),
-    };
-
-    let depth = match args.get("depth").and_then(Value::as_u64) {
-        Some(n) if n > 0 => format!("--depth {n} "),
-        _ => String::new(),
-    };
-    let clone = format!(
-        "git clone {depth}{} {}",
-        shell_quote(&format!("https://github.com/{repo}.git")),
-        shell_quote(&dir),
-    );
-
-    // One shell, because every step after the first depends on the environment
-    // `eval` sets up, and `set -e` so a failed clone does not go on to report a
-    // commit identity for a tree that does not exist.
-    //
-    // The token is captured before the eval rather than relying on `set -e` to
-    // catch a failure: `eval "$(...)"` reports the status of `eval`, which
-    // succeeds on the empty string a failed script leaves behind. Without this
-    // check, a missing credential reached git as "could not read Username for
-    // 'https://github.com'", which sends the reader looking at ssh keys instead
-    // of at [tools.git].
-    let mut script = format!(
-        "set -e\n\
-         __creds=$(scripts/github-app-git.sh env) || {{ echo \"$__creds\"; exit 1; }}\n\
-         eval \"$__creds\"\n\
-         mkdir -p \"$(dirname {dir})\"\n\
-         {clone}\n",
-        dir = shell_quote(&dir),
-    );
-    if let Some(reference) = opt_arg(args, "ref") {
-        script.push_str(&format!(
-            "git -C {} checkout {}\n",
-            shell_quote(&dir),
-            shell_quote(&reference)
-        ));
-    }
-    // The identity has to be set per clone: GIT_AUTHOR_* only lasts as long as
-    // the session that ran `env`, and a later terminal would commit as nobody.
-    script.push_str(&format!(
-        "git -C {dir} config user.name \"$GIT_AUTHOR_NAME\"\n\
-         git -C {dir} config user.email \"$GIT_AUTHOR_EMAIL\"\n\
-         git -C {dir} log --oneline -1\n\
-         git -C {dir} remote -v | head -1\n",
-        dir = shell_quote(&dir),
-    ));
-
-    let session = terminal::open(None)?;
-    // Cloning is network-bound and a large repository is slow, so this gets a
-    // longer leash than the terminal default. The session is closed either way.
-    let result = terminal::run(&session, &script, 600_000);
-    let _ = terminal::close(&session);
-
-    let output = format_terminal(result?);
-    Ok(format!(
-        "cloned {repo} into {dir}\n\n{output}\n\n\
-         The remote is tokenless and the [bot] identity is set on this clone. Before pushing, \
-         run: eval \"$(scripts/github-app-git.sh env)\" in the terminal session you push from."
-    ))
 }
 
 // --- memory tools -----------------------------------------------------------
@@ -1834,94 +1456,4 @@ fn format_exec(result: ExecResult) -> String {
         out.push_str("[no output]");
     }
     out
-}
-
-/// Tests for the parts of `ask_user` the turn loop depends on.
-///
-/// The loop ends the turn when a call named [`ASK_USER`] *succeeds*, so two
-/// things have to hold: the advertised name must equal the constant the loop
-/// matches on, and validation must reject a malformed question rather than
-/// returning `Ok`. Both are checked here because both fail silently — a rename
-/// would simply stop the pause happening, and an `Ok` on a question that was
-/// never shown would hang the conversation waiting for an answer.
-#[cfg(test)]
-mod ask_user_tests {
-    use super::{ask_user, ASK_USER, MAX_OPTIONS, MAX_QUESTIONS};
-    use serde_json::json;
-
-    // `available()` is deliberately not called here: building the tool list
-    // reads capability flags through host imports, which do not exist outside
-    // wasm, and calling it from a host test aborts the process rather than
-    // failing. The constant is what both the tool definition and the turn loop
-    // refer to, so pinning its value is what actually guards against drift.
-    #[test]
-    fn the_wire_name_is_pinned() {
-        assert_eq!(
-            ASK_USER, "ask_user",
-            "the web form, the Discord flow and the turn loop all key off this exact string"
-        );
-    }
-
-    #[test]
-    fn a_well_formed_question_succeeds_so_the_turn_pauses() {
-        let result = ask_user(&json!({
-            "questions": [{ "question": "Ship it?", "options": ["yes", "no"] }]
-        }));
-        assert!(result.is_ok(), "a valid question must report success");
-    }
-
-    #[test]
-    fn an_open_question_needs_no_options() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "What broke?", "type": "open" }]
-        }))
-        .is_ok());
-    }
-
-    // Each of these must be an `Err`. The loop only pauses on success, so a
-    // rejection here is what keeps a malformed call from stalling the
-    // conversation on a form the user never saw.
-    #[test]
-    fn a_choice_question_with_no_options_is_rejected() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Pick one", "type": "choice" }]
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn a_question_with_no_text_is_rejected() {
-        assert!(ask_user(&json!({ "questions": [{ "question": "   " }] })).is_err());
-    }
-
-    #[test]
-    fn an_empty_or_missing_question_list_is_rejected() {
-        assert!(ask_user(&json!({ "questions": [] })).is_err());
-        assert!(ask_user(&json!({})).is_err());
-    }
-
-    #[test]
-    fn too_many_questions_is_rejected() {
-        let questions: Vec<_> = (0..MAX_QUESTIONS + 1)
-            .map(|i| json!({ "question": format!("q{i}"), "type": "open" }))
-            .collect();
-        assert!(ask_user(&json!({ "questions": questions })).is_err());
-    }
-
-    #[test]
-    fn too_many_options_is_rejected() {
-        let options: Vec<_> = (0..MAX_OPTIONS + 1).map(|i| format!("o{i}")).collect();
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Pick", "options": options }]
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn an_unknown_type_is_rejected_rather_than_guessed() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Eh?", "type": "dropdown" }]
-        }))
-        .is_err());
-    }
 }
