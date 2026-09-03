@@ -25,7 +25,7 @@
  */
 
 import { $, clear, el, icon } from "../lib/dom.js";
-import { toast } from "../lib/toast.js";
+import { popover, toast } from "../lib/toast.js";
 
 // Height of the drawer, remembered across conversations and reloads. In
 // localStorage rather than the store: it is a property of this screen, not of
@@ -44,6 +44,10 @@ const ICONS = {
   chevron: "M6 8l4 4 4-4",
   close: "M6 6l8 8M14 6l-8 8",
   trash: "M4 6h12M8 6V4.5h4V6M6 6v9.5h8V6M8.5 9v4M11.5 9v4",
+  // Distinct from `trash`: clearing wipes the view, killing ends the shell, and
+  // one icon for both is how someone loses a session they meant to tidy.
+  eraser: "M5 15h10M7.5 12.5l-2-2 6-6 2 2-6 6zM9 11l-2-2",
+  info: "M10 3.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM10 9v4.5M10 6.5v.01",
 };
 
 let dock = null;
@@ -70,6 +74,9 @@ let libPromise = null;
 let resizeObserver = null;
 
 let requestList = () => {};
+// Asks the host to kill one shell. The list is not touched here: the authority
+// is the `closed` feed event that follows, which every watching tab sees.
+let requestKillFrame = () => {};
 
 // --- the vendored library ---------------------------------------------------
 
@@ -150,8 +157,9 @@ function themeColors() {
 
 // --- mounting ---------------------------------------------------------------
 
-export function mountTerminals({ onRequest }) {
+export function mountTerminals({ onRequest, onKill }) {
   requestList = onRequest || (() => {});
+  requestKillFrame = onKill || (() => {});
   dock = $("terminal-dock");
   chipEl = $("chip-terminals");
   if (!dock) return api;
@@ -188,7 +196,7 @@ export function mountTerminals({ onRequest }) {
           "aria-label": "Clear this terminal's view",
           onclick: clearActive,
         },
-        icon(ICONS.trash, { size: 14 })
+        icon(ICONS.eraser, { size: 14 })
       ),
       el(
         "button",
@@ -255,6 +263,9 @@ function storedHeight() {
 function setOpen(open) {
   if (open === openState) return;
   openState = open;
+  // The card is positioned against a row that is about to move or vanish, so it
+  // cannot be left floating over the transcript.
+  closeCard();
 
   if (open) {
     dock.hidden = false;
@@ -342,6 +353,13 @@ function leaf(path) {
 }
 
 function drawTabs() {
+  // Rows are rebuilt wholesale, which detaches the anchor an open card was
+  // placed against. The card is reopened at the end against its new row rather
+  // than dismissed: a busy shell redraws this list on every command, and a
+  // details card that evaporated as soon as the shell did something would be
+  // unreadable exactly when it is most wanted.
+  const cardFor = openCard?.id;
+  closeCard();
   clear(tabsEl);
   const ordered = [...tabs.values()].sort((a, b) => collate(a.id, b.id));
   for (const tab of ordered) {
@@ -350,43 +368,217 @@ function drawTabs() {
       : tab.alive
         ? "term-dot is-ok"
         : "term-dot is-done";
-    tabsEl.append(
+    // A row, not a button: it holds two controls of its own now, and a button
+    // inside a button is invalid and does not receive its own clicks.
+    const row = el(
+      "div",
+      {
+        class: `term-tab${tab.id === activeId ? " is-active" : ""}${tab.unread ? " has-activity" : ""}`,
+      },
       el(
         "button",
         {
-          class: `term-tab${tab.id === activeId ? " is-active" : ""}${tab.unread ? " has-activity" : ""}`,
+          class: "term-tab-pick",
           title: `${tab.id} — ${tab.shell || "shell"} in ${tab.cwd || "?"}${
             tab.remote ? ` on ${tab.remote}` : ""
           }`,
           onclick: () => showTab(tab.id),
         },
         el("span", { class: dot }),
+        // One line now, not two: the row is compact, so the directory is
+        // dimmed inline beside the name and the full path stays in the footer
+        // and the details card.
         el(
           "span",
           { class: "term-tab-text" },
-          el("span", { class: "term-tab-label mono" }, tab.id),
-          // Where it is, on a second line. In a strip there was no room for
-          // this; in a list it is the thing that tells two shells apart.
+          el("span", { class: "term-tab-label mono" }, tab.name || tab.id),
           el(
             "span",
             { class: "term-tab-sub" },
-            // Which machine first: a command that ran somewhere else is the
-            // thing you most need not to misread.
             tab.remote ? `${tab.remote}:${leaf(tab.cwd)}` : leaf(tab.cwd)
           )
         ),
         !tab.alive && el("span", { class: "term-tab-note" }, "exited")
+      ),
+      el(
+        "button",
+        {
+          class: "icon-btn sm term-tab-info",
+          title: `Details for ${tab.id}`,
+          "aria-label": `Details for ${tab.id}`,
+          dataset: { info: tab.id },
+          onclick: (e) => {
+            e.stopPropagation();
+            toggleDetails(e.currentTarget, tab.id);
+          },
+        },
+        icon(ICONS.info, { size: 12 })
+      ),
+      el(
+        "button",
+        {
+          class: "icon-btn sm term-tab-kill",
+          title: tab.alive ? `Kill ${tab.id}` : `Remove ${tab.id} from the list`,
+          "aria-label": tab.alive ? `Kill ${tab.id}` : `Remove ${tab.id}`,
+          onclick: (e) => {
+            e.stopPropagation();
+            confirmKill(e.currentTarget, tab.id);
+          },
+        },
+        icon(ICONS.trash, { size: 12 })
       )
     );
+    tabsEl.append(row);
   }
   if (!tabs.size) {
     tabsEl.append(
       el("span", { class: "term-empty" }, "No shells open — the agent opens one when it needs to run something.")
     );
   }
+  // Re-anchor a card that was open before the rebuild, if its shell still
+  // exists. Skipped when the row is gone: the card would have nothing to
+  // describe.
+  if (cardFor && tabs.has(cardFor)) {
+    const anchor = tabsEl.querySelector(`[data-info="${cardFor}"]`);
+    if (anchor) showDetails(anchor, cardFor);
+  }
 }
 
-/** Puts `term-2` ahead of `term-10`, which a plain string sort gets backwards. */
+/* Killing a shell is destructive and cannot be undone — a background process
+ * dies with its group — so it takes two steps and names what it is about to
+ * end, per the house rule against bare `confirm()`. */
+function confirmKill(anchor, id) {
+  const tab = tabs.get(id);
+  if (!tab) return;
+  if (!tab.alive) {
+    // Nothing to kill; this is just tidying a dead row away, so it needs no
+    // confirmation. The list is rebuilt from the next `terminals` frame.
+    tabs.delete(id);
+    if (activeId === id) activeId = [...tabs.keys()].sort(collate)[0] || null;
+    drawTabs();
+    drawFoot();
+    drawChip();
+    showTab(activeId);
+    if (!tabs.size) setOpen(false);
+    return;
+  }
+  popover(anchor, {
+    message: `Kill ${id}?`,
+    detail: `The shell${tab.name ? ` “${tab.name}”` : ""} in ${tab.cwd || "?"}${
+      tab.remote ? ` on ${tab.remote}` : ""
+    } and everything it is running will be terminated. The agent may be using it.`,
+    confirmLabel: "Kill",
+    danger: true,
+    onConfirm: () => {
+      // Marked busy-out immediately so the row cannot be double-killed while
+      // the round trip is in flight; the `closed` event settles it for real.
+      tab.busy = false;
+      requestKillFrame(id);
+      drawTabs();
+      toast(`Killing ${id}…`, { tone: "info" });
+    },
+  });
+}
+
+/* The details card, as in the reference: what this shell actually is.
+ *
+ * Not a `popover` — that one is confirm-shaped and always draws Confirm and
+ * Cancel, and there is nothing here to confirm. This is a floating read-only
+ * card, dismissed by leaving the row, pressing Escape, or clicking away.
+ *
+ * It is one of the few things allowed a real shadow, because it genuinely
+ * floats above the drawer rather than being docked in it. */
+let openCard = null;
+
+function closeCard() {
+  if (!openCard) return;
+  document.removeEventListener("keydown", openCard.onKey, true);
+  document.removeEventListener("click", openCard.onClick, true);
+  openCard.node.remove();
+  openCard = null;
+}
+
+/* The button toggles: a second click on the same row closes the card rather
+ * than redrawing it under the pointer. Separate from `showDetails` because a
+ * redraw re-anchors the card and must *not* toggle it shut. */
+function toggleDetails(anchor, id) {
+  const wasFor = openCard?.id;
+  closeCard();
+  if (wasFor !== id) showDetails(anchor, id);
+}
+
+function showDetails(anchor, id) {
+  closeCard();
+  const tab = tabs.get(id);
+  if (!tab) return;
+
+  const rows = [
+    ["Process ID (PID)", tab.pid ? String(tab.pid) : "not reported"],
+    ["Command line", tab.shell || "not reported"],
+    ["Working directory", tab.cwd || "not reported"],
+    ["User", tab.user || "not reported"],
+    ["Host", tab.remote || "this machine"],
+    // Only meaningful for a remote shell, where it decides whether an
+    // interrupt can be delivered at all.
+    tab.remote && ["Terminal (pty)", tab.pty ? "allocated" : "none — interrupts cannot be delivered"],
+    ["Commands run", String(tab.commands)],
+    ["State", tab.busy ? "running a command" : tab.alive ? "idle" : "exited"],
+  ].filter(Boolean);
+
+  const node = el(
+    "div",
+    { class: "term-card", role: "dialog", "aria-label": `Details for ${id}` },
+    el(
+      "div",
+      { class: "term-card-head" },
+      el("span", { class: "term-card-title mono" }, tab.shell ? leaf(tab.shell) : id),
+      el("span", { class: "term-card-id mono" }, tab.name ? `${tab.name} · ${id}` : id)
+    ),
+    ...rows.map(([label, value]) =>
+      el(
+        "div",
+        { class: "term-card-row" },
+        el("span", { class: "term-card-label" }, label),
+        el("span", { class: "term-card-value mono" }, value)
+      )
+    ),
+    el(
+      "div",
+      { class: "term-card-foot" },
+      "This view is read-only. The agent drives these shells."
+    )
+  );
+  document.body.append(node);
+
+  // Placed left of the *list*, not of the button: the list sits at the right
+  // edge of the drawer, so a card hung below the button would fall off the
+  // viewport, and one placed only left of the button would still overlap the
+  // rows it describes. Clamped both ways regardless.
+  const at = anchor.getBoundingClientRect();
+  const listBox = tabsEl?.getBoundingClientRect();
+  const w = node.offsetWidth;
+  const h = node.offsetHeight;
+  const rightEdge = (listBox ? listBox.left : at.left) - 8;
+  const left = Math.max(8, Math.min(rightEdge - w, window.innerWidth - w - 8));
+  const top = Math.max(8, Math.min(at.top - 8, window.innerHeight - h - 8));
+  node.style.left = `${left}px`;
+  node.style.top = `${top}px`;
+
+  const onKey = (e) => {
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      closeCard();
+    }
+  };
+  const onClick = (e) => {
+    if (!node.contains(e.target) && e.target !== anchor) closeCard();
+  };
+  document.addEventListener("keydown", onKey, true);
+  setTimeout(() => document.addEventListener("click", onClick, true), 0);
+  openCard = { node, id, onKey, onClick };
+}
+
+/** Sorts `term-2` before `term-10`, which a plain string sort gets backwards. */
 function collate(a, b) {
   return a.localeCompare(b, undefined, { numeric: true });
 }
@@ -533,6 +725,12 @@ function upsert(info) {
       cwd: "",
       shell: "",
       remote: "",
+      // Only the `terminals` listing carries these; a feed event does not
+      // restate them, so they stay blank until the first list arrives.
+      name: "",
+      pid: 0,
+      pty: false,
+      user: "",
       alive: true,
       commands: 0,
       busy: false,
@@ -550,6 +748,10 @@ function upsert(info) {
   // Empty on an output event, which restates none of the three — so only ever
   // written when the host actually said something.
   if (info.remote) tab.remote = info.remote;
+  if (info.name) tab.name = info.name;
+  if (info.user) tab.user = info.user;
+  if (typeof info.pid === "number" && info.pid) tab.pid = info.pid;
+  if (typeof info.pty === "boolean") tab.pty = info.pty;
   if (typeof info.alive === "boolean") tab.alive = info.alive;
   if (typeof info.commands === "number") tab.commands = info.commands;
   return tab;
@@ -566,6 +768,8 @@ function dispose() {
   }
   tabs.clear();
   activeId = null;
+  // Anchored to a row that is being torn down.
+  closeCard();
   if (paneWrapEl) clear(paneWrapEl);
 }
 
@@ -598,10 +802,16 @@ export const api = {
       // Replace rather than append: this is the authoritative transcript, and
       // anything already buffered is a prefix of it.
       if (view.transcript) {
-        tab.pending = [view.transcript];
         if (tab.term && tab.opened) {
+          // Written straight in, and *not* left in `pending`: the `showTab`
+          // below flushes pending into the emulator, which wrote the whole
+          // transcript a second time and made every listing look like the
+          // shell had run everything twice.
+          tab.pending.length = 0;
           tab.term.clear();
           tab.term.write(view.transcript);
+        } else {
+          tab.pending = [view.transcript];
         }
       }
     }
