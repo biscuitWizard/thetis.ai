@@ -44,6 +44,18 @@
              since the CSS clips it to an ellipsis (see .brand-name). -->
         <span class="brand-name" title="{agent_name}">{agent_name}</span>
       </div>
+      <!-- Everyone's conversations, for an account whose role grants
+           see_all_sessions. Hidden until the host's `user` frame says so;
+           the sidebar is personal by default even for an administrator, and
+           this is the switch. app.js wires it and keeps aria-pressed true. -->
+      <button id="see-all" class="icon-btn" title="Show everyone's conversations" aria-label="Show everyone's conversations" aria-pressed="false" hidden>
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="7" cy="7" r="2.6" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <circle cx="13.5" cy="7.5" r="2.1" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M2.5 15.5a4.5 4.5 0 0 1 9 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M12.2 12.2a3.6 3.6 0 0 1 5.3 3.3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+      </button>
       <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat">
         <svg viewBox="0 0 20 20" aria-hidden="true">
           <path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -64,7 +76,18 @@
 
     <footer class="sidebar-foot">
       <span id="status" class="status is-offline">connecting</span>
-      <a href="/admin" target="_blank" rel="noopener" class="quiet-link">admin</a>
+      <!-- Who is signed in, and the way out. Both filled from the host's
+           `user` frame: in local mode there is no account and no logout, so
+           the name stays empty and the form stays hidden. The form is a real
+           POST rather than a fetch so signing out works with the socket
+           down — which is when it is most wanted. -->
+      <span class="foot-user">
+        <span id="user-name" class="quiet" title="Signed in as"></span>
+        <form id="logout" method="post" action="/logout" hidden>
+          <button type="submit" class="quiet-link" title="Sign out of this account on this browser">log out</button>
+        </form>
+      </span>
+      <a id="admin-link" href="/admin" target="_blank" rel="noopener" class="quiet-link" hidden>admin</a>
       <!-- Your own face, and the way to change it. Sits beside `admin` because
            this is the footer's "who and what am I" corner, and because an
            avatar is settings rather than navigation — it must not be a row in

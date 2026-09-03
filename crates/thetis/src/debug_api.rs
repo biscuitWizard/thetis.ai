@@ -12,7 +12,7 @@
 //! worker as a side effect of someone opening a panel.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::grip::{Grip, Role};
@@ -52,13 +52,15 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
 
     match dispatch(grip, &frame_type, &session, &terminal).await {
         Ok(reply) => vec![reply],
-        Err(e) => vec![json!({
-            "type": frame_type,
-            "session": session,
-            "ok": false,
-            "message": format!("{e:#}"),
-        })
-        .to_string()],
+        Err(e) => vec![
+            json!({
+                "type": frame_type,
+                "session": session,
+                "ok": false,
+                "message": format!("{e:#}"),
+            })
+            .to_string(),
+        ],
     }
 }
 
@@ -90,8 +92,8 @@ async fn dispatch(
                 })
                 .to_string());
             };
-            let captured: Value = serde_json::from_str(&text)
-                .context("the stored request is not readable")?;
+            let captured: Value =
+                serde_json::from_str(&text).context("the stored request is not readable")?;
             let reply = json!({
                 "type": "debug-request",
                 "session": session,

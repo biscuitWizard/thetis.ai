@@ -20,7 +20,7 @@
 //! Merging is user-only. The agent can prepare (update from trunk, resolve
 //! conflicts), but nothing in the agent's tool surface reaches this module.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ use crate::bindings::branch::BranchState;
 use crate::branches::Branches;
 use crate::grip::Grip;
 use crate::pipeline;
-use crate::workers::{call_session, WorkerRouter};
+use crate::workers::{WorkerRouter, call_session};
 
 /// The result of asking for a merge: either trunk moved, or the branch is
 /// left holding conflicts for someone to resolve.
@@ -73,7 +73,14 @@ pub async fn merge_to_trunk(
     // the branch's worktree, where a conflict can sit safely.
     if !root.is_ancestor(&trunk, &row.branch_ref).await? {
         let state: BranchState = serde_json::from_value(
-            call_session(grip, router, session_id, "branch.update", json!({ "session": session_id })).await?,
+            call_session(
+                grip,
+                router,
+                session_id,
+                "branch.update",
+                json!({ "session": session_id }),
+            )
+            .await?,
         )?;
         if state.state == "conflict" {
             return Ok(MergeResult::Conflicts(state));
@@ -338,7 +345,9 @@ fn clamp_subject(raw: &str) -> String {
     let cut: String = collapsed.chars().take(SUBJECT_LIMIT).collect();
     match cut.rsplit_once(' ') {
         // Only respect the word boundary if it does not throw away the line.
-        Some((head, _)) if head.chars().count() >= SUBJECT_LIMIT / 2 => head.trim_end_matches(&[',', ';', ':', '-'][..]).to_string(),
+        Some((head, _)) if head.chars().count() >= SUBJECT_LIMIT / 2 => {
+            head.trim_end_matches(&[',', ';', ':', '-'][..]).to_string()
+        }
         _ => cut,
     }
 }
@@ -478,7 +487,14 @@ pub(crate) async fn refresh_trunk_kernel(
         }
 
         let built = match crate::control::build_kernel(&grip.cfg).await {
-            Ok(path) => path,
+            Ok(crate::control::KernelBuild::Built(path)) => path,
+            // Contention, not failure. The build already going covers this
+            // merge too, so the announcement above stays true and this adds
+            // nothing.
+            Ok(crate::control::KernelBuild::Busy(why)) => {
+                tracing::info!(%why, "a kernel build was already running; leaving it to finish");
+                return;
+            }
             Err(e) => {
                 incident(
                     grip.clone(),
@@ -636,7 +652,11 @@ mod tests {
     fn an_overlong_line_is_cut_at_a_word_boundary_under_the_limit() {
         let long = "Summarize ".repeat(60);
         let out = clamp_subject(&long);
-        assert!(out.chars().count() <= SUBJECT_LIMIT, "got {} chars", out.chars().count());
+        assert!(
+            out.chars().count() <= SUBJECT_LIMIT,
+            "got {} chars",
+            out.chars().count()
+        );
         assert!(out.chars().count() < 200);
         assert!(!out.ends_with(' '));
         // Cut on a boundary, so no word is left half-written.

@@ -24,10 +24,10 @@
 //! cancellation semantics and the UI all comprehensible, and the parent stays
 //! identifiable as the thing responsible for the work.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{now_ms, Store};
+use crate::store::{Store, now_ms};
 
 /// Where a sub-agent is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,10 +189,7 @@ impl<'a> Subagents<'a> {
             );
         }
         let existing = self.store.subagents_of(parent_id)?;
-        let live = existing
-            .iter()
-            .filter(|r| !r.state.is_terminal())
-            .count();
+        let live = existing.iter().filter(|r| !r.state.is_terminal()).count();
         if max_children > 0 && live >= max_children {
             bail!(
                 "this session already has {live} sub-agents running, which is the \
@@ -269,6 +266,43 @@ impl<'a> Subagents<'a> {
         })
     }
 
+    /// Fails every child still recorded as running. Returns what it changed.
+    ///
+    /// Called once, at gateway startup, where "recorded as running" can only
+    /// mean a child whose turn died with the process that was running it —
+    /// nothing is in flight before the gateway is up. Without this the row
+    /// stays `Running` forever: a sub-agent session is not a conversation, so
+    /// `reconcile_interrupted_turns` never looks at it and never resumes it,
+    /// and the parent is left waiting on a turn that no longer exists. A
+    /// `wait until: "all"` on one of those cannot do anything but burn
+    /// `max_wait_secs` and time out, every time it is called, for the life of
+    /// the database.
+    pub fn fail_orphans(&self, detail: &str) -> Result<Vec<SubagentRow>> {
+        let mut settled = Vec::new();
+        for row in self.store.all_subagents()? {
+            if row.state.is_terminal() {
+                continue;
+            }
+            // The row's own `cost_usd` is only written when a child settles
+            // normally, so an orphan would otherwise be recorded as free. The
+            // ledger has been counting all along; take what it says, so the
+            // money a dead turn actually spent stays on the books.
+            let spent = self.store.get_spend(&row.child_id).unwrap_or(0.0);
+            let updated = self.store.update_subagent(&row.child_id, |row| {
+                row.state = SubagentState::Failed;
+                row.finished_ms = now_ms();
+                if row.cost_usd == 0.0 {
+                    row.cost_usd = spent;
+                }
+                if row.detail.is_empty() {
+                    row.detail = detail.to_string();
+                }
+            })?;
+            settled.push(updated);
+        }
+        Ok(settled)
+    }
+
     /// Marks a child cancelled without waiting for its turn to unwind.
     pub fn mark_cancelled(&self, child_id: &str) -> Result<SubagentRow> {
         self.store.update_subagent(child_id, |row| {
@@ -314,21 +348,84 @@ mod tests {
             subs.register("p", &format!("c{i}"), "c", "t", "", "", "agent", 2)
                 .unwrap();
         }
-        assert!(subs.register("p", "c2", "c", "t", "", "", "agent", 2).is_err());
+        assert!(
+            subs.register("p", "c2", "c", "t", "", "", "agent", 2)
+                .is_err()
+        );
         // Settling one frees a slot: the cap is on concurrency, not on how many
         // a turn may delegate in total.
         subs.settle("c0", "an answer", 0.0, "stop").unwrap();
-        assert!(subs.register("p", "c2", "c", "t", "", "", "agent", 2).is_ok());
+        assert!(
+            subs.register("p", "c2", "c", "t", "", "", "agent", 2)
+                .is_ok()
+        );
+    }
+
+    // A child orphaned by a restart is not running and never will be again.
+    // Left as `running` it is something a parent can wait on forever.
+    #[test]
+    fn a_startup_sweep_settles_children_nothing_is_running_any_more() {
+        let store = store();
+        let subs = Subagents::new(&store);
+        subs.register("p", "alive", "a", "t", "", "", "agent", 8)
+            .unwrap();
+        subs.register("p", "done", "d", "t", "", "", "agent", 8)
+            .unwrap();
+        subs.settle("done", "an answer", 0.5, "stop").unwrap();
+
+        let swept = subs.fail_orphans("orphaned by a restart").unwrap();
+        assert_eq!(swept.len(), 1, "only the running one is an orphan");
+        assert_eq!(swept[0].child_id, "alive");
+        assert_eq!(swept[0].state, SubagentState::Failed);
+        assert!(swept[0].detail.contains("orphaned"));
+
+        // A child that had already finished keeps the answer it gave.
+        let done = subs.get("done").unwrap().unwrap();
+        assert_eq!(done.state, SubagentState::Done);
+        assert_eq!(done.result, "an answer");
+    }
+
+    // A turn that died still spent what it spent. Recording the orphan as
+    // free would quietly take it off the books.
+    #[test]
+    fn a_swept_orphan_keeps_the_money_its_turn_spent() {
+        let store = store();
+        let subs = Subagents::new(&store);
+        subs.register("p", "c", "c", "t", "", "", "agent", 8)
+            .unwrap();
+        store.add_spend("c", 4.25).unwrap();
+
+        let swept = subs.fail_orphans("orphaned").unwrap();
+        assert!(
+            (swept[0].cost_usd - 4.25).abs() < f64::EPSILON,
+            "{:?}",
+            swept[0]
+        );
+    }
+
+    #[test]
+    fn a_second_sweep_finds_nothing_left_to_do() {
+        let store = store();
+        let subs = Subagents::new(&store);
+        subs.register("p", "c", "c", "t", "", "", "agent", 8)
+            .unwrap();
+        assert_eq!(subs.fail_orphans("orphaned").unwrap().len(), 1);
+        assert!(subs.fail_orphans("orphaned").unwrap().is_empty());
     }
 
     #[test]
     fn an_empty_result_is_a_failure_not_a_success() {
         let store = store();
         let subs = Subagents::new(&store);
-        subs.register("p", "c", "c", "t", "", "", "agent", 8).unwrap();
+        subs.register("p", "c", "c", "t", "", "", "agent", 8)
+            .unwrap();
         let row = subs.settle("c", "   ", 0.01, "stop").unwrap();
         assert_eq!(row.state, SubagentState::Failed);
-        assert!(row.detail.contains("without a final answer"), "{}", row.detail);
+        assert!(
+            row.detail.contains("without a final answer"),
+            "{}",
+            row.detail
+        );
     }
 
     #[test]
@@ -347,8 +444,12 @@ mod tests {
     fn children_are_hidden_from_the_session_list() {
         let store = store();
         let subs = Subagents::new(&store);
-        let parent = store.create_session(Some("parent".into()), "agent").unwrap();
-        let child = store.create_session(Some("child".into()), "agent").unwrap();
+        let parent = store
+            .create_session(Some("parent".into()), &"agent", "local")
+            .unwrap();
+        let child = store
+            .create_session(Some("child".into()), &"agent", "local")
+            .unwrap();
         subs.register(&parent.id, &child.id, "k", "t", "", "", "agent", 8)
             .unwrap();
         let listed = store.list_sessions(true).unwrap();

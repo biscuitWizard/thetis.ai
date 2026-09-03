@@ -12,7 +12,7 @@
 //! Entries are write-once: a key names exactly one build output, so nothing
 //! is ever overwritten, and concurrent writers of the same key are benign.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,11 +134,7 @@ impl BuildCache {
 
     /// Absolute path of a cached artifact, verified to exist and match its
     /// recorded hash — a half-written or corrupted entry must never load.
-    pub fn artifact_path(
-        &self,
-        meta: &BuildMeta,
-        artifact_name: &str,
-    ) -> Result<PathBuf> {
+    pub fn artifact_path(&self, meta: &BuildMeta, artifact_name: &str) -> Result<PathBuf> {
         let path = self.entry_dir(&meta.aspect, &meta.key).join(artifact_name);
         if !path.is_file() {
             bail!("cache entry {} has no artifact {artifact_name}", meta.key);
@@ -236,7 +232,11 @@ mod tests {
         fs::write(&wasm, b"first").unwrap();
         let sha = hash_file(&wasm).unwrap();
         cache
-            .store(&wasm, "component.wasm", &meta("agent", "k", &sha, SmokeVerdict::Pass))
+            .store(
+                &wasm,
+                "component.wasm",
+                &meta("agent", "k", &sha, SmokeVerdict::Pass),
+            )
             .unwrap();
 
         // A second store of the same key keeps the original.

@@ -8,10 +8,11 @@
 //! an `Arc<Grip>`. It owns the database, the LLM client, the component
 //! registry, and the event fan-out to connected browsers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+use crate::aspect::Aspect;
 use crate::bindings::types::{Attachment, OutboundEvent, SessionEvent, ToolManifest, TurnStats};
 use crate::builder::Builder;
 use crate::config::Config;
@@ -21,7 +22,6 @@ use crate::persist::Persist;
 use crate::revisions::Revisions;
 use crate::runtime::{Budget, Caps, Runtime};
 use crate::session::SessionActors;
-use crate::aspect::Aspect;
 use crate::store::Store;
 use crate::watchdog::Breakers;
 
@@ -137,6 +137,12 @@ pub struct Grip {
     /// Turns currently in flight. What "idle" means for a worker: a long
     /// agentic turn generates no inbound traffic, and must not read as quiet.
     turns_running: std::sync::atomic::AtomicUsize,
+    /// Stamps each turn-count report to the gateway. Notes are fire and
+    /// forget and each is sent from its own task, so two reports can land out
+    /// of order — and a stale "1" arriving after the "0" that ended the turn
+    /// would leave the gateway showing a turn that finished. The receiver
+    /// keeps the highest stamp it has seen and drops anything older.
+    turn_report_seq: std::sync::atomic::AtomicU64,
     /// Rung when a sub-agent finishes, so a parent parked in `delegation::wait`
     /// wakes at once rather than at its next backstop poll. Worker-local, which
     /// is sufficient because a child always runs in its parent's worker.
@@ -159,9 +165,12 @@ pub struct TurnGuard {
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        self.grip
+        let running = self
+            .grip
             .turns_running
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_sub(1);
+        self.grip.report_turns(running);
     }
 }
 
@@ -289,6 +298,7 @@ impl Grip {
             rebuild_wanted: std::sync::Mutex::new(std::collections::HashSet::new()),
             build_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             turns_running: std::sync::atomic::AtomicUsize::new(0),
+            turn_report_seq: std::sync::atomic::AtomicU64::new(0),
             settle_bell: crate::delegation::SettleBell::default(),
         }))
     }
@@ -328,11 +338,45 @@ impl Grip {
 
     /// Marks a turn as running until the guard drops.
     pub fn begin_turn(self: &Arc<Self>) -> TurnGuard {
-        self.turns_running
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        TurnGuard {
-            grip: self.clone(),
-        }
+        let running = self
+            .turns_running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.report_turns(running);
+        TurnGuard { grip: self.clone() }
+    }
+
+    /// Tells the gateway how many turns this worker is running.
+    ///
+    /// The counter is per process, and turns run in workers, so the gateway's
+    /// own was always zero — `/admin/waits` reported "nothing is running"
+    /// while a worker was twelve minutes into a turn, which is exactly the
+    /// question that page exists to answer. Pushed rather than polled so the
+    /// admin page cannot block on a worker that is itself wedged.
+    fn report_turns(self: &Arc<Self>, running: usize) {
+        let Role::Worker(peer) = &self.role else {
+            return;
+        };
+        // A guard can be dropped from anywhere, including an unwind off the
+        // runtime; without a handle there is nothing to spawn onto and the
+        // count simply goes unreported.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Stamped before the spawn, so the order the reports were *made* in
+        // survives the order their tasks happen to run in.
+        let seq = self
+            .turn_report_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let peer = peer.clone();
+        handle.spawn(async move {
+            peer.notify(
+                "turns",
+                serde_json::json!({ "running": running, "seq": seq }),
+            )
+            .await;
+        });
     }
 
     /// Whether a turn is running right now.
@@ -366,10 +410,7 @@ impl Grip {
         if self.turns_running.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             return true;
         }
-        self.building
-            .lock()
-            .map(|b| !b.is_empty())
-            .unwrap_or(false)
+        self.building.lock().map(|b| !b.is_empty()).unwrap_or(false)
     }
 
     /// Claims the right to build an aspect, or `None` if one is already running.
@@ -448,6 +489,60 @@ impl Grip {
         });
     }
 
+    // --- policy-scoped stores ----------------------------------------------
+    pub fn gateway_store(
+        self: &Arc<Self>,
+        budget: Budget,
+        principal: Arc<crate::auth::Principal>,
+    ) -> wasmtime::Store<crate::runtime::HostState> {
+        let mut s = self
+            .runtime
+            .new_store(self.clone(), Caps::Gateway, budget, None);
+        s.data_mut().policy = principal.policy.clone();
+        s.data_mut().principal = Some(principal);
+        s
+    }
+    pub async fn session_store(
+        self: &Arc<Self>,
+        caps: Caps,
+        budget: Budget,
+        id: &str,
+    ) -> wasmtime::Store<crate::runtime::HostState> {
+        let policy = if matches!(&self.role, Role::Worker(_)) {
+            self.persist.session_policy(id).await.map(Arc::new).unwrap_or_else(|error| {
+                tracing::warn!(session = id, %error, "could not load session policy; denying worker capabilities");
+                let mut denied = self.cfg.auth.local_policy.as_ref().clone();
+                denied.admin = false;
+                denied.read_only = true;
+                denied.see_all_sessions = false;
+                denied.denied.extend(crate::policy::Cap::all().iter().copied());
+                Arc::new(denied)
+            })
+        } else {
+            match self.persist.owner_of_root(id).await {
+                Ok(Some(owner)) => self.cfg.auth.policy_for(&owner),
+                _ => self.cfg.auth.local_policy.clone(),
+            }
+        };
+        let owner = self.persist.owner_of_root(id).await.ok().flatten();
+        let principal = owner.map(|owner| {
+            let user = self.cfg.auth.user(&owner);
+            Arc::new(crate::auth::Principal::new(
+                owner.clone(),
+                user.map(|u| u.name.clone())
+                    .unwrap_or_else(|| owner.clone()),
+                user.map(|u| u.role.clone()).unwrap_or_default(),
+                policy.clone(),
+            ))
+        });
+        let mut s = self
+            .runtime
+            .new_store(self.clone(), caps, budget, Some(id.into()));
+        s.data_mut().policy = policy;
+        s.data_mut().principal = principal;
+        s
+    }
+
     // --- turns -------------------------------------------------------------
 
     /// Runs one agentic turn to completion inside a fresh store.
@@ -455,20 +550,16 @@ impl Grip {
     /// A trap (guest panic, memory limit, blown budget) surfaces here as an
     /// `Err`, never as a process failure.
     pub async fn run_turn(self: &Arc<Self>, session_id: &str) -> Result<TurnStats, TurnError> {
-        let loaded = self.loader.get(&Aspect::Agent).ok_or_else(|| {
-            TurnError::Reported("no agent component is loaded".to_string())
-        })?;
+        let loaded = self
+            .loader
+            .get(&Aspect::Agent)
+            .ok_or_else(|| TurnError::Reported("no agent component is loaded".to_string()))?;
 
         // The turn's stop signal is carried by the session's `CancelFlag`,
         // which host imports await directly; the budget only enforces the
         // grace window once one has been raised.
         let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
-        let mut store = self.runtime.new_store(
-            self.clone(),
-            Caps::Agent,
-            budget,
-            Some(session_id.to_string()),
-        );
+        let mut store = self.session_store(Caps::Agent, budget, session_id).await;
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -531,9 +622,7 @@ impl Grip {
         };
 
         let budget = Budget::probe("agent list-tools", self.cfg.probe_budget);
-        let mut store = self
-            .runtime
-            .new_store(self.clone(), Caps::Agent, budget, Some(session_id.to_string()));
+        let mut store = self.session_store(Caps::Agent, budget, session_id).await;
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -624,7 +713,10 @@ impl Grip {
                 )
                 .await
                 {
-                    Ok(v) => v.get("stopped").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                    Ok(v) => v
+                        .get("stopped")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
                     Err(e) => {
                         tracing::warn!(session = %session_id, error = %e, "cancel did not reach the worker");
                         false
@@ -697,7 +789,10 @@ impl Grip {
     /// invisible to the model, which is indistinguishable from it not being
     /// installed at all. Routing every install through here is what makes that
     /// impossible to forget.
-    pub async fn install_component(self: &Arc<Self>, component: Arc<crate::loader::LoadedComponent>) {
+    pub async fn install_component(
+        self: &Arc<Self>,
+        component: Arc<crate::loader::LoadedComponent>,
+    ) {
         let aspect = component.aspect.clone();
         self.loader.install(component);
 
@@ -788,12 +883,7 @@ impl Grip {
         let config_json = self.cfg.tool_config_json(name);
 
         let budget = Budget::new(format!("tool {name}"), self.cfg.tool_budget);
-        let mut store = self.runtime.new_store(
-            self.clone(),
-            Caps::Tool,
-            budget,
-            Some(session_id.to_string()),
-        );
+        let mut store = self.session_store(Caps::Tool, budget, session_id).await;
 
         let result = async {
             let tool = crate::bindings::tool::Tool::instantiate_async(
@@ -813,8 +903,8 @@ impl Grip {
         .await;
 
         match result {
-            Ok(Ok(output)) => Ok(self.truncate(output)),
-            Ok(Err(message)) => Err(self.truncate(message)),
+            Ok(Ok(output)) => Ok(self.cap_output(name, output)),
+            Ok(Err(message)) => Err(self.cap_output(name, message)),
             Err(trap) => {
                 // A trapping tool is a faulty revision; let the breaker see it.
                 let detail = format!("{trap:#}");
@@ -830,21 +920,17 @@ impl Grip {
     }
 
     /// Caps anything headed for the model's context window.
+    ///
+    /// Oversized text is spilled to a file in the workspace rather than clipped,
+    /// so the model is handed a way to read the rest instead of a dead end. See
+    /// `crate::spill` for why the tail is kept as well as the head.
     pub fn truncate(&self, text: String) -> String {
-        let limit = self.cfg.max_tool_output_bytes;
-        if text.len() <= limit {
-            return text;
-        }
-        let mut cut = limit;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!(
-            "{}\n\n[truncated: {} of {} bytes shown]",
-            &text[..cut],
-            cut,
-            text.len()
-        )
+        self.cap_output("tool-output", text)
+    }
+
+    /// As `truncate`, but names the source so a spilled file is identifiable.
+    pub fn cap_output(&self, label: &str, text: String) -> String {
+        crate::spill::cap(&self.cfg, label, text).text
     }
 
     // --- watcher suppression ------------------------------------------------

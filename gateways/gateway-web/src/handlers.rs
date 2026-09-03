@@ -149,8 +149,7 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
 
 // --- the model catalogue ----------------------------------------------------
 
-/// Where the overlay is kept. Global scope: the catalogue is a property of the
-/// installation, not of one conversation.
+/// Where this user's model-catalogue overlay is kept.
 const MODEL_KEY: &str = "gateway.web.models";
 /// Ceiling on stored entries, so a runaway client cannot grow the record without
 /// bound. Well past any plausible hand-curated list.
@@ -168,7 +167,7 @@ struct Entry {
 }
 
 fn load_overlay() -> Vec<Entry> {
-    let raw = sys::kv_get("global", MODEL_KEY).unwrap_or_default();
+    let raw = sys::kv_get("user", MODEL_KEY).unwrap_or_default();
     serde_json::from_str::<Value>(&raw)
         .ok()
         .as_ref()
@@ -207,7 +206,7 @@ fn save_overlay(entries: &[Entry]) {
             "id": e.id, "label": e.label, "hidden": e.hidden,
         })).collect::<Vec<_>>(),
     });
-    sys::kv_put("global", MODEL_KEY, &payload.to_string());
+    sys::kv_put("user", MODEL_KEY, &payload.to_string());
 }
 
 /// A model as the picker and the inspector see it.
@@ -474,7 +473,7 @@ const MAX_AVATAR_CHARS: usize = 2_000_000;
 pub fn user_avatar() -> GatewayAction {
     reply(json!({
         "type": "user-avatar",
-        "avatar": sys::kv_get("global", USER_AVATAR_KEY).unwrap_or_default(),
+        "avatar": sys::kv_get("user", USER_AVATAR_KEY).unwrap_or_default(),
     }))
 }
 
@@ -505,7 +504,7 @@ fn set_user_avatar(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
         return vec![error("an avatar must be an image file or an http(s) URL")];
     }
 
-    sys::kv_put("global", USER_AVATAR_KEY, raw);
+    sys::kv_put("user", USER_AVATAR_KEY, raw);
 
     let mut actions = vec![user_avatar()];
     if let Some(session) = session {
@@ -538,6 +537,8 @@ pub fn catalog() -> GatewayAction {
 
     reply(json!({
         "type": "catalog",
+        "restricted": sys::config_get("policy_models_restricted")
+            .as_deref() == Some("true"),
         "models": merged.iter().filter(|m| !m.hidden).map(entry).collect::<Vec<_>>(),
         "models_hidden": merged.iter().filter(|m| m.hidden).map(entry).collect::<Vec<_>>(),
         "modes": sys::list_modes().iter().map(|m| json!({
@@ -705,6 +706,7 @@ fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
         ("web-browser-", "browser"),
         ("web-", "web"),
         ("git-", "github"),
+        ("moo-", "moo"),
     ] {
         if name.starts_with(prefix) && known(id) {
             return id.to_string();

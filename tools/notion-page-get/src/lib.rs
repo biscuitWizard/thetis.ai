@@ -58,6 +58,25 @@ impl Guest for Component {
                         "type": "boolean",
                         "description": "For meeting notes, include the full transcript rather \
                                         than a placeholder. Defaults to false."
+                    },
+                    "content_offset": {
+                        "type": "integer",
+                        "description": "First character of the body to return, counting from 0. \
+                                        Use the offset the previous call's footer reported to \
+                                        read on through a page too long to return at once.",
+                        "minimum": 0
+                    },
+                    "content_limit": {
+                        "type": "integer",
+                        "description": "How many characters of the body to return. Defaults to \
+                                        18000, which is also the maximum.",
+                        "minimum": 200
+                    },
+                    "find": {
+                        "type": "string",
+                        "description": "Return only the paragraphs of the body containing this \
+                                        text, each with its character offset, instead of a \
+                                        window. Usually the cheaper way to read a long page."
                     }
                 },
                 "required": ["page_id"],
@@ -102,7 +121,14 @@ impl Guest for Component {
                 query.push(("include_transcript".to_string(), "true".to_string()));
             }
             let markdown = client.get(&format!("/v1/pages/{page_id}/markdown"), &query)?;
-            let body = notion::markdown_body(&markdown);
+            let body = notion::markdown_body_window(
+                &markdown,
+                notion::BodyWindow {
+                    offset: args.get("content_offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    limit: args.get("content_limit").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    find: args.get("find").and_then(Value::as_str),
+                },
+            );
 
             out.push_str("\n--- content (markdown) ---\n");
             if body.trim().is_empty() {

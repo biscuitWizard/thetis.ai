@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::bindings::types::{FinishInfo, LlmError, StreamChunk, TokenUsage, ToolCall};
@@ -36,6 +36,34 @@ pub struct LlmClient {
     /// makes, so successive calls land on different endpoints instead of each
     /// starting at the first one.
     next_replica: std::sync::atomic::AtomicUsize,
+    /// Where retry notices go, once someone is listening.
+    ///
+    /// The client cannot reach the store — the grip owns both, and the
+    /// dependency runs that way round — so it announces instead of writing.
+    /// Set once at startup by whoever wants the notices; unset in tests and in
+    /// the gateway, where nothing would read them.
+    retries: std::sync::OnceLock<mpsc::UnboundedSender<RetryNotice>>,
+}
+
+/// One failed attempt at a completion, announced as it is retried.
+///
+/// Exists because a stalled provider is invisible: the read timeout is a
+/// silence, the retry is a silence, and four of them in a row is twelve
+/// minutes in which a turn looks identical to a hung one. Whoever holds a
+/// session log turns these into something the person watching can read.
+#[derive(Debug, Clone)]
+pub struct RetryNotice {
+    /// The conversation the request belonged to, empty when untagged.
+    pub session: String,
+    /// Which attempt just failed, counted from 1. The log counts from 0; a
+    /// person reading a conversation does not.
+    pub attempt: u32,
+    /// How many attempts there will be in total, retries included.
+    pub attempts: u32,
+    /// How long the attempt ran before it gave up.
+    pub elapsed: Duration,
+    /// Why it failed, as the transport described it.
+    pub error: String,
 }
 
 /// A prepared request, as sent, with when it was sent.
@@ -83,6 +111,23 @@ impl StreamHandle {
     }
 }
 
+/// What a failed attempt should be called, in a few words.
+///
+/// A read timeout is the case worth naming outright: it is what a provider
+/// that accepted the request and then went quiet looks like from here, and it
+/// is indistinguishable from every other transport failure unless something
+/// says so.
+fn describe_attempt(result: &Result<reqwest::Response, reqwest::Error>) -> String {
+    match result {
+        Ok(resp) => format!("http {}", resp.status().as_u16()),
+        Err(e) if e.is_timeout() => {
+            format!("no response within the read timeout ({e})")
+        }
+        Err(e) if e.is_connect() => format!("could not connect ({e})"),
+        Err(e) => e.to_string(),
+    }
+}
+
 impl LlmClient {
     pub fn new(cfg: Arc<Config>) -> Result<Self> {
         // `read_timeout`, not `timeout`. reqwest's `timeout` is a *total*
@@ -106,12 +151,22 @@ impl LlmClient {
             cfg,
             last_request: std::sync::Mutex::new(None),
             next_replica: std::sync::atomic::AtomicUsize::new(0),
+            retries: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Starts announcing retries to `tx`. The first caller wins; later ones are
+    /// ignored, so a second subscriber cannot silently displace the first.
+    pub fn on_retry(&self, tx: mpsc::UnboundedSender<RetryNotice>) {
+        let _ = self.retries.set(tx);
     }
 
     /// The most recent streaming request body, for the caller to persist.
     pub fn last_request(&self) -> Option<StoredRequest> {
-        self.last_request.lock().ok().and_then(|aspect| aspect.clone())
+        self.last_request
+            .lock()
+            .ok()
+            .and_then(|aspect| aspect.clone())
     }
 
     /// Applies grip defaults to a guest-supplied request body, and works out
@@ -203,6 +258,16 @@ impl LlmClient {
                 "dropped duplicate tool results; the session log carries more than one \
                  result for the same call (a reconciliation raced a live turn) and the \
                  provider rejects that outright"
+            );
+        }
+
+        let orphans = answer_orphaned_tool_calls(&mut body);
+        if orphans > 0 {
+            tracing::warn!(
+                count = orphans,
+                "answered tool calls the log left unresolved; a turn was interrupted \
+                 between a call and its result, and a request carrying one is not merely \
+                 rejected — the provider accepts it and never replies"
             );
         }
 
@@ -298,7 +363,9 @@ impl LlmClient {
                 req = req.header(name.as_str(), value.as_str());
             }
 
+            let started = Instant::now();
             let result = req.json(body).send().await;
+            let elapsed = started.elapsed();
 
             let retryable = match &result {
                 Ok(resp) => {
@@ -311,14 +378,32 @@ impl LlmClient {
             if retryable && attempt < self.cfg.max_retries {
                 // Exponential backoff with a little jitter from the attempt index.
                 let delay = Duration::from_millis(400 * (1 << attempt) + (attempt as u64 * 37));
+                // What actually went wrong, which this line used to omit
+                // entirely: four identical warnings could be a dead socket, a
+                // 503 or a provider that accepted the request and never
+                // answered, and the log could not tell you which.
+                let why = describe_attempt(&result);
                 tracing::warn!(
                     attempt,
                     ?delay,
+                    elapsed_s = elapsed.as_secs(),
                     provider = %provider.id,
                     %url,
                     replicas = provider.replicas(),
+                    error = %why,
                     "llm request failed, retrying"
                 );
+                if let Some(tx) = self.retries.get() {
+                    let _ = tx.send(RetryNotice {
+                        session: session.unwrap_or_default().to_string(),
+                        // The log counts attempts from zero; a person reading a
+                        // conversation counts from one.
+                        attempt: attempt + 1,
+                        attempts: self.cfg.max_retries + 1,
+                        elapsed,
+                        error: why,
+                    });
+                }
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 continue;
@@ -416,7 +501,10 @@ impl LlmClient {
             pump.finish().await;
         });
 
-        Ok(StreamHandle { rx, finished: false })
+        Ok(StreamHandle {
+            rx,
+            finished: false,
+        })
     }
 }
 
@@ -864,6 +952,79 @@ fn dedupe_tool_results(body: &mut serde_json::Value) -> usize {
     before - messages.len()
 }
 
+/// What an interrupted call is told, when nothing else ever told it.
+const ORPHANED_CALL_RESULT: &str =
+    "Interrupted: this call never returned, because Thetis restarted while it was running. \
+     Run it again if the result still matters.";
+
+/// Gives every `tool_call` without a result one, returning how many it wrote.
+///
+/// The mirror of [`dedupe_tool_results`], and the more dangerous half. A tool
+/// call with *two* results is rejected with a 400 you can read; a tool call
+/// with *none* is accepted by OpenRouter and then never answered at all — the
+/// request is fully sent and acked, and not one byte comes back. Thetis sees a
+/// read timeout, retries the identical body three more times, and twelve
+/// minutes later fails the turn with "transport error". Nothing in that says
+/// what is wrong, and it repeats on every turn, forever, because the flaw is in
+/// the stored log rather than in anything the turn does.
+///
+/// One conversation reached that state exactly as you would expect: a kernel
+/// rebuild restarted the worker between a `wait` call and its result, the
+/// interrupted-turn repair that exists to synthesize the missing result was
+/// skipped, and the next user message landed straight after the unanswered
+/// call. Both of those are fixed at their sources. This is here because the
+/// cost of the shape reaching a provider is so far out of proportion to the
+/// mistake that makes it — and because no fix upstream can repair the logs
+/// already written.
+///
+/// The result is inserted immediately after the assistant message that made
+/// the call, which is the only position the schema allows.
+fn answer_orphaned_tool_calls(body: &mut serde_json::Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+        .filter_map(|m| m.get("tool_call_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    // Right to left, so an insertion never moves an index still to be visited.
+    let mut written = 0;
+    for i in (0..messages.len()).rev() {
+        if messages[i].get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let missing: Vec<String> = messages[i]
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|c| c.get("id").and_then(serde_json::Value::as_str))
+                    .filter(|id| !answered.contains(*id))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for id in missing.into_iter().rev() {
+            messages.insert(
+                i + 1,
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": ORPHANED_CALL_RESULT,
+                }),
+            );
+            written += 1;
+        }
+    }
+    written
+}
+
 /// Strips the host-only `thetis_tool_ok` marker, which the guest sets on every
 /// tool result and no provider must ever see.
 ///
@@ -1028,13 +1189,18 @@ mod tests {
         let client = LlmClient::new(Arc::new(cfg)).unwrap();
 
         let mut stream = client
-            .open_stream(r#"{"model":"local/deepseek","messages":[{"role":"user","content":"hi"}]}"#)
+            .open_stream(
+                r#"{"model":"local/deepseek","messages":[{"role":"user","content":"hi"}]}"#,
+            )
             .await
             .expect("the local provider answers");
 
         // The stream still parses, so nothing about routing disturbed the SSE path.
         let first = stream.next().await.unwrap();
-        assert!(matches!(first, StreamChunk::Delta(ref d) if d == "hi"), "{first:?}");
+        assert!(
+            matches!(first, StreamChunk::Delta(ref d) if d == "hi"),
+            "{first:?}"
+        );
 
         let request = server.await.unwrap();
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
@@ -1106,6 +1272,90 @@ mod tests {
         }
     }
 
+    /// A server that accepts the request, reads it, and then says nothing at
+    /// all — the failure that started this: OpenRouter took a 320KB prompt,
+    /// acked every byte, and returned zero.
+    async fn silent_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                // Held, not dropped: closing would be a connection error, and
+                // the case under test is a socket that stays open and quiet.
+                held.push(socket);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    // Twelve minutes of silence, in miniature. Four attempts against a
+    // provider that never answers used to produce four log lines that did not
+    // say why and nothing at all in the conversation, so the only evidence a
+    // person ever saw was the transport error at the end.
+    #[tokio::test]
+    async fn a_provider_that_never_answers_is_retried_and_announced() {
+        let (base, _server) = silent_server().await;
+
+        let mut cfg = Config::load().expect("the shipped config loads");
+        cfg.max_retries = 2;
+        cfg.request_timeout = Duration::from_millis(300);
+        cfg.providers = vec![crate::config::ProviderSpec {
+            id: "local".into(),
+            label: "quiet".into(),
+            base_urls: vec![base],
+            api_key: None,
+            headers: Vec::new(),
+        }];
+        cfg.default_provider = "local".into();
+        cfg.models = Vec::new();
+        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client.on_retry(tx);
+
+        let outcome = client
+            .open_stream_for(
+                r#"{"model":"local/x","messages":[{"role":"user","content":"hi"}]}"#,
+                Some("conv-1"),
+            )
+            .await;
+        match outcome {
+            Ok(_) => panic!("a provider that never answers cannot produce a stream"),
+            Err(e) => assert!(
+                matches!(e, LlmError::Transport(_)),
+                "a silent provider is a transport failure: {e:?}"
+            ),
+        }
+
+        // One notice per retry — the attempts before the last, which has no
+        // retry to announce.
+        let mut notices = Vec::new();
+        while let Ok(notice) = rx.try_recv() {
+            notices.push(notice);
+        }
+        assert_eq!(notices.len(), 2, "two retries, two notices: {notices:?}");
+        assert_eq!(notices[0].attempt, 1);
+        assert_eq!(notices[1].attempt, 2);
+        assert!(
+            notices.iter().all(|n| n.attempts == 3),
+            "the total has to include the first attempt: {notices:?}"
+        );
+        assert!(
+            notices.iter().all(|n| n.session == "conv-1"),
+            "a notice nobody can file against a conversation is not worth sending"
+        );
+        // The distinction the log used to lose entirely.
+        assert!(
+            notices[0].error.contains("read timeout"),
+            "a silent provider must not read as a connection failure: {}",
+            notices[0].error
+        );
+    }
+
     #[tokio::test]
     async fn a_dead_replica_is_stepped_over_on_retry() {
         // Two endpoints, the first of which is not listening. The retry should
@@ -1137,11 +1387,18 @@ mod tests {
             .await
             .expect("the live replica answers after the dead one fails");
         let first = stream.next().await.unwrap();
-        assert!(matches!(first, StreamChunk::Delta(ref d) if d == "hi"), "{first:?}");
+        assert!(
+            matches!(first, StreamChunk::Delta(ref d) if d == "hi"),
+            "{first:?}"
+        );
 
         // The live server really was the one that served it.
         let request = server.await.unwrap();
-        assert!(request.to_ascii_lowercase().starts_with("post /v1/chat/completions"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .starts_with("post /v1/chat/completions")
+        );
     }
 
     #[test]
@@ -1163,7 +1420,10 @@ mod tests {
     fn an_openrouter_model_is_unaffected_by_the_extra_provider() {
         let client = two_provider_client();
         let (body, provider) = client
-            .prepare_body(r#"{"model":"anthropic/claude-opus-4.1","messages":[]}"#, false)
+            .prepare_body(
+                r#"{"model":"anthropic/claude-opus-4.1","messages":[]}"#,
+                false,
+            )
             .unwrap();
         assert_eq!(provider, "openrouter");
         assert_eq!(body["model"], "anthropic/claude-opus-4.1");
@@ -1244,7 +1504,10 @@ mod tests {
     fn a_request_without_a_session_gains_no_routing_fields() {
         let client = two_provider_client();
         let (body, _) = client
-            .prepare_body(r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#, true)
+            .prepare_body(
+                r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#,
+                true,
+            )
             .unwrap();
         assert!(body.get("session_id").is_none());
         assert!(body.get("user").is_none());
@@ -1277,7 +1540,10 @@ mod tests {
             ["system", "user", "assistant", "user", "user"]
         );
         // The text is untouched; only where it is allowed to sit changed.
-        assert_eq!(body["messages"][3]["content"], "Interrupted: Thetis restarted.");
+        assert_eq!(
+            body["messages"][3]["content"],
+            "Interrupted: Thetis restarted."
+        );
     }
 
     #[test]
@@ -1293,7 +1559,10 @@ mod tests {
         ]});
 
         assert_eq!(normalize_system_roles(&mut body), 0);
-        assert_eq!(roles(&body), ["system", "user", "system", "assistant", "system"]);
+        assert_eq!(
+            roles(&body),
+            ["system", "user", "system", "assistant", "system"]
+        );
     }
 
     #[test]
@@ -1484,9 +1753,11 @@ mod tests {
             "data: [DONE]\n\n",
         ))
         .await;
-        assert!(!chunks
-            .iter()
-            .any(|c| matches!(c, StreamChunk::Reasoning(_))));
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::Reasoning(_)))
+        );
     }
 
     /// A slow reasoning model can stream for longer than the timeout while
@@ -1700,7 +1971,9 @@ mod tests {
         )
         .await;
         assert!(
-            items.iter().any(|i| matches!(i, Err(LlmError::Transport(_)))),
+            items
+                .iter()
+                .any(|i| matches!(i, Err(LlmError::Transport(_)))),
             "{items:?}"
         );
     }
@@ -1724,7 +1997,10 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert!(calls.is_empty(), "truncated arguments must not survive: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "truncated arguments must not survive: {calls:?}"
+        );
     }
 
     /// A complete tool call that happens to be followed by a broken connection
@@ -1864,9 +2140,11 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
                    data: [DONE]\n";
         let chunks = drain(sse).await;
-        assert!(chunks
-            .iter()
-            .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok")));
+        assert!(
+            chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok"))
+        );
     }
 
     #[test]
@@ -1892,5 +2170,98 @@ mod tests {
         assert_eq!(call_1[0]["content"], "real result");
         // Untouched when already coherent.
         assert_eq!(dedupe_tool_results(&mut body), 0);
+    }
+
+    // The exact shape that hung a conversation: a restart landed between a
+    // `wait` call and its result, and the next user message went straight
+    // after the unanswered call. OpenRouter accepted that request and never
+    // answered it — 4 x 180s, then "transport error", on every turn forever.
+    #[test]
+    fn a_tool_call_the_log_never_answered_is_answered_here() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "s" },
+                { "role": "assistant", "tool_calls": [{ "id": "call_wait" }] },
+                { "role": "user", "content": "Continue" },
+            ]
+        });
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 1);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        // Immediately after the call that made it: the only position the
+        // schema allows.
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_wait");
+        assert_eq!(messages[3]["content"], "Continue");
+        // Idempotent, so it does not grow the prefix on every turn.
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 0);
+    }
+
+    #[test]
+    fn an_assistant_message_with_several_unanswered_calls_gets_one_result_each() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [
+                    { "id": "a" }, { "id": "b" }, { "id": "c" },
+                ]},
+                { "role": "tool", "tool_call_id": "b", "content": "b came back" },
+                { "role": "user", "content": "Continue" },
+            ]
+        });
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 2);
+        let messages = body["messages"].as_array().unwrap();
+        let ids: Vec<_> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3, "every call needs exactly one result: {ids:?}");
+        // The real result is untouched; only the gaps are filled.
+        assert!(messages
+            .iter()
+            .any(|m| m["tool_call_id"] == "b" && m["content"] == "b came back"));
+    }
+
+    // Two interrupted rounds far apart: inserting for the later one must not
+    // disturb the position of the earlier.
+    #[test]
+    fn results_land_next_to_their_own_call_however_many_there_are() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "first" }] },
+                { "role": "user", "content": "one" },
+                { "role": "assistant", "tool_calls": [{ "id": "second" }] },
+                { "role": "user", "content": "two" },
+            ]
+        });
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 2);
+        let m = body["messages"].as_array().unwrap();
+        let roles: Vec<_> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "user", "assistant", "tool", "user"]
+        );
+        assert_eq!(m[1]["tool_call_id"], "first");
+        assert_eq!(m[4]["tool_call_id"], "second");
+    }
+
+    // A coherent log must come through completely untouched — this runs on
+    // every request, and moving a message would invalidate the prompt cache
+    // from that point on.
+    #[test]
+    fn a_coherent_conversation_is_left_exactly_as_it_was() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "s" },
+                { "role": "assistant", "tool_calls": [{ "id": "call_1" }] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "done" },
+                { "role": "assistant", "content": "all good" },
+                { "role": "user", "content": "next" },
+            ]
+        });
+        let before = body.clone();
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 0);
+        assert_eq!(body, before);
     }
 }

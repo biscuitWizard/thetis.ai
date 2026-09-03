@@ -7,11 +7,12 @@
 //! gateway on the other end of fd 3.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::os::fd::FromRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
+use crate::aspect::Aspect;
 use crate::config::Config;
 use crate::gateway;
 use crate::grip::Grip;
@@ -19,7 +20,6 @@ use crate::ipc::{self, Handler, Peer};
 use crate::pipeline;
 use crate::revisions::Origin;
 use crate::runtime::Runtime;
-use crate::aspect::Aspect;
 use crate::workers::WORKER_SOCKET_FD;
 use crate::{watchdog, watcher};
 
@@ -39,11 +39,7 @@ impl Handler for WorkerHandler {
             if method == "hello" {
                 return Ok(ipc::hello_response());
             }
-            let grip = self
-                .grip
-                .get()
-                .context("worker is still starting")?
-                .clone();
+            let grip = self.grip.get().context("worker is still starting")?.clone();
 
             let session = || -> Result<String> {
                 params
@@ -75,9 +71,7 @@ impl Handler for WorkerHandler {
                     grip.resume(&session()?).await;
                     Ok(Value::Null)
                 }
-                "agent_tools" => Ok(serde_json::to_value(
-                    grip.agent_tools(&session()?).await,
-                )?),
+                "agent_tools" => Ok(serde_json::to_value(grip.agent_tools(&session()?).await)?),
                 // Branch operations relayed from the gateway: the same code
                 // paths the agent's own branch tools use, so user- and
                 // agent-initiated operations behave identically.
@@ -119,14 +113,12 @@ impl Handler for WorkerHandler {
                 // exactly like agent-initiated ones.
                 "branch.record_op" => {
                     let op: crate::bindings::types::BranchOp =
-                        serde_json::from_value(params.clone())
-                            .context("unreadable branch op")?;
-                    grip
-                        .append_event(
-                            &session()?,
-                            crate::bindings::types::SessionEvent::BranchOp(op),
-                        )
-                        .await?;
+                        serde_json::from_value(params.clone()).context("unreadable branch op")?;
+                    grip.append_event(
+                        &session()?,
+                        crate::bindings::types::SessionEvent::BranchOp(op),
+                    )
+                    .await?;
                     Ok(Value::Null)
                 }
                 "branch.commit_dirty" => {
@@ -231,10 +223,7 @@ impl Handler for WorkerHandler {
     }
 }
 
-pub async fn run(
-    session: Option<String>,
-    worktree: Option<std::path::PathBuf>,
-) -> Result<()> {
+pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) -> Result<()> {
     // The checkout this worker runs against. In the single-worker phase it is
     // the project root; per-conversation worktrees arrive with branching.
     if let Some(worktree) = worktree {
@@ -251,7 +240,8 @@ pub async fn run(
     // the conversation would be unreachable until the gateway itself restarts.
     unsafe {
         if libc::fcntl(WORKER_SOCKET_FD, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
-            return Err(std::io::Error::last_os_error()).context("marking the gateway socket close-on-exec");
+            return Err(std::io::Error::last_os_error())
+                .context("marking the gateway socket close-on-exec");
         }
     }
     stream
@@ -302,6 +292,10 @@ pub async fn run(
         }
     }
 
+    // A stalled provider is otherwise completely silent. See
+    // `spawn_retry_notices`.
+    spawn_retry_notices(grip.clone());
+
     // This worker renders its own sessions' events and ships the frames up.
     spawn_render_loop(grip.clone(), peer.clone());
     // Shell activity goes up the same socket, so the browser can draw a live
@@ -342,6 +336,55 @@ pub async fn run(
     let _ = connection.await;
     tracing::info!("gateway hung up; worker exiting");
     Ok(())
+}
+
+/// Writes the LLM client's retry notices into the conversation they belong to.
+///
+/// Without this a provider that accepts a request and never answers is
+/// invisible: the read timeout is a silence, the retry is a silence, and the
+/// default four attempts at 180s each is twelve minutes in which a turn is
+/// indistinguishable from a hung one. The only thing that ever reached the
+/// person watching was the transport error at the very end.
+///
+/// An incident rather than a system note, because that is what the browser
+/// already renders as something gone wrong, and because it leaves the retries
+/// in the log afterwards — "this turn spent eleven of its twelve minutes
+/// waiting on a provider" is not reconstructible from anything else.
+fn spawn_retry_notices(grip: Arc<Grip>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    grip.llm.on_retry(tx);
+    tokio::spawn(async move {
+        while let Some(notice) = rx.recv().await {
+            if notice.session.is_empty() {
+                continue;
+            }
+            // The budget, not just this attempt. Four attempts at a 180s read
+            // timeout is twelve minutes before the turn fails, and knowing
+            // that at the first notice rather than the last is the difference
+            // between waiting and wondering.
+            let left = notice.attempts.saturating_sub(notice.attempt);
+            let text = format!(
+                "Attempt {} of {} got no answer from the model provider after {}s ({}). \
+                 Retrying — {} left, so up to about {} more minute(s) before this turn gives up.",
+                notice.attempt,
+                notice.attempts,
+                notice.elapsed.as_secs(),
+                notice.error,
+                left,
+                (u64::from(left) * notice.elapsed.as_secs()).div_ceil(60).max(1),
+            );
+            if let Err(e) = grip
+                .persist
+                .append_event(
+                    &notice.session,
+                    crate::bindings::types::SessionEvent::Incident(text),
+                )
+                .await
+            {
+                tracing::debug!(error = %e, "a retry notice was not recorded");
+            }
+        }
+    });
 }
 
 /// Exits if the gateway goes away.
@@ -395,6 +438,12 @@ fn tag_frame(frame: String, tag: &crate::delegation::ChildTag) -> String {
     obj.insert("agent".into(), json!(tag.child_id));
     obj.insert("agent_label".into(), json!(tag.label));
     obj.insert("agent_parent".into(), json!(tag.parent_id));
+    // The outer worker notification is routed to the root conversation, and the
+    // browser also filters on the frame's own `session`. Keep those two routing
+    // keys aligned: leaving the child's id here made every live child frame get
+    // delivered and then discarded by the UI, while refresh appeared to repair
+    // it because history already renders child events with the root id.
+    obj.insert("session".into(), json!(tag.root_id));
     serde_json::to_string(&value).unwrap_or(frame)
 }
 
@@ -565,4 +614,29 @@ async fn bring_up(grip: &Arc<Grip>, aspect: &Aspect) -> Result<()> {
         "loaded"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_frame_is_addressed_to_the_root_conversation() {
+        let tag = crate::delegation::ChildTag {
+            child_id: "child".into(),
+            parent_id: "parent".into(),
+            root_id: "root".into(),
+            label: "research".into(),
+        };
+        let tagged = tag_frame(
+            serde_json::json!({"type": "event", "session": "child", "kind": "turn-started"})
+                .to_string(),
+            &tag,
+        );
+        let value: Value = serde_json::from_str(&tagged).unwrap();
+        assert_eq!(value["session"], "root");
+        assert_eq!(value["agent"], "child");
+        assert_eq!(value["agent_parent"], "parent");
+        assert_eq!(value["agent_label"], "research");
+    }
 }

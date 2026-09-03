@@ -15,7 +15,7 @@
 
 import { $, clear, el, setHidden } from "./lib/dom.js";
 import { Connection } from "./lib/socket.js";
-import { store } from "./lib/store.js";
+import { store, denied } from "./lib/store.js";
 import { toast, popover } from "./lib/toast.js";
 import { mountBranch } from "./views/branch.js";
 import { mountComposer } from "./views/composer.js";
@@ -99,6 +99,10 @@ avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame })
 
 connection.onOpen(() => {
   connection.send({ type: "hello" });
+  // The "everyone's conversations" switch lives on the socket's principal,
+  // so a reconnect starts personal again; put it back before the sidebar
+  // draws a list that quietly lost half its rows.
+  if (store.viewAll) connection.send({ type: "list", all: true });
   if (store.current) connection.send({ type: "open", id: store.current });
   // `hello` already replies with the stored avatar, but it is asked for
   // explicitly too: another tab can have changed it while this socket was down,
@@ -110,7 +114,12 @@ connection.onOpen(() => {
 // for its own list rather than being told: a reconnect, a conversation switch
 // and a newly opened shell all funnel through the same request.
 const terminals = mountTerminals({
-  onRequest: (id) => connection.send({ type: "terminals", id }),
+  // The drawer asks for the list whenever a conversation opens. Not for a
+  // role that is denied terminals: the host would answer every open with an
+  // error toast, for a drawer they cannot use.
+  onRequest: (id) => {
+    if (!denied("terminal")) connection.send({ type: "terminals", id });
+  },
   // `id` is the conversation everywhere on this socket, so the shell goes in
   // its own field rather than overloading it.
   onKill: (terminal) =>
@@ -153,21 +162,70 @@ function revealInlineAgent(id) {
 // short-circuits — so the drawer would keep whatever it had from before the
 // socket dropped, having missed every feed frame in between. Re-ask here.
 connection.onOpen(() => {
-  if (store.current) connection.send({ type: "terminals", id: store.current });
+  // Not for someone whose role withholds terminals: the host would answer
+  // every open with an error toast, for a drawer they cannot use.
+  if (store.current && !denied("terminal")) connection.send({ type: "terminals", id: store.current });
 });
 
+// The "everyone's conversations" switch. Host-enforced: the frame flips a
+// per-connection flag on the principal, and `list_sessions` reads it. The
+// button only appears for a role that grants `see_all_sessions`.
+$("see-all")?.addEventListener("click", () => {
+  const on = !store.viewAll;
+  if (!connection.send({ type: "list", all: on })) {
+    return toast("Not connected.", { tone: "error" });
+  }
+  applyViewAll(on);
+});
+
+function applyViewAll(on) {
+  store.set({ viewAll: on });
+  const button = $("see-all");
+  if (!button) return;
+  button.setAttribute("aria-pressed", on ? "true" : "false");
+  button.title = on ? "Showing everyone's conversations — click for just yours" : "Show everyone's conversations";
+}
+
 connection
+  /* Who this socket is for. The host sends it before anything else, so every
+   * view can ask `store.user` when it draws. Everything identity-shaped on
+   * screen follows from here: the footer, the admin link, the logout form,
+   * the see-all switch, and which rail tabs exist at all. */
+  .on("user", (frame) => {
+    store.set({ user: frame });
+    const name = $("user-name");
+    if (name) {
+      name.textContent = frame.local ? "" : frame.name || frame.id || "";
+      name.title = frame.local ? "" : `Signed in as ${frame.id}${frame.role ? ` (${frame.role})` : ""}`;
+    }
+    setHidden($("admin-link"), !frame.admin);
+    setHidden($("logout"), Boolean(frame.local));
+    setHidden($("see-all"), !frame.see_all);
+    applyViewAll(Boolean(frame.see_all && frame.viewing_all));
+    // A tab for something the role withholds is not offered. The host refuses
+    // the frames anyway; this is so the refusal is never the first thing seen.
+    rail.setTabHidden("workspace", frame.workspace === "none");
+    rail.setTabHidden("branch", false);
+    if (frame.read_only) {
+      document.body.classList.add("is-read-only");
+    } else {
+      document.body.classList.remove("is-read-only");
+    }
+  })
+
   .on("catalog", (frame) => {
     store.set({
       models: frame.models || [],
       modelsHidden: frame.models_hidden || [],
       modes: frame.modes || [],
+      modelsRestricted: Boolean(frame.restricted),
     });
     // The catalogue is the panel's whole content, so a change made in any tab
     // redraws it here. The picker follows through its own `models` watcher.
     if (rail.isOpen("models")) drawModels();
     setHeader();
   })
+
 
   .on("sessions", (frame) => {
     store.set({ sessions: frame.sessions || [] });
@@ -863,13 +921,29 @@ function drawTools() {
     );
   }
 
+  // One line when the role is doing any withholding, because a tool whose
+  // capability is denied is simply absent from the list and nothing else on
+  // this tab says why.
+  const withheld = store.user?.read_only || (store.user?.denied || []).length > 0;
+  const policyNote = withheld
+    ? el(
+        "p",
+        { class: "panel-note is-inline" },
+        store.user?.read_only
+          ? "Your role is read-only: tools that change things are withheld."
+          : "Some tools are withheld by your role."
+      )
+    : null;
+
   rail.open({
     id: "tools",
     title: "Tools",
     subtitle: tools.length ? parts.join(" · ") : undefined,
     head,
     items: tools,
-    blocks: tools.length ? [toolScopeNote(grouping, routed), ...blocks] : undefined,
+    blocks: tools.length
+      ? [toolScopeNote(grouping, routed), policyNote, ...blocks].filter(Boolean)
+      : undefined,
     empty: "No tools are available in this mode.",
     renderItem: panel.toolItem,
   });
@@ -912,6 +986,7 @@ function drawModels() {
   const models = store.models || [];
   const hidden = store.modelsHidden || [];
 
+  const restricted = Boolean(store.modelsRestricted);
   const handlers = {
     // Only offered when a conversation is open: the catalogue is global, but
     // choosing a model is a per-conversation setting.
@@ -921,16 +996,22 @@ function drawModels() {
           store.set({ model: model.id });
         }
       : null,
-    onEdit: (model) => {
-      editing = model.id;
-      drawModels();
-    },
-    onRemove: (model) => {
-      connection.send({ type: "model-remove", id: store.current, slug: model.id });
-    },
-    onRestore: (model) => {
-      connection.send({ type: "model-restore", id: store.current, slug: model.id });
-    },
+    onEdit: restricted
+      ? null
+      : (model) => {
+          editing = model.id;
+          drawModels();
+        },
+    onRemove: restricted
+      ? null
+      : (model) => {
+          connection.send({ type: "model-remove", id: store.current, slug: model.id });
+        },
+    onRestore: restricted
+      ? null
+      : (model) => {
+          connection.send({ type: "model-restore", id: store.current, slug: model.id });
+        },
   };
 
   const save = ({ slug, label, previous }) => {
@@ -954,6 +1035,16 @@ function drawModels() {
 
   const blocks = [];
 
+  if (restricted) {
+    blocks.push(
+      el(
+        "p",
+        { class: "panel-section-note" },
+        "Your role fixes the model catalogue. You may select an offered model, but cannot add or edit entries."
+      )
+    );
+  }
+
   blocks.push(
     panel.section({
       title: "In the picker",
@@ -963,7 +1054,9 @@ function drawModels() {
   );
   blocks.push(...models.map(row));
 
-  if (editing === "") {
+  if (restricted) {
+    editing = null;
+  } else if (editing === "") {
     blocks.push(
       panel.modelForm({
         onSave: save,

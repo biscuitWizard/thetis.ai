@@ -150,10 +150,59 @@ body { display: flex; flex-direction: column; }
   font-size: var(--text-xs);
 }
 
+/* Name and logout read as one item: "bob · log out". */
+.foot-user {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gap-2);
+  min-width: 0;
+}
+.foot-user:empty { display: none; }
+.foot-user #user-name {
+  max-width: 11ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.foot-user #user-name:empty { display: none; }
+.foot-user form { display: inline-flex; margin: 0; }
+.foot-user #user-name:not(:empty) + form:not([hidden])::before {
+  content: "·";
+  color: var(--text-faint);
+  margin-right: var(--gap-2);
+}
+
+/* The "everyone's conversations" switch stays lit while it is on, so the
+ * sidebar's contents are never a mystery. */
+#see-all[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--accent-wash);
+  border-color: var(--accent-edge);
+}
+
 .quiet-link {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
   color: var(--text-faint);
   text-decoration: none;
   transition: color var(--fast) var(--ease);
+}
+
+/* A role that can read the shared workspace but not change it: the pill says
+ * so where the write buttons would have been. */
+.ws-readonly {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  white-space: nowrap;
+  align-self: center;
 }
 
 /* --- branch view -----------------------------------------------------------
@@ -335,10 +384,41 @@ body { display: flex; flex-direction: column; }
 }
 
 .session-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: var(--text-sm);
   font-weight: 500;
   line-height: 1.4;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Whose it is, when the sidebar shows everyone's. A pill before the title,
+ * because the owner is the first thing that matters about a row that is
+ * not yours. */
+.session-owner {
+  flex: none;
+  max-width: 9ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: var(--accent);
+  background: var(--accent-wash);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--r-pill);
+  padding: 0 6px;
+  line-height: 16px;
+}
+.session-everyone {
+  margin: var(--gap-2) var(--gap-3) 0;
+  padding: 6px 10px;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  background: var(--accent-wash);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--r-sm);
 }
 .session-preview {
   font-size: var(--text-xs);

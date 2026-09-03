@@ -18,11 +18,12 @@
 //! turn already in flight holds its own `Arc` to the old component and finishes
 //! on it; the next call picks up the new one.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use std::time::Instant;
 use wasmtime::component::Component;
 
+use crate::aspect::Aspect;
 use crate::buildcache::{BuildCache, BuildMeta, SmokeVerdict};
 use crate::builder::BuildOptions;
 use crate::config::Config;
@@ -30,7 +31,6 @@ use crate::grip::Grip;
 use crate::loader::Loader;
 use crate::revisions::Origin;
 use crate::runtime::{Budget, Caps};
-use crate::aspect::Aspect;
 
 /// The artifact filename inside a cache entry.
 pub const CACHE_ARTIFACT: &str = "component.wasm";
@@ -75,7 +75,11 @@ pub enum ContractCheck {
     /// The checkout binds against the contract this kernel speaks.
     Match,
     /// The checkout was behind and has been brought up to trunk.
-    Repaired { from: String, to: String, commits: u64 },
+    Repaired {
+        from: String,
+        to: String,
+        commits: u64,
+    },
     /// The checkout disagrees and trunk cannot settle it, because trunk does
     /// not match the kernel either. The binary is the stale one, so nothing
     /// was moved — moving would not have helped.
@@ -435,7 +439,12 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn failure(aspect: &Aspect, detail: impl Into<String>, stderr: String, started: Instant) -> Self {
+    fn failure(
+        aspect: &Aspect,
+        detail: impl Into<String>,
+        stderr: String,
+        started: Instant,
+    ) -> Self {
         Self {
             success: false,
             aspect: aspect.key(),
@@ -475,8 +484,16 @@ async fn cache_green(
     };
     let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg.aspect_source_rel(aspect)) {
         (Some(git), Some(rel)) => (
-            git.tree_oid("HEAD", &rel).await.ok().flatten().unwrap_or_default(),
-            git.tree_oid("HEAD", "wit").await.ok().flatten().unwrap_or_default(),
+            git.tree_oid("HEAD", &rel)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            git.tree_oid("HEAD", "wit")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
         ),
         _ => (String::new(), String::new()),
     };
@@ -535,7 +552,11 @@ pub async fn build_and_activate_with(
     //    unloaded state worth having, so for those a missing crate is a fault to
     //    report, not an instruction to remove ourselves.
     if matches!(aspect, Aspect::Tool(_))
-        && !grip.cfg.aspect_source_dir(aspect).join("Cargo.toml").is_file()
+        && !grip
+            .cfg
+            .aspect_source_dir(aspect)
+            .join("Cargo.toml")
+            .is_file()
     {
         if grip.loader.get(aspect).is_some() {
             grip.uninstall_component(aspect);
@@ -599,8 +620,7 @@ pub async fn build_and_activate_with(
                         .artifact_path(&meta, CACHE_ARTIFACT)
                         .and_then(|artifact| {
                             Loader::compile(&grip.runtime.engine, aspect, revision, &artifact)
-                        })
-                    {
+                        }) {
                         Ok(compiled) => {
                             grip.install_component(compiled).await;
                             tracing::info!(%aspect, revision, "served from the build cache; no compile needed");
@@ -782,26 +802,27 @@ pub async fn build_and_activate_with(
 ///
 /// This is what stops a self-modification from making the system unreachable:
 /// a component that traps, hangs, or is missing an export never becomes active.
-pub(crate) async fn smoke_test(grip: &Arc<Grip>, aspect: &Aspect, component: &Component) -> Result<()> {
+pub(crate) async fn smoke_test(
+    grip: &Arc<Grip>,
+    aspect: &Aspect,
+    component: &Component,
+) -> Result<()> {
     let caps = match aspect {
         Aspect::Agent => Caps::Agent,
         Aspect::Gateway(_) => Caps::Gateway,
         Aspect::Tool(_) => Caps::Tool,
     };
     let budget = Budget::probe(format!("{aspect} smoke test"), grip.cfg.probe_budget);
-    let mut store = grip
-        .runtime
-        .new_store(grip.clone(), caps, budget, None);
+    let mut store = grip.runtime.new_store(grip.clone(), caps, budget, None);
     let linker = grip.runtime.linker(caps);
 
     match aspect {
         Aspect::Agent => {
-            let agent = crate::bindings::agent::Agent::instantiate_async(
-                &mut store, component, linker,
-            )
-            .await
-            .map_err(anyhow::Error::from)
-            .context("instantiating")?;
+            let agent =
+                crate::bindings::agent::Agent::instantiate_async(&mut store, component, linker)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .context("instantiating")?;
 
             let health = agent
                 .call_health(&mut store)
@@ -819,12 +840,11 @@ pub(crate) async fn smoke_test(grip: &Arc<Grip>, aspect: &Aspect, component: &Co
         }
 
         Aspect::Gateway(_) => {
-            let gw = crate::bindings::gateway::Gateway::instantiate_async(
-                &mut store, component, linker,
-            )
-            .await
-            .map_err(anyhow::Error::from)
-            .context("instantiating")?;
+            let gw =
+                crate::bindings::gateway::Gateway::instantiate_async(&mut store, component, linker)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .context("instantiating")?;
 
             // A gateway that cannot serve its own index page would leave the
             // user with a blank screen, so that is the gate.
@@ -928,7 +948,9 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
                     contract.unwrap_or_default()
                 ));
             }
-            return Err(anyhow!("{aspect} has no green build in recent branch history"));
+            return Err(anyhow!(
+                "{aspect} has no green build in recent branch history"
+            ));
         }
     };
 
@@ -936,8 +958,7 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     grip.suppress_watch(aspect, grip.cfg.watchdog.watch_suppression);
     git.sync_paths_to(&commit, &rel).await?;
     let short = &commit[..12.min(commit.len())];
-    grip
-        .commit_worktree(&format!("watchdog: reset {aspect} to green {short}"))
+    grip.commit_worktree(&format!("watchdog: reset {aspect} to green {short}"))
         .await?;
 
     // Loading goes through the cache: the artifact for this tree is stored,
@@ -950,7 +971,9 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     let component = Loader::compile(&grip.runtime.engine, aspect, key_revision(&key), &artifact)?;
     grip.install_component(component).await;
 
-    Ok(format!("{aspect} was reset to its last green build ({short})"))
+    Ok(format!(
+        "{aspect} was reset to its last green build ({short})"
+    ))
 }
 
 #[cfg(test)]
@@ -1137,7 +1160,11 @@ mod contract_tests {
         let behind = update_to_trunk(&git, "main").await.unwrap();
 
         assert_eq!(behind, 1, "one commit behind trunk");
-        assert_ne!(contract_of(tmp.path()), before, "the contract must have moved");
+        assert_ne!(
+            contract_of(tmp.path()),
+            before,
+            "the contract must have moved"
+        );
         assert_eq!(
             contract_of(tmp.path()),
             wit_fingerprint("variant e { a, b, c }\n"),
@@ -1163,7 +1190,10 @@ mod contract_tests {
             wit_fingerprint("variant e { a, b, c }\n"),
             "the contract came forward"
         );
-        assert!(tmp.path().join("mine.txt").is_file(), "and the work survived");
+        assert!(
+            tmp.path().join("mine.txt").is_file(),
+            "and the work survived"
+        );
     }
 
     /// Uncommitted edits would block the merge outright. They are checkpointed,
@@ -1175,7 +1205,10 @@ mod contract_tests {
 
         update_to_trunk(&git, "main").await.unwrap();
 
-        assert!(!git.is_dirty().await.unwrap(), "the tree is clean afterwards");
+        assert!(
+            !git.is_dirty().await.unwrap(),
+            "the tree is clean afterwards"
+        );
         assert_eq!(
             fs::read_to_string(tmp.path().join("scratch.txt")).unwrap(),
             "unsaved\n",
@@ -1190,7 +1223,10 @@ mod contract_tests {
         let (tmp, git) = trunk_and_branch("conv/conflict").await;
         // Same file, different content: guaranteed to conflict with trunk.
         fs::write(tmp.path().join("wit/thetis.wit"), "variant e { a, b, z }\n").unwrap();
-        git.add_all_and_commit("my own contract").await.unwrap().unwrap();
+        git.add_all_and_commit("my own contract")
+            .await
+            .unwrap()
+            .unwrap();
         let head_before = git.head().await.unwrap();
 
         let err = update_to_trunk(&git, "main").await.unwrap_err();

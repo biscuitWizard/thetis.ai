@@ -17,6 +17,7 @@
 //! so it cannot reach a log through an incidental `{:?}`.
 
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,7 +48,91 @@ impl Secret {
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_empty() { "Secret(empty)" } else { "Secret(***)" })
+        f.write_str(if self.0.is_empty() {
+            "Secret(empty)"
+        } else {
+            "Secret(***)"
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Origin {
+    pub scheme: String,
+    pub authority: String,
+}
+
+#[derive(Clone)]
+pub struct UserSpec {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub password_hash: Secret,
+    pub discord_id: String,
+    pub policy: std::sync::Arc<crate::policy::EffectivePolicy>,
+}
+
+impl std::fmt::Debug for UserSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSpec")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthSettings {
+    pub users_mode: bool,
+    pub session_ttl: Duration,
+    pub claim_unowned: String,
+    pub lockout_after: u32,
+    pub lockout: Duration,
+    pub users: Vec<UserSpec>,
+    pub roles: BTreeMap<String, std::sync::Arc<crate::policy::EffectivePolicy>>,
+    pub discord_policy: std::sync::Arc<crate::policy::EffectivePolicy>,
+    pub local_policy: std::sync::Arc<crate::policy::EffectivePolicy>,
+}
+impl AuthSettings {
+    /// A user by id, matched without regard to case.
+    ///
+    /// Ids are validated as lowercase, so two of them can never differ by case
+    /// alone and this cannot be ambiguous. It exists because the id is what
+    /// somebody types into a login form, and they type their name the way they
+    /// write it: an account created as `bitmuse` was unreachable for anyone who
+    /// typed `bitMuse`, with "invalid credentials" as the only explanation.
+    pub fn user(&self, id: &str) -> Option<&UserSpec> {
+        self.users.iter().find(|u| u.id.eq_ignore_ascii_case(id))
+    }
+    pub fn owner_for_discord(&self, discord_id: &str, fallback: &str) -> String {
+        self.users
+            .iter()
+            .find(|u| !u.discord_id.is_empty() && u.discord_id == discord_id)
+            .map(|u| u.id.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    pub fn policy_for(&self, owner: &str) -> std::sync::Arc<crate::policy::EffectivePolicy> {
+        self.user(owner)
+            .map(|u| u.policy.clone())
+            .unwrap_or_else(|| {
+                if owner.starts_with("discord:") {
+                    return self.discord_policy.clone();
+                }
+                if self.users_mode {
+                    let mut fallback = self.local_policy.as_ref().clone();
+                    fallback.admin = false;
+                    fallback.read_only = true;
+                    fallback.see_all_sessions = false;
+                    fallback.denied.insert(crate::policy::Cap::Transcripts);
+                    fallback.denied.insert(crate::policy::Cap::Delegation);
+                    fallback.denied.insert(crate::policy::Cap::WorkspaceWrite);
+                    std::sync::Arc::new(fallback)
+                } else {
+                    self.local_policy.clone()
+                }
+            })
     }
 }
 
@@ -129,7 +214,11 @@ impl ProviderSpec {
         } else {
             self.base_urls[index % self.base_urls.len()].as_str()
         };
-        format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
     }
 
     /// A request URL against the first endpoint, for callers with no counter.
@@ -553,11 +642,19 @@ impl BrowserSettings {
     }
 
     pub fn node_bin(&self) -> &str {
-        if self.node.trim().is_empty() { "node" } else { self.node.trim() }
+        if self.node.trim().is_empty() {
+            "node"
+        } else {
+            self.node.trim()
+        }
     }
 
     pub fn npm_bin(&self) -> &str {
-        if self.npm.trim().is_empty() { "npm" } else { self.npm.trim() }
+        if self.npm.trim().is_empty() {
+            "npm"
+        } else {
+            self.npm.trim()
+        }
     }
 }
 
@@ -621,6 +718,8 @@ pub struct Config {
     pub tools: std::collections::BTreeMap<String, toml::Value>,
     pub paths: Paths,
     pub bind_addr: SocketAddr,
+    pub public_origin: Option<Origin>,
+    pub auth: AuthSettings,
     /// Gateway aspect that serves the browser UI.
     pub primary_gateway: String,
     pub admin_enabled: bool,
@@ -868,8 +967,9 @@ impl Config {
             if let toml::Value::Table(t) = table {
                 t.entry("endpoint".to_string())
                     .or_insert_with(|| toml::Value::String(self.browser.base_url()));
-                t.entry("token".to_string())
-                    .or_insert_with(|| toml::Value::String(crate::browser::token(self).to_string()));
+                t.entry("token".to_string()).or_insert_with(|| {
+                    toml::Value::String(crate::browser::token(self).to_string())
+                });
                 t.entry("enabled".to_string())
                     .or_insert_with(|| toml::Value::Boolean(self.browser.enabled));
             }
@@ -971,16 +1071,10 @@ impl Config {
 
             match outcome {
                 Ok(contents) => {
-                    table.insert(
-                        format!("{stem}_contents"),
-                        toml::Value::String(contents),
-                    );
+                    table.insert(format!("{stem}_contents"), toml::Value::String(contents));
                 }
                 Err(error) => {
-                    table.insert(
-                        format!("{stem}_contents_error"),
-                        toml::Value::String(error),
-                    );
+                    table.insert(format!("{stem}_contents_error"), toml::Value::String(error));
                 }
             }
         }
@@ -1014,6 +1108,9 @@ mod spec {
     #[serde(default)]
     pub struct File {
         pub server: Server,
+        pub auth: Auth,
+        pub roles: Vec<Role>,
+        pub users: Vec<User>,
         pub paths: Paths,
         pub skills: Skills,
         pub tool_groups: ToolGroups,
@@ -1044,10 +1141,57 @@ mod spec {
 
     #[derive(Debug, Deserialize)]
     #[serde(default)]
+    pub struct Auth {
+        pub mode: String,
+        pub session_ttl_hours: u64,
+        pub claim_unowned: String,
+        pub discord_role: String,
+        pub lockout_after: u32,
+        pub lockout_secs: u64,
+    }
+    impl Default for Auth {
+        fn default() -> Self {
+            Self {
+                mode: "local".into(),
+                session_ttl_hours: 720,
+                claim_unowned: String::new(),
+                discord_role: String::new(),
+                lockout_after: 5,
+                lockout_secs: 60,
+            }
+        }
+    }
+    #[derive(Debug, Deserialize)]
+    pub struct Role {
+        pub id: String,
+        #[serde(default)]
+        pub description: String,
+        #[serde(flatten)]
+        pub policy: crate::policy::PolicyLayer,
+    }
+    #[derive(Deserialize)]
+    pub struct User {
+        pub id: String,
+        #[serde(default)]
+        pub name: String,
+        pub role: String,
+        #[serde(default)]
+        pub password_hash: String,
+        #[serde(default)]
+        pub password_env: String,
+        #[serde(default)]
+        pub discord_id: String,
+        #[serde(default)]
+        pub overrides: crate::policy::PolicyLayer,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(default)]
     pub struct Server {
         pub bind: String,
         pub primary_gateway: String,
         pub admin_enabled: bool,
+        pub public_origin: String,
     }
     impl Default for Server {
         fn default() -> Self {
@@ -1055,6 +1199,7 @@ mod spec {
                 bind: "127.0.0.1:7777".into(),
                 primary_gateway: "web".into(),
                 admin_enabled: true,
+                public_origin: String::new(),
             }
         }
     }
@@ -1216,7 +1361,7 @@ mod spec {
     }
 
     #[derive(Debug, Deserialize)]
-    
+
     pub struct Model {
         pub id: String,
         #[serde(default)]
@@ -1230,7 +1375,7 @@ mod spec {
     }
 
     #[derive(Debug, Deserialize)]
-    
+
     pub struct Mode {
         pub id: String,
         #[serde(default)]
@@ -1693,7 +1838,9 @@ impl Env {
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, current: T) -> T {
-    env_string(key).and_then(|v| v.parse().ok()).unwrap_or(current)
+    env_string(key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(current)
 }
 
 /// A comma-separated environment list, as the Discord allowlists are given.
@@ -1890,8 +2037,8 @@ impl Config {
             }
         }
 
-        let (file, unknown) = parse_file(merged)
-            .with_context(|| format!("parsing {}", config_path.display()))?;
+        let (file, unknown) =
+            parse_file(merged).with_context(|| format!("parsing {}", config_path.display()))?;
         if !unknown.is_empty() {
             tracing::warn!(
                 keys = %unknown.join(", "),
@@ -1919,17 +2066,12 @@ impl Config {
             root.to_path_buf(),
             root.join("thetis.toml"),
             file,
-            Env::Process,
+            Env::None,
         )?;
         Ok(())
     }
 
-    fn assemble(
-        root: PathBuf,
-        config_path: PathBuf,
-        file: spec::File,
-        env: Env,
-    ) -> Result<Self> {
+    fn assemble(root: PathBuf, config_path: PathBuf, file: spec::File, env: Env) -> Result<Self> {
         // A worker's config is rooted at its worktree, but some paths name
         // state the whole fleet shares. The gateway pins those over the
         // environment at spawn, so a branch cannot retarget them by editing
@@ -1965,6 +2107,20 @@ impl Config {
         };
 
         let bind_raw = env.string("THETIS_BIND").unwrap_or(file.server.bind);
+        let public_origin_raw = env
+            .string("THETIS_PUBLIC_ORIGIN")
+            .unwrap_or(file.server.public_origin.clone());
+        let public_origin = if public_origin_raw.trim().is_empty() {
+            None
+        } else {
+            let (scheme, authority) = public_origin_raw
+                .split_once("://")
+                .context("server.public_origin must be scheme://authority")?;
+            Some(Origin {
+                scheme: scheme.into(),
+                authority: authority.trim_end_matches('/').into(),
+            })
+        };
         let bind_addr: SocketAddr = bind_raw
             .parse()
             .with_context(|| format!("`{bind_raw}` is not a valid host:port"))?;
@@ -1999,7 +2155,11 @@ impl Config {
                 .models
                 .into_iter()
                 .map(|m| ModelSpec {
-                    label: if m.label.is_empty() { m.id.clone() } else { m.label },
+                    label: if m.label.is_empty() {
+                        m.id.clone()
+                    } else {
+                        m.label
+                    },
                     id: m.id,
                     provider: m.provider,
                     wire_model: m.wire_model,
@@ -2011,7 +2171,9 @@ impl Config {
         // `[llm]` is always a provider, so every existing config keeps working
         // and the `[[providers]]` list is purely additive.
         let llm_api_key = resolve_api_key(env.string("OPENROUTER_API_KEY"), &file.llm.api_key);
-        let llm_base = env.string("OPENROUTER_BASE_URL").unwrap_or(file.llm.base_url);
+        let llm_base = env
+            .string("OPENROUTER_BASE_URL")
+            .unwrap_or(file.llm.base_url);
         let mut providers = vec![ProviderSpec {
             id: DEFAULT_PROVIDER_ID.to_string(),
             label: "OpenRouter".into(),
@@ -2044,7 +2206,11 @@ impl Config {
             }
             let api_key = resolve_provider_key(env, &p.api_key);
             let spec = ProviderSpec {
-                label: if p.label.is_empty() { id.clone() } else { p.label },
+                label: if p.label.is_empty() {
+                    id.clone()
+                } else {
+                    p.label
+                },
                 id: id.clone(),
                 base_urls,
                 api_key,
@@ -2069,7 +2235,11 @@ impl Config {
             if !providers.iter().any(|p| p.id == default_provider) {
                 anyhow::bail!(
                     "llm.provider `{default_provider}` is not one of the configured providers ({})",
-                    providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")
+                    providers
+                        .iter()
+                        .map(|p| p.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             default_provider
@@ -2083,7 +2253,11 @@ impl Config {
                     "model `{}` names provider `{}`, which is not configured ({})",
                     m.id,
                     m.provider,
-                    providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")
+                    providers
+                        .iter()
+                        .map(|p| p.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
         }
@@ -2094,7 +2268,11 @@ impl Config {
             file.modes
                 .into_iter()
                 .map(|m| ModeSpec {
-                    label: if m.label.is_empty() { m.id.clone() } else { m.label },
+                    label: if m.label.is_empty() {
+                        m.id.clone()
+                    } else {
+                        m.label
+                    },
                     id: m.id,
                     description: m.description,
                     read_only: m.read_only,
@@ -2108,7 +2286,9 @@ impl Config {
             mode.prompt = mode.prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name);
         }
 
-        let default_mode = env.string("THETIS_DEFAULT_MODE").unwrap_or(file.agent.default_mode);
+        let default_mode = env
+            .string("THETIS_DEFAULT_MODE")
+            .unwrap_or(file.agent.default_mode);
         if !modes.iter().any(|m| m.id == default_mode) {
             anyhow::bail!(
                 "default_mode `{default_mode}` is not one of the configured modes ({})",
@@ -2119,6 +2299,167 @@ impl Config {
                     .join(", ")
             );
         }
+
+        let all_model_ids = models.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let all_mode_ids = modes.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let base = crate::policy::EffectivePolicy::unrestricted(
+            &models,
+            &env.string("THETIS_MODEL").unwrap_or(file.llm.model.clone()),
+            &modes,
+            &default_mode,
+            file.subagents.max_children,
+        );
+        let local_policy = std::sync::Arc::new(base.clone());
+        // A role starts from the whole catalogue but from *no* authority: it
+        // is an administrator only if it says so. Resolving roles from the
+        // unrestricted base made every role an admin unless it wrote
+        // `admin = false`, which is the opposite of what a `reader` role
+        // means and what the "at least one admin" check below assumes.
+        let role_base = crate::policy::EffectivePolicy {
+            admin: false,
+            see_all_sessions: false,
+            ..base.clone()
+        };
+        let mut auth_roles = BTreeMap::new();
+        for r in &file.roles {
+            anyhow::ensure!(
+                !r.id.is_empty() && !auth_roles.contains_key(&r.id),
+                "role ids must be unique and non-empty"
+            );
+            let p = crate::policy::resolve(
+                &role_base,
+                &[&r.policy],
+                &format!("role `{}`", r.id),
+                &all_model_ids,
+                &all_mode_ids,
+            )?;
+            auth_roles.insert(r.id.clone(), std::sync::Arc::new(p));
+        }
+        let users_mode = match env
+            .string("THETIS_AUTH_MODE")
+            .unwrap_or(file.auth.mode.clone())
+            .as_str()
+        {
+            "local" => false,
+            "users" => true,
+            v => anyhow::bail!("auth.mode must be `local` or `users`, not `{v}`"),
+        };
+        let mut auth_users = Vec::new();
+        for u in file.users {
+            anyhow::ensure!(
+                !u.id.is_empty()
+                    && u.id.len() <= 64
+                    && u.id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c)),
+                "invalid user id `{}`: use lowercase letters, digits, dot, underscore \
+                 or hyphen, up to 64 characters",
+                u.id
+            );
+            anyhow::ensure!(
+                !auth_users.iter().any(|x: &UserSpec| x.id == u.id),
+                "duplicate user `{}`",
+                u.id
+            );
+            let rp = auth_roles
+                .get(&u.role)
+                .with_context(|| format!("user `{}` names missing role `{}`", u.id, u.role))?;
+            let convenience_env = format!(
+                "THETIS_USER_{}_PASSWORD_HASH",
+                u.id.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            );
+            let env_hash = if !u.password_env.is_empty() {
+                env.string(&u.password_env)
+            } else {
+                env.string(&convenience_env)
+            };
+            anyhow::ensure!(
+                (!u.password_hash.is_empty()) ^ env_hash.is_some(),
+                "user `{}` needs exactly one password source",
+                u.id
+            );
+            let policy = crate::policy::resolve(
+                rp,
+                &[&u.overrides],
+                &format!("user `{}`", u.id),
+                &all_model_ids,
+                &all_mode_ids,
+            )?;
+            let name = if u.name.is_empty() {
+                u.id.clone()
+            } else {
+                u.name
+            };
+            auth_users.push(UserSpec {
+                id: u.id,
+                name,
+                role: u.role,
+                password_hash: Secret::new(env_hash.unwrap_or(u.password_hash)),
+                discord_id: u.discord_id,
+                policy: std::sync::Arc::new(policy),
+            });
+        }
+        if users_mode {
+            anyhow::ensure!(
+                !auth_users.is_empty(),
+                "auth.mode = \"users\" but no [[users]] are configured; run `thetis hash-password` and add one"
+            );
+            anyhow::ensure!(
+                auth_users.iter().any(|u| u.policy.admin),
+                "users mode needs an admin user"
+            );
+            anyhow::ensure!(
+                auth_users.iter().any(|u| u.id == file.auth.claim_unowned),
+                "auth.claim_unowned must name a user"
+            );
+            anyhow::ensure!(
+                bind_addr.ip().is_loopback() || public_origin.is_some(),
+                "users mode bound off loopback needs server.public_origin"
+            );
+        }
+        let discord_policy = if file.auth.discord_role.is_empty() {
+            let mut policy = (*local_policy).clone();
+            policy.admin = false;
+            policy.read_only = true;
+            policy.see_all_sessions = false;
+            policy.denied.extend([
+                crate::policy::Cap::Transcripts,
+                crate::policy::Cap::Delegation,
+                crate::policy::Cap::WorkspaceWrite,
+            ]);
+            std::sync::Arc::new(policy)
+        } else {
+            auth_roles
+                .get(&file.auth.discord_role)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "auth.discord_role names missing role `{}`",
+                        file.auth.discord_role
+                    )
+                })?
+        };
+        let auth = AuthSettings {
+            users_mode,
+            session_ttl: Duration::from_secs(file.auth.session_ttl_hours * 3600),
+            claim_unowned: if file.auth.claim_unowned.is_empty() {
+                "local".into()
+            } else {
+                file.auth.claim_unowned
+            },
+            lockout_after: file.auth.lockout_after,
+            lockout: Duration::from_secs(file.auth.lockout_secs),
+            users: auth_users,
+            roles: auth_roles,
+            discord_policy,
+            local_policy,
+        };
 
         // Delegation profiles. Validated here rather than at spawn time: a
         // profile naming a model or mode that does not exist is a typo in the
@@ -2144,7 +2485,11 @@ impl Config {
                 );
             }
             profiles.push(AgentProfile {
-                label: if p.label.is_empty() { p.id.clone() } else { p.label },
+                label: if p.label.is_empty() {
+                    p.id.clone()
+                } else {
+                    p.label
+                },
                 id: p.id,
                 description: p.description,
                 model: p.model,
@@ -2166,17 +2511,19 @@ impl Config {
         let config = Self {
             paths,
             bind_addr,
-            primary_gateway: env.string("THETIS_GATEWAY")
+            public_origin,
+            auth,
+            primary_gateway: env
+                .string("THETIS_GATEWAY")
                 .unwrap_or(file.server.primary_gateway),
             admin_enabled: env.parse("THETIS_ADMIN", file.server.admin_enabled),
 
             openrouter_api_key: llm_api_key,
             openrouter_base: llm_base,
             model: env.string("THETIS_MODEL").unwrap_or(file.llm.model),
-            request_timeout: Duration::from_secs(env.parse(
-                "THETIS_REQUEST_TIMEOUT_SECS",
-                file.llm.request_timeout_secs,
-            )),
+            request_timeout: Duration::from_secs(
+                env.parse("THETIS_REQUEST_TIMEOUT_SECS", file.llm.request_timeout_secs),
+            ),
             max_retries: env.parse("THETIS_MAX_RETRIES", file.llm.max_retries),
             models,
             providers,
@@ -2189,34 +2536,26 @@ impl Config {
             modes,
             default_mode,
 
-            wasm_slice: Duration::from_secs(env.parse(
-                "THETIS_WASM_SLICE_SECS",
-                file.budgets.wasm_slice_secs,
-            )),
-            tool_budget: Duration::from_secs(env.parse(
-                "THETIS_TOOL_BUDGET_SECS",
-                file.budgets.tool_secs,
-            )),
-            probe_budget: Duration::from_secs(env.parse(
-                "THETIS_PROBE_BUDGET_SECS",
-                file.budgets.probe_secs,
-            )),
+            wasm_slice: Duration::from_secs(
+                env.parse("THETIS_WASM_SLICE_SECS", file.budgets.wasm_slice_secs),
+            ),
+            tool_budget: Duration::from_secs(
+                env.parse("THETIS_TOOL_BUDGET_SECS", file.budgets.tool_secs),
+            ),
+            probe_budget: Duration::from_secs(
+                env.parse("THETIS_PROBE_BUDGET_SECS", file.budgets.probe_secs),
+            ),
 
-            agent_memory_bytes: env.parse("THETIS_AGENT_MEM_MB", file.limits.agent_memory_mb)
-                << 20,
+            agent_memory_bytes: env.parse("THETIS_AGENT_MEM_MB", file.limits.agent_memory_mb) << 20,
             tool_memory_bytes: env.parse("THETIS_TOOL_MEM_MB", file.limits.tool_memory_mb) << 20,
-            gateway_memory_bytes: env.parse(
-                "THETIS_GATEWAY_MEM_MB",
-                file.limits.gateway_memory_mb,
-            ) << 20,
+            gateway_memory_bytes: env.parse("THETIS_GATEWAY_MEM_MB", file.limits.gateway_memory_mb)
+                << 20,
             session_spend_limit_usd: env.parse(
                 "THETIS_SESSION_SPEND_LIMIT_USD",
                 file.limits.session_spend_limit_usd,
             ),
-            max_tool_output_bytes: env.parse(
-                "THETIS_MAX_TOOL_OUTPUT",
-                file.limits.max_tool_output_bytes,
-            ),
+            max_tool_output_bytes: env
+                .parse("THETIS_MAX_TOOL_OUTPUT", file.limits.max_tool_output_bytes),
             max_attachment_bytes: env.parse(
                 "THETIS_MAX_ATTACHMENT_BYTES",
                 file.limits.max_attachment_bytes,
@@ -2225,10 +2564,13 @@ impl Config {
 
             context: ContextSettings {
                 enabled: env.parse("THETIS_COMPACT", file.context.enabled),
-                window: env.parse("THETIS_CONTEXT_WINDOW", file.context.window_tokens).max(1),
+                window: env
+                    .parse("THETIS_CONTEXT_WINDOW", file.context.window_tokens)
+                    .max(1),
                 compact_threshold: file.context.compact_threshold.clamp(0.05, 1.0),
                 compact_target: file.context.compact_target.clamp(0.01, 0.95),
-                summary_model: env.string("THETIS_SUMMARY_MODEL")
+                summary_model: env
+                    .string("THETIS_SUMMARY_MODEL")
                     .unwrap_or(file.context.summary_model),
                 keep_head: file.context.keep_head,
                 keep_tail: file.context.keep_tail,
@@ -2242,16 +2584,16 @@ impl Config {
             },
 
             skills: SkillSettings {
-                retrieval_enabled: env.parse(
-                    "THETIS_SKILL_RETRIEVAL",
-                    file.skills.retrieval_enabled,
-                ),
+                retrieval_enabled: env
+                    .parse("THETIS_SKILL_RETRIEVAL", file.skills.retrieval_enabled),
                 // A limit of zero would disable the L1 block by accident; use
                 // `retrieval_enabled = false` to mean that on purpose.
                 retrieve_limit: file.skills.retrieve_limit.clamp(1, 50),
-                embedding_model: env.string("THETIS_EMBEDDING_MODEL")
+                embedding_model: env
+                    .string("THETIS_EMBEDDING_MODEL")
                     .unwrap_or(file.skills.embedding_model),
-                embedding_provider: env.string("THETIS_EMBEDDING_PROVIDER")
+                embedding_provider: env
+                    .string("THETIS_EMBEDDING_PROVIDER")
                     .unwrap_or(file.skills.embedding_provider),
                 embedding_dimensions: file.skills.embedding_dimensions.clamp(64, 4096),
                 max_query_chars: file.skills.max_query_chars.clamp(64, 32_768),
@@ -2259,10 +2601,8 @@ impl Config {
             },
 
             tool_groups: ToolGroupSettings {
-                grouping_enabled: env.parse(
-                    "THETIS_TOOL_GROUPING",
-                    file.tool_groups.grouping_enabled,
-                ),
+                grouping_enabled: env
+                    .parse("THETIS_TOOL_GROUPING", file.tool_groups.grouping_enabled),
                 accounting_enabled: file.tool_groups.accounting_enabled,
                 always_on: file.tool_groups.always_on,
                 route_threshold: file.tool_groups.route_threshold.clamp(0.0, 1.0),
@@ -2281,14 +2621,21 @@ impl Config {
             },
 
             build: BuildSettings {
-                command: env.string("THETIS_BUILD_COMMAND").unwrap_or(file.build.command),
-                target: env.string("THETIS_BUILD_TARGET").unwrap_or(file.build.target),
-                profile: env.string("THETIS_BUILD_PROFILE").unwrap_or(file.build.profile),
+                command: env
+                    .string("THETIS_BUILD_COMMAND")
+                    .unwrap_or(file.build.command),
+                target: env
+                    .string("THETIS_BUILD_TARGET")
+                    .unwrap_or(file.build.target),
+                profile: env
+                    .string("THETIS_BUILD_PROFILE")
+                    .unwrap_or(file.build.profile),
                 target_dir: shared("THETIS_TARGET_DIR", resolve(&root, &file.build.target_dir)),
                 locked: file.build.locked,
                 extra_args: file.build.extra_args,
                 timeout: Duration::from_secs(
-                    env.parse("THETIS_BUILD_TIMEOUT_SECS", file.build.timeout_secs).max(1),
+                    env.parse("THETIS_BUILD_TIMEOUT_SECS", file.build.timeout_secs)
+                        .max(1),
                 ),
                 allowed_crates: file.build.allowed_crates,
             },
@@ -2387,22 +2734,26 @@ impl Config {
             discord: DiscordSettings {
                 enabled: env.parse("DISCORD_ENABLED", file.discord.enabled),
                 // The environment wins, so the token need never be on disk.
-                bot_token: env.string("DISCORD_BOT_TOKEN")
-                    .or_else(|| Some(file.discord.bot_token.clone()).filter(|t| !t.trim().is_empty()))
+                bot_token: env
+                    .string("DISCORD_BOT_TOKEN")
+                    .or_else(|| {
+                        Some(file.discord.bot_token.clone()).filter(|t| !t.trim().is_empty())
+                    })
                     .map(Secret::new),
                 mode: env.string("DISCORD_MODE").unwrap_or(file.discord.mode),
-                allowed_users: env.list("DISCORD_ALLOWED_USERS")
+                allowed_users: env
+                    .list("DISCORD_ALLOWED_USERS")
                     .unwrap_or(file.discord.allowed_users),
-                admin_users: env.list("DISCORD_ADMIN_USERS")
+                admin_users: env
+                    .list("DISCORD_ADMIN_USERS")
                     .unwrap_or(file.discord.admin_users),
                 allow_all_users: env.parse("DISCORD_ALLOW_ALL_USERS", file.discord.allow_all_users),
                 require_mention: env.parse("DISCORD_REQUIRE_MENTION", file.discord.require_mention),
-                free_response_channels: env.list("DISCORD_FREE_RESPONSE_CHANNELS")
+                free_response_channels: env
+                    .list("DISCORD_FREE_RESPONSE_CHANNELS")
                     .unwrap_or(file.discord.free_response_channels),
-                ignore_no_mention: env.parse(
-                    "DISCORD_IGNORE_NO_MENTION",
-                    file.discord.ignore_no_mention,
-                ),
+                ignore_no_mention: env
+                    .parse("DISCORD_IGNORE_NO_MENTION", file.discord.ignore_no_mention),
                 group_sessions_per_user: env.parse(
                     "DISCORD_GROUP_SESSIONS_PER_USER",
                     file.discord.group_sessions_per_user,
@@ -2410,30 +2761,23 @@ impl Config {
                 stream_edit_interval: Duration::from_millis(
                     file.discord.stream_edit_interval_ms.max(250),
                 ),
-                pairing_code_ttl: Duration::from_secs(
-                    file.discord.pairing_code_ttl_secs.max(30),
-                ),
+                pairing_code_ttl: Duration::from_secs(file.discord.pairing_code_ttl_secs.max(30)),
             },
 
             browser: BrowserSettings {
                 enabled: env.parse("THETIS_BROWSER_ENABLED", file.browser.enabled),
                 port: env.parse("THETIS_BROWSER_PORT", file.browser.port),
                 service_dir: resolve(&root, &file.browser.service_dir),
-                node: env.string("THETIS_BROWSER_NODE").unwrap_or(file.browser.node),
+                node: env
+                    .string("THETIS_BROWSER_NODE")
+                    .unwrap_or(file.browser.node),
                 npm: env.string("THETIS_BROWSER_NPM").unwrap_or(file.browser.npm),
                 playwright_version: env
                     .string("THETIS_BROWSER_PLAYWRIGHT_VERSION")
                     .unwrap_or(file.browser.playwright_version),
-                auto_install: env.parse(
-                    "THETIS_BROWSER_AUTO_INSTALL",
-                    file.browser.auto_install,
-                ),
-                install_timeout: Duration::from_secs(
-                    file.browser.install_timeout_secs.max(30),
-                ),
-                startup_timeout: Duration::from_secs(
-                    file.browser.startup_timeout_secs.max(5),
-                ),
+                auto_install: env.parse("THETIS_BROWSER_AUTO_INSTALL", file.browser.auto_install),
+                install_timeout: Duration::from_secs(file.browser.install_timeout_secs.max(30)),
+                startup_timeout: Duration::from_secs(file.browser.startup_timeout_secs.max(5)),
                 default_timeout_ms: file.browser.default_timeout_ms.max(1_000),
                 idle_timeout_secs: file.browser.idle_timeout_secs,
                 snapshot_chars: file.browser.snapshot_chars.max(500),
@@ -2538,11 +2882,7 @@ fn builtin_models() -> Vec<ModelSpec> {
 
 /// PowerShell on Windows, a POSIX shell elsewhere.
 fn default_shell() -> &'static str {
-    if cfg!(windows) {
-        "powershell"
-    } else {
-        "sh"
-    }
+    if cfg!(windows) { "powershell" } else { "sh" }
 }
 
 fn default_shell_args() -> Vec<String> {
@@ -2649,6 +2989,176 @@ mod tests {
         )
     }
 
+    /// A users-mode config with one administrator.
+    fn one_user(id: &str) -> String {
+        format!(
+            r#"
+[auth]
+mode = "users"
+claim_unowned = "{id}"
+[[roles]]
+id = "admin"
+admin = true
+[[users]]
+id = "{id}"
+name = "Someone"
+role = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2g"
+"#
+        )
+    }
+
+    // The id is what somebody types into a login form, and they type their name
+    // the way they write it. An account created as `bitmuse` answered `bitMuse`
+    // with "invalid credentials" and no hint that the two were the same
+    // account. Ids are validated lowercase, so two can never differ by case
+    // alone and matching loosely cannot be ambiguous.
+    #[test]
+    fn signing_in_ignores_the_case_of_the_id() {
+        let cfg = from_toml(&one_user("bitmuse")).unwrap();
+        for typed in ["bitmuse", "bitMuse", "BitMuse", "BITMUSE"] {
+            assert!(
+                cfg.auth.user(typed).is_some(),
+                "`{typed}` has to reach the one account there is"
+            );
+        }
+        assert!(cfg.auth.user("someoneelse").is_none());
+    }
+
+    // The rule itself, and a message that says what it is. "invalid user id
+    // `bitMuse`" left the reader to guess which character was the problem.
+    #[test]
+    fn an_id_that_is_not_lowercase_is_refused_with_the_rule() {
+        let err = from_toml(&one_user("bitMuse")).unwrap_err().to_string();
+        assert!(err.contains("invalid user id"), "{err}");
+        assert!(err.contains("lowercase"), "the message has to say why: {err}");
+    }
+
+    #[test]
+    fn a_user_gets_the_whole_catalogue_unless_something_narrows_it() {
+        let cfg = from_toml(&one_user("bitmuse")).unwrap();
+        let policy = &cfg.auth.user("bitmuse").unwrap().policy;
+        assert!(!policy.models_restricted);
+        assert_eq!(
+            policy.models.len(),
+            cfg.models.len(),
+            "switching on accounts must not quietly cost somebody their models"
+        );
+    }
+
+    #[test]
+    fn users_mode_validates_accounts_and_resolves_policy() {
+        let cfg = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "alice"
+
+            [[roles]]
+            id = "admin"
+            admin = true
+            deny_capabilities = ["ssh"]
+
+            [[users]]
+            id = "alice"
+            name = "Alice"
+            role = "admin"
+            password_hash = "not-a-real-hash"
+            "#,
+        )
+        .unwrap();
+        let alice = cfg.auth.user("alice").unwrap();
+        assert_eq!(alice.name, "Alice");
+        assert!(alice.policy.admin);
+        assert!(alice.policy.denies(crate::policy::Cap::Ssh));
+    }
+
+    /// A role is an administrator only when it says so. Every role used to
+    /// inherit `admin = true` from the unrestricted base, so a `reader` could
+    /// open `/admin` and write global settings.
+    #[test]
+    fn a_role_that_does_not_claim_admin_is_not_one() {
+        let cfg = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "alice"
+
+            [[roles]]
+            id = "admin"
+            admin = true
+
+            [[roles]]
+            id = "reader"
+            read_only = true
+
+            [[users]]
+            id = "alice"
+            role = "admin"
+            password_hash = "x"
+
+            [[users]]
+            id = "bob"
+            role = "reader"
+            password_hash = "y"
+            [users.overrides]
+            see_all_sessions = true
+            "#,
+        )
+        .unwrap();
+        let bob = cfg.auth.user("bob").unwrap();
+        assert!(!bob.policy.admin, "reader is not an administrator");
+        assert!(bob.policy.read_only);
+        assert!(bob.policy.see_all_sessions, "an override can still grant see-all");
+        assert!(!bob.policy.denied.is_empty() || bob.policy.denies(crate::policy::Cap::Terminal));
+        assert!(cfg.auth.user("alice").unwrap().policy.admin);
+        // The local-mode principal keeps its authority.
+        assert!(cfg.auth.local_policy.admin);
+
+        // And a users-mode config whose only role never claims admin is
+        // refused, rather than silently making everyone one.
+        let err = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "bob"
+            [[roles]]
+            id = "reader"
+            read_only = true
+            [[users]]
+            id = "bob"
+            role = "reader"
+            password_hash = "y"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("admin"), "{err}");
+    }
+
+    #[test]
+    fn users_mode_rejects_incomplete_account_configuration() {
+        let no_users = from_toml("[auth]\nmode = \"users\"\nclaim_unowned = \"admin\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(no_users.contains("no [[users]]"), "{no_users}");
+
+        let missing_role = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "alice"
+            [[users]]
+            id = "alice"
+            role = "ghost"
+            password_hash = "x"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_role.contains("role `ghost`"), "{missing_role}");
+    }
+
     #[test]
     fn runs_with_no_configuration_at_all() {
         let cfg = from_toml("").unwrap();
@@ -2668,13 +3178,19 @@ mod tests {
         let cfg = from_toml("").unwrap();
         let ws = cfg.wasi.dirs[0].clone();
         assert_eq!(ws, PathBuf::from("/proj/workspace"));
-        assert!(cfg.filesystem.roots.contains(&ws), "{:?}", cfg.filesystem.roots);
+        assert!(
+            cfg.filesystem.roots.contains(&ws),
+            "{:?}",
+            cfg.filesystem.roots
+        );
 
         // Explicit roots that omit the workspace still get it.
         let cfg = from_toml("[filesystem]\nroots = [\"/elsewhere\"]\n").unwrap();
         assert_eq!(cfg.filesystem.roots[0], PathBuf::from("/elsewhere"));
         assert!(
-            cfg.filesystem.roots.contains(&PathBuf::from("/proj/workspace")),
+            cfg.filesystem
+                .roots
+                .contains(&PathBuf::from("/proj/workspace")),
             "{:?}",
             cfg.filesystem.roots
         );
@@ -2759,7 +3275,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.mode("agent").unwrap().prompt, "You are Ada in agent mode.");
+        assert_eq!(
+            cfg.mode("agent").unwrap().prompt,
+            "You are Ada in agent mode."
+        );
     }
 
     /// Scoping must default to off. An empty config that silently narrowed the
@@ -2912,7 +3431,10 @@ endpoint = 0
 ";
         let value: toml::Value = toml::from_str(text).unwrap();
         let (_, unknown) = parse_file(value).unwrap();
-        assert!(unknown.iter().any(|k| k.contains("telemetry")), "{unknown:?}");
+        assert!(
+            unknown.iter().any(|k| k.contains("telemetry")),
+            "{unknown:?}"
+        );
     }
 
     #[test]
@@ -2984,7 +3506,10 @@ max_universal = 3
 
         let local = cfg.resolve_model("local/qwen3-30b");
         assert_eq!(local.provider.id, "local");
-        assert_eq!(local.provider.url("chat/completions"), "http://127.0.0.1:8080/v1/chat/completions");
+        assert_eq!(
+            local.provider.url("chat/completions"),
+            "http://127.0.0.1:8080/v1/chat/completions"
+        );
         // The picker's id and the name on the wire are allowed to differ.
         assert_eq!(local.wire_model, "qwen3-30b-a3b");
         // No key configured means no Authorization header at all, which is what
@@ -3062,7 +3587,12 @@ max_universal = 3
         std::env::remove_var("THETIS_TEST_PROVIDER_KEY");
 
         assert_eq!(
-            cfg.provider("vllm").unwrap().api_key.as_ref().unwrap().expose(),
+            cfg.provider("vllm")
+                .unwrap()
+                .api_key
+                .as_ref()
+                .unwrap()
+                .expose(),
             "sk-local-abc"
         );
     }
@@ -3134,7 +3664,10 @@ max_universal = 3
         )
         .unwrap();
         assert_eq!(cfg.providers.len(), 1);
-        assert_eq!(cfg.fallback_provider().base_url(), "http://proxy.internal/v1");
+        assert_eq!(
+            cfg.fallback_provider().base_url(),
+            "http://proxy.internal/v1"
+        );
     }
 
     #[test]
@@ -3206,7 +3739,10 @@ max_universal = 3
 
         assert_eq!(cfg.paths.data, PathBuf::from("/proj/var/state"));
         assert_eq!(cfg.paths.artifacts, PathBuf::from("/srv/thetis/artifacts"));
-        assert_eq!(cfg.aspect_source_dir(&Aspect::Agent), PathBuf::from("/proj/components/brain"));
+        assert_eq!(
+            cfg.aspect_source_dir(&Aspect::Agent),
+            PathBuf::from("/proj/components/brain")
+        );
         // The crate name follows the directory, so renaming it needs no code change.
         assert_eq!(cfg.aspect_crate_name(&Aspect::Agent), "brain");
         assert_eq!(cfg.aspect_wasm_filename(&Aspect::Agent), "brain.wasm");
@@ -3229,7 +3765,10 @@ max_universal = 3
             cfg.aspect_source_dir(&Aspect::gateway("web")),
             PathBuf::from("/proj/surfaces/ui-web")
         );
-        assert_eq!(cfg.aspect_wasm_filename(&Aspect::gateway("web")), "ui_web.wasm");
+        assert_eq!(
+            cfg.aspect_wasm_filename(&Aspect::gateway("web")),
+            "ui_web.wasm"
+        );
         assert_eq!(
             cfg.aspect_source_dir(&Aspect::tool("weather")),
             PathBuf::from("/proj/plugins/plugin-weather")
@@ -3313,7 +3852,10 @@ max_universal = 3
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.openrouter_api_key.as_ref().unwrap().expose(), "sk-from-file");
+        assert_eq!(
+            cfg.openrouter_api_key.as_ref().unwrap().expose(),
+            "sk-from-file"
+        );
     }
 
     #[test]
@@ -3447,27 +3989,29 @@ version = "2025-09-03"
             key_path.to_string_lossy()
         ))
         .unwrap();
-        let cfg = Config::assemble(
-            dir.clone(),
-            dir.join("thetis.toml"),
-            file,
-            Env::None,
-        )
-        .unwrap();
+        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), file, Env::None).unwrap();
 
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
-        assert!(seen["private_key_contents"]
-            .as_str()
-            .unwrap()
-            .contains("BEGIN RSA PRIVATE KEY"));
+        assert!(
+            seen["private_key_contents"]
+                .as_str()
+                .unwrap()
+                .contains("BEGIN RSA PRIVATE KEY")
+        );
         // The path itself is still visible, for error messages that name it.
-        assert!(seen["private_key_path"].as_str().unwrap().ends_with("app.pem"));
+        assert!(
+            seen["private_key_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("app.pem")
+        );
 
         // A path that cannot be read reports why, rather than looking unset.
         let missing: spec::File =
             toml::from_str("[tools.zzkeysvc]\nprivate_key_path = \"nope.pem\"\n").unwrap();
-        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), missing, Env::None).unwrap();
+        let cfg =
+            Config::assemble(dir.clone(), dir.join("thetis.toml"), missing, Env::None).unwrap();
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         assert!(seen.get("private_key_contents").is_none());
@@ -3482,14 +4026,17 @@ version = "2025-09-03"
         // A path outside the root is refused, and says so.
         let escaping: spec::File =
             toml::from_str("[tools.zzkeysvc]\nprivate_key_path = \"/etc/hostname\"\n").unwrap();
-        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), escaping, Env::None).unwrap();
+        let cfg =
+            Config::assemble(dir.clone(), dir.join("thetis.toml"), escaping, Env::None).unwrap();
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         assert!(seen.get("private_key_contents").is_none());
-        assert!(seen["private_key_contents_error"]
-            .as_str()
-            .unwrap()
-            .contains("inside the project root"));
+        assert!(
+            seen["private_key_contents_error"]
+                .as_str()
+                .unwrap()
+                .contains("inside the project root")
+        );
 
         // A relative path resolves against the shared overlay's directory too,
         // not just the project root. This is the worktree case: a conversation
@@ -3502,7 +4049,8 @@ version = "2025-09-03"
 
         let relative: spec::File =
             toml::from_str("[tools.zzkeysvc]\nprivate_key_path = \"shared.pem\"\n").unwrap();
-        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), relative, Env::None).unwrap();
+        let cfg =
+            Config::assemble(dir.clone(), dir.join("thetis.toml"), relative, Env::None).unwrap();
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         std::env::remove_var("THETIS_LOCAL_CONFIG");
@@ -3571,10 +4119,12 @@ timeout = 30
 ",
         )
         .unwrap();
-        let overlay: toml::Value =
-            toml::from_str("[tools.web-search]
+        let overlay: toml::Value = toml::from_str(
+            "[tools.web-search]
 api_key = \"secret\"
-").unwrap();
+",
+        )
+        .unwrap();
 
         merge_toml(&mut base, overlay);
 
@@ -3590,16 +4140,20 @@ api_key = \"secret\"
 
     #[test]
     fn overlay_replaces_scalars_and_arrays_rather_than_merging_them() {
-        let mut base: toml::Value =
-            toml::from_str("[build]
+        let mut base: toml::Value = toml::from_str(
+            "[build]
 locked = true
 allowed_crates = [\"a\", \"b\"]
-").unwrap();
-        let overlay: toml::Value =
-            toml::from_str("[build]
+",
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            "[build]
 locked = false
 allowed_crates = [\"c\"]
-").unwrap();
+",
+        )
+        .unwrap();
 
         merge_toml(&mut base, overlay);
 

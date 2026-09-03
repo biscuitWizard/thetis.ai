@@ -14,6 +14,14 @@ export const store = {
   /** Models pushed out of the picker; the inspector still lists them so one
    *  can be brought back. */
   modelsHidden: [],
+  modelsRestricted: false,
+  /** The `user` frame: who this socket is for and what their role withholds.
+   *  Null until the host says, which is the first thing it does. */
+  user: null,
+  /** Whether the sidebar is showing everyone's conversations. Only an
+   *  account whose role grants `see_all_sessions` can turn this on; for
+   *  anyone else the host ignores it. */
+  viewAll: false,
   modes: [],
   busy: false,
   attachments: [],
@@ -136,3 +144,13 @@ export const store = {
     return known?.label || this.model;
   },
 };
+
+/** True when the signed-in user's role withholds a host capability family
+ *  (`terminal`, `branch_write`, `workspace_write`, …). The host refuses the
+ *  frame regardless; this is what lets a view leave the control out rather
+ *  than offer a button that only ever answers with an error. Unknown until
+ *  the `user` frame arrives, and unknown reads as allowed: the frame comes
+ *  first on every socket, so nothing is drawn before it in practice. */
+export function denied(cap) {
+  return Boolean(store.user?.denied?.includes(cap));
+}

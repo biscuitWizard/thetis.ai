@@ -5,18 +5,18 @@
 //! the orchestrator gains capabilities (the sandbox, the dev kit), the flags
 //! flip and the tools appear without the agent needing to change.
 
+use crate::groups;
+use crate::plan;
 use crate::thetis::grip::types::{
     CompileReport, ConfigEntry, Dependency, EnvVar, EventRecord, ExecResult, FsEntry, LogLevel,
     ModTarget, SessionEvent, SshHostInfo, TerminalOpen, TerminalOutput, ToolManifest,
 };
 use crate::thetis::grip::{
     branch, configuration, control, delegation, devkit, hostfs, sandbox, skills, sys, terminal,
-    tooling,
+    tooling, transcripts,
 };
-use crate::groups;
-use crate::plan;
 use crate::todos;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The mode assumed when a session has not chosen one.
 pub const DEFAULT_MODE: &str = "agent";
@@ -83,6 +83,35 @@ fn read_only(mode: &str) -> bool {
         .find(|m| m.id == mode)
         .map(|m| m.read_only)
         .unwrap_or(false)
+}
+
+/// Whether this account's policy denies a built-in or hot-loaded tool by name.
+///
+/// This is the *soft* half of tool-name denial: `deny_tools` lives in the
+/// host's account policy and is surfaced here as a comma-joined config value,
+/// the same way every other per-account answer reaches the agent
+/// (`devkit_available`, `read_only`, and so on). It is soft because agent-core
+/// is exactly the component a conversation running on its own branch can
+/// rewrite — the hard boundary for anything that matters is the host import
+/// underneath the tool, gated by the account's policy on the far side of the
+/// WIT contract. Denying `terminal_run` here while `terminal::open` stays
+/// reachable would be no denial at all, so this is meant only for tools whose
+/// underlying capability is not otherwise deniable at that granularity (a
+/// single built-in inside an available capability, e.g. `delete_path` but not
+/// the rest of the filesystem tools).
+///
+/// A pattern ending in `*` matches by prefix; anything else must match the
+/// whole name. Empty or absent config denies nothing, which is the same as
+/// today for every account until a deployment sets `deny_tools`.
+fn policy_denies(name: &str) -> bool {
+    let raw = sys::config_get("policy_deny_tools").unwrap_or_default();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .any(|pat| match pat.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == pat,
+        })
 }
 
 /// Whether a tool name changes something outside the conversation.
@@ -178,6 +207,9 @@ fn restart_tools() -> Vec<ToolDef> {
              this rebuilds it for you, in the background, and reports the result here. \
              A build that fails restarts nothing and gives you the compiler error; a \
              binary that will not start is probed and rejected before it is adopted. \
+             Ask once: a rebuild takes minutes, and while one is running a second call \
+             starts nothing and changes nothing. Every outcome arrives here on its own, \
+             so silence means it is still building, not that the request was lost. \
              This turn continues afterwards unless you say otherwise; say why first, \
              because the restart happens just after your turn ends.",
         mutating: true,
@@ -232,7 +264,10 @@ fn sandbox_tools() -> Vec<ToolDef> {
             name: "read_file",
             description: "Read a file from the session's container workspace.",
             mutating: false,
-            parameters: obj(json!({ "path": string_prop("Path inside the workspace.") }), &["path"]),
+            parameters: obj(
+                json!({ "path": string_prop("Path inside the workspace.") }),
+                &["path"],
+            ),
         },
     ]
 }
@@ -250,8 +285,7 @@ fn subagent_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "spawn_agent",
-            description:
-                "Delegate a self-contained piece of work to a sub-agent: a fresh conversation \
+            description: "Delegate a self-contained piece of work to a sub-agent: a fresh conversation \
                  with its own context window, working in this same checkout, whose final answer \
                  comes back to you. Returns as soon as the child has started, so call it \
                  several times to fan out and then `wait`.\n\n\
@@ -296,8 +330,9 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "agent_status",
-            description:
-                "List your sub-agents with their state, answer so far, cost and elapsed time. \
+            description: "List your sub-agents with their state, answer so far, cost and elapsed time. \
+                 A running child also reports how much log it has written and when it last \
+                 wrote any, which is how you tell one that is working from one that is stuck. \
                  Free of side effects, but prefer `wait` when what you actually want is for one \
                  of them to be finished.",
             mutating: false,
@@ -305,8 +340,7 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "agent_transcript",
-            description:
-                "Read a sub-agent's own event log — what it did, not just what it concluded. \
+            description: "Read a sub-agent's own event log — what it did, not just what it concluded. \
                  For diagnosing a child that failed or answered oddly; the answer in \
                  agent_status is the normal way to collect work.",
             mutating: false,
@@ -323,8 +357,7 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "cancel_agent",
-            description:
-                "Stop a sub-agent that is no longer worth finishing — going the wrong way, or \
+            description: "Stop a sub-agent that is no longer worth finishing — going the wrong way, or \
                  made redundant by another child's answer. Whatever it had produced is kept.",
             mutating: true,
             parameters: obj(
@@ -334,12 +367,161 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "agent_profiles",
-            description:
-                "List the configured sub-agent profiles — each a model, a mode and a standing \
+            description: "List the configured sub-agent profiles — each a model, a mode and a standing \
                  brief — and the delegation limits: how many children may run at once, the \
                  longest a wait may block, and how much of an answer reaches you.",
             mutating: false,
             parameters: obj(json!({}), &[]),
+        },
+    ]
+}
+
+/// Recall: reading and searching past conversations and sub-agents.
+///
+/// Every one of these is read-only, and that is what justifies their reach.
+/// Unlike the rest of the tool surface they see conversations this session did
+/// not write — the host grants that precisely because nothing here can change
+/// one. Say so in the descriptions, because a caller cannot tell from a schema
+/// whose data it is about to read.
+///
+/// There are no separate sub-agent read/grep tools. A sub-agent *is* a session,
+/// so its id goes straight into `conversation_read`, and one `include_subagents`
+/// flag covers it in search. `agent_status` and `agent_transcript` remain a
+/// different job: live supervision of the children this turn started.
+fn transcript_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "conversation_list",
+            description: "List conversations in this Thetis instance, most recently active first: id, \
+                 title, mode, when it was last active, and a preview. Use it to find the \
+                 conversation you want before reading or grepping it — and prefer \
+                 `conversation_grep` when you know what you are looking for but not where.\n\n\
+                 This sees every conversation, not only your own. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Include archived conversations. Defaults to false.",
+                    },
+                    "include_subagents": {
+                        "type": "boolean",
+                        "description": "Include sub-agent sessions. Defaults to false: there \
+                                        are usually far more of them than conversations. Use \
+                                        subagent_list to see one conversation's children.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many to return, newest first. Omit for all of them.",
+                    },
+                }),
+                &[],
+            ),
+        },
+        ToolDef {
+            name: "conversation_read",
+            description: "Read a conversation's transcript by id — messages, tool calls, tool failures, \
+                 notes and incidents, oldest first. Works on any conversation and on any \
+                 sub-agent session, since a sub-agent is just a session: pass the child id from \
+                 `subagent_list` or from a grep hit.\n\n\
+                 Long entries arrive clipped, and the reply says how much was cut, so raise \
+                 `max_chars` when you need a full message rather than assuming you have it. \
+                 Page with `from_seq` set to the last seq you saw. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "session_id": string_prop(
+                        "The conversation or sub-agent session id, from conversation_list, \
+                         subagent_list or a conversation_grep hit."
+                    ),
+                    "from_seq": {
+                        "type": "integer",
+                        "description": "Skip events at or before this sequence number. Omit to \
+                                        start at the beginning; set it to the last seq you saw \
+                                        to page forward.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many entries to return. Omit for the default (200).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Characters per entry before clipping. Omit for the \
+                                        default (600); raise it to read a long message in full.",
+                    },
+                }),
+                &["session_id"],
+            ),
+        },
+        ToolDef {
+            name: "conversation_grep",
+            description: "Search transcripts for a regular expression and get back the matching lines \
+                 with the conversation and sequence number each came from. This is the tool for \
+                 recall: whether you have hit a problem before, what was decided about something \
+                 and where, which conversation a piece of work happened in.\n\n\
+                 Searches every conversation by default — pass `session_id` to search just one. \
+                 Successful tool output is skipped unless you ask for it, because file contents \
+                 and command output are most of the bytes in a transcript and would bury the \
+                 discussion; failed tool results are always searched, so error messages are \
+                 findable. Newest conversation first, and the reply says plainly when the answer \
+                 was capped. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "pattern": string_prop(
+                        "Regular expression, Rust regex syntax. Prefix with (?i) to ignore case."
+                    ),
+                    "session_id": string_prop(
+                        "Search only this conversation or sub-agent session. Omit to search all \
+                         of them."
+                    ),
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Search archived conversations too. Defaults to false.",
+                    },
+                    "include_subagents": {
+                        "type": "boolean",
+                        "description": "Search sub-agent logs too. Defaults to false. Worth \
+                                        turning on when the work you are looking for was \
+                                        delegated.",
+                    },
+                    "include_tool_output": {
+                        "type": "boolean",
+                        "description": "Also search successful tool output — file contents, \
+                                        command output, other searches' results. Defaults to \
+                                        false; it is a lot of noise, and a pattern matching a \
+                                        file's text matches it in every conversation that ever \
+                                        read that file.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Hits to return. Omit for the default (100).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Characters per hit before clipping. Omit for the default.",
+                    },
+                }),
+                &["pattern"],
+            ),
+        },
+        ToolDef {
+            name: "subagent_list",
+            description: "List the sub-agents spawned under a conversation — label, brief, state, when it \
+                 last ran, and the child's session id, which `conversation_read` will open. Works for any \
+                 conversation and reports the whole tree.\n\n\
+                 For the children *you* started in this turn, `agent_status` is the better tool: \
+                 it is live supervision, and `wait` blocks on it. This one is for looking at what \
+                 some other conversation delegated. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "session_id": string_prop(
+                        "The conversation whose sub-agents to list. Omit for this conversation."
+                    ),
+                }),
+                &[],
+            ),
         },
     ]
 }
@@ -352,8 +534,7 @@ fn configuration_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_config",
-            description:
-                "List Thetis's settings as dotted paths with their current values. Pass a \
+            description: "List Thetis's settings as dotted paths with their current values. Pass a \
                  prefix such as 'llm' or 'terminal' to narrow it.",
             mutating: false,
             parameters: obj(
@@ -372,8 +553,7 @@ fn configuration_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "set_config",
-            description:
-                "Change one setting and write it back to the config file. The change is \
+            description: "Change one setting and write it back to the config file. The change is \
                  refused if the result would not load. Settings are read at startup, so call \
                  restart_orchestrator afterwards for it to take effect.",
             mutating: true,
@@ -393,8 +573,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "remember",
-            description:
-                "Save a durable note for this conversation. Survives restarts and self-modification.",
+            description: "Save a durable note for this conversation. Survives restarts and self-modification.",
             mutating: false,
             parameters: obj(
                 json!({
@@ -406,8 +585,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "recall",
-            description:
-                "Read back a saved note. Omit the key to list everything remembered here.",
+            description: "Read back a saved note. Omit the key to list everything remembered here.",
             mutating: false,
             parameters: obj(
                 json!({ "key": string_prop("The note to read; omit to list all keys.") }),
@@ -425,8 +603,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // any other. The mode filter still applies to whatever it admits.
         ToolDef {
             name: TOOL_SEARCH,
-            description:
-                "Find and load a group of tools that is not currently in your tool list. Your \
+            description: "Find and load a group of tools that is not currently in your tool list. Your \
                  tool surface is scoped to what this conversation looks like it needs, so \
                  capabilities you have — BigQuery, Notion, the web, GitHub, ssh hosts, the dev \
                  kit — may not be visible right now. Call this with a description of what you \
@@ -457,8 +634,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // besides read. That is also what lets Discord use it.
         ToolDef {
             name: ASK_USER,
-            description:
-                "Ask the user one or more questions and have them answered in the interface \
+            description: "Ask the user one or more questions and have them answered in the interface \
                  rather than in prose. Each question is either multiple choice or open ended; \
                  every choice question also offers a free-text answer of the user's own, and \
                  every question can be skipped. Use this whenever you need input to go on — a \
@@ -529,8 +705,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // and it is the one every session can reach.
         ToolDef {
             name: "wait",
-            description:
-                "Block until something you are waiting on has happened, instead of polling in a \
+            description: "Block until something you are waiting on has happened, instead of polling in a \
                  loop — each round of polling costs an iteration and a slice of context.\n\n\
                  Predicates: 'time' — sleep for the timeout, for something outside this system, \
                  like a long build or a deploy settling; 'all' — every sub-agent named (or every \
@@ -576,8 +751,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // to be pushy: a skill that is never fetched may as well not exist.
         ToolDef {
             name: "skill_fetch",
-            description:
-                "Read a skill's full instructions before doing the thing it covers. The system \
+            description: "Read a skill's full instructions before doing the thing it covers. The system \
                  prompt lists only one-line briefs, so fetch the skill whenever its brief looks \
                  relevant — the brief is a pointer, not the content. Also fetches a bundled \
                  reference, script or asset by relative path.",
@@ -597,8 +771,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_search",
-            description:
-                "Search the skill corpus by meaning and get back matching briefs, ranked. Use \
+            description: "Search the skill corpus by meaning and get back matching briefs, ranked. Use \
                  this when a task looks like something there might be a skill for but nothing \
                  in the prompt names it — the prompt only carries universal skills plus what \
                  was retrieved for the opening message, so most of the corpus is not listed.",
@@ -613,8 +786,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_write",
-            description:
-                "Create or replace a skill, or one of its bundled files. Replaces the whole \
+            description: "Create or replace a skill, or one of its bundled files. Replaces the whole \
                  file, as with code edits. Lint diagnostics come back in the same call. Use \
                  this to record a procedure worth keeping rather than repeating it from memory \
                  next time.",
@@ -638,8 +810,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_delete",
-            description:
-                "Delete a skill. Refuses a skill with nested children unless recursive is set, \
+            description: "Delete a skill. Refuses a skill with nested children unless recursive is set, \
                  so a subtree cannot be orphaned by accident.",
             mutating: true,
             parameters: obj(
@@ -652,8 +823,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_lint",
-            description:
-                "Check skills for problems: missing or overlong briefs, broken parent links, \
+            description: "Check skills for problems: missing or overlong briefs, broken parent links, \
                  nesting deeper than the limit. Omit the id to lint the whole corpus.",
             mutating: false,
             parameters: obj(
@@ -694,6 +864,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     if delegation_available() {
         tools.extend(subagent_tools());
     }
+    // No capability flag: the event log is always there, and these only read it.
+    // A sub-agent gets them too — it is refused `subagent_tools` because it may
+    // not *spawn*, which says nothing about whether it may read. A child sent to
+    // investigate something is exactly the session most likely to need recall,
+    // and it cannot ask its parent for context mid-turn.
+    tools.extend(transcript_tools());
     tools.extend(configuration_tools());
     if restart_available() {
         tools.extend(restart_tools());
@@ -704,6 +880,10 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     if read_only(mode) {
         tools.retain(|t| !t.mutating);
     }
+
+    // Soft, per-account tool-name denial. See `policy_denies` for why this is
+    // never the hard boundary.
+    tools.retain(|t| !policy_denies(t.name));
 
     tools
 }
@@ -722,8 +902,7 @@ fn plan_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "plan_write",
-            description:
-                "Create or replace this conversation's plan document. The plan opens in its own \
+            description: "Create or replace this conversation's plan document. The plan opens in its own \
                  tab, where the user can read it and press Execute to hand it to an agent — so \
                  write it for that reader: numbered steps, the files each one touches, and the \
                  decisions that are theirs to make. Prefer `plan_edit` for a revision; a whole \
@@ -743,8 +922,7 @@ fn plan_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plan_edit",
-            description:
-                "Revise part of the plan by replacing an exact snippet — the same contract as \
+            description: "Revise part of the plan by replacing an exact snippet — the same contract as \
                  `edit_path`. Read the plan first: `old_text` must match byte for byte, \
                  whitespace included, and an edit matching nothing or matching twice is refused \
                  rather than guessed. This is the tool for reworking a step after the user \
@@ -766,8 +944,7 @@ fn plan_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plan_append",
-            description:
-                "Add a section to the end of the plan, without restating the rest of it. Use \
+            description: "Add a section to the end of the plan, without restating the rest of it. Use \
                  this while investigating, as each part of the shape becomes clear.",
             mutating: false,
             parameters: obj(
@@ -777,8 +954,7 @@ fn plan_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plan_read",
-            description:
-                "Read this conversation's plan back, with its revision number. Do this before \
+            description: "Read this conversation's plan back, with its revision number. Do this before \
                  editing: another turn may have revised it, and `plan_edit` matches exact text.",
             mutating: false,
             parameters: obj(json!({}), &[]),
@@ -806,34 +982,43 @@ fn todo_tools() -> Vec<ToolDef> {
             name: "todo_write",
             description: "Write this conversation's todo list, replacing whatever is there. Use it once when work has three or more distinct steps or the user gives you a list. Prefer todo_update afterwards: restating the whole list to change one status is how a row quietly disappears.",
             mutating: false,
-            parameters: obj(json!({ "todos": { "type": "array", "items": item.clone(), "description": "The complete replacement list." } }), &["todos"]),
+            parameters: obj(
+                json!({ "todos": { "type": "array", "items": item.clone(), "description": "The complete replacement list." } }),
+                &["todos"],
+            ),
         },
         ToolDef {
             name: "todo_add",
             description: "Add items without restating the list. Use this when work turns out to be larger than expected or a blocker becomes concrete.",
             mutating: false,
-            parameters: obj(json!({ "todos": { "type": "array", "items": item, "description": "Items to append." } }), &["todos"]),
+            parameters: obj(
+                json!({ "todos": { "type": "array", "items": item, "description": "Items to append." } }),
+                &["todos"],
+            ),
         },
         ToolDef {
             name: "todo_update",
             description: "Change items in place. Mark exactly one item in_progress before starting it and completed when it is actually done. Use cancelled for work deliberately abandoned and say why in your reply.",
             mutating: false,
-            parameters: obj(json!({
-                "updates": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": string_prop("Stable todo id, e.g. t3. Give this or index, not both."),
-                            "index": { "type": "integer", "description": "One-based item position. Give this or id, not both." },
-                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
-                            "content": string_prop("Replacement description."),
-                            "active_form": string_prop("Replacement present-continuous label."),
+            parameters: obj(
+                json!({
+                    "updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": string_prop("Stable todo id, e.g. t3. Preferred: it survives the list being reordered."),
+                                "index": { "type": "integer", "description": "One-based item position, for when you do not have the id. Sending both is fine — the id wins." },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
+                                "content": string_prop("Replacement description."),
+                                "active_form": string_prop("Replacement present-continuous label."),
+                            },
+                            "additionalProperties": false,
                         },
-                        "additionalProperties": false,
-                    },
-                }
-            }), &["updates"]),
+                    }
+                }),
+                &["updates"],
+            ),
         },
         ToolDef {
             name: "todo_read",
@@ -850,8 +1035,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "read_path",
-            description:
-                "Read a file from the host filesystem, with every line numbered. Reads the \
+            description: "Read a file from the host filesystem, with every line numbered. Reads the \
                  whole file by default; for a large one pass `offset` and `limit` to take a \
                  window, and the reply says how to read on. Prefer this over `cat`, `head`, \
                  `sed -n` or `less` in a terminal: it costs fewer tokens and the line numbers \
@@ -874,8 +1058,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "edit_path",
-            description:
-                "Change part of a file on the host filesystem by replacing an exact snippet. \
+            description: "Change part of a file on the host filesystem by replacing an exact snippet. \
                  This is the tool for an ordinary edit — reach for `write_path` only to create \
                  a file or genuinely rewrite all of it. Read the file first: `old_text` must \
                  match byte for byte, indentation included. If it appears more than once the \
@@ -899,8 +1082,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "search_files",
-            description:
-                "Search file contents across the tree for a regular expression, and get back \
+            description: "Search file contents across the tree for a regular expression, and get back \
                  `path:line: text` for each hit. This is how to find where something lives: \
                  a symbol's definition, every caller of a function, a string from a log. \
                  Narrow with `glob` ('*.rs') or `path` (a subdirectory) rather than widening \
@@ -932,8 +1114,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "find_files",
-            description:
-                "List files whose path matches a glob, most recently changed first. Use it to \
+            description: "List files whose path matches a glob, most recently changed first. Use it to \
                  find a file you know the shape of the name of, or to see what a directory \
                  holds without listing it level by level. A pattern with no '/' matches the \
                  file name anywhere in the tree, so '*.wit' finds every one. Prefer this over \
@@ -956,8 +1137,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "write_path",
-            description:
-                "Create a file on the host filesystem, or replace one outright, creating parent \
+            description: "Create a file on the host filesystem, or replace one outright, creating parent \
                  directories as needed. This writes the whole file, so use `edit_path` for a \
                  change to a file that already exists — a whole-file write costs the file's \
                  length in tokens and loses anything you did not think to repeat.",
@@ -972,8 +1152,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_path",
-            description:
-                "List one directory on the host filesystem. To look across a whole tree use \
+            description: "List one directory on the host filesystem. To look across a whole tree use \
                  `find_files` instead of walking level by level.",
             mutating: false,
             parameters: obj(
@@ -983,8 +1162,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "delete_path",
-            description:
-                "Delete a file or directory on the host filesystem. This cannot be undone, so \
+            description: "Delete a file or directory on the host filesystem. This cannot be undone, so \
                  check the path first.",
             mutating: true,
             parameters: obj(
@@ -1008,8 +1186,7 @@ fn terminal_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "terminal_open",
-            description:
-                "Open a shell session and return its id. Reuse the id for related commands so \
+            description: "Open a shell session and return its id. Reuse the id for related commands so \
                  the working directory and environment carry over. Pass `host` to open the \
                  session on a remote machine over ssh, naming a host you registered with \
                  `ssh_host_set`.\n\nThe terminal is for running programs — builds, tests, git, \
@@ -1045,8 +1222,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_run",
-            description:
-                "Run a command in an open shell session and wait for it to finish. Returns \
+            description: "Run a command in an open shell session and wait for it to finish. Returns \
                  whatever it printed, with the exit status. A command that outlives the timeout \
                  keeps running; read the session again later for the rest.\n\nThis waits for the \
                  command to complete, so it cannot drive anything interactive: a program sitting \
@@ -1076,8 +1252,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_read",
-            description:
-                "Read anything a session has printed since the last read, without running \
+            description: "Read anything a session has printed since the last read, without running \
                  anything. Use it to collect output from a command that timed out or was \
                  backgrounded — it says whether that command has since finished.",
             mutating: false,
@@ -1085,8 +1260,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_send",
-            description:
-                "Write raw input to a session and return immediately, without waiting for a \
+            description: "Write raw input to a session and return immediately, without waiting for a \
                  command to complete. This is how to answer a prompt — a confirmation, a \
                  passphrase, a `y` — or to drive a REPL, none of which `terminal_run` can do, \
                  because it waits for the command to end and an interactive program never \
@@ -1112,8 +1286,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_signal",
-            description:
-                "Interrupt what a session is running, leaving the session itself alive — the \
+            description: "Interrupt what a session is running, leaving the session itself alive — the \
                  deliberate Ctrl-C. Use it to stop a `tail -f`, end a test run whose first \
                  failure already told you what you needed, or unstick a command waiting on \
                  input you cannot give.\n\nA remote session needs a pty on its host for this to \
@@ -1139,8 +1312,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_list",
-            description:
-                "List the open shell sessions, with where each one runs, where it is, and \
+            description: "List the open shell sessions, with where each one runs, where it is, and \
                  whether it is busy with a background command.",
             mutating: false,
             parameters: obj(json!({}), &[]),
@@ -1168,8 +1340,7 @@ const CLONE_ROOT: &str = "workspace";
 fn git_tools() -> Vec<ToolDef> {
     vec![ToolDef {
         name: "git_clone",
-        description:
-            "Clone a GitHub repository into a real working tree, authenticated as the app's \
+        description: "Clone a GitHub repository into a real working tree, authenticated as the app's \
              GitHub App identity. Use this when you need actual files and a .git — a rebase, a \
              bisect, running a test suite, or a commit series with exact parentage; the git-* \
              tools read and write through the API without cloning, which is cheaper and is \
@@ -1215,16 +1386,14 @@ fn ssh_host_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "ssh_host_list",
-            description:
-                "List the named ssh hosts `terminal_open` can open a session on, with each \
+            description: "List the named ssh hosts `terminal_open` can open a session on, with each \
                  one's connection details. Start here when you need a host name.",
             mutating: false,
             parameters: obj(json!({}), &[]),
         },
         ToolDef {
             name: "ssh_host_get",
-            description:
-                "Show one registered ssh host's connection details. Use `ssh_host_list` when \
+            description: "Show one registered ssh host's connection details. Use `ssh_host_list` when \
                  you do not know the name.",
             mutating: false,
             parameters: obj(
@@ -1234,8 +1403,7 @@ fn ssh_host_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "ssh_host_set",
-            description:
-                "Register a new ssh host for `terminal_open`, or edit one that exists. Fields \
+            description: "Register a new ssh host for `terminal_open`, or edit one that exists. Fields \
                  you leave out keep their current value, so this is how to change just the port \
                  or just the pty setting.\n\nA name here is all `terminal_open` needs, so \
                  connection details are stated once. Hosts live in a gitignored file the config \
@@ -1284,8 +1452,7 @@ fn ssh_host_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "ssh_host_remove",
-            description:
-                "Delete a registered ssh host. Sessions already open on it keep running; \
+            description: "Delete a registered ssh host. Sessions already open on it keep running; \
                  nothing new can be opened by that name afterwards.",
             mutating: true,
             parameters: obj(
@@ -1295,8 +1462,7 @@ fn ssh_host_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "ssh_host_rename",
-            description:
-                "Rename a registered ssh host, keeping its connection details. The old name \
+            description: "Rename a registered ssh host, keeping its connection details. The old name \
                  stops working, so update anything that refers to it.",
             mutating: true,
             parameters: obj(
@@ -1326,8 +1492,7 @@ fn devkit_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "new_tool",
-            description:
-                "Scaffold a new tool component: creates the crate, builds it, and loads it. \
+            description: "Scaffold a new tool component: creates the crate, builds it, and loads it. \
                  Returns the compile result.",
             mutating: true,
             parameters: obj(
@@ -1340,8 +1505,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "write_code",
-            description:
-                "Replace a whole file in a component, then rebuild and hot-swap it. The compile \
+            description: "Replace a whole file in a component, then rebuild and hot-swap it. The compile \
                  result comes back immediately, so fix errors and call again until it builds.",
             mutating: true,
             parameters: obj(
@@ -1355,8 +1519,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "patch_code",
-            description:
-                "Replace an exact snippet in a component file, then rebuild and hot-swap it. \
+            description: "Replace an exact snippet in a component file, then rebuild and hot-swap it. \
                  Returns the compile result.",
             mutating: true,
             parameters: obj(
@@ -1371,8 +1534,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "add_dependency",
-            description:
-                "Add a crate from crates.io to a component's dependencies, then rebuild it. Any \
+            description: "Add a crate from crates.io to a component's dependencies, then rebuild it. Any \
                  published crate that supports wasm32-wasip2 will work; pure-computation crates \
                  almost always do. This fetches over the network, so it is slower than an \
                  ordinary edit. If the build fails the manifest is put back as it was.",
@@ -1430,16 +1592,14 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "branch_status",
-            description:
-                "Where this conversation's sandbox branch stands: what changed here, whether \
+            description: "Where this conversation's sandbox branch stands: what changed here, whether \
                  trunk has moved on, and any unresolved merge conflicts.",
             mutating: false,
             parameters: obj(json!({}), &[]),
         },
         ToolDef {
             name: "branch_log",
-            description:
-                "The commit history of this conversation's branch — every green build, skill \
+            description: "The commit history of this conversation's branch — every green build, skill \
                  edit, and checkpoint, newest first.",
             mutating: false,
             parameters: obj(
@@ -1451,8 +1611,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "update_from_trunk",
-            description:
-                "Bring the latest trunk into this conversation's branch. Fast-forwards when \
+            description: "Bring the latest trunk into this conversation's branch. Fast-forwards when \
                  possible; a conflicted merge comes back with the conflicted files listed and \
                  standard git conflict markers left in them — resolve with the normal editing \
                  tools, then call complete_merge.",
@@ -1461,8 +1620,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "reset_branch",
-            description:
-                "Restore this conversation's code to how it was at an earlier commit (see \
+            description: "Restore this conversation's code to how it was at an earlier commit (see \
                  branch_log). Use when a change made things worse. Moves forward: history is \
                  kept, nothing is rewritten.",
             mutating: true,
@@ -1475,8 +1633,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "complete_merge",
-            description:
-                "Finish a conflicted trunk update after resolving every conflict marker in the \
+            description: "Finish a conflicted trunk update after resolving every conflict marker in the \
                  working tree. Refuses while markers remain.",
             mutating: true,
             parameters: obj(
@@ -1523,15 +1680,17 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
             continue;
         }
+        if policy_denies(&manifest.name) {
+            continue;
+        }
         manifest.capabilities.push("component".to_string());
         out.push(manifest);
     }
     out
 }
 
-/// Tool definitions in the format the chat completions API expects, including
-/// any hot-loaded tool components the orchestrator has registered, restricted
-/// to an active set of tool groups.
+/// Tool definitions in chat-completions format, including hot-loaded
+/// components, restricted by account policy and the active tool groups.
 ///
 /// `None` means every group, which is the behaviour before grouping existed and
 /// what runs whenever `tool_groups.grouping_enabled` is off. A group filter is
@@ -1541,9 +1700,12 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
 pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
     let mut defs: Vec<Value> = available(mode)
         .iter()
-        .filter(|t| match active {
-            Some(active) => groups::builtin_active(t.name, active),
-            None => true,
+        .filter(|t| {
+            !groups::policy_denies_group(&groups::group_of(t.name))
+                && match active {
+                    Some(active) => groups::builtin_active(t.name, active),
+                    None => true,
+                }
         })
         .map(|t| {
             json!({
@@ -1566,10 +1728,16 @@ pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
             continue;
         }
+        if policy_denies(&manifest.name) {
+            continue;
+        }
+        let group = groups::component_group(&manifest.name, &manifest.capabilities);
+        if groups::policy_denies_group(&group) {
+            continue;
+        }
         // The manifest is already in hand, so its group is read from it rather
         // than looked up again through the registry it came from.
         if let Some(active) = active {
-            let group = groups::component_group(&manifest.name, &manifest.capabilities);
             if !active.iter().any(|a| *a == group) {
                 continue;
             }
@@ -1591,20 +1759,12 @@ pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
 
 /// Every built-in name the agent could offer, for the group-coverage check.
 pub fn builtin_names() -> Vec<String> {
-    all_builtins()
-        .iter()
-        .map(|t| t.name.to_string())
-        .collect()
+    all_builtins().iter().map(|t| t.name.to_string()).collect()
 }
 
 // --- dispatch ---------------------------------------------------------------
 
-pub fn invoke(
-    session_id: &str,
-    mode: &str,
-    name: &str,
-    args_json: &str,
-) -> Result<String, String> {
+pub fn invoke(session_id: &str, mode: &str, name: &str, args_json: &str) -> Result<String, String> {
     // Withholding a tool from the definitions is not enough on its own: a model
     // can still name one it saw earlier in the conversation. The mode is
     // enforced here, where the call would actually happen.
@@ -1612,6 +1772,13 @@ pub fn invoke(
         return Err(format!(
             "'{name}' changes things, and this conversation is in {mode} mode. Switch to agent mode to run it."
         ));
+    }
+
+    // Soft, per-account denial, checked at the same place the mode is: a model
+    // that already knows the tool's name must still be refused here, not only
+    // withheld from the definitions it is offered.
+    if policy_denies(name) || groups::policy_denies_group(&groups::group_of(name)) {
+        return Err(format!("'{name}' is not available to this account."));
     }
 
     // A tool called from outside the active groups is honoured, and its group is
@@ -1678,7 +1845,9 @@ pub fn invoke(
 
         "plan_write" => plan::write(
             session_id,
-            args.get("title").and_then(Value::as_str).map(str::to_string),
+            args.get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             &req_str(&args, "body")?,
         )
         .map(|p| {
@@ -1693,7 +1862,9 @@ pub fn invoke(
             session_id,
             &req_str(&args, "old_text")?,
             &req_str(&args, "new_text")?,
-            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+            args.get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         )
         .map(|e| {
             format!(
@@ -1703,8 +1874,13 @@ pub fn invoke(
                 plan::describe(&e.plan)
             )
         }),
-        "plan_append" => plan::append(session_id, &req_str(&args, "text")?)
-            .map(|p| format!("appended, now revision {}.\n\n{}", p.revision, plan::describe(&p))),
+        "plan_append" => plan::append(session_id, &req_str(&args, "text")?).map(|p| {
+            format!(
+                "appended, now revision {}.\n\n{}",
+                p.revision,
+                plan::describe(&p)
+            )
+        }),
         "plan_read" => {
             let p = plan::load(session_id);
             if p.body.trim().is_empty() {
@@ -1715,21 +1891,39 @@ pub fn invoke(
         }
 
         "todo_write" => {
-            let values = args.get("todos").and_then(Value::as_array).ok_or_else(|| "todos must be an array".to_string())?;
+            let values = args
+                .get("todos")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "todos must be an array".to_string())?;
             todos::write(session_id, values).map(|list| todos::render(&list))
         }
         "todo_add" => {
-            let values = args.get("todos").and_then(Value::as_array).ok_or_else(|| "todos must be an array".to_string())?;
+            let values = args
+                .get("todos")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "todos must be an array".to_string())?;
             todos::add(session_id, values).map(|list| todos::render(&list))
         }
         "todo_update" => {
-            let values = args.get("updates").and_then(Value::as_array).ok_or_else(|| "updates must be an array".to_string())?;
-            todos::update(session_id, values).map(|update| format!("updated {} item(s).\n{}", update.changed, todos::render(&update.list)))
+            let values = args
+                .get("updates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "updates must be an array".to_string())?;
+            todos::update(session_id, values).map(|update| {
+                format!(
+                    "updated {} item(s).\n{}",
+                    update.changed,
+                    todos::render(&update.list)
+                )
+            })
         }
         "todo_read" => {
             let list = todos::load(session_id);
-            if list.items.is_empty() { Ok("no todo list yet. Write one with todo_write.".to_string()) }
-            else { Ok(todos::render(&list)) }
+            if list.items.is_empty() {
+                Ok("no todo list yet. Write one with todo_write.".to_string())
+            } else {
+                Ok(todos::render(&list))
+            }
         }
 
         // `wait` is not in this arm: it is a core tool, reachable by a
@@ -1737,8 +1931,7 @@ pub fn invoke(
         // delegate. See the note beside its definition.
         "wait" => wait_for(&args),
 
-        "spawn_agent" | "agent_status" | "agent_transcript" | "cancel_agent"
-        | "agent_profiles" => {
+        "spawn_agent" | "agent_status" | "agent_transcript" | "cancel_agent" | "agent_profiles" => {
             // The one-level rule, enforced a second time at the call. The
             // withheld tool definition is the cheap enforcement; this is the
             // one that holds when the model names a tool it saw earlier in the
@@ -1753,15 +1946,67 @@ pub fn invoke(
             }
             match name {
                 "spawn_agent" => spawn_agent(&args),
-                "agent_status" => Ok(format_children(&delegation::children())),
+                "agent_status" => Ok(format_children(&delegation::children(), now_ms())),
                 "agent_transcript" => agent_transcript(&args),
                 "cancel_agent" => delegation::cancel_child(&req_str(&args, "child_id")?)
-                    .map(|row| format!("cancelled\n\n{}", format_child(&row))),
+                    .map(|row| format!("cancelled\n\n{}", format_child(&row, now_ms()))),
                 _ => Ok(format_profiles(
                     &delegation::profiles(),
                     &delegation::limits(),
                 )),
             }
+        }
+
+        // Recall. No `delegation_available` gate and no capability flag: these
+        // only read, and a sub-agent needs them as much as a parent does.
+        "conversation_list" => {
+            let rows = transcripts::conversations(
+                flag(&args, "include_archived"),
+                flag(&args, "include_subagents"),
+                args.get("limit").and_then(Value::as_u64).unwrap_or(0),
+            )?;
+            Ok(format_conversations(&rows, now_ms()))
+        }
+        "conversation_read" => {
+            let id = req_str(&args, "session_id")?;
+            let entries = transcripts::read(
+                &id,
+                args.get("from_seq").and_then(Value::as_u64).unwrap_or(0),
+                args.get("limit").and_then(Value::as_u64).unwrap_or(0),
+                args.get("max_chars").and_then(Value::as_u64).unwrap_or(0),
+            )?;
+            let header = transcripts::conversation(&id)
+                .map(|c| format_conversation_header(&c, now_ms()))
+                .unwrap_or_else(|_| format!("`{id}`"));
+            Ok(format_transcript_entries(&header, &entries))
+        }
+        "conversation_grep" => {
+            let report = transcripts::search(&transcripts::SearchQuery {
+                pattern: req_str(&args, "pattern")?,
+                session_id: opt_str(&args, "session_id"),
+                include_archived: flag(&args, "include_archived"),
+                include_subagents: flag(&args, "include_subagents"),
+                include_tool_output: flag(&args, "include_tool_output"),
+                max_results: args.get("max_results").and_then(Value::as_u64).unwrap_or(0),
+                max_chars: args.get("max_chars").and_then(Value::as_u64).unwrap_or(0),
+            })?;
+            Ok(format_search_report(&report))
+        }
+        "subagent_list" => {
+            // Defaulting to this conversation makes the common call argument-
+            // free, and is why `session_id` is optional.
+            let root = match opt_str(&args, "session_id") {
+                s if s.is_empty() => session_id.to_string(),
+                s => s,
+            };
+            let rows = transcripts::subagents(&root)?;
+            if rows.is_empty() {
+                return Ok(format!(
+                    "no sub-agents under `{root}`. If you meant the children you spawned in \
+                     this turn, agent_status is the tool for that."
+                ));
+            }
+            Ok(format_conversations(&rows, now_ms()))
         }
 
         "exec" => {
@@ -1770,7 +2015,9 @@ pub fn invoke(
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(30_000) as u32;
-            Ok(format_exec(sandbox::exec(session_id, &command, None, timeout)))
+            Ok(format_exec(sandbox::exec(
+                session_id, &command, None, timeout,
+            )))
         }
         "write_file" => sandbox::write_file(
             session_id,
@@ -1863,10 +2110,8 @@ pub fn invoke(
         }
         "update_from_trunk" => branch::update_from_trunk().map(format_branch_state),
         "reset_branch" => branch::reset_to(&req_str(&args, "rev")?).map(format_branch_state),
-        "complete_merge" => branch::complete_merge(
-            args.get("message").and_then(Value::as_str),
-        )
-        .map(format_branch_state),
+        "complete_merge" => branch::complete_merge(args.get("message").and_then(Value::as_str))
+            .map(format_branch_state),
         "abort_merge" => branch::abort_merge().map(format_branch_state),
 
         "read_path" => hostfs::read_file_range(
@@ -1878,7 +2123,9 @@ pub fn invoke(
             &req_str(&args, "path")?,
             &req_str(&args, "old_text")?,
             &req_str(&args, "new_text")?,
-            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+            args.get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ),
         "search_files" => hostfs::search_files(
             &req_str(&args, "pattern")?,
@@ -1892,14 +2139,13 @@ pub fn invoke(
             opt_arg(&args, "path").as_deref(),
             args.get("max_results").and_then(Value::as_u64).unwrap_or(0) as u32,
         ),
-        "write_path" => hostfs::write_file(
-            &req_str(&args, "path")?,
-            &req_str(&args, "contents")?,
-        ),
+        "write_path" => hostfs::write_file(&req_str(&args, "path")?, &req_str(&args, "contents")?),
         "list_path" => hostfs::list_dir(&req_str(&args, "path")?).map(format_listing),
         "delete_path" => hostfs::delete_path(
             &req_str(&args, "path")?,
-            args.get("recursive").and_then(Value::as_bool).unwrap_or(false),
+            args.get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ),
 
         "git_clone" => git_clone(&args),
@@ -1933,7 +2179,9 @@ pub fn invoke(
             &req_str(&args, "id")?,
             &req_str(&args, "command")?,
             args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0) as u32,
-            args.get("background").and_then(Value::as_bool).unwrap_or(false),
+            args.get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         )
         .map(format_terminal),
         "terminal_read" => terminal::read(&req_str(&args, "id")?).map(|text| {
@@ -1950,9 +2198,7 @@ pub fn invoke(
             args.get("text").and_then(Value::as_str).unwrap_or(""),
             args.get("submit").and_then(Value::as_bool).unwrap_or(true),
         ),
-        "terminal_signal" => {
-            terminal::signal(&req_str(&args, "id")?, &req_str(&args, "signal")?)
-        }
+        "terminal_signal" => terminal::signal(&req_str(&args, "id")?, &req_str(&args, "signal")?),
         "terminal_close" => terminal::close(&req_str(&args, "id")?),
         "terminal_list" => {
             let sessions = terminal::sessions();
@@ -1991,9 +2237,11 @@ pub fn invoke(
         "ssh_host_list" => {
             let hosts = terminal::ssh_hosts()?;
             if hosts.is_empty() {
-                return Ok("no ssh hosts defined. Add one with ssh_host_set, giving at least \
+                return Ok(
+                    "no ssh hosts defined. Add one with ssh_host_set, giving at least \
                            name and host."
-                    .to_string());
+                        .to_string(),
+                );
             }
             Ok(hosts
                 .iter()
@@ -2067,9 +2315,7 @@ pub fn invoke(
                 .map(|e| format_setting(&e))
                 .ok_or_else(|| format!("no setting named '{key}'"))
         }
-        "set_config" => {
-            configuration::set(&req_str(&args, "key")?, &req_str(&args, "value")?)
-        }
+        "set_config" => configuration::set(&req_str(&args, "key")?, &req_str(&args, "value")?),
 
         "restart_orchestrator" => control::restart(
             &req_str(&args, "reason")?,
@@ -2247,7 +2493,7 @@ fn ask_user(args: &Value) -> Result<String, String> {
             Some(other) => {
                 return Err(format!(
                     "question {position} has type '{other}'; use 'choice' or 'open'"
-                ))
+                ));
             }
             None if options.is_empty() => "open",
             None => "choice",
@@ -2455,8 +2701,9 @@ fn remember(session_id: &str, args: &Value) -> Result<String, String> {
 
 fn recall(session_id: &str, args: &Value) -> Result<String, String> {
     match args.get("key").and_then(Value::as_str) {
-        Some(key) => sys::kv_get(session_id, key)
-            .ok_or_else(|| format!("nothing remembered under '{key}'")),
+        Some(key) => {
+            sys::kv_get(session_id, key).ok_or_else(|| format!("nothing remembered under '{key}'"))
+        }
         None => {
             let keys = memory_keys(session_id);
             if keys.is_empty() {
@@ -2564,7 +2811,15 @@ fn wait_for(args: &Value) -> Result<String, String> {
     let out = delegation::wait(&until, &children, timeout)?;
 
     let mut text = if out.timed_out {
-        format!("waited {timeout}s and timed out — {}", out.reason)
+        // A timeout is the deadline expiring, not a verdict on the children.
+        // Said plainly here because the alternative reading — "they are stuck"
+        // — is the one that gets a working fan-out cancelled wholesale.
+        format!(
+            "waited {timeout}s and timed out — {}\n\nThis says the deadline passed, not that \
+             anything is wrong. Check the per-child progress below before deciding: a child \
+             whose log and cost are still moving is working, however long it has been.",
+            out.reason
+        )
     } else {
         format!("wait ended: {}", out.reason)
     };
@@ -2572,7 +2827,7 @@ fn wait_for(args: &Value) -> Result<String, String> {
         text.push_str("\n\nNo sub-agents.");
     } else {
         text.push_str("\n\n");
-        text.push_str(&format_children(&out.children));
+        text.push_str(&format_children(&out.children, now_ms()));
     }
     Ok(text)
 }
@@ -2595,7 +2850,9 @@ fn wait_plan(args: &Value, watching: bool, max_wait_secs: u64) -> Result<(String
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if asked == 0 && until == "time" {
-        return Err("a 'time' wait needs timeout_secs — it has nothing else to end it.".to_string());
+        return Err(
+            "a 'time' wait needs timeout_secs — it has nothing else to end it.".to_string(),
+        );
     }
 
     // A wait with no deadline is indistinguishable from a hung turn, so one is
@@ -2682,6 +2939,220 @@ fn format_transcript(events: &[EventRecord]) -> String {
     out.join("\n\n")
 }
 
+// --- rendering transcripts for the model ------------------------------------
+//
+// These land in a tool result, so they are prose to be skimmed rather than a
+// structure to be parsed. Two things they must always do: carry the session id
+// and seq for every line, because those are what the next call needs as
+// arguments, and say plainly when an answer is partial. A silently truncated
+// recall result reads as a complete one and gets believed.
+
+/// How long ago, in the coarsest unit that is still informative.
+///
+/// Relative rather than absolute, because "yesterday" is what a reader wants
+/// from a conversation list, and an epoch millisecond timestamp is not
+/// something either of us can read at a glance.
+///
+/// `now` is passed in rather than read from `sys::now_ms()` here, for the same
+/// reason `wait_plan` is split from `wait_for`: the host imports do not exist on
+/// the host test target, so a formatter that calls one cannot be tested at all —
+/// it traps with `entered unreachable code`. The clock read happens once, at the
+/// edge, in [`now_ms`].
+fn ago(ts_ms: u64, now: u64) -> String {
+    // A timestamp from the future means the clocks disagree, which is not worth
+    // a branch of its own.
+    if ts_ms == 0 || ts_ms >= now {
+        return "just now".to_string();
+    }
+    let secs = (now - ts_ms) / 1000;
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// The clock, read once per rendered result.
+fn now_ms() -> u64 {
+    sys::now_ms()
+}
+
+/// One conversation as a heading line: what it is, and the id to pass next.
+fn format_conversation_header(c: &transcripts::ConversationSummary, now: u64) -> String {
+    let title = if c.is_subagent && !c.label.is_empty() {
+        // A sub-agent's own title is auto-derived from its brief and so repeats
+        // the task; the label is what the parent actually called it.
+        format!("{} (sub-agent)", c.label)
+    } else if c.title.trim().is_empty() {
+        "untitled".to_string()
+    } else {
+        c.title.clone()
+    };
+
+    let mut facts: Vec<String> = vec![ago(c.updated_ms, now)];
+    if !c.state.is_empty() {
+        facts.push(c.state.clone());
+    }
+    if !c.mode.is_empty() && c.mode != DEFAULT_MODE {
+        facts.push(format!("{} mode", c.mode));
+    }
+    facts.push(format!("{} events", c.event_count));
+    if c.archived {
+        facts.push("archived".to_string());
+    }
+    format!("### {title}\n`{}` · {}", c.id, facts.join(" · "))
+}
+
+fn format_conversations(rows: &[transcripts::ConversationSummary], now: u64) -> String {
+    if rows.is_empty() {
+        return "no conversations match.".to_string();
+    }
+    let mut out = vec![format!(
+        "{} conversation(s), most recently active first:",
+        rows.len()
+    )];
+    for c in rows {
+        let mut block = format_conversation_header(c, now);
+        // The brief for a sub-agent, the last thing said for a conversation:
+        // whichever is more use in deciding whether to open it.
+        let gist = if c.is_subagent && !c.task.trim().is_empty() {
+            &c.task
+        } else {
+            &c.preview
+        };
+        if !gist.trim().is_empty() {
+            block.push_str(&format!("\n{}", one_line(gist, 160)));
+        }
+        out.push(block);
+    }
+    out.join("\n\n")
+}
+
+/// Collapses text to a single clipped line, for a preview.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    format!("{}…", flat.chars().take(max_chars).collect::<String>())
+}
+
+/// Marks what kind of line this is, compactly enough to sit in front of every
+/// entry without becoming most of the output.
+fn kind_marker(kind: &str) -> &'static str {
+    match kind {
+        "user" => "user:",
+        "assistant" => "said:",
+        "tool-call" => "→",
+        "tool-result" => "←",
+        "tool-failed" => "← FAILED",
+        "note" => "note:",
+        "nudge" => "nudge:",
+        "incident" => "INCIDENT:",
+        "modification" => "changed:",
+        "branch-op" => "branch:",
+        "turn-finished" => "turn:",
+        "compacted" => "summary:",
+        // A kind the host added and this build has not learned yet. Showing it
+        // raw beats dropping the line: the text is still the answer.
+        other => {
+            debug_assert!(false, "unknown transcript kind {other}");
+            "·"
+        }
+    }
+}
+
+fn format_transcript_entries(header: &str, entries: &[transcripts::TranscriptEntry]) -> String {
+    if entries.is_empty() {
+        return format!(
+            "{header}\n\nNothing to show in that range — either the conversation is empty or \
+             `from_seq` is past its end."
+        );
+    }
+    let mut out = vec![header.to_string()];
+    for e in entries {
+        let mut line = format!("[{}] {} {}", e.seq, kind_marker(&e.kind), e.text);
+        if e.elided > 0 {
+            // Say what was cut, so a clipped line is never quoted back as if it
+            // were the whole record.
+            line.push_str(&format!(" …[{} more chars]", e.elided));
+        }
+        out.push(line);
+    }
+    let last = entries.last().map(|e| e.seq).unwrap_or(0);
+    out.push(format!(
+        "_{} entries, through seq {last}. Page on with from_seq={last}._",
+        entries.len()
+    ));
+    out.join("\n\n")
+}
+
+fn format_search_report(report: &transcripts::SearchReport) -> String {
+    if report.hits.is_empty() {
+        let mut msg = format!(
+            "no matches in {} conversation(s) searched.",
+            report.scanned_conversations
+        );
+        if report.incomplete {
+            msg.push_str(
+                " The scan did not reach every conversation, so try a narrower pattern or name \
+                 a session_id.",
+            );
+        } else {
+            msg.push_str(
+                " Try a looser pattern, `(?i)` for case-insensitivity, or \
+                 include_tool_output=true if what you want was in a tool result.",
+            );
+        }
+        return msg;
+    }
+
+    let mut out = vec![format!(
+        "{} match(es) in {} conversation(s), from {} searched:",
+        report.total_matches, report.matched_conversations, report.scanned_conversations
+    )];
+
+    // Grouped by conversation, because the useful next action is "open that
+    // one", and a flat list makes the reader do the grouping themselves.
+    let mut current = String::new();
+    for hit in &report.hits {
+        if hit.session_id != current {
+            current = hit.session_id.clone();
+            let who = if hit.is_subagent && !hit.label.is_empty() {
+                format!("{} (sub-agent)", hit.label)
+            } else if hit.title.trim().is_empty() {
+                "untitled".to_string()
+            } else {
+                hit.title.clone()
+            };
+            out.push(format!("**{who}** · `{}`", hit.session_id));
+        }
+        out.push(format!(
+            "  [{}] {} {}",
+            hit.seq,
+            kind_marker(&hit.kind),
+            one_line(&hit.text, 300)
+        ));
+    }
+
+    if report.capped {
+        out.push(format!(
+            "_Stopped at the first {} hits of {}. Narrow the pattern, or name a session_id._",
+            report.hits.len(),
+            report.total_matches
+        ));
+    } else if report.incomplete {
+        out.push(
+            "_A scan bound was reached before every conversation was read; the oldest are \
+             missing. Narrow the pattern to be sure._"
+                .to_string(),
+        );
+    }
+    out.push("_Read any of these with conversation_read, passing the id above._".to_string());
+    out.join("\n")
+}
+
 // --- formatting -------------------------------------------------------------
 
 /// One sub-agent, as prose the model reads.
@@ -2689,7 +3160,7 @@ fn format_transcript(events: &[EventRecord]) -> String {
 /// The answer is included in full whenever there is one: the point of
 /// delegation is that the answer arrives without the work behind it, so making
 /// the parent take a second call to read it would defeat the mechanism.
-fn format_child(row: &delegation::SubagentInfo) -> String {
+fn format_child(row: &delegation::SubagentInfo, now: u64) -> String {
     let mut out = format!("### {} — {}\n`{}`\n", row.label, row.state, row.id);
 
     let mut facts: Vec<String> = Vec::new();
@@ -2702,11 +3173,11 @@ fn format_child(row: &delegation::SubagentInfo) -> String {
     if !row.mode.is_empty() && row.mode != DEFAULT_MODE {
         facts.push(format!("{} mode", row.mode));
     }
-    if row.finished_ms > row.created_ms {
-        facts.push(format!(
-            "{}s",
-            (row.finished_ms - row.created_ms).div_ceil(1000)
-        ));
+    // Elapsed for a finished child, and — the point of the live fields — for
+    // one still going. Without it a running child carried no clock at all, so
+    // thirty seconds and thirty minutes read the same.
+    if let Some(elapsed) = elapsed_secs(row, now) {
+        facts.push(format!("{elapsed}s"));
     }
     if row.cost_usd > 0.0 {
         facts.push(format!("${:.4}", row.cost_usd));
@@ -2722,12 +3193,63 @@ fn format_child(row: &delegation::SubagentInfo) -> String {
     if !row.answer.is_empty() {
         out.push_str(&format!("\n{}\n", row.answer));
     } else if row.state == "running" {
-        out.push_str("\nStill working.\n");
+        out.push_str(&format!("\n{}\n", running_progress(row, now)));
     }
     out
 }
 
-fn format_children(rows: &[delegation::SubagentInfo]) -> String {
+/// How long a child has been going, finished or not.
+///
+/// `None` only when the row carries no usable clock at all, which is what a
+/// freshly spawned child looks like for its first instant.
+fn elapsed_secs(row: &delegation::SubagentInfo, now: u64) -> Option<u64> {
+    let end = if row.finished_ms > row.created_ms {
+        row.finished_ms
+    } else if now > row.created_ms {
+        now
+    } else {
+        return None;
+    };
+    Some((end - row.created_ms).div_ceil(1000))
+}
+
+/// What a running child is doing, in the terms that separate busy from stuck.
+///
+/// "Still working" was all this used to say, which is true of a child mid-tool
+/// and equally true of one whose worker died half an hour ago. A parent that
+/// cannot tell those apart has one move available to it — cancel — and will
+/// eventually use it on work that was going fine. So: how much log the child
+/// has written, and how long since it last wrote any.
+fn running_progress(row: &delegation::SubagentInfo, now: u64) -> String {
+    if row.events == 0 && row.activity_ms == 0 {
+        // No live read got through. Say so rather than implying silence.
+        return "Still working (no progress reading available).".to_string();
+    }
+    let last = ago(row.activity_ms, now);
+    let stalled =
+        row.activity_ms > 0 && now > row.activity_ms && (now - row.activity_ms) >= STALE_CHILD_MS;
+    let mut line = format!(
+        "Still working — {} log entries, last activity {last}.",
+        row.events
+    );
+    if stalled {
+        line.push_str(
+            " Nothing for a while: check `agent_transcript` before assuming it is wedged, \
+             because a single long tool call looks exactly like this.",
+        );
+    }
+    line
+}
+
+/// How quiet a running child has to go before its listing says so.
+///
+/// Generously long on purpose. One build, one large search or one slow
+/// completion can hold a child silent for minutes without anything being
+/// wrong, and a warning that fires on healthy work teaches a parent to ignore
+/// it — which is the same failure as not having one.
+const STALE_CHILD_MS: u64 = 10 * 60 * 1000;
+
+fn format_children(rows: &[delegation::SubagentInfo], now: u64) -> String {
     if rows.is_empty() {
         return "You have not spawned any sub-agents.".to_string();
     }
@@ -2749,7 +3271,7 @@ fn format_children(rows: &[delegation::SubagentInfo]) -> String {
         head.push_str(&format!(", ${total:.4} so far"));
     }
 
-    let body: Vec<String> = rows.iter().map(format_child).collect();
+    let body: Vec<String> = rows.iter().map(|r| format_child(r, now)).collect();
     format!("{head}\n\n{}", body.join("\n"))
 }
 
@@ -2800,6 +3322,15 @@ fn opt_str(args: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// An optional boolean argument, absent meaning false.
+///
+/// Every flag on this surface is written so that false is the conservative
+/// reading — narrower search, fewer conversations, less noise — so a model that
+/// omits one gets the safe behaviour rather than the expensive one.
+fn flag(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 /// An optional string argument where absent and blank mean the same thing.
@@ -3151,11 +3682,244 @@ fn format_exec(result: ExecResult) -> String {
     out
 }
 
+/// Tests for the recall tools' rendering.
+///
+/// The formatters are the whole of the agent-side logic here — the searching
+/// itself is the host's, and is tested in `crates/thetis/src/transcripts.rs`.
+/// What these pin is the part a model acts on: that an id it needs for the next
+/// call is present, and that a partial answer says so.
+#[cfg(test)]
+mod recall_tests {
+    use super::{
+        ago, flag, format_conversations, format_search_report, format_transcript_entries, one_line,
+    };
+    use crate::thetis::grip::transcripts;
+    use serde_json::json;
+
+    /// A fixed "now", so the rendered ages are the same on every run. The
+    /// formatters take the clock as an argument precisely so this is possible.
+    /// Large enough that subtracting a few days from it stays positive.
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn conversation(id: &str, title: &str) -> transcripts::ConversationSummary {
+        transcripts::ConversationSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            mode: "agent".into(),
+            model: String::new(),
+            preview: "the last thing said".into(),
+            created_ms: 1_000,
+            updated_ms: 1_000,
+            event_count: 12,
+            archived: false,
+            is_subagent: false,
+            parent_id: String::new(),
+            root_id: String::new(),
+            label: String::new(),
+            state: String::new(),
+            task: String::new(),
+        }
+    }
+
+    fn hit(session: &str, seq: u64, text: &str) -> transcripts::TranscriptHit {
+        transcripts::TranscriptHit {
+            session_id: session.to_string(),
+            title: "some conversation".into(),
+            is_subagent: false,
+            label: String::new(),
+            seq,
+            ts_ms: 1_000,
+            kind: "user".into(),
+            text: text.to_string(),
+        }
+    }
+
+    fn report(hits: Vec<transcripts::TranscriptHit>) -> transcripts::SearchReport {
+        let n = hits.len() as u64;
+        transcripts::SearchReport {
+            hits,
+            matched_conversations: 1,
+            total_matches: n,
+            scanned_conversations: 3,
+            capped: false,
+            incomplete: false,
+        }
+    }
+
+    #[test]
+    fn every_listed_conversation_carries_the_id_the_next_call_needs() {
+        // The one thing a catalogue must not omit. A pretty listing with no ids
+        // in it leaves the model unable to act on what it just found.
+        let out = format_conversations(&[conversation("abc-123", "Fixing the build")], NOW);
+        assert!(out.contains("abc-123"), "{out}");
+        assert!(out.contains("Fixing the build"), "{out}");
+        assert!(out.contains("12 events"), "{out}");
+    }
+
+    #[test]
+    fn a_sub_agent_is_labelled_as_one_and_shows_its_brief() {
+        let mut child = conversation("child-1", "");
+        child.is_subagent = true;
+        child.label = "scout".into();
+        child.task = "go and read the parser".into();
+        child.state = "done".into();
+
+        let out = format_conversations(&[child], NOW);
+        assert!(out.contains("scout"), "{out}");
+        assert!(out.contains("sub-agent"), "the kind must be visible: {out}");
+        assert!(out.contains("done"), "{out}");
+        // The brief, not the auto-derived title, is what says what a child was
+        // for — so it is what the row shows.
+        assert!(out.contains("go and read the parser"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_listing_is_a_sentence_not_an_empty_string() {
+        let out = format_conversations(&[], NOW);
+        assert!(!out.trim().is_empty());
+        assert!(out.contains("no conversations"), "{out}");
+    }
+
+    #[test]
+    fn a_transcript_read_says_how_to_page_on() {
+        let entries = vec![
+            transcripts::TranscriptEntry {
+                seq: 4,
+                ts_ms: 1_000,
+                kind: "user".into(),
+                text: "do the thing".into(),
+                elided: 0,
+            },
+            transcripts::TranscriptEntry {
+                seq: 7,
+                ts_ms: 1_001,
+                kind: "tool-failed".into(),
+                text: "no such target".into(),
+                elided: 0,
+            },
+        ];
+        let out = format_transcript_entries("### head", &entries);
+        assert!(out.contains("[4]") && out.contains("[7]"), "{out}");
+        assert!(
+            out.contains("FAILED"),
+            "a failure must look like one: {out}"
+        );
+        // Paging is only possible if the reply says where it stopped.
+        assert!(out.contains("from_seq=7"), "{out}");
+    }
+
+    #[test]
+    fn a_clipped_entry_admits_what_was_cut() {
+        // Otherwise a half-sentence gets quoted back as though it were whole.
+        let entries = vec![transcripts::TranscriptEntry {
+            seq: 1,
+            ts_ms: 1,
+            kind: "assistant".into(),
+            text: "the beginning of a long answer".into(),
+            elided: 4_000,
+        }];
+        let out = format_transcript_entries("head", &entries);
+        assert!(out.contains("4000 more chars"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_range_distinguishes_itself_from_an_empty_conversation() {
+        let out = format_transcript_entries("head", &[]);
+        assert!(out.contains("from_seq") || out.contains("empty"), "{out}");
+    }
+
+    #[test]
+    fn a_capped_search_says_so_and_says_what_to_do() {
+        // The failure this guards against is silent: a capped result reads
+        // exactly like a complete one, and gets trusted as exhaustive.
+        let mut r = report(vec![hit("s1", 1, "needle")]);
+        r.capped = true;
+        r.total_matches = 900;
+        let out = format_search_report(&r);
+        assert!(out.contains("Stopped at the first"), "{out}");
+        assert!(out.contains("900"), "{out}");
+        assert!(out.contains("Narrow"), "it must say what to do: {out}");
+    }
+
+    #[test]
+    fn an_incomplete_scan_is_distinguished_from_a_capped_one() {
+        // Different causes needing different remedies: too many hits versus too
+        // many conversations to have opened them all.
+        let mut r = report(vec![hit("s1", 1, "needle")]);
+        r.incomplete = true;
+        let out = format_search_report(&r);
+        assert!(out.contains("oldest are"), "{out}");
+        assert!(!out.contains("Stopped at the first"), "{out}");
+    }
+
+    #[test]
+    fn hits_are_grouped_under_the_conversation_they_came_from() {
+        let out = format_search_report(&report(vec![
+            hit("session-aaa", 1, "first hit"),
+            hit("session-aaa", 9, "second hit"),
+            hit("session-bbb", 2, "third hit"),
+        ]));
+        // Once per conversation, not once per hit: the id is the expensive part
+        // of the output and repeating it per line is most of the tokens.
+        assert_eq!(out.matches("session-aaa").count(), 1, "{out}");
+        assert_eq!(out.matches("session-bbb").count(), 1, "{out}");
+        assert!(
+            out.contains("conversation_read"),
+            "say how to open one: {out}"
+        );
+    }
+
+    #[test]
+    fn no_matches_suggests_a_way_to_widen_the_search() {
+        // An empty result is where a model most needs a next move, and the two
+        // flags that would have found the answer are not obvious from a schema.
+        let out = format_search_report(&transcripts::SearchReport {
+            hits: vec![],
+            matched_conversations: 0,
+            total_matches: 0,
+            scanned_conversations: 5,
+            capped: false,
+            incomplete: false,
+        });
+        assert!(out.contains("no matches"), "{out}");
+        assert!(out.contains("include_tool_output"), "{out}");
+    }
+
+    #[test]
+    fn a_multiline_hit_is_flattened_so_one_hit_looks_like_one_hit() {
+        let out = one_line("first line\n\nsecond line", 100);
+        assert_eq!(out, "first line second line");
+    }
+
+    #[test]
+    fn an_age_is_rendered_in_the_coarsest_useful_unit() {
+        assert_eq!(ago(NOW - 30_000, NOW), "just now");
+        assert_eq!(ago(NOW - 600_000, NOW), "10m ago");
+        assert_eq!(ago(NOW - 7_200_000, NOW), "2h ago");
+        assert_eq!(ago(NOW - 172_800_000, NOW), "2d ago");
+        // A zero timestamp and a clock that disagrees must not render as
+        // "1971220d ago" or underflow.
+        assert_eq!(ago(0, NOW), "just now");
+        assert_eq!(ago(NOW + 5_000, NOW), "just now");
+    }
+
+    #[test]
+    fn an_absent_flag_reads_as_the_conservative_default() {
+        let args = json!({ "include_subagents": true });
+        assert!(flag(&args, "include_subagents"));
+        assert!(!flag(&args, "include_tool_output"));
+        assert!(!flag(&json!({}), "include_archived"));
+    }
+}
+
 /// Tests for the delegation tools' own logic: the brief-length gate, the wait
 /// plan, and the formatters a parent reads its children through.
 #[cfg(test)]
 mod delegation_tests {
-    use super::{check_brief, format_child, format_children, format_profiles, wait_plan, MIN_BRIEF};
+    use super::{
+        MIN_BRIEF, STALE_CHILD_MS, check_brief, format_child, format_children, format_profiles,
+        wait_plan,
+    };
     use crate::thetis::grip::delegation;
     use serde_json::json;
 
@@ -3174,8 +3938,14 @@ mod delegation_tests {
             cost_usd: 0.0,
             created_ms: 1_000,
             finished_ms: 0,
+            events: 0,
+            activity_ms: 0,
         }
     }
+
+    /// The clock every formatting test reads against. Far enough past
+    /// `created_ms` that elapsed time is a real number.
+    const NOW: u64 = 1_000 + 60_000;
 
     // --- the brief ---------------------------------------------------------
 
@@ -3199,11 +3969,13 @@ mod delegation_tests {
 
     #[test]
     fn a_real_brief_is_accepted() {
-        assert!(check_brief(
-            "Find every call site of `commit_worktree` under crates/ and report each as \
+        assert!(
+            check_brief(
+                "Find every call site of `commit_worktree` under crates/ and report each as \
              path:line with one line of why it is there. Do not change any file."
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     // A short brief in a multi-byte script must be measured the same way as an
@@ -3275,23 +4047,75 @@ mod delegation_tests {
     // pay a round trip for every child.
     #[test]
     fn a_finished_child_shows_its_answer_inline() {
-        let out = format_child(&child("c1", "done", "the answer is 12"));
+        let out = format_child(&child("c1", "done", "the answer is 12"), NOW);
         assert!(out.contains("the answer is 12"), "{out}");
     }
 
     #[test]
     fn a_running_child_says_so_instead_of_showing_nothing() {
-        let out = format_child(&child("c1", "running", ""));
+        let out = format_child(&child("c1", "running", ""), NOW);
         assert!(out.contains("Still working"), "{out}");
+    }
+
+    // The failure this exists to prevent: seven children working hard rendered
+    // as seven identical lines with no clock and no cost, so the parent read
+    // them as hung and cancelled every one.
+    #[test]
+    fn a_running_child_shows_progress_not_just_that_it_is_running() {
+        let mut row = child("c1", "running", "");
+        row.events = 143;
+        row.activity_ms = NOW - 5_000;
+        row.cost_usd = 4.25;
+        let out = format_child(&row, NOW);
+        assert!(out.contains("143"), "the log has to be countable: {out}");
+        assert!(out.contains("just now"), "last activity has to show: {out}");
+        assert!(out.contains("$4.25"), "live spend has to show: {out}");
+        assert!(out.contains("60s"), "a running child needs a clock: {out}");
+    }
+
+    #[test]
+    fn a_child_that_has_gone_quiet_is_called_out() {
+        let now = 1_000 + STALE_CHILD_MS * 2;
+        let mut row = child("c1", "running", "");
+        row.events = 12;
+        row.activity_ms = 1_000;
+        let out = format_child(&row, now);
+        assert!(
+            out.contains("Nothing for a while"),
+            "a long silence is the one thing worth flagging: {out}"
+        );
+    }
+
+    // A silence that is merely long is not evidence of death, and saying so
+    // keeps the warning from being the reason a parent cancels healthy work.
+    #[test]
+    fn going_quiet_suggests_looking_rather_than_cancelling() {
+        let now = 1_000 + STALE_CHILD_MS * 2;
+        let mut row = child("c1", "running", "");
+        row.events = 12;
+        row.activity_ms = 1_000;
+        let out = format_child(&row, now);
+        assert!(out.contains("agent_transcript"), "{out}");
+    }
+
+    // A failed progress read is not the same fact as a child that has done
+    // nothing, and conflating them would recreate the original bug.
+    #[test]
+    fn an_unavailable_progress_reading_says_so() {
+        let out = format_child(&child("c1", "running", ""), NOW);
+        assert!(out.contains("no progress reading available"), "{out}");
     }
 
     #[test]
     fn a_failure_reason_is_not_swallowed() {
         let mut row = child("c1", "failed", "");
         row.detail = "ran out of iterations".to_string();
-        let out = format_child(&row);
+        let out = format_child(&row, NOW);
         assert!(out.contains("ran out of iterations"), "{out}");
-        assert!(out.contains("failed"), "the state must be visible too: {out}");
+        assert!(
+            out.contains("failed"),
+            "the state must be visible too: {out}"
+        );
     }
 
     // The header is what the model reads first and often all it reads, so the
@@ -3305,7 +4129,11 @@ mod delegation_tests {
             child("c", "failed", ""),
             child("d", "cancelled", ""),
         ];
-        let head = format_children(&rows).lines().next().unwrap().to_string();
+        let head = format_children(&rows, NOW)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
         assert!(head.contains("4 sub-agent"), "{head}");
         assert!(head.contains("1 running"), "{head}");
         assert!(
@@ -3316,14 +4144,20 @@ mod delegation_tests {
 
     #[test]
     fn no_children_reads_as_a_sentence_not_an_empty_string() {
-        assert!(format_children(&[]).contains("not spawned"));
+        assert!(format_children(&[], NOW).contains("not spawned"));
     }
 
     #[test]
     fn every_child_appears_in_the_listing() {
-        let rows = vec![child("a", "done", "A answer"), child("b", "done", "B answer")];
-        let out = format_children(&rows);
-        assert!(out.contains("A answer") && out.contains("B answer"), "{out}");
+        let rows = vec![
+            child("a", "done", "A answer"),
+            child("b", "done", "B answer"),
+        ];
+        let out = format_children(&rows, NOW);
+        assert!(
+            out.contains("A answer") && out.contains("B answer"),
+            "{out}"
+        );
     }
 
     // A deployment with no profiles still delegates, so the empty case must
@@ -3376,6 +4210,57 @@ mod delegation_tests {
 /// they are assembled from are pure, so the invariant can be checked against
 /// those — which is also where it breaks, since the failure mode is a tool
 /// defined inline in `available` rather than in a named function.
+/// `policy_denies` reads `sys::config_get`, a host import that does not exist
+/// outside wasm, so it cannot be exercised directly from a native test the way
+/// the rest of this module's pure helpers are. What is tested here instead is
+/// the pattern-matching rule in isolation, factored out so a native test can
+/// call it without touching the host.
+#[cfg(test)]
+fn pattern_denies(patterns: &str, name: &str) -> bool {
+    patterns
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .any(|pat| match pat.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == pat,
+        })
+}
+
+#[cfg(test)]
+mod policy_denies_tests {
+    use super::pattern_denies;
+
+    #[test]
+    fn exact_name_matches_only_itself() {
+        assert!(pattern_denies("delete_path", "delete_path"));
+        assert!(!pattern_denies("delete_path", "delete_paths"));
+        assert!(!pattern_denies("delete_path", "read_path"));
+    }
+
+    #[test]
+    fn trailing_star_matches_by_prefix() {
+        assert!(pattern_denies("moo-*", "moo-eval"));
+        assert!(pattern_denies("moo-*", "moo-"));
+        assert!(!pattern_denies("moo-*", "moon-eval"));
+    }
+
+    #[test]
+    fn comma_joined_list_is_an_or() {
+        let patterns = "moo-*, bq-*, delete_path";
+        assert!(pattern_denies(patterns, "moo-eval"));
+        assert!(pattern_denies(patterns, "bq-query"));
+        assert!(pattern_denies(patterns, "delete_path"));
+        assert!(!pattern_denies(patterns, "read_path"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_denies_nothing() {
+        assert!(!pattern_denies("", "terminal_run"));
+        assert!(!pattern_denies("   ,  ,", "terminal_run"));
+    }
+}
+
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
@@ -3466,7 +4351,7 @@ mod coverage_tests {
 /// never shown would hang the conversation waiting for an answer.
 #[cfg(test)]
 mod ask_user_tests {
-    use super::{ask_user, ASK_USER, MAX_OPTIONS, MAX_QUESTIONS};
+    use super::{ASK_USER, MAX_OPTIONS, MAX_QUESTIONS, ask_user};
     use serde_json::json;
 
     // `available()` is deliberately not called here: building the tool list
@@ -3492,10 +4377,12 @@ mod ask_user_tests {
 
     #[test]
     fn an_open_question_needs_no_options() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "What broke?", "type": "open" }]
-        }))
-        .is_ok());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "What broke?", "type": "open" }]
+            }))
+            .is_ok()
+        );
     }
 
     // Each of these must be an `Err`. The loop only pauses on success, so a
@@ -3503,10 +4390,12 @@ mod ask_user_tests {
     // conversation on a form the user never saw.
     #[test]
     fn a_choice_question_with_no_options_is_rejected() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Pick one", "type": "choice" }]
-        }))
-        .is_err());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "Pick one", "type": "choice" }]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -3531,17 +4420,21 @@ mod ask_user_tests {
     #[test]
     fn too_many_options_is_rejected() {
         let options: Vec<_> = (0..MAX_OPTIONS + 1).map(|i| format!("o{i}")).collect();
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Pick", "options": options }]
-        }))
-        .is_err());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "Pick", "options": options }]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn an_unknown_type_is_rejected_rather_than_guessed() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Eh?", "type": "dropdown" }]
-        }))
-        .is_err());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "Eh?", "type": "dropdown" }]
+            }))
+            .is_err()
+        );
     }
 }

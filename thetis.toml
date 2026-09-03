@@ -15,6 +15,39 @@ primary_gateway = "web"
 # The host-rendered recovery console. Keep it on: it is the control surface
 # that still works when every WebAssembly guest is broken.
 admin_enabled = true
+# Required when auth.mode = "users" and bind is not loopback. TLS belongs at
+# a reverse proxy; Thetis does not trust X-Forwarded-* headers.
+# public_origin = "https://thetis.example.com"
+
+[auth]
+# "local" preserves the single implicit administrator and loopback-only access.
+# "users" requires [[roles]] and [[users]] (put password hashes in
+# thetis.local.toml; generate one with `thetis hash-password --stdin`).
+mode = "local"
+session_ttl_hours = 720
+lockout_after = 5
+lockout_secs = 60
+# In users mode these must name a configured user and role respectively.
+claim_unowned = ""
+discord_role = ""
+
+# Example role and user (normally place the user in thetis.local.toml):
+# [[roles]]
+# id = "admin"
+# admin = true
+#
+# [[users]]
+# id = "alice"
+# name = "Alice"
+# role = "admin"
+# password_hash = "$argon2id$..."
+#
+# Capability denials are hard host boundaries. `deny_tools` is hard for
+# component tools but only advisory for agent-internal built-ins; deny the
+# corresponding capability to make that restriction authoritative.
+# `deny_groups` is also soft: agent-core hides and refuses every member even
+# when attention grouping itself is disabled, but a rewritable agent is not a
+# security boundary. Use capability or `deny_tools` denials for hard limits.
 
 [paths]
 # All relative paths are resolved against the project root (the directory
@@ -524,7 +557,17 @@ enabled = true
 # agents that could already write to it — and unreachable entirely in a
 # read-only mode, where the terminal is withheld. Reaching it grants no
 # authority that the preopen had not already handed out.
-roots = []
+#
+# "." is the project root, spelled explicitly because listing any root at all
+# replaces the default instead of adding to it. It must stay FIRST: relative
+# paths resolve against roots[0], so moving it breaks every relative path.
+#
+# The second entry is the real target of /workspace/"thirteen games", which is a
+# symlink out to /tank. The root check canonicalises before comparing — by
+# design, so a link cannot be used to escape — which means a symlink out of the
+# workspace is only followable if its target is a root in its own right.
+# Anything else symlinked into /workspace needs its target added here too.
+roots = [".", "/tank/data/Dev/games/thirteen games"]
 max_read_bytes = 1048576
 # Names that may not be written or deleted anywhere under a root. This keeps the
 # system from destroying its own state by accident; it is not a security
@@ -575,6 +618,22 @@ send_settle_ms = 400
 [tools.config-probe]
 greeting = "hello from configuration"
 retries = 3
+
+[tools.moo]
+base_url = "http://10.10.10.1:7892"
+timeout_secs = 10
+request_timeout_secs = 30
+username = "Zero"
+password = "MaxPasswordLol"
+# Put credentials in gitignored thetis.local.toml or environment overlays:
+# username = "thetis-programmer"
+# password = "..."
+# wizard_username = "thetis-wizard"
+# wizard_password = "..."
+# Credentials are exchanged at /auth/connect and cached per base URL/identity.
+# moo-reconnect clears and refreshes that cache. Captured task deadlines default
+# to the daemon setting (normally 60s) and cannot exceed 300000 ms. Normal API
+# request bodies are limited to 1 MiB by mooR web-host.
 
 # The Notion tool group. Every `notion-*` tool inherits this block, so the
 # credential is named once rather than eleven times: `tool_config_json` merges

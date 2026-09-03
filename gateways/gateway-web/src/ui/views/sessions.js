@@ -75,7 +75,16 @@ export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
           title: session.title || "Untitled",
           onClick: () => onOpen(session.id),
         },
-        el("div", { class: "session-title" }, session.title || "Untitled"),
+        el(
+          "div",
+          { class: "session-title" },
+          // Somebody else's, when the sidebar is showing everyone's. The host
+          // adds `owner` only then, and only to rows that are not the viewer's.
+          session.owner && !session.mine
+            ? el("span", { class: "session-owner", title: `Belongs to ${session.owner}` }, session.owner_name || session.owner)
+            : null,
+          el("span", { class: "session-title-text" }, session.title || "Untitled")
+        ),
         el("div", { class: "session-preview" }, session.preview || "no messages yet")
       ),
       archived
@@ -108,6 +117,14 @@ export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
     const all = store.sessions || [];
     const active = all.filter((s) => !s.archived && matches(s));
     const archived = all.filter((s) => s.archived && matches(s));
+
+    // Say so when the list is everyone's, because otherwise the only clue is
+    // a lit button in the header.
+    if (store.viewAll) {
+      list.append(
+        el("div", { class: "session-everyone" }, "Everyone's conversations — yours are unlabelled")
+      );
+    }
 
     if (!all.length) {
       list.append(el("div", { class: "session-empty" }, "No conversations yet."));
