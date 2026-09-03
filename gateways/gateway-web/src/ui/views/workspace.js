@@ -16,6 +16,7 @@
  */
 
 import { el, icon } from "../lib/dom.js";
+import { store } from "../lib/store.js";
 import { popover, toast } from "../lib/toast.js";
 import * as rail from "./rail.js";
 import * as stage from "./stage.js";
@@ -333,7 +334,18 @@ function dropTarget(node, destPath, label) {
   return node;
 }
 
+/** Whether this account may change the workspace. A role can read it and
+ *  not write it (`user.workspace === "read"`); then every mutating control
+ *  is left out and a drop is refused here rather than by the host. */
+function canWrite() {
+  return store.user?.workspace !== "read";
+}
+
 async function handleDrop(dataTransfer, destPath, label) {
+  if (!canWrite()) {
+    toast("Your role can read the workspace but not change it.", { tone: "error" });
+    return;
+  }
   const items = dropItems(dataTransfer);
   if (!items.length) {
     toast("Nothing to upload — that drop carried no files.", { tone: "error" });
@@ -458,7 +470,8 @@ function toolbar() {
     el(
       "div",
       { class: "ws-actions" },
-      el(
+      !canWrite() && el("span", { class: "ws-readonly", title: "Your role can read the workspace but not change it" }, "read-only"),
+      canWrite() && el(
         "button",
         {
           type: "button",
@@ -482,7 +495,7 @@ function toolbar() {
         },
         "New file"
       ),
-      el(
+      canWrite() && el(
         "button",
         {
           type: "button",
@@ -499,7 +512,7 @@ function toolbar() {
         },
         "New folder"
       ),
-      el(
+      canWrite() && el(
         "button",
         { type: "button", class: "ghost-btn", title: "Upload files into this folder", onClick: () => input.click() },
         "Upload"
@@ -558,7 +571,7 @@ function entryRow(entry) {
         { class: "ghost-btn", href: `${rawUrl(entry.path)}?download=1`, title: "Download this file", download: entry.name },
         "Download"
       ),
-    el(
+    canWrite() && el(
       "button",
       {
         type: "button",
@@ -580,7 +593,7 @@ function entryRow(entry) {
       },
       "Rename"
     ),
-    el(
+    canWrite() && el(
       "button",
       {
         type: "button",
@@ -754,7 +767,7 @@ function fileBlocks() {
     );
   } else if (file.text_available) {
     blocks.push(el("pre", { class: "ws-text" }, file.text ?? ""));
-    blocks.push(
+    if (canWrite()) blocks.push(
       el(
         "div",
         { class: "ws-file-actions" },

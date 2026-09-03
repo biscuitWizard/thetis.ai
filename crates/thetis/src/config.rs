@@ -2310,6 +2310,16 @@ impl Config {
             file.subagents.max_children,
         );
         let local_policy = std::sync::Arc::new(base.clone());
+        // A role starts from the whole catalogue but from *no* authority: it
+        // is an administrator only if it says so. Resolving roles from the
+        // unrestricted base made every role an admin unless it wrote
+        // `admin = false`, which is the opposite of what a `reader` role
+        // means and what the "at least one admin" check below assumes.
+        let role_base = crate::policy::EffectivePolicy {
+            admin: false,
+            see_all_sessions: false,
+            ..base.clone()
+        };
         let mut auth_roles = BTreeMap::new();
         for r in &file.roles {
             anyhow::ensure!(
@@ -2317,7 +2327,7 @@ impl Config {
                 "role ids must be unique and non-empty"
             );
             let p = crate::policy::resolve(
-                &base,
+                &role_base,
                 &[&r.policy],
                 &format!("role `{}`", r.id),
                 &all_model_ids,
@@ -3061,6 +3071,69 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFz
         assert_eq!(alice.name, "Alice");
         assert!(alice.policy.admin);
         assert!(alice.policy.denies(crate::policy::Cap::Ssh));
+    }
+
+    /// A role is an administrator only when it says so. Every role used to
+    /// inherit `admin = true` from the unrestricted base, so a `reader` could
+    /// open `/admin` and write global settings.
+    #[test]
+    fn a_role_that_does_not_claim_admin_is_not_one() {
+        let cfg = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "alice"
+
+            [[roles]]
+            id = "admin"
+            admin = true
+
+            [[roles]]
+            id = "reader"
+            read_only = true
+
+            [[users]]
+            id = "alice"
+            role = "admin"
+            password_hash = "x"
+
+            [[users]]
+            id = "bob"
+            role = "reader"
+            password_hash = "y"
+            [users.overrides]
+            see_all_sessions = true
+            "#,
+        )
+        .unwrap();
+        let bob = cfg.auth.user("bob").unwrap();
+        assert!(!bob.policy.admin, "reader is not an administrator");
+        assert!(bob.policy.read_only);
+        assert!(bob.policy.see_all_sessions, "an override can still grant see-all");
+        assert!(!bob.policy.denied.is_empty() || bob.policy.denies(crate::policy::Cap::Terminal));
+        assert!(cfg.auth.user("alice").unwrap().policy.admin);
+        // The local-mode principal keeps its authority.
+        assert!(cfg.auth.local_policy.admin);
+
+        // And a users-mode config whose only role never claims admin is
+        // refused, rather than silently making everyone one.
+        let err = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "bob"
+            [[roles]]
+            id = "reader"
+            read_only = true
+            [[users]]
+            id = "bob"
+            role = "reader"
+            password_hash = "y"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("admin"), "{err}");
     }
 
     #[test]

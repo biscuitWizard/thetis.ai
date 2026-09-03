@@ -120,24 +120,36 @@ async fn guard_local(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+/// Whether an HTTP authority may reach this server: loopback always, plus the
+/// one `server.public_origin` names. Nothing else — a reverse proxy in front
+/// is expected to forward `Host` unchanged, and `X-Forwarded-*` is not read.
+fn authority_allowed(public_origin: Option<&crate::config::Origin>, authority: &str) -> bool {
+    is_loopback_authority(authority) || public_origin.is_some_and(|o| o.authority == authority)
+}
+
+/// Whether an `Origin` header (`scheme://authority`) may reach this server.
+/// An opaque or malformed origin (`null`) is not trusted.
+fn origin_allowed(public_origin: Option<&crate::config::Origin>, origin: &str) -> bool {
+    match origin.split_once("://") {
+        Some((_, authority)) => authority_allowed(public_origin, authority),
+        None => false,
+    }
+}
+
+/// `guard_local` with one extra allowed authority. In local mode there is
+/// none, and the behaviour is byte for byte the loopback-only rule above.
 async fn guard_origin(State(grip): State<Arc<Grip>>, req: Request, next: Next) -> Response {
-    let allowed = |authority: &str| {
-        is_loopback_authority(authority)
-            || grip
-                .cfg
-                .public_origin
-                .as_ref()
-                .is_some_and(|o| o.authority == authority)
-    };
+    let public = grip.cfg.public_origin.as_ref();
     let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        let authority = origin.split_once("://").map(|x| x.1).unwrap_or("");
-        if !allowed(authority) {
+        if !origin_allowed(public, origin) {
+            tracing::warn!(%origin, "refused a cross-origin request");
             return (StatusCode::FORBIDDEN, "cross-origin requests are refused").into_response();
         }
     }
     if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        if !allowed(host) {
+        if !authority_allowed(public, host) {
+            tracing::warn!(%host, "refused a Host that is neither loopback nor the public origin");
             return (StatusCode::FORBIDDEN, "host is not allowed").into_response();
         }
     }
@@ -214,21 +226,38 @@ async fn login_submit(
     headers: HeaderMap,
     Form(f): Form<LoginForm>,
 ) -> Response {
-    let Some(u) = g.cfg.auth.user(&f.user) else {
-        crate::auth::login_failed(&f.user, &g.cfg);
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        return crate::auth::page(&g.cfg, Some("Wrong user or password"), &f.next).into_response();
+    if !g.cfg.auth.users_mode {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Looked up the way people type it: `Alice` finds `alice`.
+    let typed = f.user.trim().to_lowercase();
+    // Cooling off is decided before the password is looked at, and for names
+    // that do not exist too, so a guess-the-username loop gets the same
+    // answer as a guess-the-password one.
+    if crate::auth::login_locked(&typed, &g.cfg) {
+        return crate::auth::page(
+            &g.cfg,
+            Some("Too many attempts. Try again in a minute."),
+            &f.next,
+        )
+        .into_response();
+    }
+    let user = g.cfg.auth.user(&typed);
+    // An unknown user costs the same argon2 work as a wrong password, so the
+    // response time does not say which accounts exist.
+    let ok = match user {
+        Some(u) => crate::auth::verify_password(&f.password, u.password_hash.expose()),
+        None => {
+            let _ = crate::auth::verify_password(&f.password, crate::auth::dummy_hash());
+            false
+        }
     };
-    if crate::auth::login_locked(&f.user, &g.cfg) {
-        return crate::auth::page(&g.cfg, Some("Too many attempts; try again later"), &f.next)
-            .into_response();
-    }
-    if !crate::auth::verify_password(&f.password, u.password_hash.expose()) {
-        crate::auth::login_failed(&f.user, &g.cfg);
+    let Some(u) = user.filter(|_| ok) else {
+        crate::auth::login_failed(&typed, &g.cfg);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        return crate::auth::page(&g.cfg, Some("Wrong user or password"), &f.next).into_response();
-    }
-    crate::auth::login_succeeded(&f.user);
+        return crate::auth::page(&g.cfg, Some("Wrong user or password."), &f.next).into_response();
+    };
+    crate::auth::login_succeeded(&typed);
     let t = crate::auth::new_token();
     let now = crate::store::now_ms();
     let row = crate::store::LoginRow {
@@ -244,9 +273,17 @@ async fn login_submit(
             .take(200)
             .collect(),
     };
-    if let Some(s) = g.local_store() {
-        let _ = s.put_login(&crate::auth::token_hash(&t), &row);
+    match g.local_store() {
+        Some(s) => {
+            if let Err(e) = s.put_login(&crate::auth::token_hash(&t), &row) {
+                tracing::error!(error = %e, user = %u.id, "could not record a login");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not record the login")
+                    .into_response();
+            }
+        }
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no store").into_response(),
     }
+    tracing::info!(user = %u.id, "signed in");
     (
         [(header::SET_COOKIE, crate::auth::set_cookie(&g.cfg, &t))],
         Redirect::to(&crate::auth::safe_next(&f.next)),
@@ -254,6 +291,9 @@ async fn login_submit(
         .into_response()
 }
 async fn logout(State(g): State<Arc<Grip>>, headers: HeaderMap) -> Response {
+    if !g.cfg.auth.users_mode {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if let (Some(t), Some(s)) = (crate::auth::cookie_value(&headers), g.local_store()) {
         let _ = s.remove_login(&crate::auth::token_hash(&t));
     }
@@ -263,8 +303,11 @@ async fn logout(State(g): State<Arc<Grip>>, headers: HeaderMap) -> Response {
     )
         .into_response()
 }
+/// Who the caller is. The same summary the socket sends as its first frame;
+/// this is what the UI asks when the socket keeps being refused, to tell an
+/// expired login (401, go to the door) from a gateway that is merely down.
 async fn whoami(Extension(p): Extension<Arc<crate::auth::Principal>>) -> Response {
-    axum::Json(serde_json::json!({"id":p.user_id,"name":p.display_name,"role":p.role,"admin":p.is_admin(),"read_only":p.policy.read_only})).into_response()
+    axum::Json(p.describe()).into_response()
 }
 
 /// Binds, retrying briefly while the address is still in use.
@@ -806,6 +849,11 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
         .await
         .map(|s| s.len())
         .unwrap_or(0);
+    let logins = grip
+        .local_store()
+        .and_then(|store| store.active_logins_by_user(crate::store::now_ms()).ok())
+        .unwrap_or_default();
+    let owned = grip.local_store().and_then(|store| store.owners_map().ok()).unwrap_or_default();
     let user_rows = grip
         .cfg
         .auth
@@ -816,12 +864,28 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
                 .local_store()
                 .and_then(|store| store.get_user_spend(&user.id).ok())
                 .unwrap_or(0.0);
+            let live = logins.get(&user.id).copied().unwrap_or(0);
+            let conversations = owned.values().filter(|o| *o == &user.id).count();
+            let flags = [
+                user.policy.admin.then_some("admin"),
+                user.policy.read_only.then_some("read-only"),
+                user.policy.see_all_sessions.then_some("sees all"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
             format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{:.4}</td><td><form method=post action="/admin/user/logout"><input type=hidden name=user value="{}"><button>sign out everywhere</button></form></td></tr>"#,
+                r#"<tr><td class=mono>{}</td><td>{}</td><td>{}</td><td class=note>{}</td><td>{}</td><td>{}</td><td>${:.4}</td><td class=actions><form method=post action="/admin/user/logout"><input type=hidden name=user value="{}"><button{}>sign out everywhere</button></form></td></tr>"#,
                 html_escape(&user.id),
+                html_escape(&user.name),
                 html_escape(&user.role),
+                html_escape(&flags),
+                conversations,
+                live,
                 spend,
                 html_escape(&user.id),
+                if live == 0 { " disabled" } else { "" },
             )
         })
         .collect::<Vec<_>>()
@@ -876,7 +940,10 @@ Stopping a worker loses nothing — branch state is on disk and in the log.</p>
 <table><tr><th>conversation</th><th>branch</th><th>worker</th><th>&uarr;/&darr;</th><th>state</th><th>kernel</th><th></th></tr>
 {branch_rows}</table>
 <h2>Users</h2>
-<table><tr><th>user</th><th>role</th><th>spend (USD)</th><th></th></tr>
+<p class=note>Accounts are configuration (<code>[[users]]</code> in <code>thetis.local.toml</code>);
+this is what the database says about them. "Sign out everywhere" ends every login the
+account holds, on every device. Spend is cumulative across all of the account's conversations.</p>
+<table><tr><th>user</th><th>name</th><th>role</th><th>policy</th><th>conversations</th><th>logins</th><th>spend (USD)</th><th></th></tr>
 {user_rows}</table>
 <h2>Publishing</h2>
 <p class=note>Directories holding a <code>.thetis-private</code> marker never leave this
@@ -916,7 +983,7 @@ for replacing their work. Only paths that leave this machine are touched.</p>
         },
         sessions = sessions,
         user_rows = if user_rows.is_empty() {
-            "<tr><td colspan=4><em>local mode — no configured users</em></td></tr>".to_string()
+            "<tr><td colspan=8><em>local mode — one implicit administrator, no accounts</em></td></tr>".to_string()
         } else {
             user_rows
         },
@@ -1164,12 +1231,9 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
     ));
 
     tracing::debug!(%client_id, "websocket connected");
-    let _ = out_tx.send(serde_json::json!({
-        "type":"user", "id":principal.user_id, "name":principal.display_name,
-        "role":principal.role, "admin":principal.is_admin(),
-        "read_only":principal.policy.read_only, "see_all":principal.policy.see_all_sessions,
-        "workspace": if principal.policy.denies(crate::policy::Cap::Workspace) {"none"} else if principal.policy.denies(crate::policy::Cap::WorkspaceWrite) {"read"} else {"write"}
-    }).to_string()).await;
+    // Who this socket is for, before any guest frame. Host business like
+    // `resync`: the guest has no `whoami` import and needs none.
+    let _ = out_tx.send(user_frame(&principal)).await;
 
     while let Some(Ok(msg)) = incoming.next().await {
         let text = match msg {
@@ -1186,6 +1250,25 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
+
+        // "Everyone's conversations" is a per-connection switch on the
+        // principal, read by the host's `list_sessions` import. The frame then
+        // goes on to the guest unchanged, which lists as it always did and
+        // simply gets more rows. Someone without `see_all_sessions` can send
+        // this all day: the switch is inert for them.
+        if frame_type == "list" {
+            if let Some(all) = frame.as_ref().and_then(|f| f.get("all")).and_then(|v| v.as_bool()) {
+                principal.set_view_all(all);
+                if all && !principal.may_see_all() {
+                    let _ = out_tx
+                        .send(error_frame(
+                            "your role does not include seeing everyone's conversations",
+                            Some("list".into()),
+                        ))
+                        .await;
+                }
+            }
+        }
 
         // Host-side protocols do not pass through the gateway guest, so they
         // enforce ownership and capability policy here before dispatch.
@@ -1272,11 +1355,12 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
             let Some(frame) = frame else { continue };
             let grip = grip.clone();
             let out_tx = out_tx.clone();
+            let principal = principal.clone();
             tokio::spawn(async move {
                 let replies = if crate::debug_api::handles(&frame_type) {
                     crate::debug_api::handle(&grip, &frame).await
                 } else {
-                    crate::system_api::handle(&grip, &frame).await
+                    crate::system_api::handle(&grip, &principal, &frame).await
                 };
                 for reply in replies {
                     if out_tx.send(reply).await.is_err() {
@@ -1346,10 +1430,20 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
                     });
                 }
                 GatewayAction::Subscribe(session_id) => {
-                    if crate::auth::may_access(&grip, &principal, &session_id).is_ok() {
-                        watching.write().await.insert(session_id);
-                    } else {
-                        let _=out_tx.send(serde_json::json!({"type":"error","message":"that conversation is not yours"}).to_string()).await;
+                    // A subscription is what routes broadcast frames to this
+                    // socket, and the host inserts whatever id the guest
+                    // returned — so ownership is checked here, host-side,
+                    // whatever the guest said.
+                    match crate::auth::may_access(&grip, &principal, &session_id) {
+                        Ok(()) => {
+                            watching.write().await.insert(session_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(user = %principal.user_id, session = %session_id, error = %e, "refused a subscription");
+                            let _ = out_tx
+                                .send(error_frame("that conversation is not yours", Some("open".into())))
+                                .await;
+                        }
                     }
                 }
                 GatewayAction::Unsubscribe(session_id) => {
@@ -1364,6 +1458,12 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
     drop(out_tx);
     writer.abort();
     tracing::debug!(%client_id, "websocket closed");
+}
+
+fn user_frame(principal: &crate::auth::Principal) -> String {
+    let mut frame = principal.describe();
+    frame["type"] = serde_json::Value::from("user");
+    frame.to_string()
 }
 
 /// Owns the sink and nothing else. Moves bytes; never awaits a handler.
@@ -1475,7 +1575,45 @@ mod preview_tests {
 
 #[cfg(test)]
 mod guard_tests {
-    use super::{is_loopback_authority, is_loopback_origin};
+    use super::{authority_allowed, is_loopback_authority, is_loopback_origin, origin_allowed};
+    use crate::config::Origin;
+
+    fn public() -> Origin {
+        Origin {
+            scheme: "https".into(),
+            authority: "thetis.example.com".into(),
+        }
+    }
+
+    /// Local mode: no public origin, and the rule is exactly loopback-only.
+    #[test]
+    fn without_a_public_origin_only_loopback_is_allowed() {
+        assert!(authority_allowed(None, "127.0.0.1:7777"));
+        assert!(authority_allowed(None, "localhost"));
+        assert!(!authority_allowed(None, "thetis.example.com"));
+        assert!(origin_allowed(None, "http://localhost:7777"));
+        assert!(!origin_allowed(None, "https://thetis.example.com"));
+        assert!(!origin_allowed(None, "null"));
+    }
+
+    /// Users mode behind a proxy: the configured authority is admitted, and
+    /// nothing else is — including the same name on another port, and the
+    /// loopback rule is unchanged.
+    #[test]
+    fn the_public_origin_is_admitted_exactly() {
+        let p = public();
+        assert!(authority_allowed(Some(&p), "thetis.example.com"));
+        assert!(!authority_allowed(Some(&p), "thetis.example.com:8443"));
+        assert!(!authority_allowed(Some(&p), "evil.example.com"));
+        assert!(!authority_allowed(Some(&p), "thetis.example.com.evil.com"));
+        assert!(authority_allowed(Some(&p), "127.0.0.1:7777"), "loopback still works behind a proxy");
+        assert!(origin_allowed(Some(&p), "https://thetis.example.com"));
+        // The scheme is not part of the check: TLS is the proxy's business
+        // and the origin guard is about *which site* the request is from.
+        assert!(origin_allowed(Some(&p), "http://thetis.example.com"));
+        assert!(!origin_allowed(Some(&p), "https://evil.example.com"));
+        assert!(!origin_allowed(Some(&p), "null"));
+    }
 
     #[test]
     fn loopback_authorities_are_accepted() {
