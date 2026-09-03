@@ -1,10 +1,10 @@
 ---
 name = "Compiled programs and the MOO opcode set"
 brief = "What a compiled MOO Program holds, how names and jump labels work, how StoredProgram is persisted and versioned, and what invalidates a cached program."
-when_to_use = "Use when adding or changing an opcode, reading or writing code generation or the decompiler, touching Program, PrgInner, Op, Name, Names, Label, Offset or StoredProgram, changing the moor_program FlatBuffer schema or the opcode word stream, or diagnosing a verb that will not load after an upgrade with a decode or builtin signature error. Use it before changing anything about the builtin function table, because a program records which builtins it calls. Not for what an opcode does when executed, which is moor/execution/virtual-machine. Not for MOO source syntax or the compiler front end, which is compiler-pipeline. Not for value types, which is value-model. Not for the Torchship database or in-world verb authoring. Not for Thetis internals."
+when_to_use = "Use when adding or changing an opcode, touching the stored program format, or a verb will not load after an upgrade with a decode or builtin-signature error. Not for what an opcode does when executed (read moor/execution/virtual-machine), not for MOO syntax (read compiler-pipeline), and not for value types (read value-model)."
 universal = false
-tags = ["moor", "moo", "opcode", "bytecode", "program", "storedprogram", "flatbuffers", "jump label", "names", "fork vector", "lambda", "program cache", "decode error", "builtin signature", "schema version"]
-version = 1
+tags = ["moor", "moo", "opcode", "bytecode", "program", "prginner", "op", "name", "names", "label", "offset", "storedprogram", "moor_program", "flatbuffers", "jump label", "fork vector", "lambda", "program cache", "decode error", "builtin signature", "schema version", "code generation", "decompiler"]
+version = 2
 ---
 
 # Compiled programs and the MOO opcode set

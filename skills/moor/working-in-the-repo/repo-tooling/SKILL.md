@@ -1,11 +1,11 @@
 ---
 name = "mooR repository tooling"
-brief = "What each tool in tools/ and scripts/ is for and who needs it: moorc, moor-emh, bacon, dprint, licensure, process-compose, the perf scripts, the book, and the schema generators."
-when_to_use = "Use when you need a tool and do not know which: compiling a MOO source tree offline, inspecting a database without a server, watching files and restarting, profiling a running process, generating FlatBuffers or API-reference documentation, building the book, or editing MOO and .moot files with syntax support. Use it also to know which tools must be installed before a first change. Do not use it to choose a build or a test; those are build-and-run and testing. Not for the Torchship game database, for authoring MOO verbs inside a running world, or for Thetis's own internals."
+brief = "What each tool in tools/ and scripts/ is for and who needs it: moorc, moor-emh, bacon, process-compose, the perf scripts, the book, and the schema generators."
+when_to_use = "Use when you need a tool and do not know which: compiling a MOO source tree offline, inspecting a database without a server, watching files and restarting, or generating FlatBuffers or documentation. Use it also to know which tools must be installed before a first change. Not for choosing a build or a test, and not for the Torchship database or Thetis's own internals."
 universal = false
-tags = ["moor", "tools", "moorc", "moor-emh", "bacon", "dprint", "licensure", "mdbook", "process-compose", "perf", "profiling", "flatc", "planus", "scripts", "editor"]
+tags = ["moor", "tools", "moorc", "moor-emh", "bacon", "dprint", "licensure", "mdbook", "process-compose", "perf", "profiling", "flatc", "planus", "scripts", "editor", "watching files", "api-reference documentation", "moot syntax support"]
 related = ["moor/services/wire-schema", "moor/content-pipeline/objdef-format"]
-version = 1
+version = 2
 ---
 
 # mooR repository tooling
@@ -71,7 +71,7 @@ histories for the external Elle checker, and several load and benchmark drivers
 for verb dispatch, property updates, opcodes, the scheduler and suspend-resume.
 The binary list is the `[[bin]]` sections of its `Cargo.toml`; read those rather
 than a list here. Its own `README.md` and the shell scripts beside it explain
-the Elle workflow. See `testing`.
+the Elle workflow. See [testing](skill:moor/working-in-the-repo/testing).
 
 ### `lambdamoo-harness`
 
@@ -88,7 +88,7 @@ Reach for it only when the question is "what does the real LambdaMOO do here".
 | `tools/moo-mode.el` | Emacs major mode for MOO files: syntax highlighting and indentation | Emacs users editing `.moo` files |
 | `tools/moot-lang/` | A Visual Studio Code extension that highlights `.moot` files | Anyone writing many moot tests in that editor |
 | `tools/moot-translate.awk` | A one-way helper that rewrites Ruby test files from the Stunt suite towards moot syntax | Anyone porting another Stunt regression file. It gets most lines right and leaves the rest to you |
-| `tools/perf/` | Shell wrappers around Linux `perf`, and the activation profiling binary they drive | Anyone investigating a performance regression on Linux. `performance-and-profiling` explains what they produce |
+| `tools/perf/` | Shell wrappers around Linux `perf`, and the activation profiling binary they drive | Anyone investigating a performance regression on Linux. [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling) explains what they produce |
 | `tools/example-python-worker/` | A worker implemented in Python, over the same FlatBuffers and ZeroMQ protocol the Rust workers use | Anyone writing a worker in another language, or checking that the worker protocol is genuinely language-neutral |
 
 The API reference page is generated. Do not hand-edit it; change the OpenAPI
@@ -141,8 +141,8 @@ select the cargo profile, the job count and whether tracing is compiled in.
 
 `deploy/` holds the deployment examples rather than development stacks. CI
 renders every one of those manifests on each push, so a syntax error there fails
-the build even though nothing was deployed. `deployment-and-release` owns that
-whole area.
+the build even though nothing was deployed. [deployment-and-release](skill:moor/working-in-the-repo/deployment-and-release)
+owns that whole area.
 
 ### The book
 
@@ -152,7 +152,7 @@ the book. `book/build-single-page.sh` produces a single PDF through pandoc.
 
 Edit `book/src/` and add the page to `book/src/SUMMARY.md`, or it will not
 appear. A change to user-visible behaviour must update the book in the same pull
-request; see `conventions`.
+request; see [conventions](skill:moor/working-in-the-repo/conventions).
 
 ### The schema generators
 
@@ -165,8 +165,8 @@ different lifecycles.
 | TypeScript | `flatc`, driven by an npm script | No. Built on demand; set `MOOR_FLATC` if `flatc` is not on the path |
 
 Because the Rust side is committed, a `.fbs` edit alone changes nothing that
-cargo can see. `moor/services/wire-schema` covers the schema itself and the
-compatibility rules a change must respect.
+cargo can see. [wire-schema](skill:moor/services/wire-schema) covers the
+schema itself and the compatibility rules a change must respect.
 
 ## Failure branches
 
@@ -180,14 +180,17 @@ compatibility rules a change must respect.
 | A `.fbs` change has no effect on the Rust build | Rust bindings are committed, not generated at build time | Regenerate with planus and commit the result |
 | The book build fails on a missing preprocessor | mdBook plugins are not installed | Run `book/install-tools.sh` |
 | The API reference page reverts your edit | That page is generated | Edit the OpenAPI specification and re-run the generator |
-| A `perf` script refuses to record | The kernel blocks access to performance counters | The script reports which setting to change. See `performance-and-profiling` |
+| A `perf` script refuses to record | The kernel blocks access to performance counters | The script reports which setting to change. See [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling) |
 | A Nix shell build fails on the toolchain | The flake pins an older Rust than the workspace needs | Use rustup, or update the flake |
 | `process-compose` starts the wrong world | Its launchers import a different core than the npm and bacon defaults | Check which core each launcher imports before you compare behaviour |
 
 ## Read first / read next
 
-Read `build-and-run` for which launcher to reach for first, and `conventions`
-for the gates these tools enforce. Read `performance-and-profiling` before using
-the perf scripts, and `deployment-and-release` before changing anything under
-`deploy/`. Read `moor/content-pipeline/objdef-format` before using `moorc` on a
-source tree, and `moor/services/wire-schema` before regenerating bindings.
+Read [build-and-run](skill:moor/working-in-the-repo/build-and-run) for which
+launcher to reach for first, and [conventions](skill:moor/working-in-the-repo/conventions)
+for the gates these tools enforce. Read [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling)
+before using the perf scripts, and [deployment-and-release](skill:moor/working-in-the-repo/deployment-and-release)
+before changing anything under `deploy/`. Read
+[objdef-format](skill:moor/content-pipeline/objdef-format) before using
+`moorc` on a source tree, and [wire-schema](skill:moor/services/wire-schema)
+before regenerating bindings.

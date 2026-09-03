@@ -1,11 +1,11 @@
 ---
 name = "Testing mooR"
 brief = "Choose and run the right mooR test: cargo unit tests, .moot text tests, cross-process integration tests, benches, Elle consistency runs, and what CI gates."
-when_to_use = "Use when you must add a test, decide whether a behaviour belongs in a Rust test or a .moot file, run a single test, test something that spans the daemon and a host, or explain a test that passes alone and fails in the workspace. Use it before you claim a change works. Do not use it for compiling or starting a server; that is build-and-run. Do not use it for style, licence headers or pull-request rules; that is conventions. Not for the Torchship game database, for authoring MOO verbs inside a running world, or for Thetis's own internals."
+when_to_use = "Use when you must add a test, decide whether a behaviour belongs in a Rust test or a .moot file, run a single test, or explain a test that passes alone and fails in the workspace. Use it before you claim a change works. Not for compiling or starting a server, or for style and pull-request rules, and not for the Torchship database or Thetis's own internals."
 universal = false
-tags = ["moor", "test", "moot", "cargo test", "integration test", "proptest", "bench", "elle", "jepsen", "regression", "ci", "flaky"]
+tags = ["moor", "test", "moot", "cargo test", "integration test", "proptest", "bench", "elle", "jepsen", "regression", "ci", "flaky", "test something that spans the daemon and a host", "licence headers"]
 related = ["moor/execution/task-scheduler", "moor/storage-and-state/transactions"]
-version = 1
+version = 2
 ---
 
 # Testing mooR
@@ -52,7 +52,8 @@ what you need.
 Reach for a **load tool** when the property is about concurrency: does the store
 stay serializable, does the scheduler stay fair, does throughput regress. Those
 tools are also the honest way to measure a performance change in the database or
-the scheduler; `performance-and-profiling` covers that use.
+the scheduler; [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling)
+covers that use.
 
 ## Moot
 
@@ -112,7 +113,7 @@ than on the server.
 | `crates/telnet-host/tests/` | Daemon plus host, over a real socket, driving `.moot` files |
 | `crates/server/tests/` | A smoke test that starts the single-process binary, connects by telnet and by HTTP, and shuts it down |
 | `crates/textdump/tests/`, `crates/compiler/tests/` | Format round trips and deep-structure cases |
-| `crates/*/benches/` | Benches for value types, the store, the compiler and dispatch paths. See `performance-and-profiling` |
+| `crates/*/benches/` | Benches for value types, the store, the compiler and dispatch paths. See [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling) |
 | `crates/testing/load-tools/` | Load generators and Elle history producers |
 | `crates/testing/lambdamoo-harness/` | Optional comparison against the original C LambdaMOO |
 | `cores/cowbell/tests/` | MOO-level tests for the Cowbell core, run by `moorc` through its Makefile |
@@ -191,15 +192,23 @@ example is compiled and run. Take care when you add one.
 | A telnet host test shows behaviour you already fixed | It reused a stale `moor-daemon` binary from the target directory | Rebuild `moor-daemon`, or delete it so the test builds a fresh one |
 | A test in `lambdamoo-harness` will not compile | The external LambdaMOO sources were never fetched | Run its setup script, or exclude the crate |
 | Clippy fails only in CI | CI passes `--all-targets --all-features` and denies warnings | Run clippy with the same flags before submitting |
-| An Elle run reports a cycle | Either a real isolation bug, or a workload bug | Do not dismiss it. Keep the EDN history; it is the evidence. Read `moor/storage-and-state/transactions` |
-| A bench result moves a lot between runs | Machine noise, or a debug build | Read `performance-and-profiling`, which owns measurement method and its failure branches |
+| An Elle run reports a cycle | Either a real isolation bug, or a workload bug | Do not dismiss it. Keep the EDN history; it is the evidence. Read [transactions](skill:moor/storage-and-state/transactions) |
+| A bench result moves a lot between runs | Machine noise, or a debug build | Read [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling), which owns measurement method and its failure branches |
 
 ## Read first / read next
 
 Read `crates/testing/moot/README.md` in the repository before writing your first
 moot file, and the kernel testsuite `README.md` before porting a Stunt test.
-Read `conventions` for the gates a change must pass. Read
-`moor/storage-and-state/transactions` before interpreting a consistency failure,
-and `moor/execution/task-scheduler` before writing a test that suspends or forks
-a task. Read `performance-and-profiling` when the question is speed rather than
-correctness.
+Read [conventions](skill:moor/working-in-the-repo/conventions) for the gates a
+change must pass. Read [transactions](skill:moor/storage-and-state/transactions)
+before interpreting a consistency failure, and
+[task-scheduler](skill:moor/execution/task-scheduler) before writing a test
+that suspends or forks a task. Read
+[performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling)
+when the question is speed rather than correctness.
+
+## Verify this still holds
+
+```
+cargo test -p moor-kernel --test moot-suite
+```

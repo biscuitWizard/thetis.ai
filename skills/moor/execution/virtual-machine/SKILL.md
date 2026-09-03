@@ -1,10 +1,10 @@
 ---
 name = "The mooR bytecode VM"
-brief = "How the MOO interpreter runs a verb: activations and frames, verb call setup, tick slices, error raising and stack unwinding, and why it stays a plain interpreter."
-when_to_use = "Use when working on MOO code execution inside the mooR server: the activation stack, ExecState, MooStackFrame, the value stack and scope stack, how a verb call or lambda call is set up, the program cache, opcode dispatch and tick counting, try/catch/finally unwinding, the verb d flag and when an error is raised versus pushed, E_MAXREC and stack depth, or the ExecutionResult values the VM yields to the task loop. Do not use it for the compiler or the opcode set itself, for writing a builtin function, for scheduler queues and suspension, for permission rules, or for command parsing. Do not use it for the Torchship MOO game database, in-world MOO verb authoring, or Thetis's own internals."
+brief = "How the MOO interpreter runs a verb: activations and frames, verb call setup, tick slices, error raising and stack unwinding."
+when_to_use = "Use when working on MOO code execution inside the mooR server: the activation stack, how a verb or lambda call is set up, opcode dispatch and tick counting, try/catch/finally unwinding, or a stack-depth or execution-result question. Not for the compiler or opcode set itself, writing a builtin, scheduler queues, or permission rules, and not for the Torchship database or Thetis's own internals."
 universal = false
-tags = ["moor", "vm", "interpreter", "activation", "frame", "ExecState", "unwind", "traceback", "E_MAXREC", "d flag", "opcode", "tick", "try catch finally", "program cache"]
-version = 1
+tags = ["moor", "vm", "interpreter", "activation", "frame", "execstate", "moostackframe", "value stack", "scope stack", "unwind", "traceback", "e_maxrec", "verb d flag", "opcode", "tick", "try catch finally", "program cache", "executionresult"]
+version = 2
 ---
 
 # The mooR bytecode VM

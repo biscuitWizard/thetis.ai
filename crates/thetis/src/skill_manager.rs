@@ -54,6 +54,12 @@ pub struct Card {
     pub children: Vec<String>,
     pub universal: bool,
     pub resources: Vec<String>,
+    /// Ids of neighbouring skills, from frontmatter `related`.
+    pub related: Vec<String>,
+    /// "active" or "retired". Empty means active and unstated.
+    pub status: String,
+    /// For a retired skill, the id that replaced it. Empty otherwise.
+    pub superseded_by: String,
     /// Retrieval score; 0.0 when the card was not produced by ranking.
     pub score: f64,
     /// How this card was selected: dense, lexical, parent-of-match,
@@ -492,6 +498,9 @@ impl SkillManager {
                 .collect(),
             universal: s.universal,
             resources: s.resources.clone(),
+            related: s.related.clone(),
+            status: s.status.clone(),
+            superseded_by: s.superseded_by.clone(),
             score,
             how: how.to_string(),
         }
@@ -779,7 +788,7 @@ mod tests {
 
     fn skill_md(name: &str, brief: &str) -> String {
         format!(
-            "---\nname = \"{name}\"\nbrief = \"{brief}\"\nwhen_to_use = \"When testing.\"\n---\n\nBody of {name}.\n"
+            "---\nname = \"{name}\"\nbrief = \"{brief}\"\nwhen_to_use = \"When testing.\"\n---\n\n# {name}\n\nBody of {name}.\n"
         )
     }
 

@@ -1,10 +1,10 @@
 ---
 name = "The mooR command parser"
-brief = "How a line a player types becomes a verb call: $do_command, word splitting, prepositions, object matching against the player's surroundings, verb argument specs, and :huh."
-when_to_use = "Use when working on command handling in the mooR server: $do_command, the built-in parser, dobj and iobj and prepstr and argstr, preposition tables, matching me and here and #123 and object aliases, ambiguous and failed matches, ordinal matching such as \"second lamp\", the search order across player, room, direct object and indirect object, the :huh fallback, or the parse_command, find_command_verb and dispatch_command_verb builtins. Do not use it for the scheduler, the VM, permission rules in general, or writing a builtin. Do not use it for telnet or web line handling before the command reaches the server, for the Torchship MOO game database, for in-world MOO verb authoring, or for Thetis's own internals."
+brief = "How a line a player types becomes a verb call: $do_command, word splitting, prepositions, object matching against the player's surroundings, and :huh."
+when_to_use = "Use when working on command handling in the mooR server: $do_command, object matching against the player's surroundings, ambiguous or failed matches, ordinal matching such as \"second lamp\", or the :huh fallback. Not for the scheduler, the VM, permission rules, or writing a builtin. Not for telnet/web line handling, the Torchship database, or Thetis's internals."
 universal = false
-tags = ["moor", "command parser", "do_command", "dobj", "iobj", "preposition", "object matching", "aliases", "huh", "parse_command", "argstr", "ambiguous match", "complex_match"]
-version = 1
+tags = ["moor", "command parser", "do_command", "dobj", "iobj", "prepstr", "argstr", "preposition tables", "object matching", "aliases", "huh", "parse_command", "find_command_verb", "dispatch_command_verb", "ambiguous match", "complex_match", "verb argument specs"]
+version = 2
 ---
 
 # The mooR command parser

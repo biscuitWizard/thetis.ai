@@ -4,8 +4,9 @@ brief = "Change wit/thetis.wit without breaking every guest: host impls first, r
 when_to_use = "Use when adding or changing an interface, record or function in wit/thetis.wit. Also use when a guest starts failing at instantiation rather than at compile time, which is the signature of a contract mismatch."
 tags = ["wit", "contract", "self-mod", "ordering", "tool-group:selfmod", "tool-group:shell"]
 children = "none"
-version = 1
+version = 2
 ---
+# Staging a WIT contract change
 
 The WIT contract is shared by the orchestrator and every guest. A guest is
 matched against it structurally at instantiation, so a mismatch is not a compile
