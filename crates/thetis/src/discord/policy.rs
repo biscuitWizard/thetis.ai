@@ -165,35 +165,128 @@ pub fn clean_id(entry: &str) -> String {
     entry.trim().to_string()
 }
 
-/// How a message is attributed to its author for the model.
+/// A display name fit to put in a transcript.
 ///
-/// The contract's `user-msg` has no author field, so identity has to travel in
-/// the text. It is only added where more than one person can be present: a DM
-/// is already unambiguous, and prefixing every line there would be clutter the
-/// model might start imitating.
+/// Always sanitised, because it is user-controlled and it ends up rendered
+/// beside the message. Control characters are stripped so a name cannot span
+/// lines, and the length is bounded so it cannot crowd out the message.
 ///
-/// The name is sanitised because it is user-controlled: a display name
-/// containing a newline could otherwise forge an attribution line.
-pub fn attribute(msg: &Incoming, text: &str, per_user_sessions: bool) -> String {
-    if msg.is_dm() || per_user_sessions {
-        return text.to_string();
+/// The bracket and colon stripping is kept from when identity travelled inside
+/// the message text as `[Name] said this`: there, a display name containing a
+/// bracket could forge a second speaker. Authorship is a structured field now,
+/// so that specific forgery is gone — but the same name is still interpolated
+/// into prose for the model to read (`author_prefix` in the agent), and a name
+/// that looks like punctuation is a nuisance wherever it is shown.
+pub fn display_name(raw: &str) -> String {
+    let name: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
+    name.replace(['[', ']', ':'], "").trim().to_string()
+}
+
+/// Who a Discord message is from, as the contract's `author` record.
+///
+/// `id` is what authority is resolved from, so it is the *account* this
+/// snowflake is bound to, or a synthetic `discord:` owner when it is bound to
+/// nothing — never the snowflake alone, which names no principal.
+///
+/// Attribution is now unconditional. It used to be added only in a channel and
+/// omitted in a DM, on the grounds that a DM has one speaker and a prefix would
+/// be clutter. That reasoning applied to text; a structured field is not
+/// clutter, and a transcript where some messages carry an author and others do
+/// not is worse to reason about than one where they all do — particularly for a
+/// conversation that a DM and a channel can both reach.
+pub fn author_of(msg: &Incoming, account_id: &str) -> crate::bindings::types::Author {
+    crate::bindings::types::Author {
+        id: account_id.to_string(),
+        display: display_name(&msg.author_name),
+        surface: "discord".into(),
     }
-    let name: String = msg
-        .author_name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(64)
-        .collect();
-    let name = name.replace(['[', ']', ':'], "");
-    format!("[{name}] {text}")
+}
+
+/// Why a fork was refused, as something sayable to the person who asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRefusal {
+    /// The operator has not turned `/fork` on.
+    Disabled,
+    /// This Discord identity is not bound to a Thetis account, so there is no
+    /// authority to fork *under*. Discord confers none of its own.
+    Unbound,
+}
+
+/// Whether this Discord identity may start a fork, given the account it
+/// resolves to.
+///
+/// The argument is the **resolved account** — the output of
+/// `AuthSettings::owner_for_discord` — and that is load-bearing. The tempting
+/// check is against the session key or the channel, and it fails open: with
+/// `group_sessions_per_user = false` a channel's key carries no user id at all,
+/// so a key-based check would authorise every person in the channel to fork
+/// under whoever happened to bind an account there.
+///
+/// A synthetic `discord:` owner is refused. Those are minted per channel for
+/// unbound snowflakes and carry the read-only Discord policy; forking under one
+/// would produce a conversation with the same ceiling it started with, which is
+/// pointless, and it would let an unbound stranger create conversations named
+/// after a channel. Binding is deliberate: an administrator puts `discord_id`
+/// on a `[[users]]` entry in the config file. That act is the entire chain of
+/// custody between a snowflake and a set of permissions, so nothing may
+/// shortcut it.
+pub fn may_fork(cfg: &DiscordSettings, account: &str) -> Result<(), ForkRefusal> {
+    if !cfg.allow_fork {
+        return Err(ForkRefusal::Disabled);
+    }
+    if is_synthetic_owner(account) {
+        return Err(ForkRefusal::Unbound);
+    }
+    Ok(())
+}
+
+/// Whether this speaker may go on prompting an existing fork.
+///
+/// A fork keeps its ceiling for its whole life, so speaking into one is asking
+/// work to be done with somebody else's permissions. Only the account that
+/// authorised it may, and the comparison is again on resolved accounts rather
+/// than snowflakes or channels.
+///
+/// Note what this is *not*: it is not the security boundary. Even if this
+/// returned true for the wrong person, `effective(turn) = policy(speaker) ∩
+/// ceiling(session)` means their turn would run with their own permissions
+/// narrowed by the fork's — they cannot borrow authority by typing in someone
+/// else's conversation. This check exists so the fork is not a shared workspace
+/// people can nudge sideways, and so a refusal is legible rather than a turn
+/// that mysteriously cannot do what the fork was made for.
+pub fn may_prompt_fork(fork_owner: &str, speaker: &str) -> bool {
+    !is_synthetic_owner(speaker) && !speaker.is_empty() && fork_owner == speaker
+}
+
+/// Whether an owner id is one of the synthetic per-channel ones minted for a
+/// Discord identity bound to no account. Matched by prefix, the same way
+/// `Config::policy_for` matches it when handing out the Discord policy.
+fn is_synthetic_owner(owner: &str) -> bool {
+    owner.starts_with("discord:")
+}
+
+/// The KV key mapping a Discord conversation key to its fork.
+///
+/// Deliberately a different row from `discord.session.{key}`. Sharing one would
+/// mean the channel's ordinary chat — which anyone authorised may send, and
+/// which is meant to be read-only — got redirected into the write-enabled
+/// conversation. The two live side by side: ambient chat in the channel, the
+/// fork in its thread.
+pub fn fork_key(key: &str) -> String {
+    format!("discord.fork.{key}")
+}
+
+/// The KV key mapping a Discord conversation key to its ordinary session.
+pub fn session_map_key(key: &str) -> String {
+    format!("discord.session.{key}")
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn settings() -> DiscordSettings {
+    pub(crate) fn settings() -> DiscordSettings {
         DiscordSettings {
             enabled: true,
             bot_token: None,
@@ -207,6 +300,7 @@ mod tests {
             group_sessions_per_user: true,
             stream_edit_interval: Duration::from_millis(1200),
             pairing_code_ttl: Duration::from_secs(900),
+            allow_fork: false,
         }
     }
 
@@ -404,26 +498,54 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_conversation_attributes_each_speaker() {
+    fn an_author_names_the_account_not_the_snowflake() {
+        // What the id must be is the whole point: authority is resolved from
+        // it, and a Discord snowflake names no principal. `author_of` is handed
+        // the already-resolved account precisely so this cannot be got wrong
+        // here — the test pins that it is used verbatim.
         let m = msg("alice", Some("g"), "hi");
-        assert_eq!(attribute(&m, "hi", false), "[Alice] hi");
+        let a = author_of(&m, "account-alice");
+        assert_eq!(a.id, "account-alice");
+        assert_eq!(a.display, "Alice");
+        assert_eq!(a.surface, "discord");
     }
 
     #[test]
-    fn a_dm_is_not_attributed() {
+    fn a_dm_is_attributed_too() {
+        // It deliberately was not, when identity travelled in the message text
+        // and a prefix in a one-speaker conversation was noise. A structured
+        // field costs nothing to read and a transcript where attribution comes
+        // and goes is harder to reason about than one where it is always there
+        // — and the same conversation can be reached from a DM and a channel.
         let m = msg("alice", None, "hi");
-        assert_eq!(attribute(&m, "hi", false), "hi");
+        assert_eq!(author_of(&m, "account-alice").display, "Alice");
     }
 
     #[test]
     fn a_display_name_cannot_forge_an_attribution_line() {
-        // A name carrying a newline and brackets could otherwise fake a second
-        // speaker in the transcript.
+        // This mattered absolutely when identity was a `[Name] ` prefix on the
+        // text: a name containing a bracket or a newline could fake a second
+        // speaker. Authorship is a field now, so that forgery is structurally
+        // gone — but the name is still interpolated into prose for the model
+        // and rendered in the UI, so it stays sanitised. Kept as a test rather
+        // than dropped, because the reason it is safe changed and the property
+        // did not.
         let mut m = msg("alice", Some("g"), "hi");
         m.author_name = "Bad\n[System]".into();
-        let text = attribute(&m, "hi", false);
-        assert!(!text.contains('\n'), "control characters must be stripped");
-        assert_eq!(text, "[BadSystem] hi");
+        let a = author_of(&m, "account-alice");
+        assert!(
+            !a.display.contains('\n'),
+            "control characters must be stripped"
+        );
+        assert_eq!(a.display, "BadSystem");
+    }
+
+    #[test]
+    fn a_display_name_is_bounded() {
+        // Unbounded, a name would crowd the message it is meant to label.
+        let mut m = msg("alice", Some("g"), "hi");
+        m.author_name = "x".repeat(500);
+        assert_eq!(author_of(&m, "a").display.chars().count(), 64);
     }
 
     #[test]
@@ -442,5 +564,65 @@ mod tests {
         let cfg = settings();
         assert!(cfg.authorized("bob", &["bob".to_string()]));
         assert!(!cfg.is_admin("bob"));
+    }
+
+    #[test]
+    fn forking_is_off_until_an_operator_turns_it_on() {
+        let cfg = settings();
+        assert_eq!(may_fork(&cfg, "alice"), Err(ForkRefusal::Disabled));
+    }
+
+    #[test]
+    fn only_a_bound_account_may_fork() {
+        let mut cfg = settings();
+        cfg.allow_fork = true;
+        assert_eq!(may_fork(&cfg, "alice"), Ok(()));
+        // A synthetic per-channel owner is what an unbound snowflake resolves
+        // to. It holds the read-only Discord policy and names no principal, so
+        // there is no authority to fork under.
+        assert_eq!(
+            may_fork(&cfg, "discord:channel:123"),
+            Err(ForkRefusal::Unbound)
+        );
+        assert_eq!(
+            may_fork(&cfg, "discord:private:456:789"),
+            Err(ForkRefusal::Unbound)
+        );
+    }
+
+    #[test]
+    fn a_fork_is_promptable_only_by_the_account_that_authorised_it() {
+        assert!(may_prompt_fork("alice", "alice"));
+        assert!(!may_prompt_fork("alice", "bob"));
+        // Not even by an unbound stranger who happens to be in the thread, and
+        // not by the empty speaker an older gateway would send.
+        assert!(!may_prompt_fork("alice", "discord:channel:123"));
+        assert!(!may_prompt_fork("alice", ""));
+        // And a synthetic owner cannot be prompted even by itself, which is the
+        // case that would otherwise let two unbound people in one channel share
+        // a conversation as though they were one account.
+        assert!(!may_prompt_fork("discord:channel:1", "discord:channel:1"));
+    }
+
+    #[test]
+    fn a_fork_never_shares_the_channels_own_conversation_row() {
+        // Sharing the row would redirect ambient channel chat — which anyone
+        // authorised may send, and which is meant to be read-only — into the
+        // write-enabled conversation.
+        let key = "discord:channel:123";
+        assert_ne!(fork_key(key), session_map_key(key));
+        assert!(fork_key(key).starts_with("discord.fork."));
+        assert!(session_map_key(key).starts_with("discord.session."));
+    }
+
+    #[test]
+    fn a_thread_gets_its_own_conversation_key_without_being_asked() {
+        // This is why a fork lives in a thread: `session_key_for` already
+        // partitions on thread-ness, so the fork's thread cannot collide with
+        // the parent channel's key even before the separate KV row.
+        let cfg = settings();
+        let channel = session_key_for(&cfg, false, false, "chan", "alice");
+        let thread = session_key_for(&cfg, false, true, "thread", "alice");
+        assert_ne!(channel, thread);
     }
 }

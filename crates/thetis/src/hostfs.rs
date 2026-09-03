@@ -49,6 +49,29 @@ fn rewrite_workspace_prefix(cfg: &Config, raw: &str) -> String {
     raw.to_string()
 }
 
+/// Whether a guest-supplied path lands inside the shared workspace.
+///
+/// The workspace capabilities have to be decided on this, not on the spelling
+/// the guest used, because `resolve` rewrites `/workspace/...` to its real
+/// location before any check runs — so a policy test against the raw string
+/// would miss the host spelling (`/opt/thetis/workspace/...`), and one against
+/// the resolved path would miss nothing but only if it happens after the
+/// rewrite. Resolving first and comparing against the preopen covers both.
+///
+/// Errors resolving are reported as "not the workspace": the path is about to
+/// fail the root check anyway, and answering `true` here would apply the
+/// workspace rules to something that is not in it.
+pub fn is_workspace_path(cfg: &Config, raw: &str) -> bool {
+    let Ok(resolved) = resolve(cfg, raw) else {
+        return false;
+    };
+    let probe = canonical(&resolved);
+    cfg.wasi
+        .dirs
+        .iter()
+        .any(|dir| probe.starts_with(canonical(dir)))
+}
+
 /// Resolves a guest-supplied path against the configured roots.
 ///
 /// Relative paths are taken against the first root, which is the project root
@@ -1217,6 +1240,56 @@ mod tests {
             .find(|e| e.name == "note.md")
             .expect("note.md should be listed");
         assert_eq!(read_file(&cfg, &entry.path).unwrap(), "in the workspace");
+    }
+
+    /// The workspace capabilities are decided on where a path *lands*, not on
+    /// how the guest spelled it. Both spellings name the same directory, and
+    /// `resolve` rewrites the guest one before any policy check runs — so a
+    /// check against the raw string would let the host spelling through, which
+    /// is precisely the hole that made `Cap::WorkspaceWrite` unenforced for
+    /// `write_file`.
+    #[test]
+    fn the_workspace_is_recognised_by_either_spelling() {
+        let (mut cfg, _d) = fixture();
+        let project = cfg.filesystem.roots[0].clone();
+        let ws = project.join("shared-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("note.md"), "shared").unwrap();
+        cfg.wasi.dirs = vec![ws.clone()];
+        cfg.filesystem.roots.push(ws.clone());
+
+        // The guest spelling.
+        assert!(is_workspace_path(&cfg, "/shared-ws"));
+        assert!(is_workspace_path(&cfg, "/shared-ws/note.md"));
+        // The host spelling of the very same file.
+        assert!(is_workspace_path(&cfg, ws.join("note.md").to_str().unwrap()));
+        // A file that does not exist yet is still workspace-bound, or the
+        // create case would slip past the write capability.
+        assert!(is_workspace_path(&cfg, "/shared-ws/not-yet.md"));
+
+        // And the project's own files are not the workspace, so an account
+        // denied the workspace keeps ordinary filesystem access.
+        assert!(!is_workspace_path(&cfg, "src/main.rs"));
+        assert!(!is_workspace_path(&cfg, project.join("Cargo.toml").to_str().unwrap()));
+    }
+
+    /// Traversal must not be able to launder a project path into a workspace
+    /// one or the reverse; the answer follows the normalised destination.
+    #[test]
+    fn traversal_cannot_disguise_which_side_a_path_is_on() {
+        let (mut cfg, _d) = fixture();
+        let project = cfg.filesystem.roots[0].clone();
+        let ws = project.join("shared-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(project.join("note.md"), "in the project").unwrap();
+        cfg.wasi.dirs = vec![ws.clone()];
+        cfg.filesystem.roots.push(ws.clone());
+
+        // Starts in the workspace, ends in the project: not the workspace, so
+        // it is governed by the filesystem capabilities alone.
+        assert!(!is_workspace_path(&cfg, "/shared-ws/../note.md"));
+        // Starts in the project, ends in the workspace: it counts.
+        assert!(is_workspace_path(&cfg, "shared-ws/./note.md"));
     }
 
     /// Rewriting the prefix is a spelling fix, not a grant: `..` out of the

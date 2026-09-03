@@ -596,7 +596,8 @@ pub async fn resolve_in_conversation(
          `abort_merge` and say why."
     );
 
-    grip.submit(session_id, manifest, Vec::new()).await
+    // System-authored: a conflict manifest is not a person speaking.
+    grip.submit(session_id, manifest, Vec::new(), None).await
 }
 
 /// Ahead/behind of a branch relative to trunk, readable without a worker —

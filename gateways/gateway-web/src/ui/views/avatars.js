@@ -33,6 +33,7 @@
 
 import { $, setHidden } from "../lib/dom.js";
 import { toast } from "../lib/toast.js";
+import { store } from "../lib/store.js";
 
 /* The longest edge an uploaded picture is stored at.
  *
@@ -86,10 +87,23 @@ export function mountAvatars(sendFrame) {
  * hidden-or-not decision are made once in the markup and every row inherits
  * them.
  *
+ * `authorId` is what makes this safe in a shared conversation. The stored
+ * picture is *the reader's own* — there is nowhere to get anyone else's from —
+ * so it may only be painted onto the reader's own rows. Painted onto every user
+ * row, as this did when a conversation could only have one speaker, a
+ * multi-party transcript shows every message wearing the reader's face. That
+ * misreads as correct attribution rather than as a missing feature, which is
+ * the worst way for it to be wrong.
+ *
+ * So another participant's tile keeps the drawn mark, and the byline carries
+ * their name. A face per account is a separate feature and needs somewhere to
+ * store other people's pictures.
+ *
  * @param {string} role  the event's role: "user" and "assistant" have faces
+ * @param {string} [authorId]  who spoke, for a user row; absent means the reader
  * @returns {Node|null}
  */
-export function turnAvatar(role) {
+export function turnAvatar(role, authorId) {
   const id = role === "user" ? "user-avatar-template" : role === "assistant" ? "agent-avatar-template" : null;
   if (!id) return null;
   const template = $(id);
@@ -102,9 +116,29 @@ export function turnAvatar(role) {
   const mark = node.querySelector(".turn-mark");
   // The user's tile is filled in here rather than in the markup: unlike the
   // agent's, its source is not known when the page is served.
-  if (role === "user") paint(img, mark, userAvatar);
+  if (role === "user") {
+    const mine = isReader(authorId);
+    // Marked on the element, because `draw` has to find these again when a
+    // picture arrives after the rows were rendered — and must not find
+    // somebody else's.
+    if (!mine) node.classList.add("is-other");
+    paint(img, mark, mine ? userAvatar : "");
+  }
   wireFallback(img, mark);
   return node;
+}
+
+/* Whether a user row belongs to the person reading it.
+ *
+ * Absence means yes: every message stored before authorship existed has no
+ * author, and the single-speaker case is overwhelmingly the reader's own
+ * conversation. `local` mode has no accounts at all, so there is one person by
+ * construction. */
+function isReader(authorId) {
+  if (!authorId) return true;
+  const me = store.user;
+  if (!me || me.local) return true;
+  return authorId === me.id;
 }
 
 /** The host's answer to `user-avatar` — and to any tab's `user-avatar-set`. */
@@ -125,7 +159,11 @@ export function request() {
 function draw(url) {
   userAvatar = url || "";
   paint($("user-avatar-img"), $("user-avatar-mark"), userAvatar);
-  for (const tile of document.querySelectorAll(".turn-avatar.is-user")) {
+  // `:not(.is-other)` is the load-bearing part: a picture arriving after the
+  // transcript was rendered must not be painted onto another participant's
+  // rows. Without it, uploading an avatar mid-conversation is what puts your
+  // face on everyone else's messages.
+  for (const tile of document.querySelectorAll(".turn-avatar.is-user:not(.is-other)")) {
     paint(tile.querySelector(".turn-img"), tile.querySelector(".turn-mark"), userAvatar);
   }
 }

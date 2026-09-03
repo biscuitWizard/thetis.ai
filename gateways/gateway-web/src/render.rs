@@ -18,6 +18,14 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
         SessionEvent::UserMessage(msg) => json!({
             "kind": "user",
             "text": msg.text,
+            // Absent for every message stored before authorship, and for
+            // anything the system wrote to the transcript itself. The view must
+            // treat absence as "the reader", which is what it always assumed.
+            "author": msg.author.as_ref().map(|a| json!({
+                "id": a.id,
+                "display": a.display,
+                "surface": a.surface,
+            })),
             // Only what the UI needs to draw a thumbnail; the bytes are already
             // in the browser that sent them, and other tabs re-fetch on demand.
             "attachments": msg.attachments.iter().map(|a| json!({
@@ -133,4 +141,56 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
     obj.insert("seq".into(), json!(ev.seq));
     obj.insert("ts".into(), json!(ev.ts_ms));
     Some(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thetis::grip::types::{Author, UserMsg};
+
+    fn outbound(event: SessionEvent) -> OutboundEvent {
+        OutboundEvent {
+            session_id: "s".into(),
+            seq: Some(1),
+            ts_ms: 0,
+            event,
+        }
+    }
+
+    #[test]
+    fn a_user_frame_carries_its_author() {
+        let frame = event(&outbound(SessionEvent::UserMessage(UserMsg {
+            text: "hi".into(),
+            attachments: vec![],
+            author: Some(Author {
+                id: "bob".into(),
+                display: "Bob".into(),
+                surface: "discord".into(),
+            }),
+        })))
+        .expect("a user message renders");
+
+        assert_eq!(frame["author"]["id"], json!("bob"));
+        assert_eq!(frame["author"]["display"], json!("Bob"));
+        // The surface reaches the view because a conversation someone can
+        // reach two ways needs to say which way a message came in.
+        assert_eq!(frame["author"]["surface"], json!("discord"));
+    }
+
+    #[test]
+    fn an_unattributed_message_renders_a_null_author_not_a_missing_key() {
+        // Every message from before authorship has none, as do the notes the
+        // machine writes to a transcript itself. The view reads absence as "the
+        // reader", which is what it assumed before the field existed — so this
+        // must render rather than drop the frame.
+        let frame = event(&outbound(SessionEvent::UserMessage(UserMsg {
+            text: "from before".into(),
+            attachments: vec![],
+            author: None,
+        })))
+        .expect("an unattributed message still renders");
+
+        assert_eq!(frame["text"], json!("from before"));
+        assert_eq!(frame["author"], json!(null));
+    }
 }

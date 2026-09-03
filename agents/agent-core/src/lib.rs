@@ -20,8 +20,8 @@ use thetis::grip::session as host;
 use thetis::grip::skills;
 use thetis::grip::sys;
 use thetis::grip::types::{
-    AssistantMsg, InboxItem, LlmError, LogLevel, SessionEvent, StreamChunk, TokenUsage, ToolCall,
-    ToolOutcome, UserMsg,
+    AssistantMsg, Author, EventRecord, InboxItem, LlmError, LogLevel, SessionEvent, StreamChunk,
+    TokenUsage, ToolCall, ToolOutcome, UserMsg,
 };
 // `tool-manifest` comes in via the world's own `use types.{...}`.
 use serde_json::{json, Value};
@@ -452,6 +452,12 @@ impl Turn {
         // refreshed the figure — the compaction loop this guards against.
         let usage_is_current = last_usage_seq > last_compaction_seq;
 
+        // Decided once for the whole conversation, so attribution cannot come
+        // and go between messages — and computed over every record, including
+        // ones already summarised away, because a conversation does not stop
+        // being multi-party when its opening is compacted.
+        let attribute = needs_attribution(&records);
+
         for record in records {
             if let Some(i) = notes.iter().position(|(seq, _)| *seq == record.seq) {
                 let (_, note) = notes.remove(i);
@@ -466,7 +472,18 @@ impl Turn {
             let seq = record.seq;
             match record.event {
                 SessionEvent::UserMessage(msg) => {
-                    self.push(json!({ "role": "user", "content": user_content(&msg) }), seq);
+                    let prefix = if attribute {
+                        author_prefix(msg.author.as_ref())
+                    } else {
+                        None
+                    };
+                    self.push(
+                        json!({
+                            "role": "user",
+                            "content": user_content(&msg, prefix.as_deref()),
+                        }),
+                        seq,
+                    );
                 }
                 SessionEvent::Nudge(text) => {
                     self.push(json!({ "role": "user", "content": text }), seq);
@@ -1115,7 +1132,69 @@ const MAX_INLINE_FILE_CHARS: usize = 96_000;
 /// cannot quietly spend the whole context.
 const MAX_INLINE_TOTAL_CHARS: usize = 240_000;
 
+/// How a speaker's name is shown to the model, or `None` to show nothing.
+///
+/// The author is a structured field on the message, but the model only ever
+/// reads text, so it has to be rendered into the text somewhere. This is that
+/// somewhere — the field stays the source of truth and the prefix is derived
+/// from it, never the other way round.
+///
+/// **Not a sibling `name` key on the message**, for two independent reasons.
+/// The summariser flattens spans to `[{role}] {content}`, so a sibling field
+/// vanishes from every compaction summary — a long multi-party conversation
+/// would lose exactly the attribution it most needs. And there is no typed
+/// request struct: an unknown key passes through untouched, but a provider
+/// behind an OpenAI-shaped gateway may drop it, which would give a transcript
+/// with names and a model without them and no error anywhere to say so.
+fn author_prefix(author: Option<&Author>) -> Option<String> {
+    let a = author?;
+    let name = a.display.trim();
+    // An author naming nobody is worse than no author: a blank prefix looks
+    // like a bug in the transcript and teaches the model to emit one.
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("[{name}] "))
+}
+
+/// Whether a transcript needs its speakers named.
+///
+/// Only when more than one person has actually spoken. A prefix on every
+/// message of a conversation with one participant is pure noise — and worse
+/// than noise, because the model reads its own context as a style guide and
+/// starts prefixing its *own* replies with something that looks like an
+/// attribution.
+///
+/// So the rule is: say who is speaking exactly when that is a real question.
+/// A second speaker arriving retroactively names the earlier messages too,
+/// which is right — the transcript becomes ambiguous the moment they arrive,
+/// including in what came before.
+///
+/// Counted over the whole log rather than the uncompacted tail, because a
+/// conversation whose multi-party opening has been summarised away is still
+/// multi-party.
+fn needs_attribution(records: &[EventRecord]) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for record in records {
+        if let SessionEvent::UserMessage(msg) = &record.event {
+            if let Some(author) = &msg.author {
+                if !author.id.is_empty() && !seen.contains(&author.id.as_str()) {
+                    seen.push(&author.id);
+                    if seen.len() > 1 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Builds the `content` field for a user message.
+///
+/// `prefix` names the speaker when the conversation has more than one; it is
+/// prepended to the text rather than sent as a separate part, so it survives
+/// summarisation and cannot be dropped by a provider.
 ///
 /// Plain text stays a bare string, which every provider accepts; attachments
 /// promote it to the multi-part form.
@@ -1126,14 +1205,19 @@ const MAX_INLINE_TOTAL_CHARS: usize = 240_000;
 /// the model a file exists but leaves it to guess or to spend a tool call, and
 /// the point of attaching was that the sender already knew it was relevant.
 /// The path is still given, so a truncated or edited file can be read properly.
-fn user_content(msg: &UserMsg) -> Value {
+fn user_content(msg: &UserMsg, prefix: Option<&str>) -> Value {
+    let prefix = prefix.unwrap_or("");
     if msg.attachments.is_empty() {
-        return json!(msg.text);
+        return json!(format!("{prefix}{}", msg.text));
     }
 
     let mut parts = Vec::new();
     if !msg.text.trim().is_empty() {
-        parts.push(json!({ "type": "text", "text": msg.text }));
+        parts.push(json!({ "type": "text", "text": format!("{prefix}{}", msg.text) }));
+    } else if !prefix.is_empty() {
+        // An image with no words still needs a speaker, or in a shared
+        // conversation nobody can tell whose picture it is.
+        parts.push(json!({ "type": "text", "text": prefix.trim_end() }));
     }
     let mut budget = MAX_INLINE_TOTAL_CHARS;
     for attachment in &msg.attachments {
@@ -1375,8 +1459,9 @@ mod attachment_tests {
         let msg = UserMsg {
             text: "what does this do? @workspace/moor/README.md".into(),
             attachments: vec![attach("workspace/moor/README.md", "text/markdown", "# moor\nhi")],
+            author: None,
         };
-        let content = user_content(&msg);
+        let content = user_content(&msg, None);
         let parts = content.as_array().expect("attachments promote to multi-part");
         assert_eq!(parts.len(), 2, "the text, then the file");
         assert_eq!(parts[0]["text"], json!(msg.text));
@@ -1393,8 +1478,9 @@ mod attachment_tests {
         let msg = UserMsg {
             text: String::new(),
             attachments: vec![attach("shot.png", "image/png", "\u{89}PNG-ish")],
+            author: None,
         };
-        let parts = user_content(&msg);
+        let parts = user_content(&msg, None);
         assert_eq!(parts[0]["type"], json!("image_url"));
         assert!(parts[0]["image_url"]["url"]
             .as_str()
@@ -1411,8 +1497,9 @@ mod attachment_tests {
                 mime: "application/octet-stream".into(),
                 data_base64: encode(&[0u8, 159, 146, 150]),
             }],
+            author: None,
         };
-        let parts = user_content(&msg);
+        let parts = user_content(&msg, None);
         let text = parts[0]["text"].as_str().unwrap();
         assert!(text.contains("workspace/data.bin"), "{text}");
         assert!(text.contains("not inlined"), "{text}");
@@ -1425,8 +1512,9 @@ mod attachment_tests {
         let msg = UserMsg {
             text: String::new(),
             attachments: vec![attach("workspace/big.log", "text/plain", &body)],
+            author: None,
         };
-        let parts = user_content(&msg);
+        let parts = user_content(&msg, None);
         let text = parts[0]["text"].as_str().unwrap();
         assert!(text.contains("truncated at"), "{}", &text[text.len() - 200..]);
         assert!(text.contains("read_path workspace/big.log"));
@@ -1444,8 +1532,9 @@ mod attachment_tests {
             attachments: (0..4)
                 .map(|i| attach(&format!("workspace/f{i}.txt"), "text/plain", &chunk))
                 .collect(),
+            author: None,
         };
-        let parts = user_content(&msg);
+        let parts = user_content(&msg, None);
         let total: usize = parts
             .as_array()
             .unwrap()
@@ -1460,12 +1549,103 @@ mod attachment_tests {
         assert!(last.contains("not inlined"), "the last file must be named only: {last}");
     }
 
+    fn authored(text: &str, id: &str, display: &str) -> EventRecord {
+        EventRecord {
+            seq: 1,
+            ts_ms: 0,
+            event: SessionEvent::UserMessage(UserMsg {
+                text: text.into(),
+                attachments: vec![],
+                author: Some(Author {
+                    id: id.into(),
+                    display: display.into(),
+                    surface: "web".into(),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn one_speaker_is_never_named() {
+        // The cost of naming a lone speaker is not just noise: the model reads
+        // its own context as a style guide and starts prefixing its replies
+        // with something that looks like an attribution.
+        let solo = vec![authored("hi", "alice", "Alice"), authored("again", "alice", "Alice")];
+        assert!(!needs_attribution(&solo));
+    }
+
+    #[test]
+    fn a_second_speaker_names_everyone_including_earlier_messages() {
+        // Retroactive on purpose: the transcript becomes ambiguous the moment a
+        // second person arrives, and that ambiguity covers what came before.
+        let shared = vec![authored("hi", "alice", "Alice"), authored("hello", "bob", "Bob")];
+        assert!(needs_attribution(&shared));
+    }
+
+    #[test]
+    fn an_unattributed_conversation_is_not_named() {
+        // Every message from before authorship existed, and machine-written
+        // notes that are deliberately author-less. Nothing to say.
+        let legacy = vec![EventRecord {
+            seq: 1,
+            ts_ms: 0,
+            event: SessionEvent::UserMessage(UserMsg {
+                text: "from before".into(),
+                attachments: vec![],
+                author: None,
+            }),
+        }];
+        assert!(!needs_attribution(&legacy));
+    }
+
+    #[test]
+    fn an_author_naming_nobody_produces_no_prefix() {
+        // A blank byline reads as a bug and teaches the model to emit one.
+        assert_eq!(
+            author_prefix(Some(&Author {
+                id: "x".into(),
+                display: "   ".into(),
+                surface: "web".into()
+            })),
+            None
+        );
+        assert_eq!(author_prefix(None), None);
+    }
+
+    #[test]
+    fn a_named_speaker_is_prefixed_onto_the_text_itself() {
+        // Onto the text, not beside it as a `name` key: the summariser
+        // flattens spans to `[role] content`, so a sibling field would vanish
+        // from every compaction summary — and a provider is free to drop an
+        // unknown key without saying so.
+        let msg = UserMsg {
+            text: "ship it".into(),
+            attachments: vec![],
+            author: None,
+        };
+        assert_eq!(user_content(&msg, Some("[Bob] ")), json!("[Bob] ship it"));
+    }
+
+    #[test]
+    fn an_image_with_no_words_still_carries_its_speaker() {
+        // Otherwise, in a shared conversation, nobody can tell whose picture
+        // this is — the one case where the prefix has no text to attach to.
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![attach("shot.png", "image/png", "\u{89}PNG-ish")],
+            author: None,
+        };
+        let parts = user_content(&msg, Some("[Bob] "));
+        assert_eq!(parts[0]["text"], json!("[Bob]"));
+        assert_eq!(parts[1]["type"], json!("image_url"));
+    }
+
     #[test]
     fn plain_text_stays_a_bare_string() {
         // Every provider accepts a string; promoting to multi-part when there is
         // nothing to promote would break the ones that do not.
-        let msg = UserMsg { text: "hello".into(), attachments: vec![] };
-        assert_eq!(user_content(&msg), json!("hello"));
+        let msg = UserMsg { text: "hello".into(), attachments: vec![], author: None };
+        assert_eq!(user_content(&msg, None), json!("hello"));
     }
 }
 

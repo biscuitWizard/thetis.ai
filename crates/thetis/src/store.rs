@@ -33,6 +33,20 @@ pub struct LoginRow {
     pub user_agent: String,
 }
 
+/// Someone invited into a conversation they do not own.
+///
+/// Being listed here grants the *right to speak*, never any authority: what a
+/// participant's turn may do is `policy(speaker) ∩ ceiling(session)`, so an
+/// invitation into a privileged conversation lends none of its privilege.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ParticipantRow {
+    /// The invited account's id.
+    pub account: String,
+    /// Who invited them — the owner, always, but recorded so an audit can say.
+    pub added_by: String,
+    pub added_ms: u64,
+}
+
 /// How far a session has got, read while its turn is still running.
 ///
 /// Deliberately three numbers and no interpretation: a caller that wants to
@@ -91,6 +105,24 @@ const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
 /// it breaks them at instantiation. A row here is also the authority on whether
 /// a session is a sub-agent at all, which is what the depth guard reads.
 const SUBAGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("subagents");
+/// session id -> EffectivePolicy (json): the most authority any turn in this
+/// conversation may hold, whoever is speaking.
+///
+/// The other half of `policy(speaker) ∩ ceiling(session)`. A side table for the
+/// same reason `OWNERS` and `SUBAGENTS` are: `SessionMeta` is a WIT record
+/// shared with every guest, and widening it breaks them at instantiation.
+///
+/// A missing row means no ceiling, which resolves to the speaker's own policy
+/// and is exactly today's behaviour — so conversations that predate this are
+/// unaffected rather than needing a migration.
+const CEILINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("session_ceilings");
+/// (session id, account id) -> ParticipantRow (json): someone other than the
+/// owner who may speak in this conversation.
+///
+/// The owner is *not* listed here — ownership already implies participation, so
+/// duplicating it would give two places to disagree about who owns what.
+const PARTICIPANTS: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("session_participants");
 
 /// The title a conversation starts with, and the only one auto-titling will
 /// overwrite.
@@ -132,6 +164,8 @@ impl Store {
             txn.open_table(SKILL_VECTORS)?;
             txn.open_table(BRANCHES)?;
             txn.open_table(SUBAGENTS)?;
+            txn.open_table(CEILINGS)?;
+            txn.open_table(PARTICIPANTS)?;
         }
         txn.commit()?;
 
@@ -281,6 +315,115 @@ impl Store {
         self.owner_of(&root)
     }
 
+    /// Whether an account may speak in a conversation it does not own.
+    ///
+    /// Resolved at the root, so a sub-agent inherits its parent's guest list
+    /// rather than needing rows of its own.
+    pub fn is_participant(&self, id: &str, account: &str) -> Result<bool> {
+        let mut root = id.to_owned();
+        while let Some(row) = self.get_subagent(&root)? {
+            root = row.parent_id;
+        }
+        if self.owner_of(&root)?.as_deref() == Some(account) {
+            return Ok(true);
+        }
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(PARTICIPANTS)?;
+        Ok(table.get((root.as_str(), account))?.is_some())
+    }
+
+    /// Everyone invited into a conversation, oldest invitation first.
+    pub fn participants(&self, id: &str) -> Result<Vec<ParticipantRow>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(PARTICIPANTS)?;
+        let mut out: Vec<ParticipantRow> = Vec::new();
+        for row in table.range((id, "")..(id, "\u{ffff}"))? {
+            let (_, v) = row?;
+            if let Ok(parsed) = serde_json::from_slice::<ParticipantRow>(v.value()) {
+                out.push(parsed);
+            }
+        }
+        out.sort_by_key(|p| p.added_ms);
+        Ok(out)
+    }
+
+    pub fn add_participant(&self, id: &str, account: &str, added_by: &str) -> Result<()> {
+        let row = ParticipantRow {
+            account: account.to_owned(),
+            added_by: added_by.to_owned(),
+            added_ms: now_ms(),
+        };
+        let encoded = serde_json::to_vec(&row)?;
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(PARTICIPANTS)?
+                .insert((id, account), encoded.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_participant(&self, id: &str, account: &str) -> Result<bool> {
+        let tx = self.db.begin_write()?;
+        let existed = {
+            let mut t = tx.open_table(PARTICIPANTS)?;
+            let previous = t.remove((id, account))?;
+            let had = previous.is_some();
+            drop(previous);
+            had
+        };
+        tx.commit()?;
+        Ok(existed)
+    }
+
+    /// Conversations an account was invited into but does not own.
+    pub fn sessions_participating(&self, account: &str) -> Result<Vec<String>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(PARTICIPANTS)?;
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (k, _) = row?;
+            let (session, who) = k.value();
+            if who == account {
+                out.push(session.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// The ceiling stored for a conversation, if it has one.
+    ///
+    /// Read from the root, not the session: a sub-agent runs under the same
+    /// ceiling as the conversation that spawned it, and `owner_of_root` already
+    /// establishes that a child's authority is not its own to widen.
+    pub fn ceiling_of(&self, id: &str) -> Result<Option<crate::policy::EffectivePolicy>> {
+        let mut root = id.to_owned();
+        while let Some(row) = self.get_subagent(&root)? {
+            root = row.parent_id;
+        }
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(CEILINGS)?;
+        let Some(raw) = table.get(root.as_str())? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice(raw.value()).ok())
+    }
+
+    /// Stamps the most authority any turn in this conversation may hold.
+    ///
+    /// Write-once in spirit: the callers set it at creation. Nothing exposed to
+    /// a guest reaches this, because a conversation that could raise its own
+    /// ceiling would not be a ceiling.
+    pub fn set_ceiling(&self, id: &str, policy: &crate::policy::EffectivePolicy) -> Result<()> {
+        let encoded = serde_json::to_vec(policy)?;
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(CEILINGS)?.insert(id, encoded.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_owner(&self, id: &str, owner: &str) -> Result<()> {
         let tx = self.db.begin_write()?;
         {
@@ -346,6 +489,17 @@ impl Store {
         Ok(out)
     }
 
+    /// The conversations an account should see listed: the ones it owns, plus
+    /// the ones it has been invited into.
+    ///
+    /// Participation is included here rather than merged by the caller so that
+    /// every listing path agrees. A conversation someone can open but cannot
+    /// find is not shared with them in any useful sense — and the sidebar is
+    /// the only way to reach one, so leaving it out would make an invitation
+    /// deliverable only by pasting a link.
+    ///
+    /// `None` means every conversation, for a principal with
+    /// `see_all_sessions`.
     pub fn list_sessions_owned(
         &self,
         owner: Option<&str>,
@@ -355,6 +509,7 @@ impl Store {
         let sessions = tx.open_table(SESSIONS)?;
         let children = tx.open_table(SUBAGENTS)?;
         let owners = tx.open_table(OWNERS)?;
+        let invited = tx.open_table(PARTICIPANTS)?;
         let mut out = Vec::new();
         for row in sessions.iter()? {
             let (id, v) = row?;
@@ -362,7 +517,8 @@ impl Store {
                 continue;
             }
             if let Some(want) = owner {
-                if owners.get(id.value())?.as_ref().map(|v| v.value()) != Some(want) {
+                let owned = owners.get(id.value())?.as_ref().map(|v| v.value()) == Some(want);
+                if !owned && invited.get((id.value(), want))?.is_none() {
                     continue;
                 }
             }
@@ -1228,6 +1384,7 @@ mod tests {
         SessionEvent::UserMessage(UserMsg {
             text: text.to_string(),
             attachments: vec![],
+            author: None,
         })
     }
 
@@ -1235,6 +1392,183 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         (store, dir)
+    }
+
+    /// redb refuses to open a table nothing has ever written, so a table
+    /// missing from `Store::open`'s create-up-front block works perfectly
+    /// until the first *read* on a fresh database — and then fails with
+    /// `Table 'x' does not exist` from a call site that looks correct.
+    ///
+    /// `session_ceilings` shipped that way for one build. The comment in
+    /// `open` asked for the discipline; this asserts it, by reading the
+    /// declarations out of the source rather than trusting a hand-kept list.
+    #[test]
+    fn every_declared_table_is_created_when_the_database_is_opened() {
+        let src = include_str!("store.rs");
+        let block = src
+            .split("let txn = db.begin_write()?;")
+            .nth(1)
+            .and_then(|rest| rest.split("txn.commit()?;").next())
+            .expect("Store::open still creates its tables in one block");
+
+        let mut missing = vec![];
+        for line in src.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("const ") else {
+                continue;
+            };
+            if !rest.contains("TableDefinition") {
+                continue;
+            }
+            let Some(name) = rest.split(':').next() else {
+                continue;
+            };
+            if !block.contains(&format!("open_table({name})")) {
+                missing.push(name.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these tables are declared but not created in Store::open, so the \
+             first read on a fresh database will fail: {missing:?}"
+        );
+    }
+
+    /// Whether adding an `option<>` field to a WIT record can read back rows
+    /// written before the field existed.
+    ///
+    /// This decides whether authorship can be added to `user-msg` at all.
+    /// `SessionEvent` is persisted as plain serde over the bindgen types, with
+    /// no version tag and no migration, and **`#[serde(default)]` cannot be
+    /// added to a generated type** — `additional_derives` appends derives, not
+    /// field attributes. So if serde treated a missing field as an error even
+    /// for `Option`, the field could not be added without rewriting every
+    /// stored event, and `events()` propagates the first failure, which would
+    /// make whole conversations unreadable.
+    ///
+    /// Serde's derive does fill a missing `Option` field with `None`. Asserted
+    /// rather than assumed, because the entire contract change rests on it.
+    #[test]
+    fn a_missing_option_field_deserialises_as_none() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Shaped {
+            text: String,
+            author: Option<String>,
+        }
+
+        // A row written before the field existed.
+        let legacy = r#"{"text":"hello"}"#;
+        let read: Shaped = serde_json::from_str(legacy).expect(
+            "a missing option field must read back as None, or authorship \
+             cannot be added to user-msg without a migration",
+        );
+        assert_eq!(read.author, None);
+        assert_eq!(read.text, "hello");
+
+        // An explicit null is the same thing, which is what a round-trip of
+        // `None` through the wire produces.
+        let round: Shaped = serde_json::from_str(r#"{"text":"hi","author":null}"#).unwrap();
+        assert_eq!(round.author, None);
+    }
+
+    /// The same property through the real event pipeline: a stored blob in
+    /// today's shape must still come back out of `events()` after the record
+    /// grows. Written as a raw insert, because the point is to read bytes that
+    /// the *current* struct did not write.
+    #[test]
+    fn an_event_row_in_the_old_shape_still_reads_back() {
+        let (store, _d) = temp_store();
+        let s = store.create_session(None, "agent", "local").unwrap();
+
+        // Exactly what a pre-authorship user message looks like on disk. The
+        // variant is spelled the way serde derives it from the Rust enum, not
+        // the way the WIT case is written — checked against a real round-trip
+        // below rather than guessed, because guessing it wrong is how this
+        // test passes for the wrong reason.
+        let probe = serde_json::to_string(&EventRecord {
+            seq: 1,
+            ts_ms: 1,
+            event: user("from before"),
+        })
+        .unwrap();
+        assert!(
+            probe.contains("UserMessage"),
+            "the on-disk spelling changed; this test's fixture is stale: {probe}"
+        );
+        let legacy =
+            br#"{"seq":1,"ts_ms":1,"event":{"UserMessage":{"text":"from before","attachments":[]}}}"#;
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(EVENTS).unwrap();
+            t.insert((s.id.as_str(), 1u64), legacy.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let events = store
+            .events(&s.id, 0)
+            .expect("one legacy row must not make the whole conversation unreadable");
+        assert_eq!(events.len(), 1);
+        match &events[0].event {
+            SessionEvent::UserMessage(msg) => {
+                assert_eq!(msg.text, "from before");
+                assert!(
+                    msg.author.is_none(),
+                    "a message from before authorship must read as unattributed"
+                );
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    /// The other direction: an author that was stored must come back intact.
+    ///
+    /// Worth its own test because the legacy one above passes just as happily
+    /// if `author` is silently dropped on the way *in* — absence is what it
+    /// asserts. Together they pin both halves.
+    #[test]
+    fn an_author_survives_a_round_trip_through_the_store() {
+        let (store, _d) = temp_store();
+        let s = store.create_session(None, "agent", "local").unwrap();
+        store
+            .append_event(
+                &s.id,
+                SessionEvent::UserMessage(UserMsg {
+                    text: "mine".into(),
+                    attachments: vec![],
+                    author: Some(crate::bindings::types::Author {
+                        id: "alice".into(),
+                        display: "Alice".into(),
+                        surface: "web".into(),
+                    }),
+                }),
+            )
+            .unwrap();
+
+        let events = store.events(&s.id, 0).unwrap();
+        match &events[0].event {
+            SessionEvent::UserMessage(msg) => {
+                let a = msg.author.as_ref().expect("the author was stored");
+                assert_eq!(a.id, "alice");
+                assert_eq!(a.display, "Alice");
+                assert_eq!(a.surface, "web");
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    /// And the property itself, not just its spelling: a brand-new database
+    /// must answer every read rather than erroring about a missing table.
+    #[test]
+    fn a_fresh_database_answers_reads_before_anything_is_written() {
+        let (store, _d) = temp_store();
+        let s = store.create_session(None, "agent", "local").unwrap();
+
+        assert!(store.ceiling_of(&s.id).unwrap().is_none());
+        assert!(store.participants(&s.id).unwrap().is_empty());
+        assert!(store.sessions_participating("nobody").unwrap().is_empty());
+        // The owner counts as a participant without a row being written.
+        assert!(store.is_participant(&s.id, "local").unwrap());
+        assert!(!store.is_participant(&s.id, "someone-else").unwrap());
     }
 
     // The trap this exists to close. Local mode stamps `local` on everything,
@@ -1300,6 +1634,47 @@ mod tests {
 
         let claimable = store.sessions_needing_an_owner(None).unwrap();
         assert_eq!(claimable, vec![parent.id.clone()], "{claimable:?}");
+    }
+
+    /// An invitation has to show up in the sidebar, because the sidebar is the
+    /// only way to reach a conversation. Sharing something the other person
+    /// cannot find is not sharing it.
+    #[test]
+    fn a_conversation_you_were_invited_into_is_listed_for_you() {
+        let (store, _d) = temp_store();
+        let hers = store
+            .create_session(Some("Alice's".into()), "agent", "alice")
+            .unwrap();
+        let his = store
+            .create_session(Some("Bob's".into()), "agent", "bob")
+            .unwrap();
+
+        // Before the invitation, Bob sees only his own.
+        let seen = store.list_sessions_owned(Some("bob"), false).unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].id, his.id);
+
+        store.add_participant(&hers.id, "bob", "alice").unwrap();
+
+        let seen = store.list_sessions_owned(Some("bob"), false).unwrap();
+        let ids: Vec<&str> = seen.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&hers.id.as_str()), "the invitation is listed");
+        assert!(ids.contains(&his.id.as_str()), "and so is his own");
+        assert_eq!(seen.len(), 2);
+
+        // Alice's own list is unchanged: inviting someone does not add their
+        // conversations to yours.
+        assert_eq!(
+            store.list_sessions_owned(Some("alice"), false).unwrap().len(),
+            1
+        );
+
+        // And it goes away again when the invitation does.
+        assert!(store.remove_participant(&hers.id, "bob").unwrap());
+        assert_eq!(
+            store.list_sessions_owned(Some("bob"), false).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -1530,6 +1905,7 @@ mod tests {
                         mime: "image/png".into(),
                         data_base64: "iVBORw0KGgo=".into(),
                     }],
+                    author: None,
                 }),
             )
             .unwrap();
@@ -1575,6 +1951,7 @@ mod tests {
                 SessionEvent::UserMessage(UserMsg {
                     text: String::new(),
                     attachments: vec![image.clone()],
+                    author: None,
                 }),
             )
             .unwrap();
@@ -1589,6 +1966,7 @@ mod tests {
                 SessionEvent::UserMessage(UserMsg {
                     text: String::new(),
                     attachments: vec![image.clone(), image],
+                    author: None,
                 }),
             )
             .unwrap();
