@@ -86,8 +86,25 @@ impl EffectivePolicy {
                         | Cap::WorkspaceWrite
                 )
     }
+    /// Whether this user may run `id`.
+    ///
+    /// Unrestricted means unrestricted: any id the provider will take, not
+    /// only the ones `[[models]]` happens to name. The configured catalogue is
+    /// what the picker *offers*, never the set of models that exist — one
+    /// added through the chat lives in the gateway's own overlay and is not in
+    /// `[[models]]` at all. Holding an unrestricted user to that list meant
+    /// editing configuration and restarting the process before a model could
+    /// be tried once, and it broke conversations already running on a model
+    /// added that way, which is how this was found: `openai/gpt-5.6-sol`, in
+    /// use for a day, refused the moment accounts were turned on.
+    ///
+    /// A wrong id comes back from the provider as a clear error on the next
+    /// turn, which is a better place to find out than a rejected click.
+    ///
+    /// A role or user that names `models` means it, and then the list is a
+    /// closed set — that is the whole point of setting it.
     pub fn allows_model(&self, id: &str) -> bool {
-        self.models.iter().any(|v| v == id)
+        !self.models_restricted || self.models.iter().any(|v| v == id)
     }
     pub fn allows_mode(&self, id: &str) -> bool {
         self.modes.iter().any(|v| v == id)
@@ -247,6 +264,43 @@ mod tests {
             models_restricted: false,
         }
     }
+    // The configured catalogue is what the picker offers, not the set of
+    // models that exist. A model added through the chat lives in the gateway's
+    // overlay and is in no `[[models]]` block, so holding an unrestricted user
+    // to that list broke a conversation that had been running on one for a day
+    // the moment accounts were switched on.
+    #[test]
+    fn an_unrestricted_user_may_run_a_model_the_config_never_named() {
+        let p = base();
+        assert!(!p.models_restricted);
+        assert!(p.allows_model("a"), "configured ones obviously still pass");
+        assert!(
+            p.allows_model("openai/gpt-5.6-sol"),
+            "an id the catalogue does not name is for the provider to judge"
+        );
+    }
+
+    // But a list that was set is a list that was meant.
+    #[test]
+    fn a_narrowed_list_is_a_closed_set() {
+        let l = PolicyLayer {
+            models: Some(vec!["a".into()]),
+            ..Default::default()
+        };
+        let p = resolve(
+            &base(),
+            &[&l],
+            "x",
+            &["a".into(), "b".into()],
+            &["agent".into()],
+        )
+        .unwrap();
+        assert!(p.models_restricted);
+        assert!(p.allows_model("a"));
+        assert!(!p.allows_model("b"), "narrowing has to actually narrow");
+        assert!(!p.allows_model("openai/gpt-5.6-sol"));
+    }
+
     #[test]
     fn prefixes_and_read_only() {
         let mut p = base();
