@@ -108,6 +108,7 @@ of them. Get the current list from the tool that owns it.
 |---|---|
 | Config keys and their values | `list_config`, `read_config` |
 | Your available tools | The tool list in your own prompt |
+| **The model you are running on** | `model_info` — *never* `read_config` |
 | Model ids | `list_config` with prefix `models` |
 | Mode ids | `list_config` with prefix `modes` |
 | Revision numbers | `history` |

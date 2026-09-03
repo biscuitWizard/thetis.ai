@@ -37,6 +37,11 @@ mod workspace;
 // must still be able to end its turn rather than spin forever.
 const MAX_TODO_NUDGES: u32 = 2;
 
+/// Per-session KV key holding the model id the provider reported on the last
+/// completed stream. Read by the `model_info` tool. Shared with `tools.rs`,
+/// which must not spell the string a second time.
+pub(crate) const SERVED_MODEL_KEY: &str = "__served_model";
+
 struct Component;
 
 
@@ -905,6 +910,15 @@ impl Turn {
                 }
                 Ok(StreamChunk::ToolCalls(calls)) => reply.tool_calls = calls,
                 Ok(StreamChunk::Finished(info)) => {
+                    // What the provider says it actually served, which is the
+                    // only trustworthy answer to "what model is this?". The
+                    // config file is a statement of intent: it is read at
+                    // startup, it is per-worktree, and a session override or a
+                    // `wire_model` can all make it a lie. Stashed here so
+                    // `model_info` can report ground truth instead of guessing.
+                    if !info.model.is_empty() {
+                        sys::kv_put(&self.session_id, SERVED_MODEL_KEY, &info.model);
+                    }
                     reply.model = info.model;
                     reply.usage = info.usage;
                     break;

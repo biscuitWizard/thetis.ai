@@ -67,7 +67,7 @@ tool_prefix = ""
 
 [llm]
 base_url = "https://openrouter.ai/api/v1"
-model = "anthropic/claude-opus-5"
+model = "openai/gpt-5.6-sol"
 # How long to wait on a silent server. For a streaming completion — which is
 # what a turn uses — this is a *read* timeout: it resets every time bytes
 # arrive, so a slow local model may generate for as long as it likes provided
@@ -217,6 +217,10 @@ label = "Claude Opus 5"
 [[models]]
 id = "anthropic/claude-sonnet-5"
 label = "Claude Sonnet 5"
+
+[[models]]
+id = "openai/gpt-5.6-sol"
+label = "GPT-5.6 Sol"
 
 [[models]]
 id = "openai/gpt-4o"
@@ -374,7 +378,7 @@ default_mode = ""
 id = "scout"
 label = "Scout"
 description = "Reads and searches. Answers a question about the code or the web without changing anything."
-model = "anthropic/claude-sonnet-5"
+model = "openai/gpt-5.6-sol"
 mode = "plan"
 prompt = """
 You are a scout. Your job is to find something out and report it accurately.
@@ -392,7 +396,7 @@ answer covering a gap is worse than nothing, because it will be acted on.
 id = "worker"
 label = "Worker"
 description = "Full access. Carries out a bounded implementation task in the shared checkout."
-model = "anthropic/claude-sonnet-5"
+model = "openai/gpt-5.6-sol"
 mode = "agent"
 prompt = """
 You are carrying out one bounded piece of implementation work.
