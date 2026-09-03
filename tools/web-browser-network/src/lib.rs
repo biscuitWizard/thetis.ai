@@ -1,9 +1,4 @@
-//! List the network requests the current page made, with status codes, or inspect one in detail.
-//!
-//! A Thetis tool component. `describe` tells the model what this tool is and
-//! what arguments it takes; `invoke` does the work. Edit this file with
-//! `write_code` or `patch_code` — every edit rebuilds and reloads immediately,
-//! and the compiler's output comes back in the tool result.
+//! What the page asked the network for.
 
 wit_bindgen::generate!({
     world: "tool",
@@ -11,11 +6,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// `tool-manifest` is already in scope from the world's own `use types.{...}`;
-// anything else has to be imported from the types interface.
-use thetis::grip::sys;
-use thetis::grip::types::LogLevel;
-use serde_json::{json, Value};
+mod client;
+
+use serde_json::json;
 
 struct Component;
 
@@ -23,48 +16,43 @@ impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
             name: "web-browser-network".to_string(),
-            description: "List the network requests the current page made, with status codes, or inspect one in detail.".to_string(),
-            // Must be a JSON Schema object: it becomes the tool's parameter
-            // definition in the model's tool list.
+            description: "List the requests the page has made since the last navigation, as \
+                          numbered lines with method, status and URL. Use `failedOnly` to go \
+                          straight to the 404s and connection failures behind a missing \
+                          image or an empty list, `filter` to match a URL by regex, and \
+                          `index` to pull one request's full detail. The log holds the most \
+                          recent 500 entries and is cleared on navigation."
+                .to_string(),
             args_schema_json: json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "index": {
+                        "type": "integer",
+                        "description": "Show this one request in full, numbered as in the list (starts at 1)."
+                    },
+                    "filter": {
                         "type": "string",
-                        "description": "What to work on."
+                        "description": "Only requests whose URL or status matches this regular expression, case-insensitively."
+                    },
+                    "failedOnly": {
+                        "type": "boolean",
+                        "description": "Only requests that failed outright or returned 400 and above."
                     }
                 },
-                "required": ["input"],
                 "additionalProperties": false
             })
             .to_string(),
-            // Host capabilities this tool needs, e.g. "sandbox".
-            capabilities: vec![],
+            capabilities: vec![
+                "http".to_string(),
+                "read-only".to_string(),
+                "group:browser".to_string(),
+            ],
         }
     }
 
-    /// `config_json` is this tool's own `[tools.web-browser-network]` block from
-    /// thetis.toml, or `{}` when it has none. Settings a tool needs — an API
-    /// key, an endpoint, a default — belong there rather than hardcoded here.
-    fn invoke(
-        _session_id: String,
-        args_json: String,
-        config_json: String,
-    ) -> Result<String, String> {
-        let args: Value = serde_json::from_str(&args_json)
-            .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
-        let config: Value = serde_json::from_str(&config_json).unwrap_or(json!({}));
-        let _ = &config;
-
-        let input = args
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or("missing required argument 'input'")?;
-
-        sys::log(LogLevel::Debug, &format!("web-browser-network invoked with: {input}"));
-
-        // Replace this with the real implementation.
-        Ok(format!("web-browser-network is a stub; it received: {input}"))
+    fn invoke(session_id: String, args_json: String, config_json: String) -> Result<String, String> {
+        let args = client::args(&args_json)?;
+        client::call("network", &session_id, args, &config_json)
     }
 }
 

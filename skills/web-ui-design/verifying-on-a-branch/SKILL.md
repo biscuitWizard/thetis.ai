@@ -2,8 +2,8 @@
 name = "Verifying a UI change on a branch"
 brief = "Prove a UI change works before merging, by running your branch's own gateway on a spare port and driving headless Chrome over CDP."
 when_to_use = "Use when a UI edit under gateways/gateway-web/src/ui builds green but the running page does not show it, when curl on the live port 404s a file you just added to assets.rs, or when a change needs real browser evidence — layout geometry, console errors, responsive behaviour — before it is merged to trunk. Also use when playwright MCP tools are unavailable and there is no node on the box. Not for reasoning about CSS or picking tokens; that is the parent skill."
-tags = ["ui", "verify", "browser", "headless", "chrome", "cdp", "gateway", "branch", "404", "stale", "tool-group:shell", "tool-group:selfmod"]
-version = 2
+tags = ["ui", "verify", "browser", "headless", "chrome", "cdp", "gateway", "branch", "404", "stale", "tool-group:shell", "tool-group:selfmod", "tool-group:browser"]
+version = 3
 ---
 
 # Verifying a UI change on a branch
@@ -105,9 +105,28 @@ To move the test gateway onto a new commit, keep the warm data dir and
 `git -C /tmp/uitest fetch && reset --hard origin/HEAD`, then restart it — that
 is seconds, against minutes for a fresh clone.
 
-## 2. Drive headless Chrome over CDP
+## 2. Drive the page with the `web-browser-*` tools
 
-Playwright's chromium is on the box even when the MCP tools are not:
+Load the `browser` tool group (`tool_search "browser"`) and drive the page
+directly — `web-browser-navigate`, then `web-browser-evaluate` for the
+geometry assertions below, `web-browser-console` for errors, and
+`web-browser-state` with `kind: "viewport"` for each width. This is the
+route to use: no Chrome to launch, nothing to clean up, and the browser
+survives your own restarts because the sidecar is owned by the gateway.
+
+Two things to know. The refs (`e12`) in a snapshot belong to the snapshot that
+produced them, so take a fresh one after the page re-renders. And a screenshot
+returns only a *path* — it shows you nothing by itself, so assert on computed
+geometry and treat the image as an artifact for the operator.
+
+If the tools 403, the sidecar token is stale rather than the tools broken; see
+the token note in `thetis-internals` and re-seed
+`/opt/thetis/data/browser-token` from the running sidecar's environ.
+
+<details>
+<summary>Fallback: raw CDP, if the sidecar is down</summary>
+
+Playwright's chromium is on the box regardless:
 
 ```
 $HOME/.cache/ms-playwright/chromium-*/chrome-linux64/chrome \
@@ -120,9 +139,11 @@ the shortest path: `PUT /json/new?about:blank` for a target, then a raw
 websocket to `webSocketDebuggerUrl`, then `Runtime.enable`, `Log.enable`,
 `Emulation.setDeviceMetricsOverride`, `Page.navigate`, and
 `Runtime.evaluate` with `returnByValue`. Client frames must be masked; server
-frames are not.
+frames are not. Launch it with `setsid` and poll a file, per above.
+</details>
 
-Assert on **computed geometry**, not on screenshots you cannot see:
+Assert on **computed geometry**, not on screenshots you cannot see — pass this
+to `web-browser-evaluate` as an arrow function:
 
 ```js
 const r = bar.getBoundingClientRect();
@@ -207,3 +228,5 @@ helper script has to live in the worktree and be cleaned up after.
 | Gateway and Chrome vanish together | A Thetis restart killed the shell that owned them | Launch both with `setsid`, detached |
 | Probe never returns any output | Blocked in the foreground and cut off by a restart | Redirect to a file, detached; poll with short calls |
 | Everything 404s and paths look wrong | The project root was renamed under you | Re-read `env | grep -i thetis` and relaunch |
+| `web-browser-*` returns 403 | Sidecar token stale, not a tool fault | Re-seed `/opt/thetis/data/browser-token` from the sidecar's environ |
+| A ref like `e12` errors or hits the wrong node | Refs expire with their snapshot | Take a fresh `web-browser-snapshot` |

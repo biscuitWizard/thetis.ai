@@ -1,9 +1,4 @@
-//! Wait for text to appear or vanish, an element to reach a state, or the page to finish loading.
-//!
-//! A Thetis tool component. `describe` tells the model what this tool is and
-//! what arguments it takes; `invoke` does the work. Edit this file with
-//! `write_code` or `patch_code` — every edit rebuilds and reloads immediately,
-//! and the compiler's output comes back in the tool result.
+//! Wait for the page to catch up.
 
 wit_bindgen::generate!({
     world: "tool",
@@ -11,11 +6,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// `tool-manifest` is already in scope from the world's own `use types.{...}`;
-// anything else has to be imported from the types interface.
-use thetis::grip::sys;
-use thetis::grip::types::LogLevel;
-use serde_json::{json, Value};
+mod client;
+
+use serde_json::json;
 
 struct Component;
 
@@ -23,48 +16,64 @@ impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
             name: "web-browser-wait".to_string(),
-            description: "Wait for text to appear or vanish, an element to reach a state, or the page to finish loading.".to_string(),
-            // Must be a JSON Schema object: it becomes the tool's parameter
-            // definition in the model's tool list.
+            description: "Wait for the page to reach a state before going on: text to appear \
+                          or disappear, an element to become visible or detached, or loading \
+                          to finish. Every other browser tool already waits for the page to \
+                          settle, so reach for this only when that is not enough — a spinner \
+                          to clear, a toast to vanish, a slow XHR to land. Prefer waiting on \
+                          text or an element over a fixed sleep, which is slower and still \
+                          races."
+                .to_string(),
             args_schema_json: json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "text": { "type": "string", "description": "Wait until this text is visible on the page." },
+                    "textGone": { "type": "string", "description": "Wait until this text is no longer visible — a spinner or a toast." },
+                    "target": {
                         "type": "string",
-                        "description": "What to work on."
+                        "description": "Wait for this element: a ref like 'e7' from a snapshot, or a CSS selector."
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["visible", "hidden", "attached", "detached"],
+                        "description": "Which state `target` must reach. Defaults to visible."
+                    },
+                    "loadState": {
+                        "type": "string",
+                        "enum": ["load", "domcontentloaded", "networkidle"],
+                        "description": "Wait for this load state. 'networkidle' is the one for a page that renders itself after load."
+                    },
+                    "time": {
+                        "type": "number",
+                        "description": "Wait this many milliseconds unconditionally. The last resort — prefer a condition."
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "How long to wait before giving up, in milliseconds. Defaults to the sidecar's own timeout (15000)."
                     }
                 },
-                "required": ["input"],
                 "additionalProperties": false
             })
             .to_string(),
-            // Host capabilities this tool needs, e.g. "sandbox".
-            capabilities: vec![],
+            capabilities: vec![
+                "http".to_string(),
+                "read-only".to_string(),
+                "group:browser".to_string(),
+            ],
         }
     }
 
-    /// `config_json` is this tool's own `[tools.web-browser-wait]` block from
-    /// thetis.toml, or `{}` when it has none. Settings a tool needs — an API
-    /// key, an endpoint, a default — belong there rather than hardcoded here.
-    fn invoke(
-        _session_id: String,
-        args_json: String,
-        config_json: String,
-    ) -> Result<String, String> {
-        let args: Value = serde_json::from_str(&args_json)
-            .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
-        let config: Value = serde_json::from_str(&config_json).unwrap_or(json!({}));
-        let _ = &config;
-
-        let input = args
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or("missing required argument 'input'")?;
-
-        sys::log(LogLevel::Debug, &format!("web-browser-wait invoked with: {input}"));
-
-        // Replace this with the real implementation.
-        Ok(format!("web-browser-wait is a stub; it received: {input}"))
+    fn invoke(session_id: String, args_json: String, config_json: String) -> Result<String, String> {
+        let args = client::args(&args_json)?;
+        // The sidecar checks these in order and falls through to a bare settle,
+        // which would look like a silent no-op to the caller.
+        const CONDITIONS: &[&str] = &["text", "textGone", "target", "loadState", "time"];
+        if !CONDITIONS.iter().any(|k| args.contains_key(*k)) {
+            return Err("nothing to wait for: give one of `text`, `textGone`, `target`, \
+                        `loadState` or `time`."
+                .to_string());
+        }
+        client::call("wait", &session_id, args, &config_json)
     }
 }
 

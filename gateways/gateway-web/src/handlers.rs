@@ -680,9 +680,13 @@ fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
             return if known(id) { id } else { ungrouped }.to_string();
         }
     }
+    // Order matters: the first match wins, so `web-browser-` must precede
+    // `web-`, or the browser tools would be filed under web search. Kept in
+    // step with PREFIX_RULES in agents/agent-core/src/groups.rs.
     for (prefix, id) in [
         ("bq-", "bigquery"),
         ("notion-", "notion"),
+        ("web-browser-", "browser"),
         ("web-", "web"),
         ("git-", "github"),
     ] {

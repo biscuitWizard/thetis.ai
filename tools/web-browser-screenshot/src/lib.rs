@@ -1,9 +1,4 @@
-//! Capture the current page as an image or PDF, written to the shared workspace, returning the path.
-//!
-//! A Thetis tool component. `describe` tells the model what this tool is and
-//! what arguments it takes; `invoke` does the work. Edit this file with
-//! `write_code` or `patch_code` — every edit rebuilds and reloads immediately,
-//! and the compiler's output comes back in the tool result.
+//! Capture the page as an image or a PDF.
 
 wit_bindgen::generate!({
     world: "tool",
@@ -11,11 +6,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// `tool-manifest` is already in scope from the world's own `use types.{...}`;
-// anything else has to be imported from the types interface.
-use thetis::grip::sys;
-use thetis::grip::types::LogLevel;
-use serde_json::{json, Value};
+mod client;
+
+use serde_json::json;
 
 struct Component;
 
@@ -23,48 +16,60 @@ impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
             name: "web-browser-screenshot".to_string(),
-            description: "Capture the current page as an image or PDF, written to the shared workspace, returning the path.".to_string(),
-            // Must be a JSON Schema object: it becomes the tool's parameter
-            // definition in the model's tool list.
+            description: "Capture the current page as an image, or as a PDF with \
+                          action='pdf'. The file is written under the shared workspace and \
+                          only its path comes back — a tool result is far too small to carry \
+                          an image inline, so read it with the file tools or open the path in \
+                          the UI. JPEG at quality 60 by default because it is much smaller; \
+                          ask for PNG when you need exact pixels or transparency. Note that \
+                          this shows you nothing directly: to check a layout, take the shot \
+                          and then look at the file."
+                .to_string(),
             args_schema_json: json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "action": {
                         "type": "string",
-                        "description": "What to work on."
+                        "enum": ["pdf"],
+                        "description": "Set to 'pdf' to print the page to PDF instead of capturing an image."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Capture just this element: a ref like 'e7' from a snapshot, or a CSS selector. Omit for the viewport."
+                    },
+                    "fullPage": {
+                        "type": "boolean",
+                        "description": "Capture the whole scrollable page rather than the visible viewport."
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["png", "jpeg"],
+                        "description": "Image format. Defaults to jpeg, or png if `filename` ends in .png."
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "description": "JPEG quality, 1-100. Defaults to 60. Ignored for PNG."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Basename for the file. Defaults to a timestamped name."
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Paper size for a PDF, e.g. 'Letter' or 'A4'. Defaults to Letter."
                     }
                 },
-                "required": ["input"],
                 "additionalProperties": false
             })
             .to_string(),
-            // Host capabilities this tool needs, e.g. "sandbox".
-            capabilities: vec![],
+            // Writes a file into the workspace, so not read-only.
+            capabilities: vec!["http".to_string(), "group:browser".to_string()],
         }
     }
 
-    /// `config_json` is this tool's own `[tools.web-browser-screenshot]` block from
-    /// thetis.toml, or `{}` when it has none. Settings a tool needs — an API
-    /// key, an endpoint, a default — belong there rather than hardcoded here.
-    fn invoke(
-        _session_id: String,
-        args_json: String,
-        config_json: String,
-    ) -> Result<String, String> {
-        let args: Value = serde_json::from_str(&args_json)
-            .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
-        let config: Value = serde_json::from_str(&config_json).unwrap_or(json!({}));
-        let _ = &config;
-
-        let input = args
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or("missing required argument 'input'")?;
-
-        sys::log(LogLevel::Debug, &format!("web-browser-screenshot invoked with: {input}"));
-
-        // Replace this with the real implementation.
-        Ok(format!("web-browser-screenshot is a stub; it received: {input}"))
+    fn invoke(session_id: String, args_json: String, config_json: String) -> Result<String, String> {
+        let args = client::args(&args_json)?;
+        client::call("screenshot", &session_id, args, &config_json)
     }
 }
 
