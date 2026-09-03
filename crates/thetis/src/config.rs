@@ -95,8 +95,15 @@ pub struct AuthSettings {
     pub local_policy: std::sync::Arc<crate::policy::EffectivePolicy>,
 }
 impl AuthSettings {
+    /// A user by id, matched without regard to case.
+    ///
+    /// Ids are validated as lowercase, so two of them can never differ by case
+    /// alone and this cannot be ambiguous. It exists because the id is what
+    /// somebody types into a login form, and they type their name the way they
+    /// write it: an account created as `bitmuse` was unreachable for anyone who
+    /// typed `bitMuse`, with "invalid credentials" as the only explanation.
     pub fn user(&self, id: &str) -> Option<&UserSpec> {
-        self.users.iter().find(|u| u.id == id)
+        self.users.iter().find(|u| u.id.eq_ignore_ascii_case(id))
     }
     pub fn policy_for(&self, owner: &str) -> std::sync::Arc<crate::policy::EffectivePolicy> {
         self.user(owner)
@@ -2317,7 +2324,8 @@ impl Config {
                     && u.id
                         .chars()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c)),
-                "invalid user id `{}`",
+                "invalid user id `{}`: use lowercase letters, digits, dot, underscore \
+                 or hyphen, up to 64 characters",
                 u.id
             );
             anyhow::ensure!(
@@ -2924,6 +2932,63 @@ mod tests {
             toml::from_str(text)?,
             Env::None,
         )
+    }
+
+    /// A users-mode config with one administrator.
+    fn one_user(id: &str) -> String {
+        format!(
+            r#"
+[auth]
+mode = "users"
+claim_unowned = "{id}"
+[[roles]]
+id = "admin"
+admin = true
+[[users]]
+id = "{id}"
+name = "Someone"
+role = "admin"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2g"
+"#
+        )
+    }
+
+    // The id is what somebody types into a login form, and they type their name
+    // the way they write it. An account created as `bitmuse` answered `bitMuse`
+    // with "invalid credentials" and no hint that the two were the same
+    // account. Ids are validated lowercase, so two can never differ by case
+    // alone and matching loosely cannot be ambiguous.
+    #[test]
+    fn signing_in_ignores_the_case_of_the_id() {
+        let cfg = from_toml(&one_user("bitmuse")).unwrap();
+        for typed in ["bitmuse", "bitMuse", "BitMuse", "BITMUSE"] {
+            assert!(
+                cfg.auth.user(typed).is_some(),
+                "`{typed}` has to reach the one account there is"
+            );
+        }
+        assert!(cfg.auth.user("someoneelse").is_none());
+    }
+
+    // The rule itself, and a message that says what it is. "invalid user id
+    // `bitMuse`" left the reader to guess which character was the problem.
+    #[test]
+    fn an_id_that_is_not_lowercase_is_refused_with_the_rule() {
+        let err = from_toml(&one_user("bitMuse")).unwrap_err().to_string();
+        assert!(err.contains("invalid user id"), "{err}");
+        assert!(err.contains("lowercase"), "the message has to say why: {err}");
+    }
+
+    #[test]
+    fn a_user_gets_the_whole_catalogue_unless_something_narrows_it() {
+        let cfg = from_toml(&one_user("bitmuse")).unwrap();
+        let policy = &cfg.auth.user("bitmuse").unwrap().policy;
+        assert!(!policy.models_restricted);
+        assert_eq!(
+            policy.models.len(),
+            cfg.models.len(),
+            "switching on accounts must not quietly cost somebody their models"
+        );
     }
 
     #[test]
