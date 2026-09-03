@@ -580,17 +580,14 @@ impl session::Host for HostState {
     async fn set_session_model(&mut self, session_id: String, model: String) -> Result<()> {
         self.budget.entered_host("set_session_model");
         self.may_access(&session_id)?;
+        // Only bites when a role or user has actually narrowed the list; see
+        // `EffectivePolicy::allows_model` for why an unrestricted user is not
+        // held to the configured catalogue.
         if !model.is_empty() && !self.policy.allows_model(&model) {
             return Err(err(format!(
                 "model `{model}` is not available to this user"
             )));
         };
-        // The configured list is what the picker
-        // offers, not what the provider supports, so checking against it meant a
-        // model had to be added to the config - and the process restarted -
-        // before it could ever be tried. A wrong id comes back from the provider
-        // as a clear error on the next turn, which is a better place to find out
-        // than a rejected click.
         self.grip()
             .persist
             .set_model(&session_id, &model)
