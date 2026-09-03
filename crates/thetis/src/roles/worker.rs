@@ -368,12 +368,20 @@ fn spawn_retry_notices(grip: Arc<Grip>) {
             if notice.session.is_empty() {
                 continue;
             }
+            // The budget, not just this attempt. Four attempts at a 180s read
+            // timeout is twelve minutes before the turn fails, and knowing
+            // that at the first notice rather than the last is the difference
+            // between waiting and wondering.
+            let left = notice.attempts.saturating_sub(notice.attempt);
             let text = format!(
-                "Attempt {} of {} got no answer from the model provider after {}s ({}). Retrying.",
+                "Attempt {} of {} got no answer from the model provider after {}s ({}). \
+                 Retrying — {} left, so up to about {} more minute(s) before this turn gives up.",
                 notice.attempt,
                 notice.attempts,
                 notice.elapsed.as_secs(),
                 notice.error,
+                left,
+                (u64::from(left) * notice.elapsed.as_secs()).div_ceil(60).max(1),
             );
             if let Err(e) = grip
                 .persist
