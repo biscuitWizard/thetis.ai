@@ -798,6 +798,7 @@ body { display: flex; flex-direction: column; }
 .chip-quiet:hover { color: var(--text); border-color: var(--hairline); }
 /* Still climbing: the figure includes a turn that has not finished paying. */
 .chip-quiet.is-live { color: var(--warn); }
+.chip-quiet.is-done { color: var(--ok); }
 
 /* --- turn avatars -----------------------------------------------------------
    A face per turn, in a gutter beside the conversation — outside the text
@@ -1893,6 +1894,16 @@ body { display: flex; flex-direction: column; }
   line-height: 1.55;
 }
 .panel-list { display: flex; flex-direction: column; gap: var(--gap-2); }
+
+.todo-item { display: flex; gap: var(--gap-3); padding: var(--gap-3); border: 1px solid var(--hairline); border-radius: var(--radius-sm); }
+.todo-status { flex: none; color: var(--text-faint); line-height: 1.4; }
+.todo-item.is-in_progress .todo-status { color: var(--warn); }
+.todo-item.is-completed .todo-status { color: var(--ok); }
+.todo-item.is-completed .todo-content, .todo-item.is-cancelled .todo-content { color: var(--text-faint); text-decoration: line-through; }
+.todo-copy { min-width: 0; }
+.todo-content { color: var(--text); font-size: var(--text-sm); }
+.todo-active { color: var(--warn); font-size: var(--text-xs); margin-top: var(--gap-1); }
+.todo-id { color: var(--text-faint); font-size: var(--text-xs); margin-top: var(--gap-1); }
 
 .card {
   background: var(--surface-2);
