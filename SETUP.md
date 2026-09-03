@@ -9,6 +9,28 @@ are shown.
 
 ---
 
+## Multi-user web access
+
+The default configuration uses `auth.mode = "local"`: no login page, one
+implicit administrator, and loopback-only Host/Origin checks.
+
+To enable accounts:
+
+1. Run `printf '%s\n' 'a long password' | thetis hash-password --stdin`.
+2. Put `[[roles]]` and `[[users]]` entries in `thetis.local.toml` (not the
+   tracked `thetis.toml`). Set `[auth] mode = "users"` and `claim_unowned` to
+   an administrator's user id.
+3. For remote access, set `server.bind` and `server.public_origin`, then put
+   Thetis behind a TLS reverse proxy which preserves `Host`.
+
+Thetis itself serves plain HTTP and deliberately does not trust
+`X-Forwarded-*`. Do not expose it directly to the public internet. Sessions use
+an HttpOnly, SameSite=Lax cookie with sliding expiry. Conversations and recall
+are owner-scoped. The workspace remains shared between accounts; deny its
+capabilities to roles that must not see or modify it.
+
+---
+
 ## 1. Prerequisites
 
 **Rust 1.82 or newer**, and the `wasm32-wasip2` target. That target is the only

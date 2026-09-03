@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::component::{HasSelf, Linker, ResourceTable};
-use wasmtime::{Config as WasmConfig, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
+use wasmtime::{
+    Config as WasmConfig, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
+};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::bindings;
 use crate::config::Config;
@@ -182,6 +184,8 @@ pub struct HostState {
     /// Session this call acts on behalf of. Imports use it to scope access so a
     /// guest cannot reach into a session it was not invoked for.
     pub session_id: Option<String>,
+    pub principal: Option<Arc<crate::auth::Principal>>,
+    pub policy: Arc<crate::policy::EffectivePolicy>,
     pub streams: HashMap<u64, StreamHandle>,
     pub next_stream_id: u64,
     /// Aspects the guest asked to swap at the end of this call (self-modification
@@ -236,9 +240,11 @@ impl Runtime {
         let ticker = engine.clone();
         std::thread::Builder::new()
             .name("thetis-epoch".into())
-            .spawn(move || loop {
-                std::thread::sleep(EPOCH_TICK);
-                ticker.increment_epoch();
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    ticker.increment_epoch();
+                }
             })
             .context("spawning epoch ticker")?;
 
@@ -290,6 +296,8 @@ impl Runtime {
             grip,
             budget,
             session_id,
+            principal: None,
+            policy: self.cfg.auth.local_policy.clone(),
             streams: HashMap::new(),
             next_stream_id: 1,
             pending_swaps: Vec::new(),

@@ -35,7 +35,7 @@
 //! Files are read on demand rather than cached, so editing a skill takes effect
 //! on the next turn without a restart.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -451,7 +451,7 @@ fn parse_frontmatter(source: &str) -> Result<(Frontmatter, String)> {
             Some(other) => {
                 return Err(anyhow!(
                     "children: expected \"auto\", \"none\" or a list, got \"{other}\""
-                ))
+                ));
             }
             None if v.is_array() => ChildSpec::Explicit(strings("children")),
             None => return Err(anyhow!("children: expected a string or a list")),
@@ -626,7 +626,10 @@ pub fn lint(tree: &SkillTree, id: &str) -> Vec<Diagnostic> {
     if skill.depth + 1 >= MAX_DEPTH && !tree.children(id).is_empty() {
         push(
             Severity::Warning,
-            format!("at depth {}, children below this are not loaded", skill.depth),
+            format!(
+                "at depth {}, children below this are not loaded",
+                skill.depth
+            ),
         );
     }
 
@@ -974,18 +977,22 @@ The body.
             &format!("---\nname = \"N\"\nbrief = \"{brief}\"\n---\nBody."),
         )]);
         let diags = lint(&tree, "s");
-        assert!(diags
-            .iter()
-            .any(|d| d.severity == Severity::Error && d.message.contains("over the 200 limit")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("over the 200 limit"))
+        );
     }
 
     #[test]
     fn lint_reports_a_missing_brief_as_an_error() {
         let (_d, tree) = tree_from(&[("s.md", "---\nname = \"N\"\n---\nBody.")]);
         let diags = lint(&tree, "s");
-        assert!(diags
-            .iter()
-            .any(|d| d.severity == Severity::Error && d.message.contains("brief is empty")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("brief is empty"))
+        );
     }
 
     #[test]
@@ -994,17 +1001,21 @@ The body.
             "s.md",
             "---\nname = \"N\"\nbrief = \"b\"\nrelated = [\"ghost\"]\n---\nBody.",
         )]);
-        assert!(lint(&tree, "s")
-            .iter()
-            .any(|d| d.message.contains("`ghost` does not exist")));
+        assert!(
+            lint(&tree, "s")
+                .iter()
+                .any(|d| d.message.contains("`ghost` does not exist"))
+        );
     }
 
     #[test]
     fn lint_reports_an_empty_leaf() {
         let (_d, tree) = tree_from(&[("s.md", "---\nname = \"N\"\nbrief = \"b\"\n---\n")]);
-        assert!(lint(&tree, "s")
-            .iter()
-            .any(|d| d.message.contains("nothing to disclose")));
+        assert!(
+            lint(&tree, "s")
+                .iter()
+                .any(|d| d.message.contains("nothing to disclose"))
+        );
     }
 
     #[test]
@@ -1023,9 +1034,11 @@ The body.
             .collect();
         let (_d, tree) = tree_from(&refs);
 
-        assert!(lint_all(&tree)
-            .iter()
-            .any(|d| d.id.is_empty() && d.message.contains("over the hard limit")));
+        assert!(
+            lint_all(&tree)
+                .iter()
+                .any(|d| d.id.is_empty() && d.message.contains("over the hard limit"))
+        );
     }
 
     #[test]
@@ -1055,7 +1068,10 @@ The body.
                 "---\nname = \"P\"\nbrief = \"Parent.\"\nwhen_to_use = \"When routing.\"\ntags = [\"meta\"]\n---\nx",
             ),
             ("p/references/notes.md", "notes"),
-            ("p/kid/SKILL.md", "---\nname = \"K\"\nbrief = \"Child.\"\n---\nx"),
+            (
+                "p/kid/SKILL.md",
+                "---\nname = \"K\"\nbrief = \"Child.\"\n---\nx",
+            ),
         ]);
 
         let card = l1_card(tree.get("p").unwrap(), &tree.children("p"));

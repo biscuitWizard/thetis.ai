@@ -178,9 +178,7 @@ impl Pager {
             // Reserve for closing a fence, plus one for an inline span that
             // this piece might yet open.
             let reserve = Self::reserve(in_code, !in_code);
-            let room = self
-                .limit
-                .saturating_sub(chars(&self.cur) + sep + reserve);
+            let room = self.limit.saturating_sub(chars(&self.cur) + sep + reserve);
             if room < 16 {
                 self.break_page();
                 continue;
@@ -289,7 +287,9 @@ mod tests {
     /// simply lost. Every character must now survive somewhere.
     #[test]
     fn nothing_is_dropped_from_a_long_reply() {
-        let body: String = (1..=400).map(|i| format!("line {i} of the answer\n")).collect();
+        let body: String = (1..=400)
+            .map(|i| format!("line {i} of the answer\n"))
+            .collect();
         let pages = paginate(&body, LIMIT);
         assert!(pages.len() > 1, "should have split: {}", pages.len());
         let rejoined = pages.join("\n");
@@ -307,7 +307,9 @@ mod tests {
 
     #[test]
     fn every_page_is_within_discords_limit() {
-        let body: String = (1..=600).map(|i| format!("some prose on line {i}\n")).collect();
+        let body: String = (1..=600)
+            .map(|i| format!("some prose on line {i}\n"))
+            .collect();
         for page in paginate(&body, LIMIT) {
             assert!(chars(&page) <= LIMIT, "page of {} chars", chars(&page));
         }
@@ -360,7 +362,9 @@ mod tests {
     /// Text outside a fence must not gain one.
     #[test]
     fn prose_pages_are_not_wrapped_in_code() {
-        let body: String = (1..=300).map(|i| format!("prose paragraph {i}\n\n")).collect();
+        let body: String = (1..=300)
+            .map(|i| format!("prose paragraph {i}\n\n"))
+            .collect();
         for page in paginate(&body, LIMIT) {
             assert!(!page.starts_with("```"), "prose page opened a code block");
         }
@@ -501,7 +505,11 @@ mod tests {
     #[test]
     fn only_the_growing_tail_is_touched() {
         let sent = vec!["one".to_string(), "two".to_string()];
-        let want = vec!["one".to_string(), "two and more".to_string(), "three".to_string()];
+        let want = vec![
+            "one".to_string(),
+            "two and more".to_string(),
+            "three".to_string(),
+        ];
         assert_eq!(
             plan(&sent, &want),
             vec![Op::Edit { page: 1 }, Op::Send { page: 2 }]
@@ -515,7 +523,11 @@ mod tests {
         let want = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         assert_eq!(
             plan(&[], &want),
-            vec![Op::Send { page: 0 }, Op::Send { page: 1 }, Op::Send { page: 2 }]
+            vec![
+                Op::Send { page: 0 },
+                Op::Send { page: 1 },
+                Op::Send { page: 2 }
+            ]
         );
     }
 

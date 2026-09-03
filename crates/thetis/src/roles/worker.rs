@@ -7,11 +7,12 @@
 //! gateway on the other end of fd 3.
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::os::fd::FromRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
+use crate::aspect::Aspect;
 use crate::config::Config;
 use crate::gateway;
 use crate::grip::Grip;
@@ -19,7 +20,6 @@ use crate::ipc::{self, Handler, Peer};
 use crate::pipeline;
 use crate::revisions::Origin;
 use crate::runtime::Runtime;
-use crate::aspect::Aspect;
 use crate::workers::WORKER_SOCKET_FD;
 use crate::{watchdog, watcher};
 
@@ -39,11 +39,7 @@ impl Handler for WorkerHandler {
             if method == "hello" {
                 return Ok(ipc::hello_response());
             }
-            let grip = self
-                .grip
-                .get()
-                .context("worker is still starting")?
-                .clone();
+            let grip = self.grip.get().context("worker is still starting")?.clone();
 
             let session = || -> Result<String> {
                 params
@@ -75,9 +71,7 @@ impl Handler for WorkerHandler {
                     grip.resume(&session()?).await;
                     Ok(Value::Null)
                 }
-                "agent_tools" => Ok(serde_json::to_value(
-                    grip.agent_tools(&session()?).await,
-                )?),
+                "agent_tools" => Ok(serde_json::to_value(grip.agent_tools(&session()?).await)?),
                 // Branch operations relayed from the gateway: the same code
                 // paths the agent's own branch tools use, so user- and
                 // agent-initiated operations behave identically.
@@ -119,14 +113,12 @@ impl Handler for WorkerHandler {
                 // exactly like agent-initiated ones.
                 "branch.record_op" => {
                     let op: crate::bindings::types::BranchOp =
-                        serde_json::from_value(params.clone())
-                            .context("unreadable branch op")?;
-                    grip
-                        .append_event(
-                            &session()?,
-                            crate::bindings::types::SessionEvent::BranchOp(op),
-                        )
-                        .await?;
+                        serde_json::from_value(params.clone()).context("unreadable branch op")?;
+                    grip.append_event(
+                        &session()?,
+                        crate::bindings::types::SessionEvent::BranchOp(op),
+                    )
+                    .await?;
                     Ok(Value::Null)
                 }
                 "branch.commit_dirty" => {
@@ -231,10 +223,7 @@ impl Handler for WorkerHandler {
     }
 }
 
-pub async fn run(
-    session: Option<String>,
-    worktree: Option<std::path::PathBuf>,
-) -> Result<()> {
+pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) -> Result<()> {
     // The checkout this worker runs against. In the single-worker phase it is
     // the project root; per-conversation worktrees arrive with branching.
     if let Some(worktree) = worktree {
@@ -251,7 +240,8 @@ pub async fn run(
     // the conversation would be unreachable until the gateway itself restarts.
     unsafe {
         if libc::fcntl(WORKER_SOCKET_FD, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
-            return Err(std::io::Error::last_os_error()).context("marking the gateway socket close-on-exec");
+            return Err(std::io::Error::last_os_error())
+                .context("marking the gateway socket close-on-exec");
         }
     }
     stream

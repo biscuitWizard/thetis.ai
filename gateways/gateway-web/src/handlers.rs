@@ -168,7 +168,7 @@ struct Entry {
 }
 
 fn load_overlay() -> Vec<Entry> {
-    let raw = sys::kv_get("global", MODEL_KEY).unwrap_or_default();
+    let raw = sys::kv_get("user", MODEL_KEY).unwrap_or_default();
     serde_json::from_str::<Value>(&raw)
         .ok()
         .as_ref()
@@ -207,7 +207,7 @@ fn save_overlay(entries: &[Entry]) {
             "id": e.id, "label": e.label, "hidden": e.hidden,
         })).collect::<Vec<_>>(),
     });
-    sys::kv_put("global", MODEL_KEY, &payload.to_string());
+    sys::kv_put("user", MODEL_KEY, &payload.to_string());
 }
 
 /// A model as the picker and the inspector see it.
@@ -474,7 +474,7 @@ const MAX_AVATAR_CHARS: usize = 2_000_000;
 pub fn user_avatar() -> GatewayAction {
     reply(json!({
         "type": "user-avatar",
-        "avatar": sys::kv_get("global", USER_AVATAR_KEY).unwrap_or_default(),
+        "avatar": sys::kv_get("user", USER_AVATAR_KEY).unwrap_or_default(),
     }))
 }
 
@@ -505,7 +505,7 @@ fn set_user_avatar(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
         return vec![error("an avatar must be an image file or an http(s) URL")];
     }
 
-    sys::kv_put("global", USER_AVATAR_KEY, raw);
+    sys::kv_put("user", USER_AVATAR_KEY, raw);
 
     let mut actions = vec![user_avatar()];
     if let Some(session) = session {

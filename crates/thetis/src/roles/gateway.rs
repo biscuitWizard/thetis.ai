@@ -8,11 +8,11 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::aspect::Aspect;
 use crate::config::Config;
 use crate::grip::Grip;
 use crate::loader::Loader;
 use crate::runtime::Runtime;
-use crate::aspect::Aspect;
 use crate::store::Store;
 use crate::web;
 use crate::workers::{self, WorkerRouter};
@@ -43,7 +43,9 @@ pub async fn run() -> Result<()> {
     // right stopping point — the checkout it reads *is* trunk, so a mismatch
     // here is a stale binary, and no branch this process could move would fix
     // it.
-    crate::pipeline::reconcile_wit_contract(&grip).await.report();
+    crate::pipeline::reconcile_wit_contract(&grip)
+        .await
+        .report();
 
     // Serve the UI from the last activated build straight away; if there is
     // none yet, the fallback page covers the gap until the worker's first
@@ -100,10 +102,34 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    if let Some(store) = grip.local_store() {
+        let claim = if cfg.auth.users_mode {
+            cfg.auth.claim_unowned.as_str()
+        } else {
+            "local"
+        };
+        let unowned = store.unowned_sessions()?;
+        for id in &unowned {
+            store.set_owner(id, claim)?;
+        }
+        if !unowned.is_empty() {
+            tracing::info!(
+                count = unowned.len(),
+                owner = claim,
+                "claimed legacy conversations"
+            );
+        }
+    }
+
     if grip.persist.list_sessions(true).await?.is_empty() {
+        let owner = if cfg.auth.users_mode {
+            cfg.auth.claim_unowned.as_str()
+        } else {
+            "local"
+        };
         let first = grip
             .persist
-            .create_session(Some("Welcome".into()), &cfg.default_mode)
+            .create_session(Some("Welcome".into()), &cfg.default_mode, owner)
             .await?;
         tracing::info!(session = %first.id, "created first session");
     }
@@ -130,8 +156,7 @@ pub async fn load_ui_gateway(grip: &Arc<Grip>) {
     let aspect = Aspect::gateway(&grip.cfg.primary_gateway);
 
     let trunk = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
-    if let Some(key) = crate::pipeline::cache_key_with(&trunk, &grip.cfg, "HEAD", &aspect).await
-    {
+    if let Some(key) = crate::pipeline::cache_key_with(&trunk, &grip.cfg, "HEAD", &aspect).await {
         if let Ok(Some(meta)) = grip.buildcache.lookup(&aspect.key(), &key) {
             match grip
                 .buildcache
@@ -168,8 +193,7 @@ pub async fn load_ui_gateway(grip: &Arc<Grip>) {
     let artifact = grip.revisions.component_path(&aspect, active.revision);
     match Loader::compile(&grip.runtime.engine, &aspect, active.revision, &artifact) {
         Ok(component) => {
-            if let Err(e) = crate::pipeline::smoke_test(grip, &aspect, &component.component).await
-            {
+            if let Err(e) = crate::pipeline::smoke_test(grip, &aspect, &component.component).await {
                 tracing::warn!(%aspect, error = %e,
                     "legacy UI artifact no longer runs against this kernel; a fresh build will replace it");
                 return;
@@ -182,7 +206,6 @@ pub async fn load_ui_gateway(grip: &Arc<Grip>) {
         }
     }
 }
-
 
 /// Builds the UI gateway once, in the background, when no artifact exists
 /// anywhere. Bootstrap only: every later UI build happens in a conversation's
@@ -211,7 +234,10 @@ fn bootstrap_ui_if_missing(grip: Arc<Grip>) {
 
         let trunk = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
         let key = crate::pipeline::cache_key_with(&trunk, &grip.cfg, "HEAD", &aspect).await;
-        let revision = key.as_deref().map(crate::pipeline::key_revision).unwrap_or(0);
+        let revision = key
+            .as_deref()
+            .map(crate::pipeline::key_revision)
+            .unwrap_or(0);
         let component = match Loader::compile(&grip.runtime.engine, &aspect, revision, &wasm) {
             Ok(component) => component,
             Err(e) => {
@@ -233,8 +259,18 @@ fn bootstrap_ui_if_missing(grip: Arc<Grip>) {
                 artifact_sha256: component.artifact_sha256.clone(),
                 smoke: crate::buildcache::SmokeVerdict::Pass,
                 source_commit: trunk.head().await.unwrap_or_default(),
-                aspect_tree: trunk.tree_oid("HEAD", &rel).await.ok().flatten().unwrap_or_default(),
-                wit_tree: trunk.tree_oid("HEAD", "wit").await.ok().flatten().unwrap_or_default(),
+                aspect_tree: trunk
+                    .tree_oid("HEAD", &rel)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                wit_tree: trunk
+                    .tree_oid("HEAD", "wit")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
                 created_ms: crate::buildcache::now_ms(),
                 note: "bootstrap".to_string(),
             };

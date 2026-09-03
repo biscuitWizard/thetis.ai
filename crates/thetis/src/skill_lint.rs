@@ -323,14 +323,14 @@ fn check_retirement(tree: &SkillTree, skill: &Skill, push: &mut impl FnMut(Sever
             Resolution::Found(id) if id == skill.superseded_by => {}
             Resolution::Found(id) => push(
                 Severity::Warning,
-                format!("superseded_by `{}` resolves to `{id}`; use the full id", skill.superseded_by),
+                format!(
+                    "superseded_by `{}` resolves to `{id}`; use the full id",
+                    skill.superseded_by
+                ),
             ),
             _ => push(
                 Severity::Error,
-                format!(
-                    "superseded_by `{}` matches no skill",
-                    skill.superseded_by
-                ),
+                format!("superseded_by `{}` matches no skill", skill.superseded_by),
             ),
         }
     }
@@ -343,7 +343,9 @@ fn check_retirement(tree: &SkillTree, skill: &Skill, push: &mut impl FnMut(Sever
             if id == skill.id {
                 continue;
             }
-            let Some(target) = tree.get(&id) else { continue };
+            let Some(target) = tree.get(&id) else {
+                continue;
+            };
             if target.status != "retired" {
                 continue;
             }
@@ -456,7 +458,7 @@ fn check_legacy_see_also(skill: &Skill, push: &mut impl FnMut(Severity, String))
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::{discover, ChildSpec};
+    use crate::skills::{ChildSpec, discover};
 
     fn tree_from(files: &[(&str, &str)]) -> (tempfile::TempDir, SkillTree) {
         let dir = tempfile::tempdir().unwrap();
@@ -488,7 +490,10 @@ mod tests {
     #[test]
     fn a_bare_name_shared_across_topics_is_ambiguous() {
         let (_d, tree) = tree_from(&[
-            ("one/SKILL.md", "---\nbrief = \"b\"\n---\n# One\n[x](skill:action)"),
+            (
+                "one/SKILL.md",
+                "---\nbrief = \"b\"\n---\n# One\n[x](skill:action)",
+            ),
             ("one/action/SKILL.md", "---\nbrief = \"b\"\n---\n# A"),
             ("two/SKILL.md", "---\nbrief = \"b\"\n---\n# Two"),
             ("two/action/SKILL.md", "---\nbrief = \"b\"\n---\n# A"),
@@ -544,7 +549,10 @@ mod tests {
             ),
             ("new/SKILL.md", "---\nbrief = \"b\"\n---\n# New"),
         ]);
-        assert!(says(&diags(&tree, "live"), "`old` is retired; point at `new`"));
+        assert!(says(
+            &diags(&tree, "live"),
+            "`old` is retired; point at `new`"
+        ));
     }
 
     #[test]
@@ -573,7 +581,10 @@ mod tests {
             "old/SKILL.md",
             "---\nbrief = \"b\"\nstatus = \"retired\"\nsuperseded_by = \"nowhere\"\n---\n# Old",
         )]);
-        assert!(says(&diags(&tree, "old"), "superseded_by `nowhere` matches no skill"));
+        assert!(says(
+            &diags(&tree, "old"),
+            "superseded_by `nowhere` matches no skill"
+        ));
     }
 
     #[test]

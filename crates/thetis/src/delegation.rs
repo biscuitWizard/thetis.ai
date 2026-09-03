@@ -18,7 +18,7 @@
 //! a child settling can ring a bell the parent is already sleeping on, instead
 //! of the parent polling the database across an IPC boundary.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -112,7 +112,9 @@ impl WaitFor {
         if filter.is_empty() {
             return all.iter().collect();
         }
-        all.iter().filter(|r| filter.contains(&r.child_id)).collect()
+        all.iter()
+            .filter(|r| filter.contains(&r.child_id))
+            .collect()
     }
 
     /// Whether the wait is over, and why.
@@ -123,9 +125,10 @@ impl WaitFor {
             // A parent that asks to wait for children it does not have is
             // satisfied at once rather than blocked to the deadline: the
             // alternative is a turn that appears to hang on a typo.
-            WaitFor::AllChildren | WaitFor::Children(_) => {
-                rows.iter().all(|r| r.state.is_terminal()).then_some("all finished")
-            }
+            WaitFor::AllChildren | WaitFor::Children(_) => rows
+                .iter()
+                .all(|r| r.state.is_terminal())
+                .then_some("all finished"),
             WaitFor::AnyChild(_) => {
                 if rows.is_empty() {
                     return Some("no such sub-agents");
@@ -138,9 +141,10 @@ impl WaitFor {
                 if rows.is_empty() {
                     return Some("no such sub-agents");
                 }
-                if rows.iter().any(|r| {
-                    matches!(r.state, SubagentState::Failed | SubagentState::Cancelled)
-                }) {
+                if rows
+                    .iter()
+                    .any(|r| matches!(r.state, SubagentState::Failed | SubagentState::Cancelled))
+                {
                     return Some("a sub-agent failed");
                 }
                 rows.iter()
@@ -228,14 +232,15 @@ pub async fn spawn(grip: &Arc<Grip>, parent_id: &str, req: SpawnRequest) -> Resu
     if cfg.mode(&mode).is_none() {
         bail!("unknown mode `{mode}` for a sub-agent");
     }
-    let model = first_non_empty(&[
-        &req.model,
-        profile.map(|p| p.model.as_str()).unwrap_or(""),
-    ]);
+    let model = first_non_empty(&[&req.model, profile.map(|p| p.model.as_str()).unwrap_or("")]);
     if !model.is_empty() && !cfg.models.iter().any(|m| m.id == model) {
         bail!(
             "unknown model `{model}`. Configured models: {}",
-            cfg.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", ")
+            cfg.models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 
@@ -244,11 +249,20 @@ pub async fn spawn(grip: &Arc<Grip>, parent_id: &str, req: SpawnRequest) -> Resu
     } else {
         req.label.trim().to_string()
     };
-    let label = if label.is_empty() { "sub-agent".to_string() } else { label };
+    let label = if label.is_empty() {
+        "sub-agent".to_string()
+    } else {
+        label
+    };
 
+    let owner = grip
+        .persist
+        .owner_of_root(parent_id)
+        .await?
+        .unwrap_or_else(|| "local".into());
     let child = grip
         .persist
-        .create_session(Some(label.clone()), &mode)
+        .create_session(Some(label.clone()), &mode, &owner)
         .await
         .context("creating the sub-agent's session")?;
 
@@ -378,7 +392,11 @@ pub async fn wait(
     let bell = grip.settle_bell.clone();
 
     loop {
-        let children = grip.persist.subagents_of(parent_id).await.unwrap_or_default();
+        let children = grip
+            .persist
+            .subagents_of(parent_id)
+            .await
+            .unwrap_or_default();
         if let Some(reason) = predicate.satisfied(&children) {
             return Ok(WaitOutcome {
                 reason: reason.to_string(),
@@ -429,7 +447,11 @@ pub async fn wait(
 /// the mark is what a parent's `wait` observes, and doing it second would leave
 /// a window where the turn is already unwinding but every watcher still sees a
 /// child that is running.
-pub async fn cancel_child(grip: &Arc<Grip>, parent_id: &str, child_id: &str) -> Result<SubagentRow> {
+pub async fn cancel_child(
+    grip: &Arc<Grip>,
+    parent_id: &str,
+    child_id: &str,
+) -> Result<SubagentRow> {
     let row = grip
         .persist
         .get_subagent(child_id)
@@ -448,7 +470,11 @@ pub async fn cancel_child(grip: &Arc<Grip>, parent_id: &str, child_id: &str) -> 
 /// cancelled, so a stop does not leave orphans burning tokens behind a
 /// conversation the user has walked away from.
 pub async fn cancel_all_children(grip: &Arc<Grip>, parent_id: &str) {
-    let children = grip.persist.subagents_of(parent_id).await.unwrap_or_default();
+    let children = grip
+        .persist
+        .subagents_of(parent_id)
+        .await
+        .unwrap_or_default();
     for row in children.into_iter().filter(|r| !r.state.is_terminal()) {
         let _ = grip.persist.cancel_subagent(&row.child_id).await;
         grip.cancel(&row.child_id).await;
@@ -496,8 +522,9 @@ pub struct ChildTag {
 /// created and never changes afterwards. `None` means "an ordinary
 /// conversation", which is also worth remembering: it is the common case and
 /// the one that would otherwise pay for a lookup on every single frame.
-static TAGS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Option<ChildTag>>>> =
-    std::sync::OnceLock::new();
+static TAGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<ChildTag>>>,
+> = std::sync::OnceLock::new();
 
 fn tags() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<ChildTag>>> {
     TAGS.get_or_init(Default::default)
@@ -664,10 +691,7 @@ mod tests {
     #[test]
     fn predicates_parse_from_what_the_model_writes() {
         assert_eq!(WaitFor::parse("time", vec![]).unwrap(), WaitFor::Time);
-        assert_eq!(
-            WaitFor::parse("all", vec![]).unwrap(),
-            WaitFor::AllChildren
-        );
+        assert_eq!(WaitFor::parse("all", vec![]).unwrap(), WaitFor::AllChildren);
         assert_eq!(
             WaitFor::parse("all", vec!["x".into()]).unwrap(),
             WaitFor::Children(vec!["x".into()])

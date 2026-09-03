@@ -23,7 +23,7 @@
 //! usable from every other one. `store_path` therefore prefers the directory of
 //! the shared overlay a worker is pointed at over its own worktree.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -160,10 +160,7 @@ impl SshHost {
             // Refuse to continue in the wrong directory: a build that runs in
             // the login directory instead of the project is worse than an
             // error.
-            script.push_str(&format!(
-                "cd {} || exit 1; ",
-                shell_quote(&self.remote_cwd)
-            ));
+            script.push_str(&format!("cd {} || exit 1; ", shell_quote(&self.remote_cwd)));
         }
         // `exec` so the shell we talk to is the process ssh is watching, and
         // `-s` so it reads commands from stdin whether or not there is a pty.
@@ -236,10 +233,10 @@ fn read(cfg: &Config) -> Result<StoreFile> {
     if !path.is_file() {
         return Ok(StoreFile::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let mut store: StoreFile = toml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut store: StoreFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     // The name is the table key, so it is not stored twice.
     for (name, host) in store.hosts.iter_mut() {
         host.name = name.clone();
@@ -290,12 +287,7 @@ pub fn get(cfg: &Config, name: &str) -> Result<SshHost> {
         )),
         None => Err(anyhow!(
             "no ssh host named {name:?}. Defined: {}",
-            store
-                .hosts
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
+            store.hosts.keys().cloned().collect::<Vec<_>>().join(", ")
         )),
     }
 }
@@ -342,7 +334,11 @@ pub fn set(cfg: &Config, host: SshHost, merge: bool) -> Result<String> {
     final_host.name = name.clone();
     final_host.validate()?;
 
-    let verb = if existing.is_some() { "updated" } else { "added" };
+    let verb = if existing.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
     store.hosts.insert(name.clone(), final_host.clone());
     let path = write(cfg, &store)?;
 
@@ -486,7 +482,10 @@ mod tests {
         set(&cfg, patch, true).unwrap();
         let after = get(&cfg, "prod").unwrap();
         assert_eq!(after.remote_cwd, "/srv/other");
-        assert_eq!(after.user, "deploy", "the merge must not clear other fields");
+        assert_eq!(
+            after.user, "deploy",
+            "the merge must not clear other fields"
+        );
         assert_eq!(after.port, 2222);
 
         rename(&cfg, "prod", "prod-eu").unwrap();

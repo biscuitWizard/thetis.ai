@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime::Store;
 
+use crate::aspect::Aspect;
 use crate::bindings::gateway::{Gateway, GatewayAction};
 use crate::bindings::types::{Asset, OutboundEvent};
 use crate::grip::Grip;
 use crate::runtime::{Budget, Caps, HostState};
-use crate::aspect::Aspect;
 
 /// Rebuild the warm renderer instance after this many calls, so a long-lived
 /// guest cannot accumulate unbounded state.
@@ -28,12 +28,13 @@ fn gateway_aspect(grip: &Arc<Grip>) -> Aspect {
 async fn fresh_instance(
     grip: &Arc<Grip>,
     label: &str,
+    principal: Option<Arc<crate::auth::Principal>>,
 ) -> Result<(Store<HostState>, Gateway, u64)> {
     let loaded = grip
         .loader
         .get(&gateway_aspect(grip))
         .context("no gateway component is loaded")?;
-    instance_of(grip, label, loaded).await
+    instance_of(grip, label, loaded, principal).await
 }
 
 /// As [`fresh_instance`], against a component chosen by the caller.
@@ -44,12 +45,15 @@ async fn instance_of(
     grip: &Arc<Grip>,
     label: &str,
     loaded: Arc<crate::loader::LoadedComponent>,
+    principal: Option<Arc<crate::auth::Principal>>,
 ) -> Result<(Store<HostState>, Gateway, u64)> {
     let budget = Budget::probe(label, grip.cfg.probe_budget);
-    // Gateways run unscoped: managing every session is their job.
-    let mut store = grip
-        .runtime
-        .new_store(grip.clone(), Caps::Gateway, budget, None);
+    let mut store = if let Some(p) = principal {
+        grip.gateway_store(budget, p)
+    } else {
+        grip.runtime
+            .new_store(grip.clone(), Caps::Gateway, budget, None)
+    };
 
     let instance = Gateway::instantiate_async(
         &mut store,
@@ -64,7 +68,7 @@ async fn instance_of(
 }
 
 pub async fn serve_asset(grip: &Arc<Grip>, path: &str) -> Result<Option<Asset>> {
-    let (mut store, gw, _) = fresh_instance(grip, "gateway serve-asset").await?;
+    let (mut store, gw, _) = fresh_instance(grip, "gateway serve-asset", None).await?;
     gw.call_serve_asset(&mut store, path)
         .await
         .map_err(anyhow::Error::from)
@@ -83,7 +87,7 @@ pub async fn serve_preview_asset(
     loaded: Arc<crate::loader::LoadedComponent>,
     path: &str,
 ) -> Result<Option<Asset>> {
-    let (mut store, gw, _) = instance_of(grip, "gateway preview serve-asset", loaded).await?;
+    let (mut store, gw, _) = instance_of(grip, "gateway preview serve-asset", loaded, None).await?;
     gw.call_serve_asset(&mut store, path)
         .await
         .map_err(anyhow::Error::from)
@@ -94,8 +98,10 @@ pub async fn on_client_message(
     grip: &Arc<Grip>,
     client_id: &str,
     frame_json: &str,
+    principal: Arc<crate::auth::Principal>,
 ) -> Result<Vec<GatewayAction>> {
-    let (mut store, gw, _) = fresh_instance(grip, "gateway on-client-message").await?;
+    let (mut store, gw, _) =
+        fresh_instance(grip, "gateway on-client-message", Some(principal)).await?;
     gw.call_on_client_message(&mut store, client_id, frame_json)
         .await
         .map_err(anyhow::Error::from)
@@ -117,10 +123,7 @@ struct Warm {
 
 impl Renderer {
     pub fn new(grip: Arc<Grip>) -> Self {
-        Self {
-            grip,
-            warm: None,
-        }
+        Self { grip, warm: None }
     }
 
     /// True when the cached instance is stale: a swap happened, it aged out, or
@@ -140,7 +143,7 @@ impl Renderer {
 
     pub async fn render(&mut self, event: OutboundEvent) -> Option<String> {
         if self.needs_refresh() {
-            match fresh_instance(&self.grip, "gateway render-event").await {
+            match fresh_instance(&self.grip, "gateway render-event", None).await {
                 Ok((store, instance, revision)) => {
                     self.warm = Some(Warm {
                         revision,
@@ -162,12 +165,14 @@ impl Renderer {
         // The store outlives a single call, so its budget must be rearmed: the
         // last-yield mark keeps ageing between events, and would eventually
         // read as a guest that had stopped talking to the host.
-        warm.store.data_mut().budget = Budget::probe(
-            "gateway render-event",
-            self.grip.cfg.probe_budget,
-        );
+        warm.store.data_mut().budget =
+            Budget::probe("gateway render-event", self.grip.cfg.probe_budget);
 
-        match warm.instance.call_render_event(&mut warm.store, &event).await {
+        match warm
+            .instance
+            .call_render_event(&mut warm.store, &event)
+            .await
+        {
             Ok(frame) => frame,
             Err(trap) => {
                 // A trapped store is poisoned; drop it so the next event starts clean.
@@ -209,14 +214,10 @@ pub async fn preview_component(
         .with_context(|| format!("{session_id} has no branch yet, so it has nothing to preview"))?;
 
     let aspect = gateway_aspect(grip);
-    let key = crate::pipeline::cache_key_with(
-        branches.root_git(),
-        &grip.cfg,
-        &row.branch_ref,
-        &aspect,
-    )
-    .await
-    .context("could not key this branch's gateway build")?;
+    let key =
+        crate::pipeline::cache_key_with(branches.root_git(), &grip.cfg, &row.branch_ref, &aspect)
+            .await
+            .context("could not key this branch's gateway build")?;
 
     if let Some(hit) = PREVIEWS
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))

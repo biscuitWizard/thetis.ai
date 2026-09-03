@@ -6,13 +6,13 @@
 //! control surface that must keep working when every guest is broken.
 
 use anyhow::{Context, Result};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
 use axum::Router;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Extension, Form, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,6 +25,9 @@ use crate::grip::{Grip, RenderedFrame};
 pub async fn serve(grip: Arc<Grip>) -> Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_upgrade))
+        .route("/login", get(login_page).post(login_submit))
+        .route("/logout", post(logout))
+        .route("/api/me", get(whoami))
         .route("/admin", get(admin_page))
         .route("/admin/waits", get(admin_waits))
         // One conversation's own UI build, so an agent working on the
@@ -40,11 +43,9 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         // own File stream rather than base64 inside JSON.
         .route(
             "/workspace/file/{*path}",
-            get(workspace_download)
-                .put(workspace_upload)
-                .layer(axum::extract::DefaultBodyLimit::max(
-                    crate::workspace_api::MAX_UPLOAD_BYTES,
-                )),
+            get(workspace_download).put(workspace_upload).layer(
+                axum::extract::DefaultBodyLimit::max(crate::workspace_api::MAX_UPLOAD_BYTES),
+            ),
         )
         .route("/", get(root_asset))
         .route("/{*path}", get(path_asset))
@@ -54,7 +55,8 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         // the WebSocket (the same-origin policy does not cover WS), and a domain
         // that rebinds to 127.0.0.1 to reach the /admin forms or the upload
         // route. See `guard_local`.
-        .layer(middleware::from_fn(guard_local))
+        .layer(middleware::from_fn_with_state(grip.clone(), authenticate))
+        .layer(middleware::from_fn_with_state(grip.clone(), guard_origin))
         .with_state(grip.clone());
 
     let listener = bind_with_retry(grip.cfg.bind_addr).await?;
@@ -118,6 +120,121 @@ async fn guard_local(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+async fn guard_origin(State(grip): State<Arc<Grip>>, req: Request, next: Next) -> Response {
+    let allowed = |authority: &str| {
+        is_loopback_authority(authority)
+            || grip
+                .cfg
+                .public_origin
+                .as_ref()
+                .is_some_and(|o| o.authority == authority)
+    };
+    let headers = req.headers();
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let authority = origin.split_once("://").map(|x| x.1).unwrap_or("");
+        if !allowed(authority) {
+            return (StatusCode::FORBIDDEN, "cross-origin requests are refused").into_response();
+        }
+    }
+    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        if !allowed(host) {
+            return (StatusCode::FORBIDDEN, "host is not allowed").into_response();
+        }
+    }
+    next.run(req).await
+}
+async fn authenticate(State(grip): State<Arc<Grip>>, mut req: Request, next: Next) -> Response {
+    let public = matches!(req.uri().path(), "/login" | "/logout");
+    match crate::auth::resolve(&grip, req.headers()).await {
+        Some(p) => {
+            if req.uri().path().starts_with("/admin") && !p.is_admin() {
+                return (StatusCode::FORBIDDEN, "admin only").into_response();
+            }
+            req.extensions_mut().insert(p);
+            next.run(req).await
+        }
+        None if public => next.run(req).await,
+        None => {
+            if req.method() == axum::http::Method::GET
+                && req
+                    .headers()
+                    .get(header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("text/html"))
+            {
+                Redirect::to("/login").into_response()
+            } else {
+                (StatusCode::UNAUTHORIZED, "sign in first").into_response()
+            }
+        }
+    }
+}
+#[derive(serde::Deserialize, Default)]
+struct LoginQuery {
+    #[serde(default)]
+    next: String,
+}
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    user: String,
+    password: String,
+    #[serde(default)]
+    next: String,
+}
+async fn login_page(State(g): State<Arc<Grip>>, Query(q): Query<LoginQuery>) -> Response {
+    if !g.cfg.auth.users_mode {
+        return Redirect::to("/").into_response();
+    }
+    crate::auth::page(&g.cfg, None, &q.next).into_response()
+}
+async fn login_submit(State(g): State<Arc<Grip>>, Form(f): Form<LoginForm>) -> Response {
+    let Some(u) = g.cfg.auth.user(&f.user) else {
+        crate::auth::login_failed(&f.user, &g.cfg);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        return crate::auth::page(&g.cfg, Some("Wrong user or password"), &f.next).into_response();
+    };
+    if crate::auth::login_locked(&f.user, &g.cfg) {
+        return crate::auth::page(&g.cfg, Some("Too many attempts; try again later"), &f.next)
+            .into_response();
+    }
+    if !crate::auth::verify_password(&f.password, u.password_hash.expose()) {
+        crate::auth::login_failed(&f.user, &g.cfg);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        return crate::auth::page(&g.cfg, Some("Wrong user or password"), &f.next).into_response();
+    }
+    crate::auth::login_succeeded(&f.user);
+    let t = crate::auth::new_token();
+    let now = crate::store::now_ms();
+    let row = crate::store::LoginRow {
+        user_id: u.id.clone(),
+        created_ms: now,
+        last_seen_ms: now,
+        expires_ms: now + g.cfg.auth.session_ttl.as_millis() as u64,
+        user_agent: String::new(),
+    };
+    if let Some(s) = g.local_store() {
+        let _ = s.put_login(&crate::auth::token_hash(&t), &row);
+    }
+    (
+        [(header::SET_COOKIE, crate::auth::set_cookie(&g.cfg, &t))],
+        Redirect::to(&crate::auth::safe_next(&f.next)),
+    )
+        .into_response()
+}
+async fn logout(State(g): State<Arc<Grip>>, headers: HeaderMap) -> Response {
+    if let (Some(t), Some(s)) = (crate::auth::cookie_value(&headers), g.local_store()) {
+        let _ = s.remove_login(&crate::auth::token_hash(&t));
+    }
+    (
+        [(header::SET_COOKIE, crate::auth::clear_cookie())],
+        Redirect::to("/login"),
+    )
+        .into_response()
+}
+async fn whoami(Extension(p): Extension<Arc<crate::auth::Principal>>) -> Response {
+    axum::Json(serde_json::json!({"id":p.user_id,"name":p.display_name,"role":p.role,"admin":p.is_admin(),"read_only":p.policy.read_only})).into_response()
+}
+
 /// Binds, retrying briefly while the address is still in use.
 ///
 /// A restart spawns the replacement before this process exits, so the new one
@@ -131,8 +248,9 @@ async fn bind_with_retry(addr: std::net::SocketAddr) -> Result<tokio::net::TcpLi
     loop {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => return Ok(listener),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse
-                && std::time::Instant::now() < deadline =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && std::time::Instant::now() < deadline =>
             {
                 if !reported {
                     tracing::info!(%addr, "address busy, waiting for the previous process to exit");
@@ -140,7 +258,9 @@ async fn bind_with_retry(addr: std::net::SocketAddr) -> Result<tokio::net::TcpLi
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            Err(e) => return Err(anyhow::Error::from(e)).with_context(|| format!("binding {addr}")),
+            Err(e) => {
+                return Err(anyhow::Error::from(e)).with_context(|| format!("binding {addr}"));
+            }
         }
     }
 }
@@ -173,7 +293,11 @@ async fn asset_response(grip: &Arc<Grip>, path: &str) -> Response {
         Err(e) => {
             let detail = format!("{e:#}");
             tracing::warn!(error = %detail, path, "gateway asset request failed");
-            (StatusCode::SERVICE_UNAVAILABLE, Html(fallback_page(&detail))).into_response()
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html(fallback_page(&detail)),
+            )
+                .into_response()
         }
     }
 }
@@ -201,9 +325,13 @@ component revisions and roll the gateway back to a working one.</p>"#,
 /// between viewing a file and keeping it.
 async fn workspace_download(
     State(grip): State<Arc<Grip>>,
+    Extension(principal): Extension<Arc<crate::auth::Principal>>,
     Path(path): Path<String>,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    if principal.policy.denies(crate::policy::Cap::Workspace) {
+        return (StatusCode::FORBIDDEN, "workspace access is withheld").into_response();
+    }
     let resolved = match crate::workspace_api::resolve(&grip.cfg, &path) {
         Ok(resolved) => resolved,
         Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
@@ -229,14 +357,14 @@ async fn workspace_download(
             (
                 StatusCode::OK,
                 [
-                    (header::CONTENT_TYPE, crate::workspace_api::mime_of(&name).to_string()),
+                    (
+                        header::CONTENT_TYPE,
+                        crate::workspace_api::mime_of(&name).to_string(),
+                    ),
                     (header::CONTENT_DISPOSITION, disposition),
                     // Never let the browser second-guess the declared type and
                     // sniff an upload into something executable.
-                    (
-                        header::X_CONTENT_TYPE_OPTIONS,
-                        "nosniff".to_string(),
-                    ),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
                     // The agents rewrite these files under a browser that is
                     // holding one open, so a cached copy would go stale
                     // invisibly.
@@ -256,9 +384,13 @@ async fn workspace_download(
 /// per file and a failure names the file that failed.
 async fn workspace_upload(
     State(grip): State<Arc<Grip>>,
+    Extension(principal): Extension<Arc<crate::auth::Principal>>,
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
+    if principal.policy.denies(crate::policy::Cap::WorkspaceWrite) {
+        return (StatusCode::FORBIDDEN, "workspace writes are withheld").into_response();
+    }
     let resolved = match crate::workspace_api::resolve(&grip.cfg, &path) {
         Ok(resolved) => resolved,
         Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
@@ -268,7 +400,10 @@ async fn workspace_upload(
     }
     if let Some(parent) = resolved.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot create the folder: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot create the folder: {e}"),
+            )
                 .into_response();
         }
     }
@@ -290,9 +425,11 @@ async fn workspace_upload(
             )
                 .into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write {path}: {e}")).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot write {path}: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -348,9 +485,7 @@ async fn admin_branch_action(
     let crate::grip::Role::Gateway(router) = &grip.role else {
         anyhow::bail!("admin actions run on the gateway");
     };
-    let store = grip
-        .local_store()
-        .context("gateway has no local store")?;
+    let store = grip.local_store().context("gateway has no local store")?;
     let branches = crate::branches::Branches::new(grip.cfg.clone(), store.clone());
 
     match action {
@@ -785,15 +920,23 @@ async fn admin_waits(State(grip): State<Arc<Grip>>) -> Response {
 /// Serves `/` from a conversation's own gateway build.
 async fn preview_root(
     State(grip): State<Arc<Grip>>,
+    Extension(principal): Extension<Arc<crate::auth::Principal>>,
     Path(session): Path<String>,
 ) -> Response {
+    if let Err(e) = crate::auth::may_access(&grip, &principal, &session) {
+        return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response();
+    }
     preview_response(&grip, &session, "/").await
 }
 
 async fn preview_asset(
     State(grip): State<Arc<Grip>>,
+    Extension(principal): Extension<Arc<crate::auth::Principal>>,
     Path((session, path)): Path<(String, String)>,
 ) -> Response {
+    if let Err(e) = crate::auth::may_access(&grip, &principal, &session) {
+        return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response();
+    }
     preview_response(&grip, &session, &format!("/{path}")).await
 }
 
@@ -813,7 +956,7 @@ async fn preview_response(grip: &Arc<Grip>, session: &str, path: &str) -> Respon
                 StatusCode::NOT_FOUND,
                 Html(fallback_page(&format!("{e:#}"))),
             )
-                .into_response()
+                .into_response();
         }
     };
     match gateway::serve_preview_asset(grip, loaded, path).await {
@@ -822,22 +965,26 @@ async fn preview_response(grip: &Arc<Grip>, session: &str, path: &str) -> Respon
                 asset.bytes = rewrite_preview_html(&asset.bytes, session);
             }
             (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, asset.mime),
-                // A preview is a moving target; a cached copy of yesterday's
-                // build is the one thing it must never show.
-                (header::CACHE_CONTROL, "no-store".to_string()),
-            ],
-            asset.bytes,
-        )
-            .into_response()
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, asset.mime),
+                    // A preview is a moving target; a cached copy of yesterday's
+                    // build is the one thing it must never show.
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                asset.bytes,
+            )
+                .into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
             let detail = format!("{e:#}");
             tracing::warn!(error = %detail, path, session, "preview asset request failed");
-            (StatusCode::SERVICE_UNAVAILABLE, Html(fallback_page(&detail))).into_response()
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html(fallback_page(&detail)),
+            )
+                .into_response()
         }
     }
 }
@@ -879,7 +1026,10 @@ fn rewrite_preview_html(bytes: &[u8], session: &str) -> Vec<u8> {
         let url = &tail[..end];
         // A path whose last segment has an extension is an asset this gateway
         // serves; anything else is a route on the host.
-        let is_asset = url.rsplit('/').next().is_some_and(|last| last.contains('.'));
+        let is_asset = url
+            .rsplit('/')
+            .next()
+            .is_some_and(|last| last.contains('.'));
         if is_asset {
             out.push_str(&prefix);
         }
@@ -891,7 +1041,11 @@ fn rewrite_preview_html(bytes: &[u8], session: &str) -> Vec<u8> {
     out.into_bytes()
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(grip): State<Arc<Grip>>) -> Response {
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(grip): State<Arc<Grip>>,
+    Extension(principal): Extension<Arc<crate::auth::Principal>>,
+) -> Response {
     // The protocol is small JSON frames; the one bulky payload is a
     // `workspace-write` of an edited text file (bounded well under this once
     // JSON-escaped), and raw bytes go over HTTP, not here. Capping the frame
@@ -899,14 +1053,14 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(grip): State<Arc<Grip>>) -> Resp
     const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| connection(socket, grip))
+        .on_upgrade(move |socket| connection(socket, grip, principal))
 }
 
 /// How many outbound frames may be queued for one browser before the reader
 /// starts waiting. A slow tab throttles itself; it never stalls the gateway.
 const OUTBOUND_QUEUE: usize = 256;
 
-async fn connection(socket: WebSocket, grip: Arc<Grip>) {
+async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::auth::Principal>) {
     let client_id = uuid::Uuid::new_v4().to_string();
     let (sink, mut incoming) = socket.split();
     let frames = grip.frames_tx.subscribe();
@@ -931,6 +1085,12 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>) {
     ));
 
     tracing::debug!(%client_id, "websocket connected");
+    let _ = out_tx.send(serde_json::json!({
+        "type":"user", "id":principal.user_id, "name":principal.display_name,
+        "role":principal.role, "admin":principal.is_admin(),
+        "read_only":principal.policy.read_only, "see_all":principal.policy.see_all_sessions,
+        "workspace": if principal.policy.denies(crate::policy::Cap::Workspace) {"none"} else if principal.policy.denies(crate::policy::Cap::WorkspaceWrite) {"read"} else {"write"}
+    }).to_string()).await;
 
     while let Some(Ok(msg)) = incoming.next().await {
         let text = match msg {
@@ -998,24 +1158,23 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>) {
             }
         }
 
-        let actions = match gateway::on_client_message(&grip, &client_id, &text).await {
-            Ok(actions) => actions,
-            Err(e) => {
-                // Show the whole chain: the outer context alone ("gateway
-                // on-client-message") says nothing about what went wrong.
-                let detail = format!("{e:#}");
-                tracing::warn!(error = %detail, "gateway rejected a client message");
-                // Naming the frame this answers lets the client tell an
-                // incidental error from the refusal of the thing it is
-                // waiting on — a `send` whose worker would not start arrives
-                // here, and the composer stays locked behind an optimistic
-                // message until it knows.
-                let _ = out_tx
-                    .send(error_frame(&detail, inbound_type(&text)))
-                    .await;
-                continue;
-            }
-        };
+        let actions =
+            match gateway::on_client_message(&grip, &client_id, &text, principal.clone()).await {
+                Ok(actions) => actions,
+                Err(e) => {
+                    // Show the whole chain: the outer context alone ("gateway
+                    // on-client-message") says nothing about what went wrong.
+                    let detail = format!("{e:#}");
+                    tracing::warn!(error = %detail, "gateway rejected a client message");
+                    // Naming the frame this answers lets the client tell an
+                    // incidental error from the refusal of the thing it is
+                    // waiting on — a `send` whose worker would not start arrives
+                    // here, and the composer stays locked behind an optimistic
+                    // message until it knows.
+                    let _ = out_tx.send(error_frame(&detail, inbound_type(&text))).await;
+                    continue;
+                }
+            };
 
         for action in actions {
             match action {
@@ -1031,7 +1190,11 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>) {
                     });
                 }
                 GatewayAction::Subscribe(session_id) => {
-                    watching.write().await.insert(session_id);
+                    if crate::auth::may_access(&grip, &principal, &session_id).is_ok() {
+                        watching.write().await.insert(session_id);
+                    } else {
+                        let _=out_tx.send(serde_json::json!({"type":"error","message":"that conversation is not yours"}).to_string()).await;
+                    }
                 }
                 GatewayAction::Unsubscribe(session_id) => {
                     watching.write().await.remove(&session_id);

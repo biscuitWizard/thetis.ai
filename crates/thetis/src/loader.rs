@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use wasmtime::component::Component;
 use wasmtime::Engine;
+use wasmtime::component::Component;
 
 use crate::aspect::Aspect;
 
