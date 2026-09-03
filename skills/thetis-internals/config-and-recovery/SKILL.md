@@ -5,7 +5,7 @@ when_to_use = "Use when you must change a setting, add a mode, model or LLM prov
 universal = false
 tags = ["config", "thetis.toml", "restart", "rollback", "branch", "watchdog", "recovery", "modes", "models", "providers", "openrouter", "llama.cpp", "local model", "prompt cache", "admin", "tool-group:config", "tool-group:branch", "tool-group:selfmod"]
 related = ["careful-surgery"]
-version = 3
+version = 4
 ---
 
 # Configuration, restart and recovery
@@ -121,6 +121,34 @@ Two behaviours worth knowing:
 
 Embeddings route the same way, either by the id in `skills.embedding_model` or
 by naming `skills.embedding_provider` outright.
+
+### Timeouts are about silence, not length
+
+`llm.request_timeout_secs` is a **read** timeout for a streaming completion: it
+resets whenever bytes arrive, so a slow local model may generate for as long as
+it likes provided it keeps sending, and only a genuine stall trips it. For a
+non-streaming call it is the total deadline for the whole request.
+
+Do not "simplify" this back to reqwest's `ClientBuilder::timeout`. That is a
+deadline on the whole request *including the body*, which for a stream is a cap
+on total generation time — it severs a long answer mid-body, and the user sees
+`transport error: error decoding response body`. A test in `llm.rs` drives a
+real socket that trickles past the timeout and fails if this regresses.
+
+### A broken stream keeps what arrived
+
+Once response headers are in, a mid-body failure is not treated as a failed
+turn. `SsePump::abort` checks whether anything usable arrived — answer text
+already shown, or accumulated tool calls — and if so closes the stream as
+`Finished` with reason `error` rather than as `Err`. The user keeps the partial
+answer, completed tool calls still run, and the transcript stays true.
+
+Tool calls whose accumulated arguments are not valid JSON on their own are
+dropped, because dispatching half-parsed arguments is worse than dropping the
+call. Reasoning does not count as salvageable: it is never persisted, so a break
+during the thinking phase still surfaces as an error. With nothing to salvage
+the error propagates unchanged, since hiding it behind an empty `Finished` would
+turn a failure into a silent no-op.
 
 A model or `llm.provider` naming a provider that does not exist is rejected at
 startup — otherwise the mistake surfaces as a confusing 404 mid-conversation.
@@ -244,6 +272,8 @@ usable locally, and the publish machinery filters them from anything pushed.
 | Symptom | Cause | Action |
 |---|---|---|
 | A setting change did nothing | Configuration is read at startup | `restart_orchestrator`. |
+| `transport error: error decoding response body` | A stream was cut off mid-body. Usually the timeout shape; otherwise the server or a proxy dropped the connection. | Check `llm.rs` still uses `read_timeout`, not `timeout`. The message now carries reqwest's source chain, so read past the first clause. |
+| A long answer stops part-way and the turn ends with reason `error` | A mid-stream break that was salvaged rather than failed | Expected behaviour, not a bug. The endpoint dropped the connection; check the server's own log. |
 | `set_config` was refused | The result would not load | Read the message. Fix the value. |
 | A build succeeded but the aspect still traps | The failure is at instantiation, not at compile time. Usually a contract mismatch. | `reset_branch`, then read `careful-surgery/contract-changes`. |
 | A component reset by itself | The circuit breaker fired | Read the incident in the conversation. Find the trap before you try the change again. |

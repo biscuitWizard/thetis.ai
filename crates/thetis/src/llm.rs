@@ -85,8 +85,21 @@ impl StreamHandle {
 
 impl LlmClient {
     pub fn new(cfg: Arc<Config>) -> Result<Self> {
+        // `read_timeout`, not `timeout`. reqwest's `timeout` is a *total*
+        // deadline: it runs from connect until the body has finished. For a
+        // streaming completion the body only finishes when generation does, so
+        // a total deadline caps the whole answer — and a slow reasoning model
+        // that legitimately streams for longer than the limit has its
+        // connection cut mid-body, surfacing as the singularly unhelpful
+        // "error decoding response body".
+        //
+        // A read timeout instead bounds the gap *between* reads and resets on
+        // each one. That is the thing actually worth detecting — a server that
+        // has stopped talking — and it lets a slow-but-alive stream run as long
+        // as it keeps producing. Non-streaming callers restore a total deadline
+        // per request, where it is the correct shape.
         let http = reqwest::Client::builder()
-            .timeout(cfg.request_timeout)
+            .read_timeout(cfg.request_timeout)
             .build()?;
         Ok(Self {
             http,
@@ -183,6 +196,7 @@ impl LlmClient {
         &self,
         body: &serde_json::Value,
         provider_id: &str,
+        streaming: bool,
     ) -> Result<reqwest::Response, LlmError> {
         let provider = self
             .cfg
@@ -214,6 +228,11 @@ impl LlmClient {
             let url = provider.url_for("chat/completions", slot + attempt as usize);
 
             let mut req = self.http.post(&url);
+            if !streaming {
+                // A non-streaming call has a bounded body, so a total deadline
+                // is meaningful and is what the setting has always meant.
+                req = req.timeout(self.cfg.request_timeout);
+            }
             if let Some(key) = &provider.api_key {
                 req = req.bearer_auth(key.expose());
             }
@@ -276,7 +295,7 @@ impl LlmClient {
     /// Non-streaming completion; returns the raw provider JSON.
     pub async fn chat(&self, request_json: &str) -> Result<String, LlmError> {
         let (body, provider) = self.prepare_body(request_json, false)?;
-        let resp = self.send(&body, &provider).await?;
+        let resp = self.send(&body, &provider, false).await?;
         resp.text()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))
@@ -298,7 +317,7 @@ impl LlmClient {
                 body: body.clone(),
             });
         }
-        let resp = self.send(&body, &provider).await?;
+        let resp = self.send(&body, &provider, true).await?;
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
@@ -312,7 +331,11 @@ impl LlmClient {
                         }
                     }
                     Err(e) => {
-                        let _ = pump.send(Err(LlmError::Transport(e.to_string()))).await;
+                        // Mid-body failure. `describe_reqwest` because
+                        // reqwest's own Display for a decode error is just
+                        // "error decoding response body", which says nothing
+                        // about the cause.
+                        pump.abort(LlmError::Transport(describe_reqwest(&e))).await;
                         return;
                     }
                 }
@@ -321,6 +344,51 @@ impl LlmClient {
         });
 
         Ok(StreamHandle { rx, finished: false })
+    }
+}
+
+/// A reqwest error as something a person can act on.
+///
+/// `reqwest::Error`'s own `Display` is frequently a dead end — a broken stream
+/// renders as bare "error decoding response body", with the actual cause (a
+/// closed connection, a read timeout, an upstream reset) hidden in the source
+/// chain. Walk the chain and append what it says, and classify the shapes worth
+/// naming outright.
+fn describe_reqwest(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+
+    if e.is_timeout() {
+        // With `read_timeout` this means the server stopped sending, not that
+        // the answer was too long, so say which knob is relevant.
+        parts.push(
+            "the server stopped sending data (read timeout; see llm.request_timeout_secs)".into(),
+        );
+    }
+    if e.is_body() {
+        parts.push("the response body ended early".into());
+    }
+
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !parts.iter().any(|p| p == &text) {
+            parts.push(text);
+        }
+        source = std::error::Error::source(cause);
+    }
+
+    parts.join(": ")
+}
+
+/// The message inside an `LlmError`, for logging.
+fn describe(e: &LlmError) -> &str {
+    match e {
+        LlmError::Auth(m)
+        | LlmError::RateLimited(m)
+        | LlmError::BadRequest(m)
+        | LlmError::ModelError(m)
+        | LlmError::Budget(m)
+        | LlmError::Transport(m) => m,
     }
 }
 
@@ -342,6 +410,10 @@ struct SsePump {
     model: String,
     finish_reason: String,
     done: bool,
+    /// Whether any answer text has been handed to the consumer. Reasoning does
+    /// not count: it is never part of the persisted message, so a stream that
+    /// broke during the thinking phase has produced nothing to salvage.
+    streamed_text: bool,
 }
 
 impl SsePump {
@@ -354,11 +426,53 @@ impl SsePump {
             model: String::new(),
             finish_reason: String::new(),
             done: false,
+            streamed_text: false,
         }
     }
 
     async fn send(&self, item: Result<StreamChunk, LlmError>) -> bool {
         self.tx.send(item).await.is_ok()
+    }
+
+    /// Whether anything usable has arrived: text already streamed to the user,
+    /// or tool calls accumulated.
+    fn has_partial_work(&self) -> bool {
+        self.streamed_text || !self.tool_calls.is_empty()
+    }
+
+    /// Ends a stream that broke part-way through.
+    ///
+    /// A transport failure after some of the answer has arrived is not the same
+    /// as a failure to get an answer at all. The user has already watched text
+    /// appear, and a bare `Err` throws it away and fails the turn — which is
+    /// what "transport error: error decoding response body" looked like from
+    /// the outside.
+    ///
+    /// So when there is partial work, close the stream as `finished` with an
+    /// explicit reason instead. The agent keeps what it has, the transcript
+    /// stays true, and any tool calls that did complete still run. When there
+    /// is nothing to salvage, the error is the whole story and is passed
+    /// through unchanged.
+    async fn abort(&mut self, err: LlmError) {
+        if !self.has_partial_work() {
+            let _ = self.send(Err(err)).await;
+            return;
+        }
+        tracing::warn!(
+            error = %describe(&err),
+            streamed_text = self.streamed_text,
+            tool_calls = self.tool_calls.len(),
+            "completion stream broke mid-body; keeping what arrived"
+        );
+        // A truncated tool call is worse than none: half-parsed arguments
+        // would be dispatched as if complete. Only keep calls whose arguments
+        // are valid JSON on their own.
+        self.tool_calls.retain(|_, acc| {
+            acc.arguments.trim().is_empty()
+                || serde_json::from_str::<serde_json::Value>(&acc.arguments).is_ok()
+        });
+        self.finish_reason = "error".to_string();
+        self.finish().await;
     }
 
     /// Returns false when the consumer has gone away.
@@ -431,6 +545,7 @@ impl SsePump {
 
         if let Some(delta) = choice.delta {
             if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
+                self.streamed_text = true;
                 if !self.send(Ok(StreamChunk::Delta(content))).await {
                     return false;
                 }
@@ -1082,6 +1197,267 @@ mod tests {
         assert!(!chunks
             .iter()
             .any(|c| matches!(c, StreamChunk::Reasoning(_))));
+    }
+
+    /// A slow reasoning model can stream for longer than the timeout while
+    /// never actually stalling. `ClientBuilder::timeout` is a deadline on the
+    /// *whole* request including the body, so it used to cut such a stream off
+    /// mid-answer — surfacing as "error decoding response body". A read timeout
+    /// resets on each read, so a trickle keeps the connection alive and only a
+    /// genuine stall trips it.
+    ///
+    /// This drives a real socket that trickles for well over the configured
+    /// timeout, so it fails if the timeout shape ever regresses.
+    #[tokio::test]
+    async fn a_slow_stream_is_not_cut_off_while_it_is_still_sending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Trickles 8 deltas 60ms apart: 480ms total body, far beyond the
+        // 150ms timeout below, but never a 150ms gap.
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = vec![0u8; 8192];
+            let _ = sock.read(&mut scratch).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            for i in 0..8 {
+                let body =
+                    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{i}\"}}}}]}}\n\n");
+                sock.write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
+                    .await
+                    .unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            }
+            sock.write_all(b"0\r\n\r\n").await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let mut cfg = Config::load().expect("the shipped config loads");
+        cfg.request_timeout = Duration::from_millis(150);
+        cfg.max_retries = 0;
+        cfg.providers = vec![crate::config::ProviderSpec {
+            id: "slow".into(),
+            label: "Slow".into(),
+            base_urls: vec![format!("http://127.0.0.1:{port}/v1")],
+            api_key: None,
+            headers: Vec::new(),
+        }];
+        cfg.default_provider = "slow".into();
+        cfg.models = Vec::new();
+        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let mut handle = client
+            .open_stream(r#"{"model":"slow/trickle","messages":[{"role":"user","content":"hi"}]}"#)
+            .await
+            .expect("the stream should open");
+
+        let mut text = String::new();
+        let mut error = None;
+        loop {
+            match handle.next().await {
+                Ok(StreamChunk::Delta(d)) => text.push_str(&d),
+                Ok(StreamChunk::Finished(_)) => break,
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+
+        assert!(error.is_none(), "a trickling stream was cut off: {error:?}");
+        assert_eq!(text, "01234567", "the whole answer should arrive");
+    }
+
+    /// The other side of the same coin: a server that goes quiet must still be
+    /// given up on, or a wedged endpoint would hang the turn forever.
+    #[tokio::test]
+    async fn a_stalled_stream_does_eventually_give_up() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Sends one delta, then holds the connection open saying nothing.
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = vec![0u8; 8192];
+            let _ = sock.read(&mut scratch).await;
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"stuck\"}}]}\n\n";
+            sock.write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let mut cfg = Config::load().expect("the shipped config loads");
+        cfg.request_timeout = Duration::from_millis(150);
+        cfg.max_retries = 0;
+        cfg.providers = vec![crate::config::ProviderSpec {
+            id: "stall".into(),
+            label: "Stall".into(),
+            base_urls: vec![format!("http://127.0.0.1:{port}/v1")],
+            api_key: None,
+            headers: Vec::new(),
+        }];
+        cfg.default_provider = "stall".into();
+        cfg.models = Vec::new();
+        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let mut handle = client
+            .open_stream(r#"{"model":"stall/wedged","messages":[{"role":"user","content":"hi"}]}"#)
+            .await
+            .expect("the stream should open");
+
+        let mut text = String::new();
+        let mut reason = None;
+        loop {
+            match handle.next().await {
+                Ok(StreamChunk::Delta(d)) => text.push_str(&d),
+                Ok(StreamChunk::Finished(f)) => {
+                    reason = Some(f.reason);
+                    break;
+                }
+                Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+
+        // The delta that did arrive is kept, and the stall is reported as a
+        // break rather than a clean stop.
+        assert_eq!(text, "stuck");
+        assert_eq!(reason.as_deref(), Some("error"));
+    }
+
+    /// Feeds a stream that breaks part-way through, and reports what the
+    /// consumer saw.
+    async fn drain_aborted(sse: &str) -> Vec<Result<StreamChunk, LlmError>> {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut pump = SsePump::new(tx);
+        for piece in sse.as_bytes().chunks(7) {
+            pump.feed(piece).await;
+        }
+        // Whatever reqwest would have handed us mid-body.
+        pump.abort(LlmError::Transport("error decoding response body".into()))
+            .await;
+        drop(pump);
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            out.push(item);
+        }
+        out
+    }
+
+    /// The reported bug: a stream that dies after some of the answer has been
+    /// shown must not throw that answer away. The turn should end, not fail.
+    #[tokio::test]
+    async fn a_broken_stream_keeps_the_text_that_already_arrived() {
+        let items = drain_aborted(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half an \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+        ))
+        .await;
+
+        assert!(
+            items.iter().all(|i| i.is_ok()),
+            "a salvageable stream must not surface an error: {items:?}"
+        );
+        let text: String = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(StreamChunk::Delta(d)) => Some(d.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "half an answer");
+
+        // It ends as finished, but honestly: the reason says it broke.
+        let reason = items.iter().find_map(|i| match i {
+            Ok(StreamChunk::Finished(f)) => Some(f.reason.clone()),
+            _ => None,
+        });
+        assert_eq!(reason.as_deref(), Some("error"));
+    }
+
+    /// With nothing to salvage the error is the whole story, and hiding it
+    /// behind an empty "finished" would turn a failure into a silent no-op.
+    #[tokio::test]
+    async fn a_stream_that_breaks_before_anything_arrives_still_errors() {
+        let items = drain_aborted("").await;
+        assert!(
+            matches!(items.first(), Some(Err(LlmError::Transport(_)))),
+            "{items:?}"
+        );
+    }
+
+    /// Reasoning is not the answer: it is never persisted, so a break during
+    /// the thinking phase has produced nothing to keep and must still fail.
+    #[tokio::test]
+    async fn a_break_during_reasoning_is_not_salvageable() {
+        let items = drain_aborted(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+        )
+        .await;
+        assert!(
+            items.iter().any(|i| matches!(i, Err(LlmError::Transport(_)))),
+            "{items:?}"
+        );
+    }
+
+    /// A tool call cut off mid-arguments must be dropped, not dispatched: half
+    /// a JSON object is not a request anyone should act on.
+    #[tokio::test]
+    async fn a_truncated_tool_call_is_discarded_rather_than_dispatched() {
+        let items = drain_aborted(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"working\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+            "\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+        ))
+        .await;
+
+        let calls: Vec<ToolCall> = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(StreamChunk::ToolCalls(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(calls.is_empty(), "truncated arguments must not survive: {calls:?}");
+    }
+
+    /// A complete tool call that happens to be followed by a broken connection
+    /// is still good, and re-running the turn without it would lose work.
+    #[tokio::test]
+    async fn a_complete_tool_call_survives_a_later_break() {
+        let items = drain_aborted(concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+            "\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n",
+        ))
+        .await;
+
+        let calls: Vec<ToolCall> = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(StreamChunk::ToolCalls(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(calls.len(), 1, "{items:?}");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments_json, "{\"path\":\"a\"}");
     }
 
     async fn drain(sse: &str) -> Vec<StreamChunk> {
