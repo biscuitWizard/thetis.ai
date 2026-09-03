@@ -309,6 +309,55 @@ pub struct ControlSettings {
 /// start if that mode is missing or is not read-only, because
 /// `read_only()` in the agent treats an unknown mode as full access -- so a
 /// typo here would otherwise hand a public chat surface the dev kit.
+/// The headless browser sidecar that backs the `web-browser-*` tools.
+///
+/// Tool components are wasm and cannot spawn processes, so none of them can
+/// drive Playwright directly. The kernel runs one Node sidecar on loopback and
+/// the tools speak JSON to it; this is where that process is configured.
+///
+/// Headless is not a setting. There is no display on a host running Thetis, and
+/// a headed browser would simply hang, so the sidecar hardcodes it.
+#[derive(Debug, Clone)]
+pub struct BrowserSettings {
+    pub enabled: bool,
+    /// Loopback port. Never bound on a public interface.
+    pub port: u16,
+    /// The sidecar's directory, holding `package.json` and `server.js`.
+    pub service_dir: PathBuf,
+    /// `node` and `npm` binaries. Empty means look on PATH.
+    pub node: String,
+    pub npm: String,
+    /// The playwright version to install and check for.
+    pub playwright_version: String,
+    /// Whether boot may run `npm install`. Off means verify and warn only.
+    pub auto_install: bool,
+    pub install_timeout: Duration,
+    pub startup_timeout: Duration,
+    /// Default per-operation timeout inside the browser.
+    pub default_timeout_ms: u64,
+    /// How long an unused browser context is kept.
+    pub idle_timeout_secs: u64,
+    /// Characters of accessibility snapshot returned before trimming.
+    pub snapshot_chars: usize,
+    /// Where screenshots and PDFs are written.
+    pub artifact_dir: PathBuf,
+}
+
+impl BrowserSettings {
+    /// The loopback base URL tools are told to call.
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    pub fn node_bin(&self) -> &str {
+        if self.node.trim().is_empty() { "node" } else { self.node.trim() }
+    }
+
+    pub fn npm_bin(&self) -> &str {
+        if self.npm.trim().is_empty() { "npm" } else { self.npm.trim() }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscordSettings {
     pub enabled: bool,
@@ -424,6 +473,7 @@ pub struct Config {
     pub terminal: TerminalSettings,
     pub control: ControlSettings,
     pub discord: DiscordSettings,
+    pub browser: BrowserSettings,
     pub sandbox_available: bool,
 }
 
@@ -530,6 +580,22 @@ impl Config {
         }
         if let Some(table) = merged.as_mut() {
             self.inline_file_secrets(table);
+        }
+        // The browser tools need to know where the sidecar is and hold the
+        // token for it. Both are runtime facts — the port is settings-derived
+        // and the token is generated fresh each boot — so they are injected
+        // here rather than written into a file a user would have to keep in
+        // step. A value the user did set explicitly still wins.
+        if tool.starts_with("web-browser") {
+            let table = merged.get_or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            if let toml::Value::Table(t) = table {
+                t.entry("endpoint".to_string())
+                    .or_insert_with(|| toml::Value::String(self.browser.base_url()));
+                t.entry("token".to_string())
+                    .or_insert_with(|| toml::Value::String(crate::browser::token().to_string()));
+                t.entry("enabled".to_string())
+                    .or_insert_with(|| toml::Value::Boolean(self.browser.enabled));
+            }
         }
         merged
             .and_then(|v| serde_json::to_string(&v).ok())
@@ -689,6 +755,7 @@ mod spec {
         pub terminal: Terminal,
         pub control: Control,
         pub discord: Discord,
+        pub browser: Browser,
         pub wasi: Wasi,
         /// Free-form per-tool settings. Shapes are up to each tool, so this is
         /// carried as-is rather than being given a schema here.
@@ -1092,6 +1159,54 @@ mod spec {
                 // a session that never works at all.
                 ssh_connect_timeout_ms: 25_000,
                 send_settle_ms: 400,
+            }
+        }
+    }
+
+    /// The headless browser sidecar. See [`super::BrowserSettings`].
+    #[derive(Debug, Deserialize)]
+    #[serde(default)]
+    pub struct Browser {
+        pub enabled: bool,
+        pub port: u16,
+        pub service_dir: String,
+        pub node: String,
+        pub npm: String,
+        pub playwright_version: String,
+        pub auto_install: bool,
+        pub install_timeout_secs: u64,
+        pub startup_timeout_secs: u64,
+        pub default_timeout_ms: u64,
+        pub idle_timeout_secs: u64,
+        pub snapshot_chars: usize,
+        pub artifact_dir: String,
+    }
+    impl Default for Browser {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                // Loopback only, and well clear of the usual dev-server ports.
+                port: 39412,
+                service_dir: "services/playwright-sidecar".into(),
+                // Empty means "find it on PATH".
+                node: String::new(),
+                npm: String::new(),
+                // Pinned deliberately: this version's browser build is the one
+                // the install step checks for, so a floating version would mean
+                // an unexpected browser download on some later boot.
+                playwright_version: "1.61.0".into(),
+                auto_install: true,
+                // A cold `npm install` fetches playwright; a warm one is
+                // instant. This bounds only the cold case.
+                install_timeout_secs: 300,
+                startup_timeout_secs: 45,
+                default_timeout_ms: 15_000,
+                idle_timeout_secs: 900,
+                // A tool result is capped at 32 KB and a snapshot is only part
+                // of one, so leave room for the rest of the response.
+                snapshot_chars: 12_000,
+                // Inside `workspace` so the wasm guests' preopen can reach it.
+                artifact_dir: "workspace/browser".into(),
             }
         }
     }
@@ -1749,6 +1864,31 @@ impl Config {
                 pairing_code_ttl: Duration::from_secs(
                     file.discord.pairing_code_ttl_secs.max(30),
                 ),
+            },
+
+            browser: BrowserSettings {
+                enabled: env.parse("THETIS_BROWSER_ENABLED", file.browser.enabled),
+                port: env.parse("THETIS_BROWSER_PORT", file.browser.port),
+                service_dir: resolve(&root, &file.browser.service_dir),
+                node: env.string("THETIS_BROWSER_NODE").unwrap_or(file.browser.node),
+                npm: env.string("THETIS_BROWSER_NPM").unwrap_or(file.browser.npm),
+                playwright_version: env
+                    .string("THETIS_BROWSER_PLAYWRIGHT_VERSION")
+                    .unwrap_or(file.browser.playwright_version),
+                auto_install: env.parse(
+                    "THETIS_BROWSER_AUTO_INSTALL",
+                    file.browser.auto_install,
+                ),
+                install_timeout: Duration::from_secs(
+                    file.browser.install_timeout_secs.max(30),
+                ),
+                startup_timeout: Duration::from_secs(
+                    file.browser.startup_timeout_secs.max(5),
+                ),
+                default_timeout_ms: file.browser.default_timeout_ms.max(1_000),
+                idle_timeout_secs: file.browser.idle_timeout_secs,
+                snapshot_chars: file.browser.snapshot_chars.max(500),
+                artifact_dir: resolve(&root, &file.browser.artifact_dir),
             },
 
             sandbox_available: env.parse("THETIS_SANDBOX", file.sandbox.enabled),
