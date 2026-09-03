@@ -295,9 +295,9 @@ max_output_bytes = 65536
 # Sessions idle longer than this are closed. 0 disables reaping.
 idle_timeout_secs = 1800
 
-# Remote sessions. `terminal_open` takes the name of a host registered with the
-# `ssh_host` tool, and runs the session's shell on that machine instead of this
-# one. Turning this off withdraws both the `ssh_host` tool and the `host`
+# Remote sessions. `terminal_open` takes the name of a host registered with
+# `ssh_host_set`, and runs the session's shell on that machine instead of this
+# one. Turning this off withdraws the `ssh_host_*` tools and the `host`
 # argument, without touching the registry.
 #
 # The registry itself lives in `ssh-hosts.local.toml`, deliberately *not* in

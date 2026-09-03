@@ -252,7 +252,7 @@ fn write(cfg: &Config, store: &StoreFile) -> Result<PathBuf> {
     let text = format!(
         "# Named SSH hosts for Thetis terminal sessions.\n\
          #\n\
-         # Written by the ssh_host tool. This file is deliberately NOT \
+         # Written by the ssh_host_* tools. This file is deliberately NOT \
          thetis.local.toml:\n\
          # it is gitignored by *.local.toml, invisible to the config loader, and \
          so cannot\n\
@@ -286,7 +286,7 @@ pub fn get(cfg: &Config, name: &str) -> Result<SshHost> {
         Some(host) => Ok(host.clone()),
         None if store.hosts.is_empty() => Err(anyhow!(
             "no ssh host named {name:?}, and none are defined yet. Add one with \
-             ssh_host action=set."
+             ssh_host_set."
         )),
         None => Err(anyhow!(
             "no ssh host named {name:?}. Defined: {}",

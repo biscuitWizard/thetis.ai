@@ -124,7 +124,8 @@ never offered a tool that must fail.
 | Sandbox | `sandbox::available()` | `exec`, `write_file`, `read_file` |
 | Dev kit | `devkit_available` | `new_tool`, `write_code`, `patch_code`, `add_dependency`, `remove_dependency`, `list_dependencies`, `read_code`, `list_code`, `rollback`, `history` |
 | Host files | `hostfs::available()` | `read_path`, `write_path`, `list_path`, `delete_path` |
-| Terminal | `terminal::available()` | `terminal_open`, `terminal_run`, `terminal_read`, `terminal_close`, `terminal_list` |
+| Terminal | `terminal::available()` | `terminal_open`, `terminal_run`, `terminal_read`, `terminal_send`, `terminal_signal`, `terminal_close`, `terminal_list` |
+| SSH hosts | `terminal::available()` and `terminal::ssh_available()` | `ssh_host_list`, `ssh_host_get`, `ssh_host_set`, `ssh_host_remove`, `ssh_host_rename` |
 | Configuration | always | `list_config`, `read_config`, `set_config` |
 | Control | `control::available()` | `restart_orchestrator` |
 
