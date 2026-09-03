@@ -30,7 +30,10 @@ export is `handle-turn(session-id)`.
       results pile up. See the `compaction` child skill.
    b. `stream_completion` — Send `model`, `messages` and `tools`. Read chunks
       until `Finished`. Each `Delta` chunk goes to the browser immediately with
-      `emit_output`, and also into the reply text.
+      `emit_output`, and also into the reply text. A `Reasoning` chunk goes to
+      the browser with `emit_reasoning` and **not** into the reply text: a
+      reasoning model's thinking is not its answer, must not be persisted, and
+      must not be replayed to the model next iteration.
    c. Append an `AssistantMessage` event **before** you act on it. The log must
       be true even if a tool traps.
    d. `record_usage` — Add the prompt tokens, completion tokens and cost, and

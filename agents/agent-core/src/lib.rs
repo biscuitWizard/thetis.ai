@@ -815,6 +815,13 @@ impl Turn {
                     host::emit_output(&self.session_id, &chunk);
                     reply.text.push_str(&chunk);
                 }
+                Ok(StreamChunk::Reasoning(thought)) => {
+                    // Shown as it arrives, but deliberately not appended to
+                    // `reply.text`: the thinking is not the answer, and must
+                    // not end up in the persisted message or be replayed to
+                    // the model on the next round.
+                    host::emit_reasoning(&self.session_id, &thought);
+                }
                 Ok(StreamChunk::ToolCalls(calls)) => reply.tool_calls = calls,
                 Ok(StreamChunk::Finished(info)) => {
                     reply.model = info.model;
