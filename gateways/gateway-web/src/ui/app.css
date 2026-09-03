@@ -669,6 +669,120 @@ body { display: flex; flex-direction: column; }
   overflow-y: auto;
 }
 
+/* --- sub-agents -------------------------------------------------------------
+ *
+ * A sub-agent's work is another agent's conversation happening inside this one,
+ * and the reader must never mistake one for the other. Three devices say so,
+ * and none of them is a new colour:
+ *
+ *  - the whole block is inset and carries a continuous accent rail down its
+ *    left edge, so every row inside it is visibly *within* something;
+ *  - it sits on --surface-1, one step up from the conversation's own ground,
+ *    the same way every other nested surface in the app does;
+ *  - its rows are scaled down slightly, which is what makes a wall of a
+ *    child's tool calls read as subordinate rather than as competing.
+ *
+ * Folded by default once finished. The whole point of delegating is not having
+ * to read the middle of it; the answer is quoted into the parent transcript.
+ */
+.agent {
+  max-width: var(--measure);
+  margin: 0 auto var(--gap-4);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-left: 2px solid var(--accent-edge);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+.agent > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.agent > summary::-webkit-details-marker { display: none; }
+.agent > summary:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+
+/* The disclosure arrow, on the far side from the reasoning block's, because
+ * this one is a container the reader opens rather than an aside they peek at. */
+.agent > summary::after {
+  content: "\25B8";
+  margin-left: auto;
+  color: var(--text-faint);
+  transition: transform var(--fast) var(--ease);
+}
+.agent[open] > summary::after { transform: rotate(90deg); }
+
+/* A running child pulses; a finished one is a flat dot. Motion is the only
+   honest way to say "still going" in a block that is otherwise static. */
+.agent-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--text-faint);
+}
+.agent.is-running > summary > .agent-dot {
+  background: var(--accent);
+  animation: agent-pulse 1.6s var(--ease) infinite;
+}
+.agent.is-bad > summary > .agent-dot { background: var(--err); }
+@keyframes agent-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent.is-running > summary > .agent-dot { animation: none; }
+}
+
+.agent-label {
+  font-family: var(--mono);
+  color: var(--accent);
+  letter-spacing: .01em;
+}
+.agent.is-bad > summary > .agent-label { color: var(--err); }
+.agent-state { color: var(--text-faint); }
+.agent.is-bad > summary > .agent-state { color: var(--err); }
+.agent-meta {
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+
+/* Inside the block the conversation's own gutters do not apply. Every row here
+   belongs to the one agent named in the summary, so the avatar column has
+   nothing to distinguish and is dropped: the tile is positioned into the
+   scroll container's reserved gutter, which is outside this block entirely, so
+   leaving it visible would have it clipped by the block's own overflow.
+   Reclaiming that space is also what stops a nested transcript from being a
+   thin ribbon down the middle of an already-narrow column. */
+.agent-body {
+  padding: var(--gap-3);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--text-sm);
+}
+.agent-body .row,
+.agent-body .meta,
+.agent-body .tool,
+.agent-body .compacting {
+  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
+}
+.agent-body .row { margin-bottom: var(--gap-3); }
+.agent-body .turn-avatar { display: none; }
+/* A child's own user row is its brief, not something the user typed. Left
+   aligned like everything else in the block, so it does not masquerade as a
+   message from the person reading. */
+.agent-body .row.user .row-head { justify-content: flex-start; }
+.agent-body > :last-child { margin-bottom: 0; }
+
 /* A message the host has not acknowledged yet: present and readable, but
  * visibly not yet part of the record. Dimming the whole row is the point —
  * it says "in flight" without a second colour or a badge shouting about it. */

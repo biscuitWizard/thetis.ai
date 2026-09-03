@@ -137,6 +137,10 @@ pub struct Grip {
     /// Turns currently in flight. What "idle" means for a worker: a long
     /// agentic turn generates no inbound traffic, and must not read as quiet.
     turns_running: std::sync::atomic::AtomicUsize,
+    /// Rung when a sub-agent finishes, so a parent parked in `delegation::wait`
+    /// wakes at once rather than at its next backstop poll. Worker-local, which
+    /// is sufficient because a child always runs in its parent's worker.
+    pub settle_bell: crate::delegation::SettleBell,
 }
 
 /// A build that failed, remembered so the identical source is not retried.
@@ -285,6 +289,7 @@ impl Grip {
             rebuild_wanted: std::sync::Mutex::new(std::collections::HashSet::new()),
             build_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             turns_running: std::sync::atomic::AtomicUsize::new(0),
+            settle_bell: crate::delegation::SettleBell::default(),
         }))
     }
 

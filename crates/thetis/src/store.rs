@@ -11,6 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::branches::BranchRow;
+use crate::subagents::SubagentRow;
 use crate::bindings::types::{
     EventRecord, SessionEvent, SessionMeta, ToolCall, ToolOutcome, TurnStats, UserMsg,
 };
@@ -53,6 +54,13 @@ pub(crate) const SNAPSHOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("
 const SKILL_VECTORS: TableDefinition<&str, &[u8]> = TableDefinition::new("skill_vectors");
 /// session id -> BranchRow (json): the sandbox branch backing a conversation
 const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
+/// child session id -> SubagentRow (json): a session spawned by another agent.
+///
+/// Parentage lives in its own table rather than as a field on `SessionMeta`,
+/// because `SessionMeta` is a WIT record shared with every guest and widening
+/// it breaks them at instantiation. A row here is also the authority on whether
+/// a session is a sub-agent at all, which is what the depth guard reads.
+const SUBAGENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("subagents");
 
 /// The title a conversation starts with, and the only one auto-titling will
 /// overwrite.
@@ -90,6 +98,7 @@ impl Store {
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(SKILL_VECTORS)?;
             txn.open_table(BRANCHES)?;
+            txn.open_table(SUBAGENTS)?;
         }
         txn.commit()?;
 
@@ -228,12 +237,23 @@ impl Store {
         }
     }
 
+    /// Top-level conversations, most recently active first.
+    ///
+    /// A sub-agent has a session of its own but is not a conversation: it
+    /// belongs to the turn that spawned it and is shown nested inside its
+    /// parent's transcript. Listing it beside real conversations would fill the
+    /// sidebar with rows nobody started, so children are filtered out here —
+    /// one place, so every surface that lists sessions agrees.
     pub fn list_sessions(&self, include_archived: bool) -> Result<Vec<SessionMeta>> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(SESSIONS)?;
+        let children = txn.open_table(SUBAGENTS)?;
         let mut out = Vec::new();
         for row in t.iter()? {
-            let (_, v) = row?;
+            let (id, v) = row?;
+            if children.get(id.value())?.is_some() {
+                continue;
+            }
             let meta: SessionMeta = serde_json::from_slice(v.value())?;
             if include_archived || !meta.archived {
                 out.push(meta);
@@ -242,6 +262,79 @@ impl Store {
         // Most recently active first — the order the sidebar wants.
         out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
         Ok(out)
+    }
+
+    // --- sub-agents ---------------------------------------------------------
+
+    pub fn put_subagent(&self, row: &SubagentRow) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut t = txn.open_table(SUBAGENTS)?;
+            t.insert(row.child_id.as_str(), serde_json::to_vec(row)?.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_subagent(&self, child_id: &str) -> Result<Option<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        match t.get(child_id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every sub-agent spawned by one session, oldest first.
+    pub fn subagents_of(&self, parent_id: &str) -> Result<Vec<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (_, v) = entry?;
+            let row: SubagentRow = serde_json::from_slice(v.value())?;
+            if row.parent_id == parent_id {
+                out.push(row);
+            }
+        }
+        out.sort_by_key(|r| r.created_ms);
+        Ok(out)
+    }
+
+    /// Every sub-agent under one root conversation, whatever its depth.
+    pub fn subagents_under(&self, root_id: &str) -> Result<Vec<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (_, v) = entry?;
+            let row: SubagentRow = serde_json::from_slice(v.value())?;
+            if row.root_id == root_id {
+                out.push(row);
+            }
+        }
+        out.sort_by_key(|r| r.created_ms);
+        Ok(out)
+    }
+
+    /// Applies `f` to a sub-agent row in one transaction.
+    pub fn update_subagent<F>(&self, child_id: &str, f: F) -> Result<SubagentRow>
+    where
+        F: FnOnce(&mut SubagentRow),
+    {
+        let txn = self.db.begin_write()?;
+        let row = {
+            let mut t = txn.open_table(SUBAGENTS)?;
+            let mut row: SubagentRow = match t.get(child_id)? {
+                Some(v) => serde_json::from_slice(v.value())?,
+                None => return Err(anyhow!("no such sub-agent: {child_id}")),
+            };
+            f(&mut row);
+            t.insert(child_id, serde_json::to_vec(&row)?.as_slice())?;
+            row
+        };
+        txn.commit()?;
+        Ok(row)
     }
 
     fn update_meta<F>(&self, id: &str, f: F) -> Result<SessionMeta>

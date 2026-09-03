@@ -6,7 +6,7 @@
 use crate::thetis::grip::session as host;
 use crate::thetis::grip::skills_view as view;
 use crate::thetis::grip::sys;
-use crate::thetis::grip::types::Attachment;
+use crate::thetis::grip::types::{Attachment, SessionEvent};
 use crate::render;
 use crate::{GatewayAction, OutboundEvent};
 use serde_json::{json, Value};
@@ -888,9 +888,47 @@ fn session_settings(session_id: &str) -> GatewayAction {
     }))
 }
 
+/// Prefix of the system note the host writes when an agent spawns a sub-agent.
+/// The remainder is the child's session id, a space, then its label. Defined in
+/// `crates/thetis/src/delegation.rs` as `SPAWN_NOTE`; the two must agree.
+const SPAWN_NOTE: &str = "subagent:spawned ";
+
+/// Replays a conversation, sub-agents included.
+///
+/// A sub-agent is a session of its own, so its turns are in its own log and not
+/// in the parent's. Live, that does not matter: the worker re-addresses a
+/// child's frames to the conversation the user is watching and tags them, so
+/// they arrive as they happen. But a reload asks only for the parent's events,
+/// and without this the sub-agent blocks would silently disappear from a
+/// transcript that had them a moment earlier — the reader would be left unable
+/// to tell whether work had happened at all.
+///
+/// The parent's log names its children in a spawn note, so that note is the
+/// index: for each one, the child's own events are read, tagged the way the
+/// live path tags them, and merged in. The merge is by timestamp, because two
+/// logs have unrelated sequence numbers and interleaving by time is what puts a
+/// child's work where the reader saw it happen.
 fn history(session_id: &str) -> GatewayAction {
     let meta = host::get_session(session_id);
-    let events: Vec<Value> = host::events(session_id, 0)
+    let own = host::events(session_id, 0);
+
+    // (child id, label), in spawn order.
+    let children: Vec<(String, String)> = own
+        .iter()
+        .filter_map(|record| match &record.event {
+            SessionEvent::SystemNote(text) => text.strip_prefix(SPAWN_NOTE),
+            _ => None,
+        })
+        .map(|rest| match rest.split_once(' ') {
+            Some((id, label)) => (id.to_string(), label.to_string()),
+            None => (rest.to_string(), String::new()),
+        })
+        .collect();
+
+    // Timestamp first so the merge is by time; the parent's own events sort
+    // ahead of a child's at the same millisecond, which keeps a spawn note
+    // above the block it opened.
+    let mut rows: Vec<(u64, u8, Value)> = own
         .iter()
         .filter_map(|record| {
             render::event(&OutboundEvent {
@@ -899,8 +937,31 @@ fn history(session_id: &str) -> GatewayAction {
                 ts_ms: record.ts_ms,
                 event: record.event.clone(),
             })
+            .map(|frame| (record.ts_ms, 0u8, frame))
         })
         .collect();
+
+    for (child_id, label) in &children {
+        for record in host::events(child_id, 0) {
+            let Some(mut frame) = render::event(&OutboundEvent {
+                session_id: session_id.to_string(),
+                seq: Some(record.seq),
+                ts_ms: record.ts_ms,
+                event: record.event.clone(),
+            }) else {
+                continue;
+            };
+            if let Some(obj) = frame.as_object_mut() {
+                obj.insert("agent".into(), json!(child_id));
+                obj.insert("agent_label".into(), json!(label));
+                obj.insert("agent_parent".into(), json!(session_id));
+            }
+            rows.push((record.ts_ms, 1u8, frame));
+        }
+    }
+
+    rows.sort_by_key(|(ts, tier, _)| (*ts, *tier));
+    let events: Vec<Value> = rows.into_iter().map(|(_, _, frame)| frame).collect();
 
     reply(json!({
         "type": "history",
