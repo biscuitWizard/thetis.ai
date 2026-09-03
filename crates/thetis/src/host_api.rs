@@ -281,7 +281,9 @@ impl sys::Host for HostState {
             "workspace_dir" => cfg.wasi.dirs.first().map(|d| d.display().to_string()),
             // The dev kit is wired up; the agent uses this to decide whether to
             // offer itself the self-modification tools.
-            "devkit_available" => Some(cfg.devkit.enabled.to_string()),
+            "devkit_available" => Some(
+                (cfg.devkit.enabled && !self.policy.denies(crate::policy::Cap::Devkit)).to_string(),
+            ),
             // Context compaction. The agent owns the decision of what to shed,
             // so it needs the thresholds rather than being told when to act.
             "compact_enabled" => Some(cfg.context.enabled.to_string()),
@@ -571,6 +573,7 @@ impl session::Host for HostState {
 
     async fn available_tools(&mut self, session_id: String) -> Result<Vec<ToolManifest>> {
         self.budget.entered_host("available_tools");
+        self.may_access(&session_id)?;
         let grip = self.grip.clone();
         let tools = grip.agent_tools(&session_id).await;
         self.yielded();
@@ -600,6 +603,28 @@ impl session::Host for HostState {
 // --- llm -------------------------------------------------------------------
 
 impl HostState {
+    fn requested_model(request_json: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(request_json)
+            .ok()?
+            .get("model")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn check_model(&self, request_json: &str) -> std::result::Result<(), LlmError> {
+        let Some(model) = Self::requested_model(request_json) else {
+            return Ok(());
+        };
+        if self.policy.allows_model(&model) {
+            Ok(())
+        } else {
+            Err(LlmError::BadRequest(format!(
+                "model `{model}` is not available to this user; pick one of: {}",
+                self.policy.models.join(", ")
+            )))
+        }
+    }
+
     /// Refuses a call that would push the session past its spend ceiling.
     ///
     /// Takes owned values rather than `&self`: holding the host state across
@@ -607,28 +632,48 @@ impl HostState {
     async fn check_budget(
         persist: crate::persist::Persist,
         session_id: Option<String>,
-        limit: f64,
+        session_limit: f64,
+        owner: Option<String>,
+        user_limit: f64,
     ) -> std::result::Result<(), LlmError> {
-        if limit <= 0.0 {
-            return Ok(());
+        if session_limit > 0.0 {
+            if let Some(sid) = session_id {
+                let spent = persist.get_spend(&sid).await.unwrap_or(0.0);
+                if spent >= session_limit {
+                    return Err(LlmError::Budget(format!(
+                        "session has spent ${spent:.4} of its ${session_limit:.4} limit"
+                    )));
+                }
+            }
         }
-        let Some(sid) = session_id else {
-            return Ok(());
-        };
-        let spent = persist.get_spend(&sid).await.unwrap_or(0.0);
-        if spent >= limit {
-            return Err(LlmError::Budget(format!(
-                "session has spent ${spent:.4} of its ${limit:.4} limit"
-            )));
+        if user_limit > 0.0 {
+            if let Some(owner) = owner {
+                let spent = persist.get_user_spend(&owner).await.unwrap_or(0.0);
+                if spent >= user_limit {
+                    return Err(LlmError::Budget(format!(
+                        "user has spent ${spent:.4} of their ${user_limit:.4} limit"
+                    )));
+                }
+            }
         }
         Ok(())
     }
 
-    fn budget_inputs(&self) -> (crate::persist::Persist, Option<String>, f64) {
+    fn budget_inputs(
+        &self,
+    ) -> (
+        crate::persist::Persist,
+        Option<String>,
+        f64,
+        Option<String>,
+        f64,
+    ) {
         (
             self.grip.persist.clone(),
             self.session_id.clone(),
             self.grip.cfg.session_spend_limit_usd,
+            self.principal.as_ref().map(|p| p.user_id.clone()),
+            self.policy.spend_limit_usd,
         )
     }
 
@@ -676,9 +721,19 @@ impl HostState {
                 let persist = self.grip.persist.clone();
                 let sid = sid.clone();
                 let cost = usage.cost_usd;
+                let principal_owner = self.principal.as_ref().map(|p| p.user_id.clone());
                 tokio::spawn(async move {
                     if let Err(e) = persist.add_spend(&sid, cost).await {
                         tracing::warn!(error = %e, "spend was not recorded");
+                    }
+                    let owner = match principal_owner {
+                        Some(owner) => Some(owner),
+                        None => persist.owner_of_root(&sid).await.ok().flatten(),
+                    };
+                    if let Some(owner) = owner {
+                        if let Err(e) = persist.add_user_spend(&owner, cost).await {
+                            tracing::warn!(error = %e, "user spend was not recorded");
+                        }
                     }
                 });
             }
@@ -692,8 +747,11 @@ impl llm::Host for HostState {
         request_json: String,
     ) -> Result<std::result::Result<String, LlmError>> {
         self.budget.entered_host("chat");
-        let (persist, sid, limit) = self.budget_inputs();
-        if let Err(e) = Self::check_budget(persist, sid, limit).await {
+        if let Err(e) = self.check_model(&request_json) {
+            return Ok(Err(e));
+        }
+        let (persist, sid, session_limit, owner, user_limit) = self.budget_inputs();
+        if let Err(e) = Self::check_budget(persist, sid, session_limit, owner, user_limit).await {
             return Ok(Err(e));
         }
         let llm = self.grip.llm.clone();
@@ -722,8 +780,11 @@ impl llm::Host for HostState {
         request_json: String,
     ) -> Result<std::result::Result<u64, LlmError>> {
         self.budget.entered_host("stream_open");
-        let (persist, sid, limit) = self.budget_inputs();
-        if let Err(e) = Self::check_budget(persist, sid, limit).await {
+        if let Err(e) = self.check_model(&request_json) {
+            return Ok(Err(e));
+        }
+        let (persist, sid, session_limit, owner, user_limit) = self.budget_inputs();
+        if let Err(e) = Self::check_budget(persist, sid, session_limit, owner, user_limit).await {
             return Ok(Err(e));
         }
         let llm = self.grip.llm.clone();
@@ -877,6 +938,37 @@ impl tooling::Host for HostState {
         self.may_access(&session_id)?;
         if self.policy.denies_tool(&name) {
             return Ok(Err(format!("'{name}' is withheld for this user by policy")));
+        }
+        if let Some(group) = self
+            .grip()
+            .tool_registry()
+            .into_iter()
+            .find(|manifest| manifest.name == name)
+            .and_then(|manifest| {
+                manifest
+                    .capabilities
+                    .into_iter()
+                    .find_map(|cap| cap.strip_prefix("group:").map(str::to_string))
+            })
+        {
+            if self.policy.denies_group(&group) {
+                return Ok(Err(format!(
+                    "'{name}' belongs to tool group '{group}', which is withheld by policy"
+                )));
+            }
+        }
+        if self.policy.read_only {
+            let read_only = self
+                .grip()
+                .tool_registry()
+                .into_iter()
+                .find(|manifest| manifest.name == name)
+                .is_some_and(|manifest| manifest.capabilities.iter().any(|c| c == "read-only"));
+            if !read_only {
+                return Ok(Err(format!(
+                    "'{name}' may change something, and this user is read-only"
+                )));
+            }
         }
         let grip = self.grip.clone();
         // A tool can spend a long time on the network. Stopping the turn should
@@ -1402,23 +1494,13 @@ fn info_from_row(
 
 // --- transcripts ------------------------------------------------------------
 
-/// Reading and searching conversation logs across the whole database.
+/// Reading and searching conversation logs owned by the calling principal.
 ///
-/// This is the one host interface that reads a conversation the calling session
-/// did not write, and it is unscoped on purpose: recall — "have I solved this
-/// before", "what did that sub-agent find" — cannot be answered from one log.
-/// `scope_ok` is therefore *not* called here, and the justification is that
-/// nothing reachable from this impl can write. Every function routes into
-/// `crate::transcripts`, which holds no write path at all; a test in that module
-/// pins the property, because the read was widened on precisely that promise.
-///
-/// Ordinary session mutation is untouched: `session.append`, `submit`,
-/// `rename` and the rest still refuse a session that is not the caller's, both
-/// here and again at the gateway's `own_session` check.
-///
-/// Every call is redb work on whatever runtime thread the guest's import landed
-/// on, and a search walks many logs, so all of them are offloaded and marked as
-/// having yielded — a scan is host time, not the agent spinning.
+/// Recall spans multiple conversations, so these calls are not pinned by
+/// `scope_ok`; instead the gateway-side persistence service resolves the
+/// caller's root owner and filters every catalogue/read/search operation to
+/// that owner. The interface remains read-only, and every scan is offloaded so
+/// host time is not charged as guest spin.
 impl transcripts::Host for HostState {
     async fn conversations(
         &mut self,

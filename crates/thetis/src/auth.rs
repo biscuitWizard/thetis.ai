@@ -163,12 +163,21 @@ pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
         None => bail!("no such conversation"),
     }
 }
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 pub fn page(c: &Config, msg: Option<&str>, next: &str) -> axum::response::Html<String> {
     axum::response::Html(format!(
         "<!doctype html><meta charset=utf-8><title>{0} — sign in</title><style>body{{font:15px system-ui;max-width:24rem;margin:6rem auto;background:#16161a;color:#eee}}input,button{{font:inherit;padding:.6rem;margin:.3rem;width:100%;box-sizing:border-box}}</style><h1>{0}</h1><p>{1}</p><form method=post action=/login><input type=hidden name=next value=\"{2}\"><input name=user autocomplete=username required autofocus><input name=password type=password autocomplete=current-password required><button>Sign in</button></form>",
-        c.agent_name,
-        msg.unwrap_or(""),
-        safe_next(next)
+        html_escape(&c.agent_name),
+        html_escape(msg.unwrap_or("")),
+        html_escape(&safe_next(next))
     ))
 }
 #[cfg(test)]
