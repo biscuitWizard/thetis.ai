@@ -1011,8 +1011,14 @@ impl Rest {
 
 /// Discord rejects a message body over 2000 characters.
 ///
-/// Splitting into several messages would be better for long answers; this keeps
-/// the tail, which is where a conclusion usually is, and marks the cut.
+/// This is a **backstop**, not the way long replies are handled. An agent reply
+/// is laid out across several messages by `split::paginate` before it reaches
+/// here, so a body arriving overlong means a caller that did not paginate — an
+/// ephemeral command reply, or a bug. Losing text is worse than a rejected
+/// request only just, so the cut keeps the tail, where a conclusion usually is,
+/// and says it happened.
+///
+/// If you find yourself widening this, paginate at the call site instead.
 pub fn truncate(content: &str) -> String {
     const LIMIT: usize = 2000;
     if content.chars().count() <= LIMIT {
