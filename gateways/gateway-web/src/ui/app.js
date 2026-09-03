@@ -1114,6 +1114,20 @@ mountSessions({
 
 transcript.mountTranscript({
   onInspect: () => context.openTab("request"),
+  /* Answers from an `ask_user` form go through the ordinary send path: they are
+   * a user message, they belong in the log as one, and reusing `send` means the
+   * pending row, the composer lock and the failure handling all apply without a
+   * second mechanism. Returns whether the socket took it, as the composer does. */
+  onAnswer: (text) => {
+    if (!store.current) {
+      toast("No conversation open — the answers were not sent.", { tone: "error" });
+      return false;
+    }
+    const sent = connection.send({ type: "send", id: store.current, text, attachments: [] });
+    if (sent) beginPending(text, []);
+    else toast("Not connected — the answers were not sent.", { tone: "error" });
+    return sent;
+  },
 });
 
 const composer = mountComposer({

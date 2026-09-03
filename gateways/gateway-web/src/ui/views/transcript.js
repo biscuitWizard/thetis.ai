@@ -12,11 +12,19 @@
 import { $, clear, el } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { renderMarkdown } from "../lib/markdown.js";
+import { askCard, parseAsk } from "./askuser.js";
+
+/** The tool whose call renders as a form instead of a tool row. */
+const ASK_TOOL = "ask_user";
 
 let root = null;
 let live = null; // element collecting streamed tokens
 let onInspect = null; // opens the Context tab at the latest request
+let onAnswer = null; // sends an ask_user form's answers as a user message
 let pendingNode = null; // the optimistic row for a message not yet acknowledged
+// Ask forms still open. A user message means they were answered — during a
+// replay as much as live — so they lock rather than invite a second answer.
+let openAsks = [];
 // Tool calls awaiting their result, by call id. A call and its result are one
 // row, so the result has to find the row the call opened.
 const open = new Map();
@@ -27,12 +35,14 @@ const RESULT_PREVIEW_CHARS = 4000;
 export function mountTranscript(hooks = {}) {
   root = $("transcript");
   onInspect = hooks.onInspect || null;
+  onAnswer = hooks.onAnswer || null;
   showEmpty();
 }
 
 export function reset() {
   live = null;
   pendingNode = null;
+  openAsks = [];
   open.clear();
   clear(root);
   store.set({
@@ -286,9 +296,48 @@ function fmtK(n) {
 
 // --- event renderers --------------------------------------------------------
 
+/* Draws an ask_user call as a form.
+ *
+ * Returns false when the arguments cannot be read, so the caller falls back to
+ * the ordinary tool row: a malformed call is still something the reader should
+ * be able to see, and a silently missing row would look like a lost turn.
+ */
+function askRow(ev) {
+  const ask = parseAsk(ev.arguments);
+  if (!ask?.questions.length) return false;
+
+  const card = askCard(ask, {
+    onAnswer: (text) => {
+      const sent = onAnswer?.(text);
+      // No handler wired is a programming error, not a dead socket; treat a
+      // missing hook as a failure so the form does not claim it sent.
+      return sent === undefined ? false : sent;
+    },
+  });
+  root.append(card);
+  openAsks.push(card);
+  return true;
+}
+
+/** Locks every open form: the user has answered, so the controls are spent. */
+function lockAsks() {
+  openAsks.forEach((card) => {
+    if (card.classList.contains("is-answered")) return;
+    card.classList.add("is-answered");
+    card.querySelectorAll("input, textarea, button").forEach((node) => {
+      node.disabled = true;
+    });
+    const foot = card.querySelector(".ask-foot");
+    if (foot) clear(foot).append(el("div", { class: "ask-note" }, "Answered."));
+  });
+  openAsks = [];
+}
+
 const RENDERERS = {
   user(ev) {
     live = null;
+    // Whatever was asked has now been replied to, one way or another.
+    lockAsks();
     row("user", "you",
       ev.text ? el("div", { class: "bubble-text" }, ev.text) : null,
       thumbs(ev.attachments));
@@ -341,10 +390,18 @@ const RENDERERS = {
 
   "tool-call"(ev) {
     live = null;
+    // The form stands in for the tool row entirely. Showing both would put the
+    // same questions on screen twice, once as JSON.
+    if (ev.name === ASK_TOOL && askRow(ev)) return;
     open.set(ev.id, toolRow(ev));
   },
 
-  "tool-result": completeToolRow,
+  "tool-result"(ev) {
+    // The result of an ask is only the note telling the model to stop and wait.
+    // The form above says all of that to the reader already.
+    if (ev.name === ASK_TOOL && !open.has(ev.id)) return;
+    completeToolRow(ev);
+  },
 
   compacted(ev) {
     live = null;
