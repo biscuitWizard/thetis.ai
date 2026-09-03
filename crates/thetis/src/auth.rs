@@ -277,13 +277,29 @@ fn html_escape(value: &str) -> String {
 /// login page is the one screen a person sees before any of their settings
 /// have loaded.
 pub fn page(c: &Config, msg: Option<&str>, next: &str) -> axum::response::Html<String> {
-    axum::response::Html(page_html(&c.agent_name, msg, next))
+    axum::response::Html(page_html(&c.agent_name, &c.agent_avatar, msg, next))
 }
 
-fn page_html(agent_name: &str, msg: Option<&str>, next: &str) -> String {
+fn page_html(agent_name: &str, agent_avatar: &str, msg: Option<&str>, next: &str) -> String {
     let banner = msg
         .map(|m| format!(r#"<p class="banner" role="alert">{}</p>"#, html_escape(m)))
         .unwrap_or_default();
+    // The same face as the app's header: the configured picture when there is
+    // one (a URL or a data: URI, both fine in a `src`), otherwise the mark.
+    // Only `http(s):` and `data:image/` are let through, so a stray value in
+    // the config cannot become a `javascript:` URL on the one page that has
+    // no CSP of its own.
+    let avatar_ok = agent_avatar.starts_with("https://")
+        || agent_avatar.starts_with("http://")
+        || agent_avatar.starts_with("data:image/");
+    let brand_mark = if avatar_ok {
+        format!(
+            r#"<img class="mark" src="{}" alt="" width="36" height="36" decoding="async">"#,
+            html_escape(agent_avatar)
+        )
+    } else {
+        r#"<svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="9" fill="none" stroke="currentColor" stroke-width="2.5"/><circle cx="16" cy="16" r="3" fill="currentColor"/></svg>"#.to_string()
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -292,31 +308,34 @@ fn page_html(agent_name: &str, msg: Option<&str>, next: &str) -> String {
 <meta name="color-scheme" content="dark light">
 <title>{name} — sign in</title>
 <style>
-:root{{--bg:#0b0b0f;--surface:#101016;--surface-2:#16161f;--hairline:#24242f;--hairline-strong:#32323f;--text:#ececf2;--text-dim:#a3a3b4;--text-faint:#6e6e82;--accent:#7c9cff;--accent-hot:#96b0ff;--err:#f2788f;--err-wash:rgba(242,120,143,.12)}}
-@media (prefers-color-scheme:light){{:root{{--bg:#f5f5f8;--surface:#ffffff;--surface-2:#ededf3;--hairline:#d9d9e3;--hairline-strong:#c3c3d1;--text:#17171f;--text-dim:#565669;--text-faint:#8a8a9c;--accent:#4a5fd0;--accent-hot:#3646b3;--err:#c0384f;--err-wash:rgba(192,56,79,.10)}}}}
+:root{{--bg:#0b0b0f;--surface:#101016;--surface-2:#16161f;--surface-3:#1d1d28;--hairline:#24242f;--hairline-strong:#32323f;--text:#ececf2;--text-dim:#a3a3b4;--text-faint:#6e6e82;--accent:#7c9cff;--accent-hot:#96b0ff;--accent-deep:#4a5fd0;--err:#f2788f;--err-wash:rgba(242,120,143,.12);--glow:rgba(124,156,255,.18)}}
+@media (prefers-color-scheme:light){{:root{{--bg:#f5f5f8;--surface:#ffffff;--surface-2:#f1f1f6;--surface-3:#e6e6ee;--hairline:#dedee6;--hairline-strong:#c8c8d4;--text:#17171f;--text-dim:#565669;--text-faint:#8a8a9c;--accent:#4a5fd0;--accent-hot:#3646b3;--accent-deep:#4a5fd0;--err:#c0384f;--err-wash:rgba(192,56,79,.10);--glow:rgba(74,95,208,.14)}}}}
 *{{box-sizing:border-box}}
 html,body{{height:100%}}
-body{{margin:0;display:grid;place-items:center;padding:1.5rem;background:var(--bg);color:var(--text);font:15px/1.6 "Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}}
-main{{width:100%;max-width:22rem;padding:1.75rem 1.75rem 1.5rem;background:var(--surface);border:1px solid var(--hairline);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.25)}}
-.brand{{display:flex;align-items:center;gap:.6rem;margin:0 0 1.25rem}}
-.brand svg{{width:22px;height:22px;color:var(--accent);flex:none}}
-h1{{font-size:1.05rem;font-weight:600;margin:0;letter-spacing:.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-p.lead{{margin:0 0 1rem;color:var(--text-dim);font-size:.9rem}}
-label{{display:block;margin:.9rem 0 .3rem;color:var(--text-dim);font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em}}
-input{{font:inherit;width:100%;padding:.55rem .7rem;border-radius:8px;border:1px solid var(--hairline-strong);background:var(--surface-2);color:var(--text);outline:none;transition:border-color .12s,box-shadow .12s}}
-input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent)}}
-button{{font:inherit;font-weight:600;width:100%;margin-top:1.3rem;padding:.6rem .9rem;border-radius:8px;border:1px solid transparent;background:var(--accent);color:#fff;cursor:pointer;transition:background .12s}}
+body{{margin:0;display:grid;place-items:center;padding:1.5rem;background:var(--bg);background-image:radial-gradient(60rem 30rem at 50% -10%,var(--glow),transparent 60%);color:var(--text);font:15px/1.6 "Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}}
+main{{width:100%;max-width:24rem;padding:2rem 2rem 1.5rem;background:var(--surface);border:1px solid var(--hairline);border-radius:16px;box-shadow:0 1px 2px rgba(0,0,0,.25),0 24px 60px -20px rgba(0,0,0,.5)}}
+.brand{{display:flex;flex-direction:column;align-items:center;gap:.7rem;margin:0 0 1.4rem;text-align:center}}
+.mark{{width:44px;height:44px;border-radius:12px;color:var(--accent);background:var(--surface-2);border:1px solid var(--hairline);padding:6px;object-fit:cover}}
+img.mark{{padding:0}}
+h1{{font-size:1.2rem;font-weight:600;margin:0;letter-spacing:-.01em;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.lead{{margin:0;color:var(--text-dim);font-size:.88rem}}
+label{{display:block;margin:1rem 0 .35rem;color:var(--text-dim);font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em}}
+input{{font:inherit;width:100%;padding:.6rem .75rem;border-radius:9px;border:1px solid var(--hairline-strong);background:var(--surface-2);color:var(--text);outline:none;transition:border-color .12s,box-shadow .12s,background .12s}}
+input:hover{{border-color:var(--text-faint)}}
+input:focus{{border-color:var(--accent);background:var(--surface);box-shadow:0 0 0 3px var(--glow)}}
+button{{font:inherit;font-weight:600;width:100%;margin-top:1.4rem;padding:.65rem .9rem;border-radius:9px;border:1px solid transparent;background:var(--accent-deep);color:#fff;cursor:pointer;transition:background .12s,transform .06s}}
 button:hover{{background:var(--accent-hot)}}
+button:active{{transform:translateY(1px)}}
 button:focus-visible{{outline:2px solid var(--accent-hot);outline-offset:2px}}
-.banner{{margin:0 0 .5rem;padding:.55rem .75rem;border-radius:8px;font-size:.88rem;color:var(--err);background:var(--err-wash);border:1px solid color-mix(in srgb,var(--err) 40%,transparent)}}
-.foot{{margin:1.25rem 0 0;color:var(--text-faint);font-size:.78rem;text-align:center}}
+.banner{{margin:0 0 .25rem;padding:.6rem .8rem;border-radius:9px;font-size:.88rem;color:var(--err);background:var(--err-wash);border:1px solid color-mix(in srgb,var(--err) 35%,transparent)}}
+.foot{{margin:1.4rem 0 0;color:var(--text-faint);font-size:.78rem;text-align:center;line-height:1.5}}
 </style>
 <main>
   <div class="brand">
-    <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="9" fill="none" stroke="currentColor" stroke-width="2.5"/><circle cx="16" cy="16" r="3" fill="currentColor"/></svg>
+    {brand_mark}
     <h1 title="{name}">{name}</h1>
+    <p class="lead">Sign in to continue</p>
   </div>
-  <p class="lead">Sign in to your conversations.</p>
   {banner}
   <form method="post" action="/login">
     <input type="hidden" name="next" value="{next}">
@@ -326,10 +345,11 @@ button:focus-visible{{outline:2px solid var(--accent-hot);outline-offset:2px}}
     <input id="password" name="password" type="password" autocomplete="current-password" required>
     <button type="submit">Sign in</button>
   </form>
-  <p class="foot">Accounts are configured by the operator of this Thetis.</p>
+  <p class="foot">No account? Ask whoever runs this Thetis.</p>
 </main>
 "#,
         name = html_escape(agent_name),
+        brand_mark = brand_mark,
         banner = banner,
         next = html_escape(&safe_next(next))
     )
@@ -427,14 +447,21 @@ mod tests {
     fn the_page_escapes_what_it_is_given() {
         // The page needs a Config only for the agent name; a minimal one is
         // enough to see that nothing typed lands in the HTML unescaped.
-        let html = page_html("Thetis <x>", Some("Wrong \"user\""), "/a?b=<c>");
+        let html = page_html("Thetis <x>", "", Some("Wrong \"user\""), "/a?b=<c>");
         assert!(html.contains("Thetis &lt;x&gt;"));
         assert!(html.contains("Wrong &quot;user&quot;"));
         assert!(html.contains("value=\"/a?b=&lt;c&gt;\""));
         assert!(!html.contains("<x>"));
-        let quiet = page_html("T", None, "");
+        let quiet = page_html("T", "", None, "");
         assert!(!quiet.contains("role=\"alert\""), "no banner without a message");
         assert!(quiet.contains("value=\"/\""), "an empty next goes home");
+        assert!(quiet.contains("<svg class=\"mark\""), "no avatar means the mark");
+        // The avatar is used when it is a picture, and never when it is a script.
+        let pic = page_html("T", "data:image/png;base64,AAAA", None, "");
+        assert!(pic.contains("<img class=\"mark\" src=\"data:image/png;base64,AAAA\""));
+        let bad = page_html("T", "javascript:alert(1)", None, "");
+        assert!(!bad.contains("javascript:"));
+        assert!(bad.contains("<svg class=\"mark\""));
     }
 
     #[test]

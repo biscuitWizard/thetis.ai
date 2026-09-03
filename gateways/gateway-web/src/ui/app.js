@@ -114,7 +114,12 @@ connection.onOpen(() => {
 // for its own list rather than being told: a reconnect, a conversation switch
 // and a newly opened shell all funnel through the same request.
 const terminals = mountTerminals({
-  onRequest: (id) => connection.send({ type: "terminals", id }),
+  // The drawer asks for the list whenever a conversation opens. Not for a
+  // role that is denied terminals: the host would answer every open with an
+  // error toast, for a drawer they cannot use.
+  onRequest: (id) => {
+    if (!denied("terminal")) connection.send({ type: "terminals", id });
+  },
   // `id` is the conversation everywhere on this socket, so the shell goes in
   // its own field rather than overloading it.
   onKill: (terminal) =>
