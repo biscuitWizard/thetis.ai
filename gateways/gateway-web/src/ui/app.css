@@ -574,6 +574,65 @@ body { display: flex; flex-direction: column; }
 .meta.is-nudge { color: var(--warn); }
 .meta.is-good { color: var(--ok); }
 
+/* --- the compaction card -------------------------------------------------
+   Shown under the last message while the context is being summarized down.
+
+   Transient by design and it looks it: the same surface as a tool card so it
+   does not read as a message, with the one progress element in the transcript.
+   Before this a compaction was tens of seconds of total silence with a dead
+   stop button, which is indistinguishable from a hang. */
+
+.compacting {
+  max-width: var(--measure);
+  margin: 0 auto var(--gap-4);
+  padding: 10px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--r-md);
+  font-size: var(--text-sm);
+}
+.compacting.is-bad { border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+
+.compacting-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-dim);
+}
+.compacting-title { font-weight: 500; }
+.compacting-count {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* The house progress element: a 4px track a step above the card, accent fill. */
+.compacting-track {
+  height: 4px;
+  margin: 9px 0 8px;
+  background: var(--surface-3);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+.compacting-fill {
+  display: block;
+  height: 4px;
+  width: 0;
+  background: var(--accent);
+  border-radius: var(--r-pill);
+  transition: width var(--med) var(--ease);
+}
+.compacting.is-done .compacting-fill { background: var(--ok); }
+.compacting.is-bad .compacting-fill { background: var(--warn); }
+
+.compacting-detail { color: var(--text-dim); }
+.compacting-foot {
+  margin-top: 3px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 /* --- tool cards ----------------------------------------------------------- */
 
 .tool {
