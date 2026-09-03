@@ -88,6 +88,31 @@ impl HostState {
         }
     }
 
+    /// Whether `account` owns this conversation (resolved to its root, so a
+    /// sub-agent answers for its parent).
+    ///
+    /// Ownership decides who may *share* a conversation, which is a different
+    /// question from who may read it: `may_access` admits participants too. A
+    /// guard written in terms of participation would let a guest re-share
+    /// something they were shown, widening an audience that was the owner's to
+    /// choose.
+    ///
+    /// This lives here, above the `Persist` split, because it is the only layer
+    /// both callers pass through. The equivalent checks in the `store.*` IPC
+    /// arms guard the *worker* path only — on the gateway, `Persist::Local`
+    /// runs the store call directly and never sees them — which is exactly how
+    /// the invite guard came to be missing for every browser client.
+    async fn owns(&mut self, session_id: &str, account: &str) -> Result<bool> {
+        let owner = self
+            .grip()
+            .persist
+            .owner_of_root(session_id)
+            .await
+            .wt()?
+            .unwrap_or_default();
+        Ok(!owner.is_empty() && owner == account)
+    }
+
     /// The workspace capabilities, for a filesystem call that turns out to
     /// touch `/workspace`.
     ///
@@ -555,6 +580,22 @@ impl session::Host for HostState {
     async fn archive_session(&mut self, session_id: String, archived: bool) -> Result<()> {
         self.budget.entered_host("archive_session");
         self.scope_ok(&session_id)?;
+        // Archiving is the owner's disposition of their own conversation, and
+        // `scope_ok` is not enough to establish that any more: it admits
+        // participants now, so inviting somebody used to hand them the power to
+        // retire the conversation out from under you. That is not a shared
+        // setting like the mode — it shuts the worker down, releases the
+        // worktree, and is the cross-surface "start over". A guest's way out is
+        // to remove themselves.
+        let me = self.principal.as_ref().map(|p| p.user_id.clone());
+        if let Some(me) = me {
+            if !self.owns(&session_id, &me).await? {
+                return Err(err(
+                    "only the owner can archive a conversation; \
+                     you can remove yourself from it instead",
+                ));
+            }
+        }
         self.grip()
             .persist
             .archive_session(&session_id, archived)
@@ -706,9 +747,23 @@ impl session::Host for HostState {
         Ok(out)
     }
 
-    /// Invites an account. The native side checks that the caller owns the
-    /// conversation; this only refuses obvious nonsense early so the browser
-    /// gets a useful message instead of a store error.
+    /// Invites an account.
+    ///
+    /// **Only the owner may invite, and that is enforced here.** It used to say
+    /// "the native side checks that the caller owns the conversation", meaning
+    /// the `store.add_participant` IPC arm — which was true and useless: that
+    /// arm is only reached from `Persist::Remote`, i.e. from a worker. The
+    /// browser talks to the gateway, where `Persist::Local` runs the store call
+    /// directly and skips every IPC guard. So a *participant* could invite
+    /// further accounts into someone else's conversation, which is an
+    /// escalation: sharing is the owner's decision, and anyone who could
+    /// re-share would be able to widen an audience the owner chose.
+    ///
+    /// Caught by `ws_participants`, driving the real websocket against a real
+    /// kernel; every unit test passed throughout, because they exercise the
+    /// store and the IPC arm and neither is this path. The check belongs here,
+    /// above the `Persist` split, since this import is the one chokepoint both
+    /// the browser and a worker must come through.
     async fn add_participant(
         &mut self,
         session_id: String,
@@ -722,6 +777,11 @@ impl session::Host for HostState {
         if !self.grip().cfg.auth.users_mode {
             return Ok(Err(
                 "inviting needs accounts turned on (auth.mode = \"users\")".into(),
+            ));
+        }
+        if !self.owns(&session_id, &me).await? {
+            return Ok(Err(
+                "only the owner of a conversation can invite people to it".into(),
             ));
         }
         // Resolve through `user()` so the invitation stores the canonical id
@@ -756,6 +816,16 @@ impl session::Host for HostState {
         let Some(me) = self.principal.as_ref().map(|p| p.user_id.clone()) else {
             return Ok(Err("only a signed-in account may remove a participant".into()));
         };
+        // The owner may remove anyone; anyone may remove themselves. Enforced
+        // here for the same reason as `add_participant`: the matching IPC guard
+        // is bypassed entirely on the gateway's local store. Without it, one
+        // guest could evict another — including to hide what they had been
+        // shown from the person who shared it.
+        if account != me && !self.owns(&session_id, &me).await? {
+            return Ok(Err(
+                "only the owner can remove someone else; you can always remove yourself".into(),
+            ));
+        }
         match self
             .grip()
             .persist
@@ -780,17 +850,13 @@ impl session::Host for HostState {
         // The account list is not public. Only the owner is offered it,
         // because only the owner can act on it — and anyone else asking is
         // enumerating users.
-        let owner = self
-            .grip()
-            .persist
-            .owner_of_root(&session_id)
-            .await
-            .wt()?
-            .unwrap_or_default();
-        let me = self.principal.as_ref().map(|p| p.user_id.clone());
-        if me.as_deref() != Some(owner.as_str()) {
+        let Some(me) = self.principal.as_ref().map(|p| p.user_id.clone()) else {
+            return Ok(Vec::new());
+        };
+        if !self.owns(&session_id, &me).await? {
             return Ok(Vec::new());
         }
+        let owner = me.clone();
         let already = self
             .grip()
             .persist
@@ -2788,6 +2854,54 @@ mod tests {
                  `self.scope_ok(&session_id)?;` after the budget line, or — if \
                  it genuinely must be unscoped — say why in a comment and \
                  remove it from this list."
+            );
+        }
+    }
+
+    /// Sharing a conversation must not hand over the right to re-share it, to
+    /// evict the other guests, or to retire the conversation itself.
+    ///
+    /// This is the guard `may_access` cannot provide. `may_access` answers "may
+    /// this person see it", and since participants exist it admits them — so
+    /// every import that used it as a stand-in for "is this the owner" widened
+    /// silently the moment sharing landed. The ownership check has to be a
+    /// separate question, asked here.
+    ///
+    /// Written as a source-text test for the same reason as the two above it:
+    /// the equivalent checks in the `store.*` IPC arms of `persist.rs` look
+    /// like enforcement and are not. They are only reached from
+    /// `Persist::Remote`, i.e. from a worker. The browser talks to the gateway,
+    /// where `Persist::Local` runs the store call directly and every one of
+    /// those guards is skipped. That is exactly how invite-by-a-guest shipped:
+    /// the check existed, in the arm no browser ever reaches, and the unit
+    /// tests that covered it passed. Only a live two-account websocket test
+    /// caught it. So the check belongs above the split, in this file, and this
+    /// test is what says so.
+    #[test]
+    fn sharing_a_conversation_does_not_hand_over_the_owners_decisions() {
+        let src = include_str!("host_api.rs");
+        let session_impl = src
+            .split("impl session::Host for HostState")
+            .nth(1)
+            .expect("the session impl");
+        for method in [
+            "async fn add_participant(",
+            "async fn remove_participant(",
+            "async fn archive_session(",
+        ] {
+            let body = session_impl
+                .split(method)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{method}` is gone from the session impl"));
+            let body = body.split("    async fn ").next().unwrap_or(body);
+            assert!(
+                body.contains("self.owns(&session_id, &me).await?"),
+                "`{method}` does not check ownership, so a participant can use \
+                 it on a conversation somebody else shared with them. \
+                 `may_access` is not enough — it admits participants by \
+                 design. Call `self.owns(&session_id, &me).await?` here, in \
+                 this file: the matching guard in the `store.*` IPC arm is \
+                 reached only from a worker, never from a browser."
             );
         }
     }
