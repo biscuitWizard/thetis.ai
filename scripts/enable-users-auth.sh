@@ -43,6 +43,18 @@ id=$(printf '%s' "$given" | tr '[:upper:]' '[:lower:]')
 
 [ -x "$binary" ] || die "no binary at $binary — run: cargo build --release -p thetis"
 
+# Does that binary know what `hash-password` is? A build from before users
+# mode landed does not, and an unknown first argument is not an error to it:
+# it falls through to starting a gateway, fails on the database lock the
+# running one holds, and returns 1. That is indistinguishable from a hashing
+# failure unless it is asked here, before a password has been typed twice.
+if ! probe=$(printf 'probe' | "$binary" hash-password --stdin 2>&1) \
+    || [ "${probe#\$argon2}" = "$probe" ]; then
+    echo "${probe:-(no output)}" | sed 's/^/  /' >&2
+    die "$binary does not answer \`hash-password\` with a hash — it predates users mode. Rebuild it: cargo build --release -p thetis"
+fi
+unset probe
+
 if [ -f "$overlay" ] && grep -qE '^\[\[users\]\]' "$overlay"; then
     die "$overlay already defines [[users]]; edit it by hand rather than adding a second account here"
 fi
@@ -57,10 +69,18 @@ read -rs confirm; echo >&2
 [ -n "$password" ] || die "an empty password is not a password"
 [ "$password" = "$confirm" ] || die "the two did not match"
 
-hash=$(printf '%s' "$password" | "$binary" hash-password --stdin 2>/dev/null) \
-    || die "hashing failed"
+# stderr is kept rather than discarded. It is the only account of why this
+# failed, and "hashing failed" on its own tells nobody anything.
+errs=$(mktemp) || die "could not make a temporary file"
+hash=$(printf '%s' "$password" | "$binary" hash-password --stdin 2>"$errs")
+status=$?
 unset password confirm
-[ -n "$hash" ] || die "hashing produced nothing"
+if [ $status -ne 0 ] || [ -z "$hash" ]; then
+    sed 's/^/  /' "$errs" >&2
+    rm -f -- "$errs"
+    die "hashing failed"
+fi
+rm -f -- "$errs"
 
 backup=$overlay.before-users-auth
 [ -f "$overlay" ] && cp -- "$overlay" "$backup"
