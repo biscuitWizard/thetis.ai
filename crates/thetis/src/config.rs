@@ -97,16 +97,7 @@ pub struct BuildSettings {
     pub command: String,
     pub target: String,
     pub profile: String,
-    /// Cargo target directory for guest builds, resolved against the config's
-    /// own root — so each worktree compiles into its own.
-    ///
-    /// Deliberately not shared between checkouts. Cargo only rewrites an output
-    /// when the copy it is building is dirty, so one shared directory let two
-    /// branches serve each other's artifacts, and the workaround for that
-    /// (dirtying a source file before every build) fed the file watcher a fake
-    /// edit and span cargo forever. Dependencies are still compiled once per
-    /// worktree rather than once per fleet; cross-branch reuse comes from the
-    /// content-addressed build cache in `paths.artifacts`, which is shared.
+    /// Shared cargo target directory, so guests compile their dependencies once.
     pub target_dir: PathBuf,
     /// Pass `--locked` when a lockfile exists, keeping resolution reproducible.
     pub locked: bool,
@@ -274,20 +265,6 @@ pub struct TerminalSettings {
     pub default_timeout: Duration,
     pub max_output_bytes: usize,
     pub idle_timeout: Duration,
-    /// Whether a session may be opened against a registered ssh host.
-    ///
-    /// Separate from `enabled` because it is a wider boundary: a local shell
-    /// reaches this machine, a remote one reaches whatever the keys on this
-    /// machine can reach. The host registry is not a substitute for this
-    /// switch — turning it off disables remote sessions with the hosts still
-    /// defined.
-    pub ssh_enabled: bool,
-    pub ssh_program: String,
-    /// How long a new remote session has to answer its first command before it
-    /// is declared unusable and torn down.
-    pub ssh_connect_timeout: Duration,
-    /// How long `send` waits for a reply before returning what arrived.
-    pub send_settle: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -433,18 +410,6 @@ impl Config {
     /// name process-wide ground truth, not per-checkout state.
     pub fn build_lock_path(&self) -> PathBuf {
         self.paths.data.join("build.lock")
-    }
-
-    /// The cross-process lock for orchestrator builds.
-    ///
-    /// Separate from the guest build lock: a kernel build is minutes of four
-    /// cores and gigabytes of target directory, while a guest build is
-    /// seconds, so making them queue behind each other would stall every
-    /// conversation's edit-compile loop. Also in the shared data directory,
-    /// because the point is to serialize across *workers*, each of which is
-    /// its own process with its own in-process mutex.
-    pub fn kernel_build_lock_path(&self) -> PathBuf {
-        self.paths.data.join("kernel-build.lock")
     }
 
     /// Source directory for an aspect.
@@ -1046,10 +1011,6 @@ mod spec {
         pub default_timeout_ms: u64,
         pub max_output_bytes: usize,
         pub idle_timeout_secs: u64,
-        pub ssh_enabled: bool,
-        pub ssh_program: String,
-        pub ssh_connect_timeout_ms: u64,
-        pub send_settle_ms: u64,
     }
     impl Default for Terminal {
         fn default() -> Self {
@@ -1062,17 +1023,6 @@ mod spec {
                 default_timeout_ms: 30_000,
                 max_output_bytes: 65_536,
                 idle_timeout_secs: 1_800,
-                // On by default, and the reason is that it grants nothing on
-                // its own: a remote session needs a host in the registry, and
-                // adding one is a deliberate act. Nobody's reach widens until
-                // they define somewhere to reach.
-                ssh_enabled: true,
-                ssh_program: "ssh".into(),
-                // A connect, an auth handshake and a shell start, over a link
-                // that may be slow. Generous, because the failure it guards is
-                // a session that never works at all.
-                ssh_connect_timeout_ms: 25_000,
-                send_settle_ms: 400,
             }
         }
     }
@@ -1664,16 +1614,6 @@ impl Config {
                 default_timeout: Duration::from_millis(file.terminal.default_timeout_ms),
                 max_output_bytes: file.terminal.max_output_bytes,
                 idle_timeout: Duration::from_secs(file.terminal.idle_timeout_secs),
-                ssh_enabled: env.parse("THETIS_TERMINAL_SSH", file.terminal.ssh_enabled),
-                ssh_program: if file.terminal.ssh_program.is_empty() {
-                    "ssh".into()
-                } else {
-                    file.terminal.ssh_program
-                },
-                ssh_connect_timeout: Duration::from_millis(
-                    file.terminal.ssh_connect_timeout_ms.max(1_000),
-                ),
-                send_settle: Duration::from_millis(file.terminal.send_settle_ms),
             },
 
             control: ControlSettings {

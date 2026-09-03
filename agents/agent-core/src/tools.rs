@@ -6,8 +6,8 @@
 //! flip and the tools appear without the agent needing to change.
 
 use crate::thetis::grip::types::{
-    CompileReport, ConfigEntry, Dependency, EnvVar, ExecResult, FsEntry, LogLevel, ModTarget,
-    SshHostInfo, TerminalOpen, TerminalOutput, ToolManifest,
+    CompileReport, ConfigEntry, Dependency, ExecResult, FsEntry, LogLevel, ModTarget,
+    TerminalOutput, ToolManifest,
 };
 use crate::thetis::grip::{
     branch, configuration, control, devkit, hostfs, sandbox, skills, sys, terminal, tooling,
@@ -124,11 +124,6 @@ fn all_builtins() -> Vec<ToolDef> {
     if !terminal_available() {
         tools.extend(terminal_tools());
         tools.extend(git_tools());
-    }
-    // Classification must cover it either way: whether `ssh_host` is offered
-    // depends on config, but it is mutating in every configuration.
-    if !(terminal_available() && terminal::ssh_available()) {
-        tools.extend(ssh_host_tools());
     }
     tools
 }
@@ -406,9 +401,6 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // git_clone runs the credential script in a shell, so it is offered on
         // the same condition as the terminal itself.
         tools.extend(git_tools());
-        if terminal::ssh_available() {
-            tools.extend(ssh_host_tools());
-        }
     }
     tools.extend(configuration_tools());
     if restart_available() {
@@ -607,36 +599,15 @@ fn terminal_tools() -> Vec<ToolDef> {
             name: "terminal_open",
             description:
                 "Open a shell session and return its id. Reuse the id for related commands so \
-                 the working directory and environment carry over. Pass `host` to open the \
-                 session on a remote machine over ssh, naming a host you registered with \
-                 `ssh_host`.\n\nThe terminal is for running programs — builds, tests, git, \
-                 package managers, processes, anything whose output you need. It is not the way \
-                 to look at or change files: `search_files`, `find_files`, `read_path` and \
-                 `edit_path` do that far more cheaply and reliably than grep, sed and heredocs, \
-                 and edits made through the shell are attributed to the user rather than to you.",
+                 the working directory and environment carry over.\n\nThe terminal is for \
+                 running programs — builds, tests, git, package managers, processes, anything \
+                 whose output you need. It is not the way to look at or change files: \
+                 `search_files`, `find_files`, `read_path` and `edit_path` do that far more \
+                 cheaply and reliably than grep, sed and heredocs, and edits made through the \
+                 shell are attributed to the user rather than to you.",
             mutating: true,
             parameters: obj(
-                json!({
-                    "cwd": string_prop(
-                        "Directory to start in; defaults to the project root. Ignored for a \
-                         remote session, which starts where its host says.",
-                    ),
-                    "host": string_prop(
-                        "Name of a registered ssh host, to open the session on that machine \
-                         instead of this one. Omit for a local shell. List the names with \
-                         `ssh_host action=list`.",
-                    ),
-                    "name": string_prop(
-                        "A label for this session, so listings read as something better than \
-                         term-1. Optional.",
-                    ),
-                    "env": {
-                        "type": "object",
-                        "description": "Environment variables for the session's shell, as a \
-                                        flat name-to-value object.",
-                        "additionalProperties": { "type": "string" },
-                    },
-                }),
+                json!({ "cwd": string_prop("Directory to start in; defaults to the project root.") }),
                 &[],
             ),
         },
@@ -644,11 +615,8 @@ fn terminal_tools() -> Vec<ToolDef> {
             name: "terminal_run",
             description:
                 "Run a command in an open shell session and wait for it to finish. Returns \
-                 whatever it printed, with the exit status. A command that outlives the timeout \
-                 keeps running; read the session again later for the rest.\n\nThis waits for the \
-                 command to complete, so it cannot drive anything interactive: a program sitting \
-                 at a prompt never finishes. Use `terminal_send` for that, and `terminal_signal` \
-                 to interrupt.",
+                 whatever it printed. A command that outlives the timeout keeps running; read \
+                 the session again later for the rest.",
             mutating: true,
             parameters: obj(
                 json!({
@@ -658,15 +626,6 @@ fn terminal_tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "description": "How long to wait. Omit for the configured default.",
                     },
-                    "background": {
-                        "type": "boolean",
-                        "description": "Start the command and return at once instead of waiting. \
-                                        Use for something long whose output you want later — a \
-                                        build, a test suite, a server. Collect it with \
-                                        `terminal_read`. The session will not accept another \
-                                        command until it ends, so open a second session if you \
-                                        need to work meanwhile.",
-                    },
                 }),
                 &["id", "command"],
             ),
@@ -675,58 +634,9 @@ fn terminal_tools() -> Vec<ToolDef> {
             name: "terminal_read",
             description:
                 "Read anything a session has printed since the last read, without running \
-                 anything. Use it to collect output from a command that timed out or was \
-                 backgrounded — it says whether that command has since finished.",
+                 anything. Use it to collect output from a command that timed out.",
             mutating: false,
             parameters: obj(json!({ "id": string_prop("Session id.") }), &["id"]),
-        },
-        ToolDef {
-            name: "terminal_send",
-            description:
-                "Write raw input to a session and return immediately, without waiting for a \
-                 command to complete. This is how to answer a prompt — a confirmation, a \
-                 passphrase, a `y` — or to drive a REPL, none of which `terminal_run` can do, \
-                 because it waits for the command to end and an interactive program never \
-                 ends.\n\nWhatever the program printed in the moment after is returned; use \
-                 `terminal_read` for the rest.",
-            mutating: true,
-            parameters: obj(
-                json!({
-                    "id": string_prop("Session id."),
-                    "text": string_prop(
-                        "The text to write. Pass an empty string with submit to send a bare \
-                         newline.",
-                    ),
-                    "submit": {
-                        "type": "boolean",
-                        "description": "Append a newline, as pressing Enter would. Defaults to \
-                                        true; set false to send a partial line or a control \
-                                        sequence.",
-                    },
-                }),
-                &["id", "text"],
-            ),
-        },
-        ToolDef {
-            name: "terminal_signal",
-            description:
-                "Interrupt what a session is running, leaving the session itself alive — the \
-                 deliberate Ctrl-C. Use it to stop a `tail -f`, end a test run whose first \
-                 failure already told you what you needed, or unstick a command waiting on \
-                 input you cannot give.\n\nA remote session needs a pty on its host for this to \
-                 be deliverable, and can then take only INT, QUIT and TSTP.",
-            mutating: true,
-            parameters: obj(
-                json!({
-                    "id": string_prop("Session id."),
-                    "signal": {
-                        "type": "string",
-                        "description": "Which signal to send. INT is the usual one.",
-                        "enum": ["INT", "TERM", "TSTP", "HUP", "QUIT", "KILL"],
-                    },
-                }),
-                &["id", "signal"],
-            ),
         },
         ToolDef {
             name: "terminal_close",
@@ -736,9 +646,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_list",
-            description:
-                "List the open shell sessions, with where each one runs, where it is, and \
-                 whether it is busy with a background command.",
+            description: "List the open shell sessions.",
             mutating: false,
             parameters: obj(json!({}), &[]),
         },
@@ -792,70 +700,6 @@ fn git_tools() -> Vec<ToolDef> {
                 },
             }),
             &["repo"],
-        ),
-    }]
-}
-
-/// The named-host registry, offered only when remote sessions are actually
-/// possible — a tool for managing hosts nothing can connect to is noise.
-///
-/// Connection details live here once and are referred to by name, so a session
-/// is opened with `host: "build-box"` rather than a line of ssh arguments.
-fn ssh_host_tools() -> Vec<ToolDef> {
-    vec![ToolDef {
-        name: "ssh_host",
-        description:
-            "Manage the named ssh hosts that `terminal_open` can open a session on. Add, edit, \
-             rename, remove and list them.\n\nA name here is all `terminal_open` needs, so \
-             connection details are stated once. They are kept in a gitignored file that the \
-             config loader never reads: it cannot be published by accident, it never appears in \
-             `list_config`, and a bad entry cannot stop Thetis from starting. Only the *path* to \
-             a private key is stored, never a key or a password — ssh runs with BatchMode on and \
-             will not prompt, so a host must authenticate by key.",
-        mutating: true,
-        parameters: obj(
-            json!({
-                "action": {
-                    "type": "string",
-                    "description": "What to do. `set` adds a host or edits one, keeping any \
-                                    field you leave out.",
-                    "enum": ["list", "get", "set", "remove", "rename"],
-                },
-                "name": string_prop(
-                    "The host's name, for every action except list. Letters, digits, '-', '_' \
-                     and '.'.",
-                ),
-                "host": string_prop("Hostname or address. Required when first adding."),
-                "port": {
-                    "type": "integer",
-                    "description": "Port. Omit to let ssh decide, which respects ~/.ssh/config.",
-                },
-                "user": string_prop("Login user. Omit to let ssh decide."),
-                "identity_file": string_prop(
-                    "Path to the private key to authenticate with. Omit for ssh's own key \
-                     discovery.",
-                ),
-                "options": {
-                    "type": "array",
-                    "description": "Extra ssh arguments, each complete, e.g. \
-                                    \"-oStrictHostKeyChecking=accept-new\".",
-                    "items": { "type": "string" },
-                },
-                "remote_cwd": string_prop(
-                    "Directory to enter on connecting. A session refuses to start if it does \
-                     not exist, rather than landing in the login directory.",
-                ),
-                "pty": {
-                    "type": "boolean",
-                    "description": "Allocate a remote terminal. Needed for `terminal_signal` to \
-                                    reach that host, and for anything that demands a tty such \
-                                    as sudo. Costs echoed commands and prompts mixed into \
-                                    output, so leave it off unless you need it.",
-                },
-                "description": string_prop("A note to yourself about what this host is."),
-                "to": string_prop("The new name, for rename."),
-            }),
-            &["action"],
         ),
     }]
 }
@@ -1319,36 +1163,11 @@ pub fn invoke(
 
         "git_clone" => git_clone(&args),
 
-        "terminal_open" => {
-            let env: Vec<EnvVar> = args
-                .get("env")
-                .and_then(Value::as_object)
-                .map(|map| {
-                    map.iter()
-                        .map(|(key, value)| EnvVar {
-                            key: key.clone(),
-                            // A number or a bool in an env map is a slip, not a
-                            // reason to fail: render it rather than dropping it.
-                            value: match value {
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            },
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            terminal::open(&TerminalOpen {
-                cwd: opt_arg(&args, "cwd"),
-                name: opt_arg(&args, "name"),
-                env,
-                host: opt_arg(&args, "host"),
-            })
-        }
+        "terminal_open" => terminal::open(args.get("cwd").and_then(Value::as_str)),
         "terminal_run" => terminal::run(
             &req_str(&args, "id")?,
             &req_str(&args, "command")?,
             args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0) as u32,
-            args.get("background").and_then(Value::as_bool).unwrap_or(false),
         )
         .map(format_terminal),
         "terminal_read" => terminal::read(&req_str(&args, "id")?).map(|text| {
@@ -1358,16 +1177,6 @@ pub fn invoke(
                 text
             }
         }),
-        "terminal_send" => terminal::send(
-            &req_str(&args, "id")?,
-            // Deliberately not `req_str`: an empty string is a legitimate
-            // payload, being how a bare newline is sent.
-            args.get("text").and_then(Value::as_str).unwrap_or(""),
-            args.get("submit").and_then(Value::as_bool).unwrap_or(true),
-        ),
-        "terminal_signal" => {
-            terminal::signal(&req_str(&args, "id")?, &req_str(&args, "signal")?)
-        }
         "terminal_close" => terminal::close(&req_str(&args, "id")?),
         "terminal_list" => {
             let sessions = terminal::sessions();
@@ -1377,101 +1186,16 @@ pub fn invoke(
             Ok(sessions
                 .iter()
                 .map(|s| {
-                    let mut line = s.id.clone();
-                    if !s.name.is_empty() {
-                        line.push_str(&format!(" ({})", s.name));
-                    }
-                    // Where it runs comes before where it is: a path alone does
-                    // not say which machine it is a path on.
-                    line.push_str(&format!(
-                        "  {}  {}  {} command(s)  {}",
-                        if s.remote.is_empty() {
-                            "local".to_string()
-                        } else {
-                            format!("ssh:{}", s.remote)
-                        },
+                    format!(
+                        "{}  {}  {} command(s)  {}",
+                        s.id,
                         s.cwd,
                         s.commands,
                         if s.alive { "running" } else { "exited" }
-                    ));
-                    if !s.busy.is_empty() {
-                        line.push_str(&format!("\n    busy in the background: {}", s.busy));
-                    }
-                    line
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))
-        }
-
-        "ssh_host" => {
-            let action = req_str(&args, "action")?;
-            match action.as_str() {
-                "list" => {
-                    let hosts = terminal::ssh_hosts()?;
-                    if hosts.is_empty() {
-                        return Ok("no ssh hosts defined. Add one with ssh_host action=set, \
-                                   giving at least name and host."
-                            .to_string());
-                    }
-                    Ok(hosts
-                        .iter()
-                        .map(format_ssh_host)
-                        .collect::<Vec<_>>()
-                        .join("\n"))
-                }
-                "get" => {
-                    let name = req_str(&args, "name")?;
-                    let hosts = terminal::ssh_hosts()?;
-                    match hosts.iter().find(|h| h.name == name) {
-                        Some(host) => Ok(format_ssh_host(host)),
-                        None => Err(format!(
-                            "no ssh host named {name:?}. Defined: {}",
-                            if hosts.is_empty() {
-                                "none".to_string()
-                            } else {
-                                hosts
-                                    .iter()
-                                    .map(|h| h.name.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            }
-                        )),
-                    }
-                }
-                "set" => terminal::ssh_host_set(
-                    &SshHostInfo {
-                        name: req_str(&args, "name")?,
-                        host: opt_str(&args, "host"),
-                        port: args.get("port").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        user: opt_str(&args, "user"),
-                        identity_file: opt_str(&args, "identity_file"),
-                        options: args
-                            .get("options")
-                            .and_then(Value::as_array)
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_string)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        remote_cwd: opt_str(&args, "remote_cwd"),
-                        pty: args.get("pty").and_then(Value::as_bool).unwrap_or(false),
-                        description: opt_str(&args, "description"),
-                    },
-                    // Always a merge: editing one field of a host should not
-                    // silently clear the rest, and there is no plausible reason
-                    // to want that.
-                    true,
-                ),
-                "remove" => terminal::ssh_host_remove(&req_str(&args, "name")?),
-                "rename" => {
-                    terminal::ssh_host_rename(&req_str(&args, "name")?, &req_str(&args, "to")?)
-                }
-                other => Err(format!(
-                    "unknown action {other:?}; use list, get, set, remove or rename"
-                )),
-            }
         }
 
         "list_config" => {
@@ -1742,18 +1466,10 @@ fn git_clone(args: &Value) -> Result<String, String> {
         dir = shell_quote(&dir),
     ));
 
-    // A local session, labelled so it is recognisable in a listing if the clone
-    // is slow enough that someone looks.
-    let session = terminal::open(&TerminalOpen {
-        cwd: None,
-        name: Some(format!("git_clone {repo}")),
-        env: Vec::new(),
-        host: None,
-    })?;
+    let session = terminal::open(None)?;
     // Cloning is network-bound and a large repository is slow, so this gets a
     // longer leash than the terminal default. The session is closed either way.
-    // Not backgrounded: the whole point here is to wait for the clone.
-    let result = terminal::run(&session, &script, 600_000, false);
+    let result = terminal::run(&session, &script, 600_000);
     let _ = terminal::close(&session);
 
     let output = format_terminal(result?);
@@ -2086,55 +1802,12 @@ fn format_terminal(result: TerminalOutput) -> String {
     } else {
         out.push_str(&result.output);
     }
-    // A non-zero status is the thing most easily missed in a wall of output, so
-    // it goes last where it will be read, and names the host when there is one.
-    if let Some(code) = result.exit_code.filter(|c| *c != 0) {
-        out.push_str(&format!("\n\n[exit status {code}"));
-        if !result.host.is_empty() {
-            out.push_str(&format!(" on {}", result.host));
-        }
-        out.push(']');
-    }
-    // A backgrounded command is also "timed out" internally, but it said so
-    // itself and in its own words; repeating it as a timeout would be wrong.
-    // Anchored at the start rather than searched for: the note is always the
-    // first thing in a background result, and a `contains` would also match a
-    // command whose own output happened to quote the phrase.
-    if result.timed_out && !result.output.starts_with("[started in the background") {
+    if result.timed_out {
         out.push_str(
-            "\n\n[still running: the timeout elapsed. Use terminal_read to collect the rest, or \
-             terminal_signal to interrupt it.]",
+            "\n\n[still running: the timeout elapsed. Use terminal_read to collect the rest.]",
         );
     }
     out
-}
-
-fn format_ssh_host(host: &SshHostInfo) -> String {
-    let mut parts = vec![if host.user.is_empty() {
-        host.host.clone()
-    } else {
-        format!("{}@{}", host.user, host.host)
-    }];
-    if host.port != 0 {
-        parts.push(format!("port {}", host.port));
-    }
-    if !host.identity_file.is_empty() {
-        parts.push(format!("key {}", host.identity_file));
-    }
-    if !host.remote_cwd.is_empty() {
-        parts.push(format!("cwd {}", host.remote_cwd));
-    }
-    if host.pty {
-        parts.push("pty".to_string());
-    }
-    for option in &host.options {
-        parts.push(option.clone());
-    }
-    let mut line = format!("{}  {}", host.name, parts.join("  ·  "));
-    if !host.description.is_empty() {
-        line.push_str(&format!("\n    {}", host.description));
-    }
-    line
 }
 
 fn format_exec(result: ExecResult) -> String {

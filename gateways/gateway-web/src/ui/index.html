@@ -53,7 +53,6 @@
         <button id="chip-branch" class="picker-btn chat-chip" title="This conversation's sandbox branch — open the Branch tab" hidden></button>
       </div>
       <div class="chat-actions">
-        <button id="chip-terminals" class="chip-quiet term-chip" title="Show the shells this conversation has open" hidden></button>
         <button id="chip-spend" class="chip-quiet" title="What this conversation has cost — open Usage" hidden></button>
         <button id="archive-chat" class="icon-btn" title="Archive this chat" aria-label="Archive this chat">
           <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -107,13 +106,6 @@
       </form>
       <p class="composer-hint">Enter to send · Shift+Enter for a newline · sending mid-turn nudges the running turn</p>
     </div>
-
-    <!-- The terminal drawer: the shells this conversation's agent has open,
-         live. Inside .main rather than across the whole shell, because it
-         belongs to the conversation — so it shortens the transcript and leaves
-         the sidebar and the rail alone. Empty until views/terminal.js fills
-         it; hidden until a shell exists. -->
-    <section id="terminal-dock" class="terminal-dock" aria-label="Terminals" hidden></section>
 
     <div id="drop-veil" class="drop-veil" hidden><span>Drop images to attach</span></div>
   </main>

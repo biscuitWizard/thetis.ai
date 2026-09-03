@@ -107,21 +107,24 @@ impl Builder {
             ));
         }
 
-        // No source is touched here, and nothing may reintroduce that.
-        //
-        // This used to dirty `src/lib.rs` before every build to force a
-        // re-link, because every checkout compiled into one shared target
-        // directory and cargo only rewrites the output when *this* copy is
-        // dirty — so a "Fresh" build could hand back whichever checkout linked
-        // last. The fix for that is per-checkout target directories (a worker's
-        // `target_dir` now resolves against its own worktree), which removes
-        // the need entirely.
-        //
-        // The touch was also actively harmful: `open(write)` + `set_modified`
-        // emits an inotify MODIFY, indistinguishable from a real edit, so the
-        // file watcher rebuilt the aspect that had just been built, forever.
-        // Green trees escaped only via the pipeline's hash-identical
-        // short-circuit, and a failing tree spun cargo without limit.
+        // Force a re-link. Every checkout's copy of this crate writes the
+        // same output path in the shared target dir, and cargo only rewrites
+        // it when *this* copy is dirty — so a "Fresh" build here would hand
+        // back whichever checkout linked last, silently serving another
+        // branch's component as this one's. Dirtying one source file costs a
+        // few seconds of incremental rebuild and buys the guarantee that the
+        // artifact returned was built from the tree we were asked to build.
+        for entry in ["src/lib.rs", "src/main.rs"] {
+            let path = src.join(entry);
+            if path.is_file() {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                break;
+            }
+        }
+
         let mut cmd = tokio::process::Command::new(&cfg.build.command);
         cmd.current_dir(&src)
             .env("CARGO_TARGET_DIR", &cfg.build.target_dir)
@@ -198,7 +201,7 @@ impl Builder {
 /// `flock` blocks, so acquisition runs on the blocking pool; release is the
 /// kernel dropping the lock when the file closes, which makes a crashed
 /// holder impossible to deadlock on.
-pub struct FileLock {
+struct FileLock {
     _file: std::fs::File,
 }
 
@@ -211,7 +214,7 @@ impl FileLock {
     /// deadline at all, so a worker waiting here was unreachable for as long
     /// as the holder took, with its stop button dead and the gateway's
     /// readiness timer running.
-    pub async fn acquire(path: &std::path::Path, limit: Duration) -> Result<Option<Self>> {
+    async fn acquire(path: &std::path::Path, limit: Duration) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

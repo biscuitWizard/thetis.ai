@@ -658,27 +658,6 @@ impl ipc::Handler for GatewayHandler {
                     });
                 }
             }
-            // Shell activity in this worker's sandbox, broadcast as an ordinary
-            // frame so the browser's terminal drawer draws it live. Tagged with
-            // the session here rather than by the worker: the socket already
-            // identifies the conversation, and asking the far end to restate it
-            // would let the two disagree.
-            "terminal" => {
-                let mut frame = params;
-                if let Some(obj) = frame.as_object_mut() {
-                    obj.insert("type".into(), Value::String("terminal".into()));
-                    obj.insert(
-                        "session".into(),
-                        Value::String(self.session_id.clone()),
-                    );
-                }
-                if let Ok(text) = serde_json::to_string(&frame) {
-                    let _ = grip.frames_tx.send(RenderedFrame {
-                        session_id: self.session_id.clone(),
-                        frame: text,
-                    });
-                }
-            }
             // The worker's raw event stream, mirrored so connectors on this
             // side (Discord) can follow conversations exactly as before the
             // split. Browsers are fed by the rendered `frame` notes instead.
@@ -1006,17 +985,7 @@ fn spawn_worker_process(
         // retarget it by editing its own copy of thetis.toml.
         .env("THETIS_DATA_DIR", &cfg.paths.data)
         .env("THETIS_ARTIFACTS_DIR", &cfg.paths.artifacts)
-        // Deliberately NOT pinning THETIS_TARGET_DIR. A cargo target directory
-        // is not shared state: it is keyed by nothing but its own path, so two
-        // checkouts building the same aspect into one target dir write the same
-        // output file and each can be handed the other's component. That is a
-        // correctness bug, and the workaround for it (dirtying a source file
-        // before every build, so cargo always re-links) fed the file watcher a
-        // real-looking modify event and made every build trigger the next one.
-        // Letting each worktree resolve `target-wasm` against its own root cuts
-        // both problems off at the root. Cross-branch reuse is not lost: it
-        // lives in the content-addressed artifact cache, which IS shared, and
-        // which serves an identical tree with no toolchain at all.
+        .env("THETIS_TARGET_DIR", &cfg.build.target_dir)
         .env("THETIS_LOCAL_CONFIG", cfg.local_overlay())
         .env("THETIS_TRUNK", trunk)
         // A worker must never mistake itself for a supervised service: its

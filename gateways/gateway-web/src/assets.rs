@@ -2,9 +2,7 @@
 //!
 //! Every file the browser can fetch is listed in one table. Adding a stylesheet
 //! or a new ES module is a single line here plus the file itself — there is no
-//! build step and no bundler. A file missing from the table 404s at runtime with
-//! the module graph half-loaded, which looks like a dead page rather than a
-//! missing line.
+//! build step and no bundler.
 
 pub struct Asset {
     pub path: &'static str,
@@ -12,12 +10,6 @@ pub struct Asset {
     pub body: &'static str,
 }
 
-// Charset is spelled out on every one: a bare `text/javascript` lets the
-// browser guess, and a guess of latin-1 turns every em dash in a comment into
-// mojibake.
-// Charset is spelled out on every one: a bare `text/javascript` lets the
-// browser guess, and a guess of latin-1 turns every em dash in a comment into
-// mojibake.
 const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
@@ -49,31 +41,8 @@ pub const ASSETS: &[Asset] = &[
     // The system status bar along the foot of the shell: trunk's version, the
     // build being served, the worker fleet, and the machine.
     Asset { path: "/views/statusbar.js", mime: JS, body: include_str!("ui/views/statusbar.js") },
-    // The terminal drawer: the shells the agent has open, live. Not a rail tab
-    // — a terminal is watched *while* the agent works, so it docks along the
-    // foot of the conversation and the transcript shortens to make room.
-    Asset { path: "/views/terminal.js", mime: JS, body: include_str!("ui/views/terminal.js") },
-    // xterm.js 5.3.0, vendored under /vendor. views/terminal.js builds these
-    // URLs relative to its own module URL rather than absolutely, so they
-    // resolve under /preview/<session>/ as well as at the root.
-    //
-    // They remain the one exception to "hand-rolled, no
-    // dependencies": a terminal emulator is a pile of correctness (wrapping,
-    // scroll regions, 256-colour SGR, wide characters) that is not worth
-    // reimplementing, and getting it wrong shows up as garbled build output.
-    Asset { path: "/vendor/xterm.css", mime: CSS, body: include_str!("ui/vendor/xterm.css") },
-    Asset { path: "/vendor/xterm.js", mime: JS, body: include_str!("ui/vendor/xterm.js") },
-    Asset {
-        path: "/vendor/xterm-addon-fit.js",
-        mime: JS,
-        body: include_str!("ui/vendor/xterm-addon-fit.js"),
-    },
 ];
 
-/// Looks an asset up by request path. Linear over a table of a couple of dozen
-/// entries, which costs less than hashing the string a map would have to hash.
-/// A miss is a 404, so a new file added above is the difference between the
-/// module graph loading and half of it 404ing at runtime.
 pub fn find(path: &str) -> Option<&'static Asset> {
     ASSETS.iter().find(|a| a.path == path)
 }

@@ -282,7 +282,7 @@ max_read_bytes = 1048576
 protected = ["data", "artifacts", ".git"]
 allow_delete = true
 
-# Shell sessions, local or over ssh. A session keeps its working directory and
+# Shell sessions on this machine. A session keeps its working directory and
 # shell state between commands.
 [terminal]
 enabled = true
@@ -294,29 +294,6 @@ default_timeout_ms = 30000
 max_output_bytes = 65536
 # Sessions idle longer than this are closed. 0 disables reaping.
 idle_timeout_secs = 1800
-
-# Remote sessions. `terminal_open` takes the name of a host registered with the
-# `ssh_host` tool, and runs the session's shell on that machine instead of this
-# one. Turning this off withdraws both the `ssh_host` tool and the `host`
-# argument, without touching the registry.
-#
-# The registry itself lives in `ssh-hosts.local.toml`, deliberately *not* in
-# this file and not in thetis.local.toml: `*.local.toml` is gitignored so it
-# cannot be published, and the config loader never reads it, so a malformed
-# entry cannot stop Thetis from starting. It holds the path to a private key,
-# never a key or a password — ssh runs with BatchMode on and will not prompt, so
-# a host has to authenticate by key.
-ssh_enabled = true
-# The ssh client to run. A full path pins which one.
-ssh_program = "ssh"
-# How long a new remote session has to connect and answer before it is given up
-# on. This covers DNS, the handshake and the login shell, so it is generous
-# compared with a local open.
-ssh_connect_timeout_ms = 25000
-# How long `terminal_send` waits after writing, to catch the prompt or reply
-# that the input provoked. Whatever arrives later is picked up by the next
-# `terminal_read`.
-send_settle_ms = 400
 
 # Per-tool settings. Each tool component is handed its own block as JSON when it
 # is invoked, and never sees another's or anything else here. The shape is

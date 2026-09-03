@@ -170,12 +170,6 @@ pub async fn kernel_source_moved(
 /// Only one kernel build at a time in this process. Two `cargo build` runs on
 /// one target directory block on cargo's own lock anyway; this makes the second
 /// caller skip instead of waiting out a multi-minute build.
-///
-/// This is necessary but not sufficient: every conversation runs in its own
-/// worker *process*, so this mutex is uncontended while N workers each start a
-/// release build of the orchestrator. On a four-core machine two were enough to
-/// starve every conversation on the box. [`build_kernel`] therefore also takes
-/// a file lock, which is what actually serializes the fleet.
 static KERNEL_BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Runs a child to completion, killing it if it outstays `limit`.
@@ -213,115 +207,14 @@ pub async fn run_child(
     }
 }
 
-/// The cache key for a kernel built from a given revision, or `None` when the
-/// revision cannot be resolved.
-///
-/// Keyed on the trees in [`KERNEL_PATHS`] — everything the binary is compiled
-/// from. Two checkouts whose four oids agree produce the same executable, so
-/// they can share one, and a branch that has not touched `crates/` or `wit/`
-/// never needs its own build at all.
-///
-/// The toolchain is part of the key too: the same source under a different
-/// rustc is a different binary, and serving a stale one would be silent.
-pub async fn kernel_cache_key(
-    git: &crate::gitctl::GitCtl,
-    rev: &str,
-    toolchain: &str,
-) -> Option<String> {
-    let mut parts = vec![toolchain.to_string()];
-    for path in KERNEL_PATHS {
-        parts.push(git.tree_oid(rev, path).await.ok().flatten()?);
-    }
-    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-    Some(crate::buildcache::BuildCache::cache_key(&refs))
-}
-
-/// Identifies the compiler, for the kernel cache key.
-async fn toolchain_id(cfg: &crate::config::Config) -> String {
-    let mut cmd = tokio::process::Command::new(&cfg.build.command);
-    cmd.arg("--version");
-    match run_child(cmd, PROBE_TIMEOUT, "cargo --version").await {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        // Unknown is a distinct, never-repeating key: better to rebuild than
-        // to share a binary built by a compiler we cannot name.
-        Err(_) => format!("unknown-toolchain-{}", crate::buildcache::now_ms()),
-    }
-}
-
 /// Compiles the orchestrator from `cfg.root`, where a restart looks for it.
 ///
 /// Returns the binary's path. Serialized process-wide, and it declines rather
 /// than queues when another build already holds the lock.
-///
-/// A cached binary built from the same source by any checkout is used instead
-/// of compiling. That is the difference between a restart costing seconds and
-/// costing several minutes of every core: the ~390 dependency units behind the
-/// orchestrator (cranelift and wasmtime dominate) are identical for every
-/// branch that has not touched `crates/` or `wit/`.
 pub async fn build_kernel(cfg: &crate::config::Config) -> Result<PathBuf> {
     let Ok(_one_at_a_time) = KERNEL_BUILD.try_lock() else {
         bail!("a kernel build is already running in this process");
     };
-
-    // And once across the fleet. A kernel build is the most expensive thing
-    // this system does — minutes of every core, and its own multi-gigabyte
-    // target directory per checkout — so several at once do not merely queue,
-    // they starve the machine that is also serving conversations. Waiting is
-    // the right behaviour here rather than declining: the caller has already
-    // told the user their kernel is being rebuilt, and a build that is slow
-    // because another finished first is still the build they asked for.
-    let lock_path = cfg.kernel_build_lock_path();
-    let Some(_fleet) = crate::builder::FileLock::acquire(&lock_path, KERNEL_BUILD_WAIT).await?
-    else {
-        bail!(
-            "another conversation has been building the orchestrator for over {}s. Nothing was \
-             built or restarted, and you are still on the kernel you started with — try again \
-             once it finishes.",
-            KERNEL_BUILD_WAIT.as_secs()
-        );
-    };
-
-    let destination = kernel_binary(&cfg.root);
-    let cache = crate::buildcache::BuildCache::new(cfg.paths.artifacts.join("cache"));
-
-    // Only a clean tree may use or fill the cache. With uncommitted edits the
-    // key names HEAD, which is not what would be compiled — serving that would
-    // quietly run code the source does not say, and storing under it would
-    // poison the entry for every other checkout.
-    let git = crate::gitctl::GitCtl::new(&cfg.root);
-    let cache_key = if git.is_dirty().await.unwrap_or(true) {
-        // Dirty, or not a repository at all: build, and do not cache.
-        None
-    } else {
-        let toolchain = toolchain_id(cfg).await;
-        kernel_cache_key(&git, "HEAD", &toolchain).await
-    };
-
-    if let Some(key) = &cache_key {
-        if let Ok(Some(meta)) = cache.lookup(KERNEL_CACHE_ASPECT, key) {
-            match cache.artifact_path(&meta, KERNEL_CACHE_ARTIFACT) {
-                Ok(cached) => match install_kernel_from_cache(&cached, &destination).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            key = %key,
-                            "kernel served from the build cache; no compile needed"
-                        );
-                        return Ok(destination);
-                    }
-                    // Not fatal: fall through and build properly.
-                    Err(e) => tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "a cached kernel would not install; building instead"
-                    ),
-                },
-                Err(e) => tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "the cached kernel failed its integrity check; building instead"
-                ),
-            }
-        }
-    }
-
     let target = cfg.root.join("target");
 
     let mut cmd = tokio::process::Command::new(&cfg.build.command);
@@ -342,91 +235,7 @@ pub async fn build_kernel(cfg: &crate::config::Config) -> Result<PathBuf> {
             tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         );
     }
-
-    // File it so the next checkout of this source does not pay again. Probed
-    // first: an unprobed binary in the cache would be handed to other
-    // conversations as if it were known good.
-    if let Some(key) = &cache_key {
-        match probe_kernel(&destination).await {
-            Ok(()) => {
-                if let Err(e) = store_kernel(&cache, key, &destination) {
-                    tracing::warn!(error = %format!("{e:#}"), "could not cache the kernel build");
-                }
-            }
-            Err(e) => tracing::warn!(
-                error = %format!("{e:#}"),
-                "the fresh kernel did not pass its probe, so it was not cached"
-            ),
-        }
-    }
-
-    Ok(destination)
-}
-
-/// Where source-keyed kernel builds are filed, and under what name.
-///
-/// Deliberately a subdirectory of `cache/kernel`, not `cache/kernel` itself:
-/// `workers::adopt_branch_kernel` already keeps binaries there keyed by
-/// *commit*, with no `meta.json`. The two schemes answer different questions —
-/// "which kernel did this branch adopt" versus "has this source been compiled
-/// by anyone" — and a commit key rebuilds whenever any file in the repo
-/// changes, which is the cost this cache exists to avoid. Keeping them in
-/// separate directories means neither can read the other's entries by
-/// accident.
-const KERNEL_CACHE_ASPECT: &str = "kernel/by-source";
-const KERNEL_CACHE_ARTIFACT: &str = "thetis";
-
-/// Copies a cached kernel into the place a restart reads from.
-///
-/// Staged and renamed rather than written in place: the destination may be a
-/// running binary, and writing onto one fails with ETXTBSY.
-async fn install_kernel_from_cache(cached: &Path, destination: &Path) -> Result<()> {
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let staging = destination.with_extension(format!("incoming.{}", std::process::id()));
-    let _ = std::fs::remove_file(&staging);
-    std::fs::copy(cached, &staging)
-        .with_context(|| format!("copying the cached kernel to {}", staging.display()))?;
-
-    // The copy loses the executable bit on some filesystems; a restart needs it.
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&staging)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&staging, perms)?;
-
-    // Confirm it runs *before* it becomes the binary a restart will exec.
-    if let Err(e) = probe_kernel(&staging).await {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e).context("the cached kernel failed its probe");
-    }
-
-    std::fs::rename(&staging, destination).map_err(|e| {
-        let _ = std::fs::remove_file(&staging);
-        e
-    })?;
-    Ok(())
-}
-
-fn store_kernel(
-    cache: &crate::buildcache::BuildCache,
-    key: &str,
-    binary: &Path,
-) -> Result<()> {
-    let meta = crate::buildcache::BuildMeta {
-        aspect: KERNEL_CACHE_ASPECT.to_string(),
-        key: key.to_string(),
-        artifact_sha256: crate::buildcache::hash_file(binary)?,
-        smoke: crate::buildcache::SmokeVerdict::Pass,
-        source_commit: String::new(),
-        aspect_tree: String::new(),
-        wit_tree: String::new(),
-        created_ms: crate::buildcache::now_ms(),
-        note: "orchestrator build".to_string(),
-    };
-    cache.store(binary, KERNEL_CACHE_ARTIFACT, &meta)?;
-    Ok(())
+    Ok(kernel_binary(&cfg.root))
 }
 
 /// Asks a kernel binary whether it starts and speaks our IPC protocol.
@@ -479,14 +288,6 @@ fn free_bytes(path: &Path) -> Option<u64> {
 /// conversation's build with it. Refusing early is recoverable; a full disk on
 /// a machine that is also serving is not.
 const KERNEL_BUILD_HEADROOM: u64 = 20 * 1024 * 1024 * 1024;
-
-/// How long to wait for another checkout's kernel build before giving up.
-///
-/// Generous, because the thing being waited for legitimately takes minutes and
-/// the alternative is refusing a restart the user asked for. Bounded, because
-/// a crashed holder must not wedge every future kernel build — though `flock`
-/// releases on process death, so that is a backstop rather than the mechanism.
-const KERNEL_BUILD_WAIT: Duration = Duration::from_secs(20 * 60);
 
 fn refuse_if_disk_is_tight(cfg: &crate::config::Config) -> Result<()> {
     let Some(free) = free_bytes(&cfg.root) else {
@@ -765,200 +566,6 @@ fn respawn() -> Result<()> {
     // holds the port for a moment.
     tracing::info!("replacement started; exiting");
     std::process::exit(0);
-}
-
-#[cfg(test)]
-mod kernel_cache_tests {
-    use super::*;
-    use crate::gitctl::GitCtl;
-
-    fn git_cmd(dir: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("running git");
-        assert!(out.status.success(), "git {args:?} failed");
-    }
-
-    async fn repo(tmp: &std::path::Path) -> GitCtl {
-        let git = GitCtl::new(tmp);
-        git_cmd(tmp, &["init", "-b", "main"]);
-        git_cmd(tmp, &["config", "user.name", "test"]);
-        git_cmd(tmp, &["config", "user.email", "t@example.com"]);
-        for path in ["crates/thetis", "wit"] {
-            std::fs::create_dir_all(tmp.join(path)).unwrap();
-        }
-        std::fs::write(tmp.join("crates/thetis/lib.rs"), "fn main() {}").unwrap();
-        std::fs::write(tmp.join("wit/thetis.wit"), "package thetis:grip;").unwrap();
-        std::fs::write(tmp.join("Cargo.toml"), "[workspace]").unwrap();
-        std::fs::write(tmp.join("Cargo.lock"), "# lock").unwrap();
-        git.add_all_and_commit("base").await.unwrap().unwrap();
-        git
-    }
-
-    /// Sharing a kernel binary between checkouts is only safe if the key
-    /// changes whenever the compiled result would. Each of the four
-    /// KERNEL_PATHS, and the toolchain, must move it.
-    #[tokio::test]
-    async fn the_kernel_key_covers_every_input_to_the_binary() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let git = repo(tmp.path()).await;
-
-        let base = kernel_cache_key(&git, "HEAD", "rustc 1.0")
-            .await
-            .expect("a committed tree has a key");
-
-        // Deterministic: this is what lets a second checkout find the entry.
-        assert_eq!(
-            base,
-            kernel_cache_key(&git, "HEAD", "rustc 1.0").await.unwrap()
-        );
-
-        // A different compiler is a different binary.
-        assert_ne!(
-            base,
-            kernel_cache_key(&git, "HEAD", "rustc 2.0").await.unwrap(),
-            "the toolchain must be part of the key"
-        );
-
-        // Each compiled-from path must move the key, or a real change to the
-        // kernel would silently serve the previous binary.
-        for (file, body) in [
-            ("crates/thetis/lib.rs", "fn main() { changed() }"),
-            ("wit/thetis.wit", "package thetis:grip; // changed"),
-            ("Cargo.toml", "[workspace]\n# changed"),
-            ("Cargo.lock", "# lock changed"),
-        ] {
-            let before = kernel_cache_key(&git, "HEAD", "rustc 1.0").await.unwrap();
-            std::fs::write(tmp.path().join(file), body).unwrap();
-            git.add_all_and_commit("change").await.unwrap().unwrap();
-            let after = kernel_cache_key(&git, "HEAD", "rustc 1.0").await.unwrap();
-            assert_ne!(before, after, "{file} must change the kernel cache key");
-        }
-
-        // A file the kernel is *not* built from must not change the key —
-        // otherwise every branch gets its own entry and nothing is ever shared.
-        let before = kernel_cache_key(&git, "HEAD", "rustc 1.0").await.unwrap();
-        std::fs::write(tmp.path().join("README.md"), "docs").unwrap();
-        git.add_all_and_commit("docs").await.unwrap().unwrap();
-        assert_eq!(
-            before,
-            kernel_cache_key(&git, "HEAD", "rustc 1.0").await.unwrap(),
-            "an unrelated file must not change the kernel cache key"
-        );
-    }
-
-    /// Two separate checkouts of the same source must agree on the key: that
-    /// agreement is the entire mechanism for skipping the build.
-    #[tokio::test]
-    async fn two_checkouts_of_one_tree_share_a_key() {
-        let a = tempfile::TempDir::new().unwrap();
-        let b = tempfile::TempDir::new().unwrap();
-        let git_a = repo(a.path()).await;
-        let git_b = repo(b.path()).await;
-
-        assert_eq!(
-            kernel_cache_key(&git_a, "HEAD", "rustc 1.0").await.unwrap(),
-            kernel_cache_key(&git_b, "HEAD", "rustc 1.0").await.unwrap(),
-            "identical source in two checkouts must produce one key"
-        );
-    }
-
-    /// An unresolvable revision yields no key, so the caller builds rather
-    /// than sharing an entry under a meaningless name.
-    #[tokio::test]
-    async fn an_unknown_revision_has_no_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let git = repo(tmp.path()).await;
-        assert!(kernel_cache_key(&git, "nope", "rustc 1.0").await.is_none());
-    }
-
-    /// The store-then-install round trip, over a stand-in "binary" that is a
-    /// shell script so it can actually be probed.
-    ///
-    /// What this pins: the installed file is executable, byte-identical to
-    /// what was stored, and lands at the path a restart reads
-    /// (`target/release/thetis`).
-    #[tokio::test]
-    async fn a_stored_kernel_installs_as_an_executable_at_the_restart_path() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cache = crate::buildcache::BuildCache::new(tmp.path().join("cache"));
-
-        // A "kernel" that answers the probe the way a real one does.
-        let built = tmp.path().join("built-thetis");
-        std::fs::write(
-            &built,
-            format!(
-                "#!/bin/sh\necho 'thetis-worker-probe-ok {}'\n",
-                crate::ipc::PROTOCOL_VERSION
-            ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&built, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        store_kernel(&cache, "key-abc", &built).expect("storing");
-
-        // A second checkout looks the key up and installs it.
-        let meta = cache
-            .lookup(KERNEL_CACHE_ASPECT, "key-abc")
-            .unwrap()
-            .expect("the entry is found by key");
-        let cached = cache
-            .artifact_path(&meta, KERNEL_CACHE_ARTIFACT)
-            .expect("the artifact passes its integrity check");
-
-        let destination = tmp.path().join("checkout-b/target/release/thetis");
-        install_kernel_from_cache(&cached, &destination)
-            .await
-            .expect("installing");
-
-        assert!(destination.is_file(), "the kernel lands at the restart path");
-        assert_eq!(
-            std::fs::read(&built).unwrap(),
-            std::fs::read(&destination).unwrap(),
-            "the installed kernel is byte-identical to the one built"
-        );
-        let mode = std::fs::metadata(&destination).unwrap().permissions().mode();
-        assert!(mode & 0o111 != 0, "the installed kernel must be executable");
-
-        // Installing again over the file that is already there must work:
-        // a retry at the same key is normal, and writing onto a running
-        // binary is what the staging-and-rename dance exists to survive.
-        install_kernel_from_cache(&cached, &destination)
-            .await
-            .expect("installing a second time");
-    }
-
-    /// A cached binary that does not answer the probe must never be renamed
-    /// into the restart path: a restart onto it would take the conversation
-    /// down, and the whole point of the cache is to be invisible when it works
-    /// and harmless when it does not.
-    #[tokio::test]
-    async fn a_cached_kernel_that_fails_its_probe_is_not_installed() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let bad = tmp.path().join("bad-thetis");
-        std::fs::write(&bad, "#!/bin/sh\necho nonsense\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let destination = tmp.path().join("target/release/thetis");
-        assert!(
-            install_kernel_from_cache(&bad, &destination).await.is_err(),
-            "a binary that fails the probe must be refused"
-        );
-        assert!(
-            !destination.exists(),
-            "nothing may be left at the restart path"
-        );
-
-        // And no staging litter behind.
-        let strays: Vec<_> = std::fs::read_dir(tmp.path().join("target/release"))
-            .map(|d| d.flatten().map(|e| e.file_name()).collect())
-            .unwrap_or_default();
-        assert!(strays.is_empty(), "staging files must be cleaned up: {strays:?}");
-    }
 }
 
 #[cfg(test)]

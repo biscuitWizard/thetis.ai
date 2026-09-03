@@ -26,8 +26,7 @@ fn err(msg: impl Into<String>) -> wasmtime::Error {
 use crate::bindings::types::{
     Attachment, CompileReport, ConfigEntry, Dependency, EventRecord, ExecResult, FsEntry, InboxItem,
     LlmError, LogLevel, ModeInfo, ModTarget, ModelInfo, SessionEvent,
-    SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen, TerminalOutput,
-    ToolManifest,
+    SessionMeta, StreamChunk, TerminalInfo, TerminalOutput, ToolManifest,
 };
 use crate::bindings::{
     branch, configuration, control, devkit, hostfs, llm, sandbox, session, sys, terminal,
@@ -1052,57 +1051,13 @@ impl terminal::Host for HostState {
         Ok(self.grip().cfg.terminal.enabled)
     }
 
-    async fn open(&mut self, spec: TerminalOpen) -> Result<std::result::Result<String, String>> {
+    async fn open(&mut self, cwd: Option<String>) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("open");
         let grip = self.grip.clone();
         let result = grip
             .terminals
-            .open(
-                &grip.cfg,
-                crate::terminal::OpenSpec {
-                    cwd: spec.cwd,
-                    name: spec.name,
-                    env: spec.env.into_iter().map(|v| (v.key, v.value)).collect(),
-                    host: spec.host,
-                },
-            )
+            .open(&grip.cfg, cwd.as_deref())
             .await
-            .map_err(|e| format!("{e:#}"));
-        self.yielded();
-        Ok(result)
-    }
-
-    async fn signal(
-        &mut self,
-        id: String,
-        signal: String,
-    ) -> Result<std::result::Result<String, String>> {
-        self.budget.entered_host("signal");
-        let grip = self.grip.clone();
-        tracing::info!(terminal = %id, %signal, "signalling a session");
-        let result = grip
-            .terminals
-            .signal(&grip.cfg, &id, &signal)
-            .await
-            .map(|text| grip.truncate(text))
-            .map_err(|e| format!("{e:#}"));
-        self.yielded();
-        Ok(result)
-    }
-
-    async fn send(
-        &mut self,
-        id: String,
-        text: String,
-        submit: bool,
-    ) -> Result<std::result::Result<String, String>> {
-        self.budget.entered_host("send");
-        let grip = self.grip.clone();
-        let result = grip
-            .terminals
-            .send(&grip.cfg, &id, &text, submit, grip.cfg.terminal.send_settle)
-            .await
-            .map(|out| grip.truncate(out))
             .map_err(|e| format!("{e:#}"));
         self.yielded();
         Ok(result)
@@ -1113,7 +1068,6 @@ impl terminal::Host for HostState {
         id: String,
         command: String,
         timeout_ms: u32,
-        background: bool,
     ) -> Result<std::result::Result<TerminalOutput, String>> {
         self.budget.entered_host("run");
         let grip = self.grip.clone();
@@ -1137,7 +1091,6 @@ impl terminal::Host for HostState {
                     &id,
                     &command,
                     timeout,
-                    background,
                     cancel,
                 ),
             )
@@ -1176,86 +1129,6 @@ impl terminal::Host for HostState {
         let list = grip.terminals.list().await;
         self.yielded();
         Ok(list)
-    }
-
-    // --- the named-host registry -------------------------------------------
-
-    async fn ssh_available(&mut self) -> Result<bool> {
-        self.budget.entered_host("ssh-available");
-        let cfg = &self.grip().cfg;
-        Ok(cfg.terminal.enabled && cfg.terminal.ssh_enabled)
-    }
-
-    async fn ssh_hosts(&mut self) -> Result<std::result::Result<Vec<SshHostInfo>, String>> {
-        self.budget.entered_host("ssh-hosts");
-        let grip = self.grip.clone();
-        Ok(crate::sshhosts::list(&grip.cfg)
-            .map(|hosts| hosts.iter().map(host_info).collect())
-            .map_err(|e| format!("{e:#}")))
-    }
-
-    async fn ssh_host_set(
-        &mut self,
-        host: SshHostInfo,
-        merge: bool,
-    ) -> Result<std::result::Result<String, String>> {
-        self.budget.entered_host("ssh-host-set");
-        let grip = self.grip.clone();
-        let result = crate::sshhosts::set(&grip.cfg, from_host_info(host), merge)
-            .map_err(|e| format!("{e:#}"));
-        self.yielded();
-        Ok(result)
-    }
-
-    async fn ssh_host_remove(
-        &mut self,
-        name: String,
-    ) -> Result<std::result::Result<String, String>> {
-        self.budget.entered_host("ssh-host-remove");
-        let grip = self.grip.clone();
-        let result = crate::sshhosts::remove(&grip.cfg, &name).map_err(|e| format!("{e:#}"));
-        self.yielded();
-        Ok(result)
-    }
-
-    async fn ssh_host_rename(
-        &mut self,
-        from: String,
-        to: String,
-    ) -> Result<std::result::Result<String, String>> {
-        self.budget.entered_host("ssh-host-rename");
-        let grip = self.grip.clone();
-        let result = crate::sshhosts::rename(&grip.cfg, &from, &to).map_err(|e| format!("{e:#}"));
-        self.yielded();
-        Ok(result)
-    }
-}
-
-fn host_info(host: &crate::sshhosts::SshHost) -> SshHostInfo {
-    SshHostInfo {
-        name: host.name.clone(),
-        host: host.host.clone(),
-        port: host.port,
-        user: host.user.clone(),
-        identity_file: host.identity_file.clone(),
-        options: host.options.clone(),
-        remote_cwd: host.remote_cwd.clone(),
-        pty: host.pty,
-        description: host.description.clone(),
-    }
-}
-
-fn from_host_info(info: SshHostInfo) -> crate::sshhosts::SshHost {
-    crate::sshhosts::SshHost {
-        name: info.name,
-        host: info.host,
-        port: info.port,
-        user: info.user,
-        identity_file: info.identity_file,
-        options: info.options,
-        remote_cwd: info.remote_cwd,
-        pty: info.pty,
-        description: info.description,
     }
 }
 

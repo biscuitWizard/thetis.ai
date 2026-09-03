@@ -149,41 +149,6 @@ impl Handler for WorkerHandler {
                     "busy": grip.is_busy(),
                     "rss_kb": crate::system_api::self_rss_kb(),
                 })),
-                // Every shell this worker holds, with its transcript, for a
-                // browser tab that has just opened the terminal drawer.
-                "terminals.list" => Ok(serde_json::json!({
-                    "terminals": grip.terminals.views().await,
-                })),
-                // Closing a shell from the drawer. The agent may be holding
-                // this session, so the kill goes through the same `close` the
-                // agent's own tool uses — process group and all — and the
-                // resulting `closed` feed event is what updates every watching
-                // tab, including the one that asked.
-                "terminals.close" => {
-                    let id = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if id.is_empty() {
-                        anyhow::bail!("terminals.close needs an id");
-                    }
-                    match grip.terminals.close(&id).await {
-                        Ok(note) => Ok(serde_json::json!({
-                            "ok": true,
-                            "id": id,
-                            "note": note,
-                        })),
-                        // A shell that has already gone is the outcome the
-                        // caller wanted, so this is reported as success rather
-                        // than as an error the drawer would have to explain.
-                        Err(e) => Ok(serde_json::json!({
-                            "ok": true,
-                            "id": id,
-                            "note": format!("{e:#}"),
-                        })),
-                    }
-                }
                 "live_revisions" => {
                     let map: std::collections::BTreeMap<String, u64> = grip
                         .loader
@@ -286,12 +251,6 @@ pub async fn run(
 
     // This worker renders its own sessions' events and ships the frames up.
     spawn_render_loop(grip.clone(), peer.clone());
-    // Shell activity goes up the same socket, so the browser can draw a live
-    // terminal. The session it belongs to is not sent: the gateway end of this
-    // socket already knows which conversation this worker serves, and having
-    // one side of a per-conversation link restate that invites the two to
-    // disagree.
-    spawn_terminal_feed(grip.clone(), peer.clone());
 
     // The agent creates tools here. Make sure it exists before the watcher
     // starts, or newly scaffolded tools would not be watched until a restart.
@@ -380,67 +339,6 @@ fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
             }
         }
     });
-}
-
-/// Mirrors shell activity up to the gateway.
-///
-/// Coalesced, not per line: a `cargo build` writes hundreds of lines a second,
-/// and one IPC note each would swamp the socket the same build's tool calls are
-/// travelling on. Output for one shell is gathered for a few tens of
-/// milliseconds and sent as one note; structural events (opened, command, exit,
-/// closed) go straight through, because their ordering against the output is
-/// what makes the transcript readable.
-fn spawn_terminal_feed(grip: Arc<Grip>, peer: Arc<Peer>) {
-    const FLUSH_MS: u64 = 60;
-    tokio::spawn(async move {
-        let mut feed = grip.terminals.subscribe();
-        // id -> pending output, in arrival order.
-        let mut pending: Vec<(String, String)> = Vec::new();
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(FLUSH_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                event = feed.recv() => match event {
-                    Ok(item) if item.kind == "output" => {
-                        match pending.iter_mut().find(|(id, _)| *id == item.id) {
-                            Some((_, text)) => text.push_str(&item.text),
-                            None => pending.push((item.id, item.text)),
-                        }
-                    }
-                    Ok(item) => {
-                        // Flush first, or a command's output would arrive after
-                        // the "exit" that ended it.
-                        flush(&peer, &mut pending).await;
-                        peer.notify("terminal", json!({
-                            "id": item.id,
-                            "kind": item.kind,
-                            "text": item.text,
-                            "cwd": item.cwd,
-                            "shell": item.shell,
-                            "remote": item.remote,
-                        }))
-                        .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        tracing::debug!(missed, "terminal feed fell behind");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                },
-                _ = ticker.tick() => flush(&peer, &mut pending).await,
-            }
-        }
-    });
-}
-
-async fn flush(peer: &Arc<Peer>, pending: &mut Vec<(String, String)>) {
-    for (id, text) in pending.drain(..) {
-        peer.notify(
-            "terminal",
-            json!({ "id": id, "kind": "output", "text": text }),
-        )
-        .await;
-    }
 }
 
 async fn bring_up(grip: &Arc<Grip>, aspect: &Aspect) -> Result<()> {

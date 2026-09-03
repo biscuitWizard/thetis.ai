@@ -25,7 +25,6 @@ use wasmtime::component::Component;
 
 use crate::buildcache::{BuildCache, BuildMeta, SmokeVerdict};
 use crate::builder::BuildOptions;
-use crate::config::Config;
 use crate::grip::Grip;
 use crate::loader::Loader;
 use crate::revisions::Origin;
@@ -127,73 +126,6 @@ pub fn discover_aspects(cfg: &crate::config::Config) -> Vec<Aspect> {
     aspects
 }
 
-/// A fingerprint of everything a build's success depends on, for the negative
-/// cache.
-///
-/// Deliberately independent of git: the build cache's key needs a committed
-/// tree, but a *failing* build never commits, and the failures worth
-/// suppressing are exactly those. So this hashes what is on disk.
-///
-/// Covers the aspect's own sources, the WIT contract, and this kernel's
-/// contract fingerprint. The contract matters because the loop this was
-/// written for was a smoke test failing on a contract mismatch: the aspect's
-/// own files were not changing, so a source-only fingerprint would have
-/// suppressed the retry correctly, but a later `wit/` fix must un-suppress it.
-fn source_fingerprint(cfg: &Config, aspect: &Aspect) -> Option<String> {
-    fingerprint_dirs(&[cfg.aspect_source_dir(aspect), cfg.paths.wit.clone()])
-}
-
-/// The hashing behind [`source_fingerprint`], over an explicit set of roots so
-/// it can be tested without assembling a whole `Config`.
-fn fingerprint_dirs(roots: &[std::path::PathBuf]) -> Option<String> {
-    use sha2::{Digest, Sha256};
-
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for root in roots {
-        collect_files(root, &mut files);
-    }
-    if files.is_empty() {
-        return None;
-    }
-    // Directory order is not stable across filesystems; the hash must be.
-    files.sort();
-
-    let mut hasher = Sha256::new();
-    hasher.update(kernel_wit_fingerprint().as_bytes());
-    hasher.update([0]);
-    for path in &files {
-        let Ok(bytes) = std::fs::read(path) else {
-            // Unreadable mid-build: treat the tree as un-fingerprintable
-            // rather than hashing a partial view and suppressing wrongly.
-            return None;
-        };
-        hasher.update(path.to_string_lossy().as_bytes());
-        hasher.update([0]);
-        hasher.update(&bytes);
-        hasher.update([0]);
-    }
-    Some(hex::encode(&hasher.finalize()[..16]))
-}
-
-/// Every file under a directory, recursively, skipping build output.
-fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == "target" || name.starts_with("target-") || name == ".git" {
-            continue;
-        }
-        if path.is_dir() {
-            collect_files(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
-}
-
 /// The result of pushing a change through the pipeline, shaped so it can be
 /// handed straight back to the model as a compile report.
 #[derive(Debug, Clone)]
@@ -284,125 +216,21 @@ pub async fn build_and_activate_with(
         ));
     }
 
-    // 1. Has this exact tree already been built, by any branch? The cache is
-    //    keyed by content — the aspect's tree, the WIT contract, this kernel's
-    //    fingerprint and the build settings — so a hit is the same artifact
-    //    cargo would produce, already smoke-tested. Skipping cargo here is what
-    //    makes "update from trunk" and "reset to a green commit" instant rather
-    //    than a full compile each time.
-    //
-    //    Only for a clean tree: with uncommitted edits, HEAD's key names a tree
-    //    that is not what is on disk, and loading the cached artifact would
-    //    silently serve something the source no longer says.
-    let clean = match &grip.git {
-        Some(git) => !git.is_dirty().await.unwrap_or(true),
-        None => false,
-    };
-    if clean {
-        if let Some(key) = aspect_cache_key(grip, "HEAD", aspect).await {
-            if let Ok(Some(meta)) = grip.buildcache.lookup(&aspect.key(), &key) {
-                if meta.smoke == SmokeVerdict::Pass {
-                    let revision = key_revision(&key);
-                    let already = grip
-                        .loader
-                        .get(aspect)
-                        .is_some_and(|loaded| loaded.revision == revision);
-                    if already {
-                        return Ok(Outcome {
-                            success: true,
-                            aspect: aspect.key(),
-                            revision: Some(revision),
-                            stderr: String::new(),
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            detail: "no change: this tree is already serving".to_string(),
-                            pending_swap: false,
-                        });
-                    }
-                    match grip
-                        .buildcache
-                        .artifact_path(&meta, CACHE_ARTIFACT)
-                        .and_then(|artifact| {
-                            Loader::compile(&grip.runtime.engine, aspect, revision, &artifact)
-                        })
-                    {
-                        Ok(compiled) => {
-                            grip.install_component(compiled).await;
-                            tracing::info!(%aspect, revision, "served from the build cache; no compile needed");
-                            return Ok(Outcome {
-                                success: true,
-                                aspect: aspect.key(),
-                                revision: Some(revision),
-                                stderr: String::new(),
-                                duration_ms: started.elapsed().as_millis() as u64,
-                                detail: "loaded from the build cache; this tree was already built"
-                                    .to_string(),
-                                pending_swap: matches!(aspect, Aspect::Agent),
-                            });
-                        }
-                        Err(e) => {
-                            // A corrupt or contract-mismatched entry is not
-                            // fatal; fall through and compile properly.
-                            tracing::warn!(%aspect, error = %e,
-                                "cached artifact would not load; compiling instead");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Has this exact source already failed? A failed build never commits and
-    //    never caches, so without this the same broken tree is recompiled on
-    //    every file event, forever, at full CPU. Refusing costs nothing: an
-    //    identical input cannot produce a different result.
-    //
-    //    `refresh_lockfile` means the caller is deliberately retrying after
-    //    changing dependencies, so it always gets a real attempt.
-    let fingerprint = source_fingerprint(&grip.cfg, aspect);
-    if !opts.refresh_lockfile {
-        if let Some(fp) = &fingerprint {
-            if let Some(previous) = grip.known_bad_build(aspect, fp) {
-                tracing::debug!(%aspect, "skipping rebuild: this exact source already failed");
-                return Ok(Outcome::failure(
-                    aspect,
-                    format!(
-                        "this exact source already failed to build, so it was not \
-                         compiled again: {previous}. Change the source, or fix the \
-                         contract, to trigger a real attempt."
-                    ),
-                    String::new(),
-                    started,
-                ));
-            }
-        }
-    }
-
-    // A new fingerprint deserves a clean slate, so a tree that fails in a
-    // different way reports its newest error rather than the first.
-    grip.clear_build_failure(aspect);
-
-    // Remembers a failure against the source that caused it. Every gate below
-    // funnels through here so no failure path can forget to record itself.
-    let remember = |detail: String, stderr: String| {
-        if let Some(fp) = &fingerprint {
-            grip.record_build_failure(aspect, fp, &detail);
-        }
-        Ok(Outcome::failure(aspect, detail, stderr, started))
-    };
-
-    // 3. Compile.
+    // 1. Compile.
     let build = grip.builder.build_with(&grip.cfg, aspect, opts).await?;
     if !build.success {
-        return remember(
-            "compilation failed; the running revision is unchanged".to_string(),
+        return Ok(Outcome::failure(
+            aspect,
+            "compilation failed; the running revision is unchanged",
             build.stderr,
-        );
+            started,
+        ));
     }
     let wasm = build
         .wasm_path
         .context("build reported success without an artifact")?;
 
-    // 4. If cargo produced a byte-identical component and it is what the
+    // 2. If cargo produced a byte-identical component and it is what the
     //    loader is actually serving, nothing changed — but the *source* may
     //    still have (a comment, whitespace), so checkpoint it either way.
     let fresh_hash = crate::buildcache::hash_file(&wasm).unwrap_or_default();
@@ -425,28 +253,32 @@ pub async fn build_and_activate_with(
         });
     }
 
-    // 5. Does wasmtime accept it as a component for this world? Validation
+    // 3. Does wasmtime accept it as a component for this world? Validation
     //    runs before anything is committed: the branch log's last commit must
     //    always be a build that passed every gate.
     let compiled = match Loader::compile(&grip.runtime.engine, aspect, 0, &wasm) {
         Ok(c) => c,
         Err(e) => {
-            return remember(
+            return Ok(Outcome::failure(
+                aspect,
                 format!("the build is not a valid component: {e:#}"),
                 build.stderr,
-            );
+                started,
+            ));
         }
     };
 
-    // 6. Does it actually run?
+    // 4. Does it actually run?
     if let Err(e) = smoke_test(grip, aspect, &compiled.component).await {
-        return remember(
+        return Ok(Outcome::failure(
+            aspect,
             format!("the build compiled but failed its smoke test: {e:#}"),
             build.stderr,
-        );
+            started,
+        ));
     }
 
-    // 7. Green: freeze the source on the branch, then file the artifact under
+    // 5. Green: freeze the source on the branch, then file the artifact under
     //    the tree that produced it. Every branch holding this tree — and every
     //    later checkout of it — now loads without a toolchain.
     let commit = grip
@@ -481,7 +313,7 @@ pub async fn build_and_activate_with(
         }
     }
 
-    // 8. Live. Installing through the grip keeps the tool registry in step.
+    // 6. Live. Installing through the grip keeps the tool registry in step.
     let component = Arc::new(crate::loader::LoadedComponent {
         aspect: compiled.aspect.clone(),
         revision,
@@ -657,123 +489,4 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     grip.install_component(component).await;
 
     Ok(format!("{aspect} was reset to its last green build ({short})"))
-}
-
-#[cfg(test)]
-mod fingerprint_tests {
-    use super::*;
-
-    fn write(dir: &std::path::Path, name: &str, body: &str) {
-        let path = dir.join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
-
-    /// The negative cache is only safe if the fingerprint moves whenever the
-    /// build's input moves. Too sticky and a fixed tree stays suppressed —
-    /// which would be far worse than the spinning it replaced.
-    #[test]
-    fn the_fingerprint_tracks_source_and_contract_but_not_mtime() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let src = tmp.path().join("tools/demo");
-        let wit = tmp.path().join("wit");
-        write(&src, "src/lib.rs", "fn a() {}");
-        write(&wit, "thetis.wit", "package thetis:grip;");
-        let roots = vec![src.clone(), wit.clone()];
-
-        let first = fingerprint_dirs(&roots).unwrap();
-
-        // Stable across calls: nothing changed, so a retry is recognised.
-        assert_eq!(first, fingerprint_dirs(&roots).unwrap());
-
-        // A touch is not a change. This is the whole point — the watcher fires
-        // on mtime, and a fingerprint that followed mtime would never suppress.
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .open(src.join("src/lib.rs"))
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
-        assert_eq!(
-            first,
-            fingerprint_dirs(&roots).unwrap(),
-            "a touch must not change the fingerprint"
-        );
-
-        // Editing the aspect's source must change it, or a fix stays blocked.
-        write(&src, "src/lib.rs", "fn a() { todo!() }");
-        let edited = fingerprint_dirs(&roots).unwrap();
-        assert_ne!(first, edited, "a source edit must change the fingerprint");
-
-        // Fixing the *contract* must change it too. The real loop was a smoke
-        // test failing on a contract mismatch, with the aspect's own files
-        // untouched; if `wit/` did not count, repairing it would not release
-        // the suppression and the aspect would stay broken until restart.
-        write(&wit, "thetis.wit", "package thetis:grip; // fixed");
-        assert_ne!(
-            edited,
-            fingerprint_dirs(&roots).unwrap(),
-            "a contract change must change the fingerprint"
-        );
-
-        // Adding a file counts.
-        let with_extra = fingerprint_dirs(&roots).unwrap();
-        write(&src, "src/extra.rs", "fn b() {}");
-        assert_ne!(with_extra, fingerprint_dirs(&roots).unwrap());
-
-        // Build output must not count, or every build would invalidate itself
-        // and the suppression would never hold.
-        let settled = fingerprint_dirs(&roots).unwrap();
-        write(&src, "target/debug/junk.o", "binary noise");
-        write(&src, "target-wasm/out.wasm", "more noise");
-        assert_eq!(
-            settled,
-            fingerprint_dirs(&roots).unwrap(),
-            "build output must not affect the fingerprint"
-        );
-    }
-
-    /// An aspect with no source at all has no fingerprint, so the caller falls
-    /// through to a real build rather than suppressing on an empty hash — two
-    /// different missing aspects must not share one negative-cache entry.
-    #[test]
-    fn an_empty_tree_has_no_fingerprint() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        assert!(fingerprint_dirs(&[tmp.path().join("nope")]).is_none());
-    }
-
-    /// The decision the pipeline makes, over the fingerprints a real edit
-    /// sequence produces: refuse the identical retry, allow the fix.
-    ///
-    /// This models `known_bad_build`'s contract without standing up a whole
-    /// `Grip` (which needs a runtime, a database and a checkout).
-    #[test]
-    fn a_failed_tree_is_refused_until_it_changes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let src = tmp.path().join("agent");
-        let wit = tmp.path().join("wit");
-        write(&src, "src/lib.rs", "broken");
-        write(&wit, "thetis.wit", "package thetis:grip;");
-        let roots = vec![src.clone(), wit.clone()];
-
-        // A build fails; the pipeline remembers the source that caused it.
-        let failed_at = fingerprint_dirs(&roots).unwrap();
-        let remembered = Some(failed_at.clone());
-
-        // The watcher fires again with nothing changed — the spin. Refused.
-        let now = fingerprint_dirs(&roots).unwrap();
-        assert_eq!(
-            remembered.as_deref(),
-            Some(now.as_str()),
-            "an unchanged tree must match the remembered failure and be skipped"
-        );
-
-        // The agent fixes the source. The fingerprint moves, so the guard no
-        // longer matches and a real build happens.
-        write(&src, "src/lib.rs", "fixed");
-        let after_fix = fingerprint_dirs(&roots).unwrap();
-        assert_ne!(
-            remembered.as_deref(),
-            Some(after_fix.as_str()),
-            "a fixed tree must not be suppressed"
-        );
-    }
 }
