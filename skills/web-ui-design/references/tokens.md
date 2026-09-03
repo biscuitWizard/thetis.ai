@@ -284,9 +284,53 @@ kept — a wall of stale ones is worse than losing the oldest.
 
 `renderMarkdown(text)` returns block nodes: paragraphs, `###` headings, fenced
 code with a language strip and a copy button, inline code, bold, italic, http
-links, flat lists, blockquotes, rules. Anything else falls through as text.
-Streaming stays plain text and is replaced by rendered markdown when the final
-`assistant` frame arrives, so a mid-stream reconnect still lands right.
+links, flat lists, blockquotes, rules, GFM pipe tables. Anything else falls
+through as text. Streaming stays plain text and is replaced by rendered markdown
+when the final `assistant` frame arrives, so a mid-stream reconnect still lands
+right.
+
+**Tables** handle two forms. The ordinary multi-line one, and the *collapsed*
+one-liner — `| a | b | |---|---| | 1 | 2 |` — which arrives when something has
+eaten the newlines, and which models emit often enough to matter. The collapsed
+form is genuinely ambiguous: `| |` is both an empty leading cell and a row
+boundary. It is resolved by counting cells against the header width
+(`chunkRows`), never by guessing. A table needs **two or more** delimiter cells
+to be recognised, so a sentence containing a pipe and a dash stays a paragraph.
+Wrap in `.md-table-wrap`, which scrolls: a nine-column table is wider than
+`--measure` and must not stretch the text column.
+
+### `lib/mermaid.js`
+
+A ```` ```mermaid ```` fence renders as a diagram. **The second approved
+exception to "no dependencies"**, after xterm — mermaid 11.17.2 is vendored at
+`ui/vendor/mermaid.js`, self-served, so the UI still reaches only its own origin.
+The operator chose vendoring over a CDN and the full library over a
+flowchart-only subset; do not relitigate either.
+
+Four things hold this together, and none is decorative:
+
+- **It is 3.5 MB, so it loads lazily** — a classic script tag on the first
+  mermaid fence, never on the startup path. Verified: a full page load fetches
+  only the 9 KB module. It is an IIFE assigning `globalThis.mermaid`, so
+  `import` would parse it and define nothing, exactly as with xterm. Build the
+  URL relative to `import.meta.url` or it 404s under `/preview/`.
+- **Rendered SVG is cached by source.** `renderMarkdown` re-runs on every
+  streaming delta, so without this a finished diagram is redrawn dozens of times
+  and flickers as the text after it arrives.
+- **The fallback is the code block**, with the source and its copy button, plus
+  a `--warn`-tinted note. The reader is never worse off than before diagrams
+  existed. This is also why the load has a **timeout**: if neither `load` nor
+  `error` fires, the promise never settles and the source is stranded behind
+  "drawing diagram…" for ever. Only a rejection surfaces the code block.
+- **It is the one place model-derived content becomes `innerHTML`**, because
+  mermaid's output *is* an SVG string. `securityLevel: "strict"` (its bundled
+  DOMPurify), `htmlLabels: false` (SVG `<text>`, no `foreignObject`), and
+  parse-before-render keep that honest. Do not remove any of the three.
+  Verified with script tags, `onerror` attributes and `javascript:` click
+  hrefs in node labels: nothing executed, against a control that did.
+
+Theme comes from `theme.css` via `getComputedStyle`, since mermaid needs
+resolved colour strings and cannot read a custom property itself.
 
 ## File map
 

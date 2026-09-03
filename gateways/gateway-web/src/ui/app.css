@@ -2352,6 +2352,87 @@ body { display: flex; flex-direction: column; }
   color: var(--text-dim);
 }
 
+/* A table scrolls inside its own wrapper: a nine-column table is wider than
+ * the 48rem measure, and stretching the text column to fit one would reflow
+ * the whole transcript. */
+.md-table-wrap {
+  margin: 0 0 var(--gap-3);
+  overflow-x: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+}
+.md-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--text-sm);
+  /* Numeric columns read as columns rather than as ragged text. */
+  font-variant-numeric: tabular-nums;
+}
+.md-table th,
+.md-table td {
+  padding: 6px var(--gap-3);
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--hairline);
+}
+.md-table thead th {
+  background: var(--surface-2);
+  font-weight: 600;
+  color: var(--text-dim);
+}
+/* No trailing hairline: the wrapper's own border closes the last row. */
+.md-table tbody tr:last-child td { border-bottom: 0; }
+.md-table tbody tr:hover td { background: var(--surface-1); }
+
+/* A mermaid diagram. Framed like a code block, because that is what it was
+ * before it could be drawn and what it falls back to when it cannot. */
+.md-mermaid {
+  margin: 0 0 var(--gap-3);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+/* The fallback brings its own frame, so drop this one to avoid a double border. */
+.md-mermaid:has(> .md-code) {
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+.md-mermaid > .md-code { margin: 0; }
+
+.md-mermaid-figure {
+  display: flex;
+  justify-content: center;
+  padding: var(--gap-3);
+  overflow-x: auto;
+}
+.md-mermaid-figure svg { max-width: 100%; height: auto; }
+
+.md-mermaid-wait {
+  padding: var(--gap-2) 0;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+/* Tints its text and border and leaves the fill alone — a failed diagram is a
+ * note, not an alarm. */
+.md-mermaid-error {
+  margin: 0 var(--gap-3) var(--gap-3);
+  padding: var(--gap-1) var(--gap-2);
+  font-size: var(--text-xs);
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent);
+  border-radius: var(--r-sm);
+}
+
+/* Alignment from the delimiter row (`:--`, `:-:`, `--:`). Scoped through
+ * .md-table so these outrank the `text-align: left` on `.md-table th, td`
+ * above on specificity, without reaching for !important. */
+.md-table .md-cell-left { text-align: left; }
+.md-table .md-cell-center { text-align: center; }
+.md-table .md-cell-right { text-align: right; }
+
 /* An inline action on a meta line ("Inspect ↗"). */
 .meta-link {
   padding: 0;
