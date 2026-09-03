@@ -184,6 +184,38 @@ pub async fn build_and_activate_with(
         ));
     };
 
+    // 0. Has the source been deleted? A tool whose crate is gone must leave
+    //    service, or the loader serves the last artifact forever: the tool stays
+    //    callable, and every future rebuild fails with "no crate found".
+    //    Restricted to tools on purpose — the agent and the gateway have no
+    //    unloaded state worth having, so for those a missing crate is a fault to
+    //    report, not an instruction to remove ourselves.
+    if matches!(aspect, Aspect::Tool(_))
+        && !grip.cfg.aspect_source_dir(aspect).join("Cargo.toml").is_file()
+    {
+        if grip.loader.get(aspect).is_some() {
+            grip.uninstall_component(aspect);
+            let _ = grip
+                .commit_worktree(&format!("{}: removed {aspect}", origin.label()))
+                .await;
+            return Ok(Outcome {
+                success: true,
+                aspect: aspect.key(),
+                revision: None,
+                stderr: String::new(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                detail: "the crate is gone, so the tool was unloaded and deregistered".to_string(),
+                pending_swap: false,
+            });
+        }
+        return Ok(Outcome::failure(
+            aspect,
+            "no crate at this path, and nothing loaded to remove",
+            String::new(),
+            started,
+        ));
+    }
+
     // 1. Compile.
     let build = grip.builder.build_with(&grip.cfg, aspect, opts).await?;
     if !build.success {
