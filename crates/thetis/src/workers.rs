@@ -663,8 +663,14 @@ impl ipc::Handler for GatewayHandler {
                     .grip
                     .local_store()
                     .context("gateway has no local store")?;
-                return crate::persist::serve_store_call(store, &method, params, &self.session_id)
-                    .await;
+                return crate::persist::serve_store_call(
+                    store,
+                    Some(&self.grip.cfg),
+                    &method,
+                    params,
+                    &self.session_id,
+                )
+                .await;
             }
             anyhow::bail!("unknown gateway method {method}")
         })

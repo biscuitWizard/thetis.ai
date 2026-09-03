@@ -369,4 +369,6 @@ When binding off loopback, `server.public_origin` is required. Put Thetis behind
 a TLS reverse proxy that preserves `Host`; proxy headers are not trusted. Role
 capability denials are enforced in native host imports. Per-name denials of
 agent-internal built-ins are advisory; deny their capability family for a hard
-boundary. The shared workspace is not partitioned between users.
+boundary. Tool-group denials are likewise soft, but agent-core applies them
+whether attention grouping is enabled or not. The shared workspace is not
+partitioned between users.

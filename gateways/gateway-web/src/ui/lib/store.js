@@ -14,6 +14,8 @@ export const store = {
   /** Models pushed out of the picker; the inspector still lists them so one
    *  can be brought back. */
   modelsHidden: [],
+  modelsRestricted: false,
+  user: null,
   modes: [],
   busy: false,
   attachments: [],

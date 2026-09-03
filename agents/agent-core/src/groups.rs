@@ -205,8 +205,17 @@ pub fn all() -> &'static [ToolGroup] {
             id: "files",
             brief: "Reading, searching, writing and deleting files on the host.",
             tags: &[
-                "file", "files", "read", "write", "edit", "search", "grep", "directory", "path",
-                "code", "source",
+                "file",
+                "files",
+                "read",
+                "write",
+                "edit",
+                "search",
+                "grep",
+                "directory",
+                "path",
+                "code",
+                "source",
             ],
             // Almost every task touches a file, and these are the tools the
             // system prompt tells the model to prefer over shell equivalents.
@@ -225,9 +234,8 @@ pub fn all() -> &'static [ToolGroup] {
             id: "shell",
             brief: "Terminal sessions for builds, tests, git and long-running processes.",
             tags: &[
-                "run", "build", "test", "tests", "compile", "command", "shell", "terminal",
-                "bash", "process", "script", "cargo", "npm", "python", "git", "clone", "install",
-                "deploy",
+                "run", "build", "test", "tests", "compile", "command", "shell", "terminal", "bash",
+                "process", "script", "cargo", "npm", "python", "git", "clone", "install", "deploy",
             ],
             always_on: false,
             members: &[
@@ -269,8 +277,18 @@ pub fn all() -> &'static [ToolGroup] {
             // either admits this group, and a stray call admits it at invoke
             // time. Skill edges are a better signal here than keywords.
             tags: &[
-                "yourself", "loop", "gateway", "devkit", "component", "wasm", "rebuild",
-                "recompile", "dependency", "crate", "restart", "scaffold",
+                "yourself",
+                "loop",
+                "gateway",
+                "devkit",
+                "component",
+                "wasm",
+                "rebuild",
+                "recompile",
+                "dependency",
+                "crate",
+                "restart",
+                "scaffold",
             ],
             always_on: false,
             members: &[
@@ -307,7 +325,14 @@ pub fn all() -> &'static [ToolGroup] {
         ToolGroup {
             id: "config",
             brief: "Reading and changing Thetis's own settings.",
-            tags: &["config", "configuration", "setting", "settings", "toml", "option"],
+            tags: &[
+                "config",
+                "configuration",
+                "setting",
+                "settings",
+                "toml",
+                "option",
+            ],
             always_on: false,
             members: &["list_config", "read_config", "set_config"],
         },
@@ -328,8 +353,17 @@ pub fn all() -> &'static [ToolGroup] {
             // long tool descriptions into every conversation, including the
             // ones where delegation would be the wrong idea.
             tags: &[
-                "subagent", "subagents", "delegate", "delegation", "spawn", "concurrently",
-                "parallel", "parallelise", "parallelize", "fan-out", "background",
+                "subagent",
+                "subagents",
+                "delegate",
+                "delegation",
+                "spawn",
+                "concurrently",
+                "parallel",
+                "parallelise",
+                "parallelize",
+                "fan-out",
+                "background",
             ],
             always_on: false,
             members: &[
@@ -355,8 +389,19 @@ pub fn all() -> &'static [ToolGroup] {
             // cheap — a session that wants recall says so in words this matches,
             // or calls `tool_search`.
             tags: &[
-                "conversation", "conversations", "transcript", "transcripts", "chat", "chats",
-                "recall", "earlier", "previously", "before", "remember", "discussed", "decided",
+                "conversation",
+                "conversations",
+                "transcript",
+                "transcripts",
+                "chat",
+                "chats",
+                "recall",
+                "earlier",
+                "previously",
+                "before",
+                "remember",
+                "discussed",
+                "decided",
             ],
             always_on: false,
             members: &[
@@ -385,7 +430,13 @@ pub fn all() -> &'static [ToolGroup] {
             // it is the word for what a retriever takes. The remaining tokens
             // are ones that really do imply a warehouse.
             tags: &[
-                "bigquery", "bq", "sql", "dataset", "warehouse", "gcp", "partition",
+                "bigquery",
+                "bq",
+                "sql",
+                "dataset",
+                "warehouse",
+                "gcp",
+                "partition",
                 "analytics",
             ],
             always_on: false,
@@ -407,8 +458,8 @@ pub fn all() -> &'static [ToolGroup] {
             // local tree far more often than the internet. "documentation" goes
             // the same way — usually it is the repo's own docs.
             tags: &[
-                "web", "internet", "online", "arxiv", "paper", "papers", "research", "url",
-                "link", "article", "news", "blog", "google",
+                "web", "internet", "online", "arxiv", "paper", "papers", "research", "url", "link",
+                "article", "news", "blog", "google",
             ],
             always_on: false,
             members: &[],
@@ -423,8 +474,16 @@ pub fn all() -> &'static [ToolGroup] {
             // from `web-ui-design/verifying-on-a-branch` is the better signal
             // anyway, since verifying a UI change is the main use.
             tags: &[
-                "playwright", "headless", "click", "screenshot", "dom", "css",
-                "viewport", "responsive", "render", "frontend",
+                "playwright",
+                "headless",
+                "click",
+                "screenshot",
+                "dom",
+                "css",
+                "viewport",
+                "responsive",
+                "render",
+                "frontend",
             ],
             always_on: false,
             members: &[],
@@ -441,7 +500,15 @@ pub fn all() -> &'static [ToolGroup] {
             brief: "The GitHub API: reading and committing files, repos, branches, PRs.",
             // "commit" is a `branch` tag and means the local branch more often;
             // "pull" and "push" are ambiguous with plain git over the shell.
-            tags: &["github", "repo", "repository", "pr", "issue", "upstream", "clone"],
+            tags: &[
+                "github",
+                "repo",
+                "repository",
+                "pr",
+                "issue",
+                "upstream",
+                "clone",
+            ],
             always_on: false,
             members: &[],
         },
@@ -675,6 +742,15 @@ fn groups_from_skills(cards: &[skills::SkillCard]) -> Vec<String> {
     out
 }
 
+pub(crate) fn policy_denies_group(id: &str) -> bool {
+    id != "core"
+        && sys::config_get("policy_deny_groups")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .any(|denied| !denied.is_empty() && denied == id)
+}
+
 /// Decides the active set for a conversation and pins it. Idempotent: once
 /// pinned, the pin is what is returned, so the tool block stays byte-identical
 /// between turns.
@@ -683,7 +759,10 @@ fn groups_from_skills(cards: &[skills::SkillCard]) -> Vec<String> {
 /// regardless of the order evidence arrived in.
 pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
     if let Some(pinned) = read_pin(session_id) {
-        return pinned;
+        return pinned
+            .into_iter()
+            .filter(|id| !policy_denies_group(id))
+            .collect();
     }
 
     // Every admission records why, so the panel can explain an attached group
@@ -692,7 +771,7 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
 
     let mut active: Vec<String> = all()
         .iter()
-        .filter(|g| g.always_on)
+        .filter(|g| g.always_on && !policy_denies_group(g.id))
         .map(|g| g.id.to_string())
         .collect();
     for id in &active {
@@ -702,7 +781,7 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
     // Configured always-on, for a deployment that wants a group unconditionally
     // without editing this table.
     for id in configured_always_on() {
-        if find(&id).is_some() && !active.contains(&id) {
+        if find(&id).is_some() && !policy_denies_group(&id) && !active.contains(&id) {
             why.push((id.clone(), REASON_CONFIGURED));
             active.push(id);
         }
@@ -712,7 +791,7 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
     // pass and unconditionally.
     let from_skills = groups_from_skills(&skills::pinned(session_id));
     for id in &from_skills {
-        if !active.contains(id) {
+        if !policy_denies_group(id) && !active.contains(id) {
             why.push((id.clone(), REASON_SKILL));
             active.push(id.clone());
         }
@@ -723,7 +802,7 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
     let query_tokens = tokens(query);
     let mut from_tags = Vec::new();
     for group in all() {
-        if active.iter().any(|a| a == group.id) {
+        if policy_denies_group(group.id) || active.iter().any(|a| a == group.id) {
             continue;
         }
         let s = score(group, &query_tokens);
@@ -758,13 +837,13 @@ pub fn admit(session_id: &str, ids: &[String]) -> Vec<String> {
     let mut active = read_pin(session_id).unwrap_or_else(|| {
         all()
             .iter()
-            .filter(|g| g.always_on)
+            .filter(|g| g.always_on && !policy_denies_group(g.id))
             .map(|g| g.id.to_string())
             .collect()
     });
     let mut added = Vec::new();
     for id in ids {
-        if find(id).is_some() && !active.contains(id) {
+        if find(id).is_some() && !policy_denies_group(id) && !active.contains(id) {
             active.push(id.clone());
             added.push(id.clone());
         }
@@ -781,7 +860,11 @@ pub fn admit(session_id: &str, ids: &[String]) -> Vec<String> {
 /// The active set for a session, without routing. Used per turn, where the
 /// answer must come from the pin rather than be recomputed.
 pub fn active(session_id: &str) -> Vec<String> {
-    read_pin(session_id).unwrap_or_else(|| all().iter().map(|g| g.id.to_string()).collect())
+    read_pin(session_id)
+        .unwrap_or_else(|| all().iter().map(|g| g.id.to_string()).collect())
+        .into_iter()
+        .filter(|id| !policy_denies_group(id))
+        .collect()
 }
 
 fn in_table_order(ids: &[String]) -> Vec<String> {
@@ -820,13 +903,16 @@ fn repair_pin(raw: &str) -> Option<Vec<String>> {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .filter(|l| find(l).is_some())
+        .filter(|l| find(l).is_some() && !policy_denies_group(l))
         .map(str::to_string)
         .collect();
     if ids.is_empty() {
         return None;
     }
-    for group in all().iter().filter(|g| g.always_on) {
+    for group in all()
+        .iter()
+        .filter(|g| g.always_on && !policy_denies_group(g.id))
+    {
         if !ids.iter().any(|i| i == group.id) {
             ids.push(group.id.to_string());
         }
@@ -926,7 +1012,11 @@ fn json_str(s: &str) -> String {
 fn json_array(items: &[&str]) -> String {
     format!(
         "[{}]",
-        items.iter().map(|i| json_str(i)).collect::<Vec<_>>().join(",")
+        items
+            .iter()
+            .map(|i| json_str(i))
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -968,7 +1058,7 @@ fn configured_always_on() -> Vec<String> {
 pub fn catalogue(active: &[String]) -> String {
     let mut out = String::new();
     for group in all() {
-        if group.id == UNGROUPED {
+        if group.id == UNGROUPED || policy_denies_group(group.id) {
             continue;
         }
         let mark = if active.iter().any(|a| a == group.id) {
@@ -988,7 +1078,7 @@ pub fn rank(query: &str) -> Vec<(&'static ToolGroup, f64)> {
     let query_tokens = tokens(query);
     let mut scored: Vec<(&'static ToolGroup, f64)> = all()
         .iter()
-        .filter(|g| g.id != UNGROUPED)
+        .filter(|g| g.id != UNGROUPED && !policy_denies_group(g.id))
         .map(|g| (g, score(g, &query_tokens)))
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.id.cmp(b.0.id)));
@@ -1062,7 +1152,10 @@ mod tests {
     /// long tool descriptions it has no use for.
     #[test]
     fn the_word_wait_alone_does_not_route_to_delegation() {
-        assert_eq!(score(group("subagents"), &tokens("wait for the build")), 0.0);
+        assert_eq!(
+            score(group("subagents"), &tokens("wait for the build")),
+            0.0
+        );
     }
 
     /// A tag containing a hyphen or a space used to be unmatchable, because
@@ -1070,11 +1163,20 @@ mod tests {
     /// failure was silent — the group just never got offered.
     #[test]
     fn a_multi_word_tag_matches_the_words_it_is_made_of() {
-        assert!(tag_present("fan-out", &tokens("please fan out the reading")));
-        assert!(tag_present("fan out", &tokens("fan-out across four agents")));
+        assert!(tag_present(
+            "fan-out",
+            &tokens("please fan out the reading")
+        ));
+        assert!(tag_present(
+            "fan out",
+            &tokens("fan-out across four agents")
+        ));
         // Adjacency is required, or a tag's commonest word fires on its own.
         assert!(!tag_present("fan-out", &tokens("out of the fan")));
-        assert!(!tag_present("fan-out", &tokens("switch the fan off and head out")));
+        assert!(!tag_present(
+            "fan-out",
+            &tokens("switch the fan off and head out")
+        ));
         // The single-token path is unaffected.
         assert!(tag_present("spawn", &tokens("spawn a helper")));
         assert!(!tag_present("spawn", &tokens("spawning a helper")));

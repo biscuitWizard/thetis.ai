@@ -45,6 +45,9 @@ discord_role = ""
 # Capability denials are hard host boundaries. `deny_tools` is hard for
 # component tools but only advisory for agent-internal built-ins; deny the
 # corresponding capability to make that restriction authoritative.
+# `deny_groups` is also soft: agent-core hides and refuses every member even
+# when attention grouping itself is disabled, but a rewritable agent is not a
+# security boundary. Use capability or `deny_tools` denials for hard limits.
 
 [paths]
 # All relative paths are resolved against the project root (the directory
