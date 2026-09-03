@@ -13,6 +13,7 @@ import { $, AGENT_NAME, clear, el } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { askCard, parseAsk } from "./askuser.js";
+import { bylineAvatar as avatarFor } from "./avatars.js";
 
 /** The tool whose call renders as a form instead of a tool row. */
 const ASK_TOOL = "ask_user";
@@ -106,6 +107,7 @@ export function showPending({ text, attachments, note }) {
     el(
       "div",
       { class: "row-head" },
+      avatarFor("user"),
       "you",
       el("span", { class: "row-flag" }, "sending")
     ),
@@ -161,11 +163,16 @@ function toBottom(instant) {
 
 // --- pieces -----------------------------------------------------------------
 
+/* One turn: a byline, then whatever the turn said.
+ *
+ * `role` picks the avatar as well as the colour — "user" and "assistant" are
+ * the two that have a face, and any other role (a system note, a tool) gets a
+ * byline with no tile rather than a blank square. */
 function row(role, who, ...content) {
   const node = el(
     "div",
     { class: `row ${role}` },
-    el("div", { class: "row-head" }, who),
+    el("div", { class: "row-head" }, avatarFor(role), who),
     ...content
   );
   root.append(node);
