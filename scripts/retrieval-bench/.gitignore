@@ -1,6 +1,0 @@
-# Lifted source: copied in by run.sh, content depends on the revision measured.
-/src/lifted/*
-!/src/lifted/.keep
-/target/
-*.jsonl
-*.svg
