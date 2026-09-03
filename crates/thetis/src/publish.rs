@@ -3,7 +3,8 @@
 //! Tools and skills marked private — a `.thetis-private` file in their
 //! directory — stay fully tracked locally (branching, merging, and resets all
 //! need them), so privacy is enforced where it actually matters: at the push.
-//! A derived `public` branch mirrors trunk commit-for-commit with private
+//! `main` on the remote *is* the published version: a derived local branch
+//! mirrors trunk commit-for-commit with private
 //! paths filtered out of every tree, and a pre-push hook refuses to let any
 //! other branch reach a remote. Publishing is an explicit human action from
 //! /admin; nothing here runs on its own.
@@ -27,7 +28,16 @@ pub const PRIVATE_MARKER: &str = ".thetis-private";
 pub const LEGACY_PRIVATE_MARKER: &str = ".genesis-private";
 
 /// The branch the export writes and the only one the hook lets out.
+/// Where the filtered history is built, locally.
+///
+/// It is pushed to `main` on the remote — that branch *is* the published
+/// version of the project — but it cannot be built on local `main`, which is
+/// trunk and carries whatever is private. The two are deliberately different
+/// refs with the same public meaning.
 pub const PUBLIC_REF: &str = "refs/heads/public";
+
+/// The branch the filtered history is published as.
+pub const REMOTE_BRANCH: &str = "main";
 /// Bookkeeping: the last trunk commit the export has processed.
 const SOURCE_REF: &str = "refs/thetis/public-source";
 
@@ -170,16 +180,17 @@ pub async fn install_push_guard(git: &GitCtl) -> Result<()> {
     let hook = format!(
         r#"#!/bin/sh
 {HOOK_MARKER}
-# Only the filtered `public` branch may leave this machine: trunk and the
-# conversation branches can carry private tools and skills. Export from
-# /admin, then push `public`. Set THETIS_ALLOW_PUSH=1 to override once.
+# Only the filtered export may leave this machine: local `main` is trunk and
+# the conversation branches can carry private tools and skills. Publish from
+# /admin, which exports and pushes it as `main` on the remote. Set
+# THETIS_ALLOW_PUSH=1 to override once.
 if [ -n "$THETIS_ALLOW_PUSH" ]; then exit 0; fi
 while read local_ref local_sha remote_ref remote_sha; do
   case "$local_ref" in
     refs/heads/public|"") ;;
     *)
-      echo "thetis: refusing to push $local_ref — only 'public' leaves this machine." >&2
-      echo "thetis: export it from /admin, or set THETIS_ALLOW_PUSH=1 to override." >&2
+      echo "thetis: refusing to push $local_ref — only the filtered export leaves this machine." >&2
+      echo "thetis: publish from /admin, or set THETIS_ALLOW_PUSH=1 to override." >&2
       exit 1
       ;;
   esac
@@ -335,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_push_guard_blocks_everything_but_public() {
+    async fn only_the_filtered_export_can_become_the_remote_main() {
         let (tmp, git) = repo().await;
         install_push_guard(&git).await.unwrap();
 
@@ -348,13 +359,26 @@ mod tests {
             .await
             .unwrap();
 
-        // main is refused... (the guard is a hook, so this must go hooked)
+        // Local main is trunk and may carry private paths, so pushing it is
+        // refused even though the remote branch it would land on is called
+        // main too. (The guard is a hook, so this must go hooked.)
         let refused = git.run_hooked(&["push", "origin", "main"], &[]).await;
-        assert!(refused.is_err(), "pushing main must be refused");
+        assert!(refused.is_err(), "pushing trunk must be refused");
 
-        // ...public goes through.
+        // ...but the filtered export becomes the remote's main, which is what
+        // "published" means here.
         export_public(&git).await.unwrap();
-        git.run_hooked(&["push", "origin", "public"], &[]).await.unwrap();
+        git.run_hooked(&["push", "origin", "public:main"], &[])
+            .await
+            .unwrap();
+        let published = git
+            .run_raw(&["ls-remote", "origin", "refs/heads/main"])
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&published.stdout).trim().is_empty(),
+            "the remote's main must now exist"
+        );
 
         // ...and the documented override works.
         git.run_hooked(&["push", "origin", "main"], &[("THETIS_ALLOW_PUSH", "1")])

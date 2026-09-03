@@ -402,7 +402,7 @@ async fn admin_branch_action(
                 "released the checkout for {target}; its branch and commits remain"
             ))
         }
-        // Publishing: derive the filtered public branch, then (separately)
+        // Publishing: derive the filtered history, then (separately)
         // push it. Two explicit human actions, never automatic.
         "export-public" => {
             let root = branches.root_git();
@@ -428,14 +428,29 @@ async fn admin_branch_action(
             let Some(head) = export.public_head else {
                 anyhow::bail!(
                     "there is nothing to publish yet: trunk has no commits that survive \
-                     the private-path filter, so no public branch was created."
+                     the private-path filter, so nothing was exported."
                 );
             };
-            root.run_hooked(&["push", "origin", "public"], &[]).await?;
+
+            // The remote's `main` *is* the published version, so that is where
+            // the filtered history goes. It is not a fast-forward of anything
+            // local — the filtered chain is derived, and rewriting trunk's
+            // history rewrites it too — so publishing necessarily replaces
+            // what is there. The lease is what keeps that honest: it refuses
+            // if the remote has moved since we last saw it, so this can
+            // overwrite our own previous publish and never somebody else's.
+            root.run_hooked(&["fetch", "origin", crate::publish::REMOTE_BRANCH], &[])
+                .await
+                .ok();
+            let refspec = format!("public:{}", crate::publish::REMOTE_BRANCH);
+            let lease = format!("--force-with-lease={}", crate::publish::REMOTE_BRANCH);
+            root.run_hooked(&["push", &lease, "origin", &refspec], &[])
+                .await?;
             Ok(format!(
-                "exported {} commit(s) and pushed public ({}) to origin",
+                "exported {} commit(s) and published {} as '{}' on origin",
                 export.commits,
-                &head[..12.min(head.len())]
+                &head[..12.min(head.len())],
+                crate::publish::REMOTE_BRANCH
             ))
         }
         other => anyhow::bail!("unknown action '{other}'"),
@@ -613,11 +628,11 @@ machine: a filtered <code>public</code> branch mirrors trunk without them, and a
 hook refuses everything else. Currently private: {private_list}.</p>
 <form method=post action="/admin/branch">
   <input type=hidden name=action value="export-public">
-  <button>export public branch</button></form>
+  <button>export public history</button></form>
 <form method=post action="/admin/branch"
-      onsubmit="return confirm('Push the public branch to origin?')">
+      onsubmit="return confirm('Publish to origin/main? This replaces the remote\'s main with the filtered export of trunk.')">
   <input type=hidden name=action value="push-public">
-  <button>push public to origin</button></form>
+  <button>publish to origin/main</button></form>
 <p class=note>{sessions} session(s) on record.</p>
 <p><a href="/">&larr; back to chat</a></p>"#,
         banner = banner,
