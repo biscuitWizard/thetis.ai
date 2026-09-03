@@ -77,6 +77,7 @@ the change is wrong.
 | Why did my context get smaller? | `thetis-internals/compaction` |
 | How does skill retrieval work? | `thetis-internals/skill-system` |
 | Which file holds this behaviour? | `thetis-internals/code-map` |
+| How do I write or fix a tool? | `thetis-internals/tool-authorship` |
 | How do I change a setting or restart? | `thetis-internals/config-and-recovery` |
 | What may a guest do at all? | `references/wit-contract.md` |
 | What are the current settings and tools? | `references/snapshot.md` |
