@@ -44,6 +44,10 @@ let active = CHAT;
  *  `workspace-file` replies apart from the Files explorer's. */
 const wanted = new Set();
 
+/** Opens a sub-agent's inline block in the conversation and scrolls to it.
+ *  Supplied by `mountStage`; see the note there about the import cycle. */
+let revealInline = null;
+
 function find(id) {
   return tabs.find((t) => t.id === id);
 }
@@ -238,14 +242,12 @@ export function openAgentPane(id, label) {
           type: "button",
           class: "ghost-btn",
           title: "Jump to this sub-agent's block in the conversation",
+          // Delegated to the owner of the inline copy, which knows whether that
+          // copy's rows have been built yet. Doing it here through the DOM
+          // scrolled to a block that was still empty.
           onClick: () => {
             show(CHAT);
-            const block = document.querySelector(`details.agent[data-agent="${id}"]`);
-            if (!block) return;
-            block.open = true;
-            block.scrollIntoView({ behavior: "smooth", block: "center" });
-            block.classList.add("is-flashed");
-            setTimeout(() => block.classList.remove("is-flashed"), 1200);
+            revealInline?.(id);
           },
         },
         "Show in conversation"
@@ -282,6 +284,30 @@ store.watch("agents", (list) => {
   }
   drawStrip();
 });
+
+/* Registers work to do the first time a sub-agent's pane is actually shown.
+ *
+ * The transcript uses this to defer building the pane's rows: a child's tab may
+ * never be opened, and a finished child has hundreds of rows that cost real time
+ * to build. `show` fires it once, on the transition to visible, and then forgets
+ * it — the callback is expected to be idempotent anyway, but a pane is only
+ * filled once and re-running it on every switch would be a slow no-op.
+ *
+ * If the pane happens to be the active tab already, the callback runs now: the
+ * pane is on screen and there would be no later `show` to trigger it. */
+export function onAgentPaneShown(id, fn) {
+  const tab = find(`agent:${id}`);
+  if (!tab) return false;
+  if (tab.id === active) {
+    fn();
+    return true;
+  }
+  tab.onShow = () => {
+    tab.onShow = null;
+    fn();
+  };
+  return true;
+}
 
 /** Brings a sub-agent's tab forward. Used by the sidebar's sub-agent rows. */
 export function focusAgent(id) {
@@ -585,6 +611,10 @@ export function mountStage(hooks = {}) {
   stage = $("stage");
   send = hooks.sendFrame || (() => false);
   onRename = hooks.onRename || null;
+  // Injected rather than imported: the transcript imports this module to get its
+  // panes, so reaching back into it directly would be a cycle. The owner of both
+  // (app.js) supplies the one call that crosses.
+  revealInline = hooks.onRevealInline || null;
 
   tabs.length = 0;
   tabs.push({

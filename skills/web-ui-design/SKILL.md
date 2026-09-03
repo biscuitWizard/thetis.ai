@@ -331,3 +331,38 @@ about the diff:
 | A streaming delta lands in the wrong copy of a sub-agent | Two homes sharing one `live`/`open` cursor | Per-home cursors in `inAgent()` |
 | An editor loses its caret on save | The pane was rebuilt instead of refreshed | Build furniture once; assert node identity across a save |
 | A file pane says "reading…" for ever | A failed read replies only with `workspace-result` | Handle `op === "read"` failure and clear the wanted set |
+| Opening a conversation freezes the tab for seconds | Every off-screen pane is built up front — with sub-agents the transcript is rendered twice | Queue events per home, drain on first show (see below) |
+| A drained pane glides through thousands of pixels of history | The scroller inherits `scroll-behavior: smooth` | `scrollTo({top, behavior:"instant"})`, guarded — linkedom has no `scrollTo` |
+
+## Keeping an off-screen pane cheap
+
+A pane that stays in the DOM to preserve its state must not also *build* while
+off screen. Sub-agent panes broke this: a conversation with four children
+rendered every child's history twice — once inline, once into a hidden tab — and
+opening it blocked the main thread for **5346ms** across 28,623 nodes, 87% of the
+events belonging to a child.
+
+The fix is one flag per home, not a new data structure:
+
+1. Each home carries `awake` and a `queue`. While asleep, `inAgent` pushes the
+   event instead of rendering it.
+2. `wake(spot)` is idempotent: flip `awake`, drain the queue through the same
+   renderer, then scroll to the bottom once.
+3. Wake on the real reveal events — `stage.onAgentPaneShown(id, …)` for a tab,
+   the `<details>` `toggle` for the inline block. `details.open = true` fires
+   `toggle` *asynchronously*, so a programmatic reveal must call `wake`
+   synchronously or the caller sees an empty block.
+4. Set a `draining` flag during the drain and skip the scroll-position read while
+   it is set. Asking for `scrollHeight` between rows flushes layout hundreds of
+   times, and the answer cannot change while nothing is on screen.
+5. Keep every store side effect — the ledger, `busy`, `publishAgents()` — in
+   `dispatch`, once per event, never per home. Otherwise waking a pane
+   double-counts spend.
+6. During `replay`, spawn homes asleep (a `bulk` flag) and wake only what is
+   actually open when it finishes.
+
+Result on the same conversation: 5346ms → **388ms**, 28,623 → 2,612 nodes, and a
+woken pane builds byte-identical content (verify by comparing node counts against
+the eager numbers). Assert the *emptiness* of an unfocused pane, not just the
+content of a focused one — that assertion is what fails if someone reverts the
+laziness.
