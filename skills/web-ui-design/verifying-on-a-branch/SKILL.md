@@ -3,7 +3,7 @@ name = "Verifying a UI change on a branch"
 brief = "Prove a UI change works before merging, by running your branch's own gateway on a spare port and driving headless Chrome over CDP."
 when_to_use = "Use when a UI edit under gateways/gateway-web/src/ui builds green but the running page does not show it, when curl on the live port 404s a file you just added to assets.rs, or when a change needs real browser evidence — layout geometry, console errors, responsive behaviour — before it is merged to trunk. Also use when playwright MCP tools are unavailable and there is no node on the box. Not for reasoning about CSS or picking tokens; that is the parent skill."
 tags = ["ui", "verify", "browser", "headless", "chrome", "cdp", "gateway", "branch", "404", "stale", "tool-group:shell", "tool-group:selfmod", "tool-group:browser"]
-version = 4
+version = 5
 ---
 
 # Verifying a UI change on a branch
@@ -26,9 +26,20 @@ the build up in the cache, and `pipeline::cache_key_with` mixes
 `kernel_wit_fingerprint()` — the *running* kernel's compiled-in contract — into
 the key. A branch holding a different contract therefore never gets a hit, and
 you get the "has not built gateway/web yet" fallback however many times the
-guest builds green. Do not chase it. Either restart onto a kernel this branch
-built, or verify the module directly (see *Driving a view module under Node*
-below), which is usually the cheaper answer for renderer logic.
+guest builds green. Do not chase it.
+
+Two ways out, and the first is better than it sounds:
+
+- **Land the contract change, then `restart_orchestrator`.** Once the running
+  kernel's contract matches the branch's, the fingerprints agree and `/preview/`
+  starts working — no second instance, and you get real layout. If the contract
+  part of your work is already merged, or you were going to restart anyway, just
+  check `git diff <trunk>..HEAD -- wit/thetis.wit` and `curl` the preview before
+  assuming you are still locked out. A branch that is 24 commits ahead can still
+  preview fine, provided none of those commits is the contract.
+- **Drive the module under Node** (see *Driving a view module under Node*), which
+  is the cheaper answer for renderer logic and the only answer while the contract
+  is genuinely divergent.
 
 Only fall through to a second gateway when `/preview/` genuinely cannot answer
 the question, and say why. It starts another Thetis, which
@@ -248,6 +259,23 @@ Feed it the *adversarial* stream, not the happy one. Two concurrent sources with
 colliding ids is the case that finds flat-keyed state: a sub-agent numbers its
 event log from 1, so two children emit the same `seq` and the same tool-call id
 as each other and as the parent.
+
+Wrap each assertion in a `try`, and give a missing node a stand-in rather than
+letting it throw:
+
+```js
+const check = (name, fn) => {
+  try { checks[name] = !!fn(); } catch { checks[name] = false; }
+};
+const NONE = { textContent: "", classList: { contains: () => false },
+               getAttribute: () => "" };
+```
+
+Without this a harness that finds a real bug dies on the first missing node and
+reports nothing about the checks after it — so the output tells you something
+broke but not which invariant. Prove the harness can fail: delete the one line
+that makes the feature work and confirm you get a list of named failures, not a
+stack trace. A test suite that has never failed has not been tested.
 
 ## 4. Clean up
 

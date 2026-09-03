@@ -151,7 +151,45 @@ fn all_builtins() -> Vec<ToolDef> {
     if !delegation_available() {
         tools.extend(subagent_tools());
     }
+    if !restart_available() {
+        tools.extend(restart_tools());
+    }
     tools
+}
+
+/// Restarting the runtime, which is how a change to the kernel or to a
+/// startup-only setting takes effect.
+///
+/// One tool, but still a named group rather than an inline block in
+/// `available`, for the reason given on every other group here: a tool defined
+/// inline cannot be added back by `all_builtins`, so in a deployment where the
+/// capability is off the name becomes unclassifiable — `is_mutating` falls
+/// through to the component path and guesses, and the group table reports the
+/// `selfmod` entry for it as a phantom.
+fn restart_tools() -> Vec<ToolDef> {
+    vec![ToolDef {
+        name: "restart_orchestrator",
+        description: "Restart this conversation's own runtime — no other conversation notices. \
+             Needed for changes to settings read only at startup, and for changes to \
+             the orchestrator's own source under crates/. Do NOT build the \
+             orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
+             this rebuilds it for you, in the background, and reports the result here. \
+             A build that fails restarts nothing and gives you the compiler error; a \
+             binary that will not start is probed and rejected before it is adopted. \
+             This turn continues afterwards unless you say otherwise; say why first, \
+             because the restart happens just after your turn ends.",
+        mutating: true,
+        parameters: obj(
+            json!({
+                "reason": string_prop("Why a restart is needed."),
+                "resume": {
+                    "type": "boolean",
+                    "description": "Carry this turn on once Thetis is back, which is the default. Set false only if the restart is the last thing you mean to do.",
+                },
+            }),
+            &["reason"],
+        ),
+    }]
 }
 
 /// The isolated per-session container: running a command and moving files in and
@@ -647,30 +685,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     }
     tools.extend(configuration_tools());
     if restart_available() {
-        tools.push(ToolDef {
-            name: "restart_orchestrator",
-            description:
-                "Restart this conversation's own runtime — no other conversation notices. \
-                 Needed for changes to settings read only at startup, and for changes to \
-                 the orchestrator's own source under crates/. Do NOT build the \
-                 orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
-                 this rebuilds it for you, in the background, and reports the result here. \
-                 A build that fails restarts nothing and gives you the compiler error; a \
-                 binary that will not start is probed and rejected before it is adopted. \
-                 This turn continues afterwards unless you say otherwise; say why first, \
-                 because the restart happens just after your turn ends.",
-            mutating: true,
-            parameters: obj(
-                json!({
-                    "reason": string_prop("Why a restart is needed."),
-                    "resume": {
-                        "type": "boolean",
-                        "description": "Carry this turn on once Thetis is back, which is the default. Set false only if the restart is the last thing you mean to do.",
-                    },
-                }),
-                &["reason"],
-            ),
-        });
+        tools.extend(restart_tools());
     }
 
     // In a read-only mode the tools that would change something are simply not
@@ -750,7 +765,10 @@ fn filesystem_tools() -> Vec<ToolDef> {
             parameters: obj(
                 json!({
                     "pattern": string_prop("Regular expression, Rust regex syntax. Prefix with (?i) to ignore case."),
-                    "path": string_prop("Directory to search under. Omit for the project root."),
+                    "path": string_prop(
+                        "Where to search: a directory, or a single file to search just that one. \
+                         Omit for the project root.",
+                    ),
                     "glob": string_prop("Only search files whose name matches, e.g. '*.rs' or 'src/**/*.toml'."),
                     "mode": {
                         "type": "string",
@@ -777,7 +795,10 @@ fn filesystem_tools() -> Vec<ToolDef> {
             parameters: obj(
                 json!({
                     "glob": string_prop("Glob such as '*.rs', 'crates/**/*.toml', or 'Cargo.*'."),
-                    "path": string_prop("Directory to look under. Omit for the project root."),
+                    "path": string_prop(
+                        "Where to look: a directory, or a single file to test just that one. \
+                         Omit for the project root.",
+                    ),
                     "max_results": {
                         "type": "integer",
                         "description": "How many to return. Omit for a sensible bound.",
@@ -2905,14 +2926,8 @@ fn format_exec(result: ExecResult) -> String {
     out
 }
 
-/// Tests for the parts of `ask_user` the turn loop depends on.
-///
-/// The loop ends the turn when a call named [`ASK_USER`] *succeeds*, so two
-/// things have to hold: the advertised name must equal the constant the loop
-/// matches on, and validation must reject a malformed question rather than
-/// returning `Ok`. Both are checked here because both fail silently — a rename
-/// would simply stop the pause happening, and an `Ok` on a question that was
-/// never shown would hang the conversation waiting for an answer.
+/// Tests for the delegation tools' own logic: the brief-length gate, the wait
+/// plan, and the formatters a parent reads its children through.
 #[cfg(test)]
 mod delegation_tests {
     use super::{check_brief, format_child, format_children, format_profiles, wait_plan, MIN_BRIEF};
@@ -3129,6 +3144,101 @@ mod delegation_tests {
     }
 }
 
+/// Tests for the classification invariant that `all_builtins` exists to keep.
+///
+/// Neither `available` nor `all_builtins` can be called here: both probe host
+/// capabilities, and a host import traps outside wasm. But the group functions
+/// they are assembled from are pure, so the invariant can be checked against
+/// those — which is also where it breaks, since the failure mode is a tool
+/// defined inline in `available` rather than in a named function.
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// Every capability-gated tool set, as `all_builtins` sees them. A new
+    /// group must be added here and to `all_builtins` together.
+    fn gated() -> Vec<ToolDef> {
+        let mut all = Vec::new();
+        all.extend(sandbox_tools());
+        all.extend(devkit_tools());
+        all.extend(filesystem_tools());
+        all.extend(terminal_tools());
+        all.extend(git_tools());
+        all.extend(ssh_host_tools());
+        all.extend(subagent_tools());
+        all.extend(restart_tools());
+        all
+    }
+
+    /// A capability-gated tool must live in a named function, because that is
+    /// the only kind `all_builtins` can add back when the capability is off.
+    ///
+    /// This is the bug that hid in `restart_orchestrator`: defined inline under
+    /// `if restart_available()`, it silently left the builtin list in any
+    /// deployment without the control capability. Nothing failed loudly — the
+    /// name merely became unclassifiable, so `is_mutating` fell through to the
+    /// component path and guessed, and the group table reported the `selfmod`
+    /// entry for it as naming a tool that does not exist.
+    ///
+    /// Asserted from the group table's side, so it holds for tools not yet
+    /// written: every member of a group whose tools are capability-gated has to
+    /// be reachable without any capability being live.
+    #[test]
+    fn every_gated_group_member_is_reachable_without_its_capability() {
+        let reachable: Vec<&str> = gated().iter().map(|t| t.name).collect();
+        // The groups whose members are all capability-gated. `core`, `skills`,
+        // `files` and `config` are unconditional, and the rest are hot-loaded
+        // components with no members in the table.
+        for id in ["sandbox", "shell", "ssh", "selfmod", "branch", "subagents"] {
+            let group = crate::groups::all()
+                .iter()
+                .find(|g| g.id == id)
+                .unwrap_or_else(|| panic!("no `{id}` group"));
+            for member in group.members {
+                assert!(
+                    reachable.contains(member),
+                    "`{member}` is in the `{id}` group but no named group function \
+                     yields it, so `all_builtins` cannot classify it when the \
+                     capability is off. Move it out of the inline block in \
+                     `available` into a named function, and add that function to \
+                     both `available` and `all_builtins`."
+                );
+            }
+        }
+    }
+
+    /// `restart_orchestrator` mutates, and a read-only mode must withhold it.
+    /// It is the tool whose flag matters most: it is how a kernel change goes
+    /// live.
+    #[test]
+    fn restarting_is_classified_as_mutating() {
+        let restart = restart_tools();
+        assert_eq!(restart.len(), 1);
+        assert_eq!(restart[0].name, "restart_orchestrator");
+        assert!(restart[0].mutating);
+    }
+
+    /// No name may be yielded by two group functions, or `group_of` and the
+    /// mutating flag both become order-dependent.
+    #[test]
+    fn no_gated_tool_is_defined_twice() {
+        let all = gated();
+        for (i, tool) in all.iter().enumerate() {
+            if let Some(dup) = all[..i].iter().find(|t| t.name == tool.name) {
+                panic!("`{}` is defined twice", dup.name);
+            }
+        }
+    }
+}
+
+/// Tests for the parts of `ask_user` the turn loop depends on.
+///
+/// The loop ends the turn when a call named [`ASK_USER`] *succeeds*, so two
+/// things have to hold: the advertised name must equal the constant the loop
+/// matches on, and validation must reject a malformed question rather than
+/// returning `Ok`. Both are checked here because both fail silently — a rename
+/// would simply stop the pause happening, and an `Ok` on a question that was
+/// never shown would hang the conversation waiting for an answer.
 #[cfg(test)]
 mod ask_user_tests {
     use super::{ask_user, ASK_USER, MAX_OPTIONS, MAX_QUESTIONS};

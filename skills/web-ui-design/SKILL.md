@@ -6,7 +6,7 @@ universal = false
 tags = ["ui", "web ui", "frontend", "css", "design", "design tokens", "panel", "rail", "inspector", "chat interface", "gateway-web", "layout", "restyle", "sloppy ui", "tool-group:selfmod"]
 children = "auto"
 related = ["thetis-internals", "careful-surgery"]
-version = 1
+version = 2
 ---
 
 # Web UI design
@@ -89,7 +89,12 @@ These are not preferences. Breaking one has bitten this codebase.
    and means it. Use a token; add one to `theme.css` if none fits. Stale
    fallbacks like `var(--ok, #9ece6a)` are the same bug wearing a hat, and a
    typo'd token name (`var(--sans)` when it is `--font`) fails silently — the
-   branch graph's labels inherited the wrong family for weeks.
+   branch graph's labels inherited the wrong family for weeks. Spacing is the
+   easiest to get wrong, because the scale is *numbered*: `--gap-1` … `--gap-6`,
+   and there is no `--gap-xs`. An invented name yields no gap at all rather than
+   a wrong one, so the build is green and the row just looks tight. Read the
+   value back — `getComputedStyle(el).gap` or `.marginLeft` — rather than
+   trusting the name you wrote.
 2. **No `confirm()`, `prompt()` or `alert()`.** Use `popover(anchor, {...})` for
    anything destructive or needing a name, and `toast()` for outcomes. Native
    dialogs cannot say what they are about to destroy, and they cannot be

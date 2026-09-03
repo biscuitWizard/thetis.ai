@@ -97,9 +97,35 @@ function agentBlock(id, label) {
 
   // Each child keeps its own streaming cursors and its own open-call map, so
   // concurrent children cannot corrupt each other's rows.
-  const entry = { block, body, live: null, thinking: null, open: new Map() };
+  const entry = {
+    block,
+    body,
+    live: null,
+    thinking: null,
+    open: new Map(),
+    label: label || "sub-agent",
+    state: "running",
+    cost: 0,
+  };
   agents.set(id, entry);
+  publishAgents();
   return entry;
+}
+
+/* Mirrors the block map into the store, for the sidebar.
+ *
+ * A fresh array each time: `store.set` compares by identity, so mutating the
+ * existing one in place would notify nobody. Insertion order is spawn order,
+ * which is the order a reader expects. */
+function publishAgents() {
+  store.set({
+    agents: [...agents.entries()].map(([id, entry]) => ({
+      id,
+      label: entry.label || "sub-agent",
+      state: entry.state || "running",
+      cost: entry.cost || 0,
+    })),
+  });
 }
 
 /** Runs a renderer with a sub-agent's block and state swapped in. */
@@ -148,6 +174,10 @@ function settleAgent(entry, ev) {
   if (ev.prompt_tokens > 0) bits.push(`${fmtK(ev.prompt_tokens)} tok`);
   const info = entry.block.querySelector(".agent-meta");
   if (info) info.textContent = bits.join(" · ");
+
+  entry.state = failed ? ev.stopped_by : "done";
+  entry.cost = ev.cost > 0 ? ev.cost : 0;
+  publishAgents();
 }
 
 export function mountTranscript(hooks = {}) {
@@ -169,6 +199,7 @@ export function reset() {
   agents.clear();
   clear(root);
   store.set({
+    agents: [],
     turnStats: [],
     liveTurn: null,
     spendSession: 0,
