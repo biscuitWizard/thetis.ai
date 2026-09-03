@@ -59,6 +59,18 @@ export const store = {
    * known to this client at all. */
   agents: [],
 
+  /* What every conversation is doing right now, by session id.
+   *
+   * Shape: {state, step, steps, cost, agents, since_ms, outcome, rev}, the
+   * host's `activity` snapshot. Unlike `agents` above this covers conversations
+   * this tab is *not* watching: the host folds every worker frame into one
+   * snapshot per conversation and pushes a change to every socket allowed to
+   * see it, so the sidebar can show a background conversation working, waiting
+   * on a question, or failed. Seeded from the `sessions` list, then kept
+   * current by `activity` frames; merged by `rev`, since the two can cross.
+   * A conversation with no entry is idle. */
+  activity: {},
+
   /** The current conversation's branch-status frame, or null (panel hidden). */
   branch: null,
   /** Commits for the History view. */

@@ -67,6 +67,10 @@
   --ease: cubic-bezier(.2, .7, .3, 1);
   --fast: 110ms;
   --med: 180ms;
+  /* One pass of the sheen that glides over a working conversation's row in
+     the sidebar. views/sessions.js anchors each row's phase to wall time with
+     this same figure (SHEEN_MS), so change both together. */
+  --sheen: 2600ms;
 
   /* Terminal — the palette the drawer renders shell output with.
    *
@@ -133,4 +137,5 @@
 
 @media (prefers-reduced-motion: reduce) {
   :root { --fast: 0ms; --med: 0ms; }
+  /* The sheen is not shortened but removed: see app.css. */
 }

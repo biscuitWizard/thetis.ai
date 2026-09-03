@@ -1226,8 +1226,11 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
         sink,
         out_rx,
         frames,
+        grip.activity.subscribe(),
         watching.clone(),
         client_id.clone(),
+        grip.clone(),
+        principal.clone(),
     ));
 
     tracing::debug!(%client_id, "websocket connected");
@@ -1419,11 +1422,7 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
         for action in actions {
             match action {
                 GatewayAction::Reply(frame) => {
-                    let frame = if principal.viewing_all() {
-                        annotate_owners(&grip, &principal, frame)
-                    } else {
-                        frame
-                    };
+                    let frame = decorate_sessions(&grip, &principal, frame);
                     if out_tx.send(frame).await.is_err() {
                         return;
                     }
@@ -1465,12 +1464,20 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
     tracing::debug!(%client_id, "websocket closed");
 }
 
-/// Adds `owner`, `owner_name` and `mine` to each row of a `sessions` frame,
-/// for the sidebar that is showing everyone's conversations. `SessionMeta`
-/// is a WIT record and cannot carry an owner, and the guest does not know
-/// who is asking, so the rows are decorated here on the way out. Any other
-/// frame passes through untouched.
-fn annotate_owners(grip: &Grip, principal: &crate::auth::Principal, frame: String) -> String {
+/// Decorates each row of a `sessions` frame with what the guest cannot know.
+///
+/// `SessionMeta` is a WIT record, so it cannot grow a field without changing
+/// the contract every guest is matched against; these are added to the JSON on
+/// the way out instead, which an older UI simply ignores.
+///
+/// - `activity`: the conversation's live state from `activity.rs` — working,
+///   waiting, failed or idle, and the current step — so a freshly opened tab's
+///   sidebar is right on first paint rather than after the next push.
+/// - `owner`, `owner_name` and `mine`, only when this socket is showing
+///   everyone's conversations: the guest does not know who is asking.
+///
+/// Any other frame passes through untouched.
+fn decorate_sessions(grip: &Grip, principal: &crate::auth::Principal, frame: String) -> String {
     if !frame.contains("\"type\":\"sessions\"") {
         return frame;
     }
@@ -1480,8 +1487,21 @@ fn annotate_owners(grip: &Grip, principal: &crate::auth::Principal, frame: Strin
     if value.get("type").and_then(|t| t.as_str()) != Some("sessions") {
         return frame;
     }
+    let activity = grip.activity.all();
+    if let Some(rows) = value.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+        for row in rows.iter_mut() {
+            let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
+            let Some(snap) = activity.get(id) else { continue };
+            if let (Some(obj), Ok(snap)) = (row.as_object_mut(), serde_json::to_value(snap)) {
+                obj.insert("activity".into(), snap);
+            }
+        }
+    }
+    if !principal.viewing_all() {
+        return value.to_string();
+    }
     let Some(owners) = grip.local_store().and_then(|s| s.owners_map().ok()) else {
-        return frame;
+        return value.to_string();
     };
     let name_of = |owner: &str| -> String {
         if let Some(user) = grip.cfg.auth.user(owner) {
@@ -1517,19 +1537,56 @@ fn user_frame(principal: &crate::auth::Principal) -> String {
 }
 
 /// Owns the sink and nothing else. Moves bytes; never awaits a handler.
+///
+/// Three inputs: the connection's own replies, the rendered frames of the
+/// conversations it is watching, and `activity` changes for *every*
+/// conversation its principal may see — that last one is how the sidebar
+/// learns that a conversation it is not looking at has started, stopped, or
+/// is waiting on a question. Visibility is checked once per session and
+/// remembered: ownership does not change, and a chatty turn would otherwise
+/// cost a store read per step.
+#[allow(clippy::too_many_arguments)]
 async fn write_loop(
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
     mut out_rx: tokio::sync::mpsc::Receiver<String>,
     mut frames: tokio::sync::broadcast::Receiver<RenderedFrame>,
+    mut activity: tokio::sync::broadcast::Receiver<crate::activity::Change>,
     watching: Arc<tokio::sync::RwLock<HashSet<String>>>,
     client_id: String,
+    grip: Arc<Grip>,
+    principal: Arc<crate::auth::Principal>,
 ) {
+    let mut visible: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     loop {
         tokio::select! {
             queued = out_rx.recv() => {
                 let Some(text) = queued else { return };
                 if sink.send(Message::Text(text.into())).await.is_err() {
                     return;
+                }
+            }
+            change = activity.recv() => {
+                match change {
+                    Ok(change) => {
+                        let may_see = *visible
+                            .entry(change.session_id.clone())
+                            .or_insert_with(|| {
+                                crate::auth::may_access(&grip, &principal, &change.session_id).is_ok()
+                            });
+                        if may_see
+                            && sink
+                                .send(Message::Text(crate::activity::Activity::frame(&change).into()))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // Intermediate states are gone; the client's next
+                    // `sessions` list carries the current ones. Nothing to
+                    // rebuild, unlike a lagged event stream.
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
                 }
             }
             broadcast = frames.recv() => {
