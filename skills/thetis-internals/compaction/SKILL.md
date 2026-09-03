@@ -10,8 +10,16 @@ version = 1
 # Context compaction
 
 The code is `agents/agent-core/src/compaction.rs`. The agent calls it from
-`maybe_compact` in `lib.rs`, before the first completion of the turn. The turn
-that is about to run is therefore the turn that gets the benefit.
+`maybe_compact` in `lib.rs`, **at the top of every iteration of the turn loop**,
+immediately before each completion.
+
+It used to run once, before the turn's first completion. That made a new user
+message the only thing that could ever trigger a compaction, which is the wrong
+trigger: a turn does not stay the size it started at. Context overflow is
+overwhelmingly built *inside* one long agentic turn — twenty iterations of file
+reads and command output — and none of that growth was visible to a check that
+had already run. A runaway turn could take the context past the window and start
+getting requests refused, with the next user message arriving far too late.
 
 ## The most important property
 
@@ -38,9 +46,42 @@ key names are different from the config file names.
 | `keep_head` | `keep_head` | `context.keep_head` |
 | `keep_tail` | `keep_tail` | `context.keep_tail` |
 
-Compaction starts when `context_tokens > window * threshold`. It tries to get to
-`window * target`. An unknown context size, which is `0`, is not a reason to
-compact. An empty `summary_model` means the host gives the main model.
+Compaction starts when the context size exceeds `window * threshold`. It tries to
+get to `window * target`. An unknown context size, which is `0`, is not a reason
+to compact. An empty `summary_model` means the host gives the main model.
+
+### What the size is measured from
+
+`Turn::context_estimate` is the number the trigger sees, and it is two terms:
+
+- `context_tokens` — the provider's own count for the last request, covering
+  system prompt, tool schemas and history. Set by `record_usage`, which also
+  records `billed_to`: the message-list length at the moment that request went
+  out.
+- `compaction::estimate(&messages[billed_to..])` — four-characters-per-token over
+  everything appended since. These are the tool results, and they are exactly
+  what a checked-every-turn trigger needs, because no request has been priced
+  with them in it yet.
+
+Checking `context_tokens` alone is the bug, not a simplification: within a turn
+that figure does not move, so the check returns the same answer every iteration
+no matter how much has been appended.
+
+### Two traps in checking every iteration
+
+Both are guarded; do not remove either without replacing it.
+
+- **The compaction loop.** A provider count taken *before* a compaction
+  describes a conversation that has since been summarized away. Trust it and
+  the very next check compacts again, and again, until a completion refreshes
+  the figure. `rehydrate` tracks `last_usage_seq` against
+  `last_compaction_seq` and ignores a count that is not newer than the last
+  compaction; `context_estimate` then falls back to estimating the whole list.
+- **The duplicated nudge.** Queued `pending` text is already in the log but not
+  yet in `messages`. Compaction ends by rehydrating from the log, which picks it
+  up — and `flush_pending` would then add it a second time. `maybe_compact`
+  returns early while `pending` is non-empty; the loop flushes first, so the
+  next iteration checks again.
 
 Read the current values with `read_config`. Do not trust a number that is
 written here.
@@ -124,15 +165,22 @@ Stopping works on two levels, and both are needed:
   await lasting tens of seconds with no stop checkpoint at all. `stream_next`
   had its own race; the non-streaming path had nothing.
 
-`maybe_compact`'s caller also checks `stopped_before_starting()` before entering
-the loop, so a turn stopped during compaction ends with `stopped_by =
-"cancelled"` and zero iterations rather than proceeding to a completion.
+The turn loop also drains the inbox immediately after `maybe_compact`, *before*
+`iterations` is incremented, so a turn stopped during a compaction ends with
+`stopped_by = "cancelled"` rather than proceeding to a completion — and one
+stopped during its first compaction still reports zero iterations. This replaced
+a `stopped_before_starting()` check that sat outside the loop and therefore only
+covered the first compaction, which is the only one that used to exist.
 
 ## Failure branches
 
 | Symptom | Cause | Action |
 |---|---|---|
 | Nothing is compacted although the context is large | The middle is not eligible, or every round is protected | Check `keep_head` and `keep_tail` against the conversation length. A short conversation has no eligible middle. |
+| A long agentic turn overflows the window without ever compacting | The trigger is reading `context_tokens` alone, which does not move within a turn | Check `maybe_compact` is called per iteration and uses `context_estimate`, not the bare field. |
+| The same conversation compacts several times in a row | A pre-compaction provider count is being trusted | Check the `last_usage_seq > last_compaction_seq` test in `rehydrate`. |
+| A nudge appears twice in the history | Compaction rehydrated with text still in `pending` | Check `maybe_compact`'s early return on a non-empty `pending`. |
+| The log says "a span has no log sequence" | A span reached `origins` index holding 0 | Refused deliberately: seq 0 means the system prompt or in-turn nudge text, and recording it would cover the whole log. Find what put a seq-0 message inside a round. |
 | The log says "message and origin lists disagree" | A `push` did not add to both lists | Find the code path that added a message without a sequence. Compaction refuses rather than guess, because a panic would trap the turn. |
 | A summary got summarized | A note did not take the `user` role | Notes must be `user` role. Check `compaction::note`. |
 | The UI goes silent and stop does nothing for tens of seconds | A summary call is not interruptible | Check `llm::chat` is still wrapped in `interruptible` in `host_api.rs`. |

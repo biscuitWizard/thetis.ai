@@ -85,6 +85,12 @@ struct Turn {
     /// prompt, tool schemas and the whole history. This is what compaction
     /// triggers on - an estimate of one part of the request would not do.
     context_tokens: u32,
+    /// How many messages `context_tokens` accounts for. Everything from here on
+    /// was added since the last completion and has never been priced by a
+    /// provider, so the compaction check estimates it instead. Without this a
+    /// turn that piles up tool results looks exactly as large as it did before
+    /// the first one.
+    billed_to: usize,
     iterations: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -126,6 +132,7 @@ impl Turn {
             messages: Vec::new(),
             origins: Vec::new(),
             context_tokens: 0,
+            billed_to: 0,
             iterations: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -147,21 +154,6 @@ impl Turn {
         // are the strongest evidence for which groups this conversation wants,
         // and they do not exist until the pin does.
         self.route_tools_once();
-        self.maybe_compact();
-
-        // A stop pressed during compaction should end the turn there, not after
-        // one more completion paid for at the full context size.
-        if self.stopped_before_starting() {
-            self.stopped_by = "cancelled";
-            return Ok(TurnStats {
-                iterations: 0,
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.completion_tokens,
-                cost_usd: self.cost_usd,
-                tools_used: self.tools_used,
-                stopped_by: self.stopped_by.to_string(),
-            });
-        }
 
         loop {
             if self.iterations >= self.max_iterations {
@@ -172,6 +164,33 @@ impl Turn {
                 ));
                 break;
             }
+
+            // Anything the user typed is folded in before the size is measured,
+            // so compaction sees the list the request will really carry — and so
+            // a nudge is never left queued behind a compaction it arrived
+            // before.
+            if matches!(self.flush_pending(), Interrupt::Cancelled) {
+                self.stopped_by = "cancelled";
+                break;
+            }
+
+            // Every completion, not just the turn's first. This is the fix for
+            // compaction only ever being triggered by a new user message: the
+            // context that overflows is usually built *inside* one long agentic
+            // turn, and a check that ran once at the top of the turn could not
+            // see any of it. Placed immediately before the request so the
+            // decision is made on the list that request will actually send.
+            self.maybe_compact();
+
+            // A stop pressed during compaction ends the turn here rather than
+            // after one more completion paid for at the full context size.
+            // Before the counter moves, so a turn stopped during its first
+            // compaction still reports zero iterations.
+            if matches!(self.drain_inbox(), Interrupt::Cancelled) {
+                self.stopped_by = "cancelled";
+                break;
+            }
+
             self.iterations += 1;
 
             let reply = match self.stream_completion() {
@@ -346,6 +365,12 @@ impl Turn {
     fn rehydrate(&mut self) {
         self.messages.clear();
         self.origins.clear();
+        // Both are rebuilt from the log below. Clearing them matters on a
+        // *re*hydration — the one just after a compaction — where a stale
+        // provider count left in place would describe the longer conversation
+        // that has only now been summarized.
+        self.context_tokens = 0;
+        self.billed_to = 0;
 
         self.push(
             json!({ "role": "system", "content": self.system_prompt() }),
@@ -357,8 +382,17 @@ impl Turn {
         // Which sequences a summary now stands for, and where each note goes.
         let mut covered: Vec<(u64, u64)> = Vec::new();
         let mut notes: Vec<(u64, Value)> = Vec::new();
+        // The newest compaction, and the newest completion that reported a
+        // context size. Compared below: a count taken before a compaction
+        // describes a conversation that no longer exists.
+        let mut last_compaction_seq = 0u64;
+        let mut last_usage_seq = 0u64;
         for record in &records {
+            if matches!(record.event, SessionEvent::AssistantMessage(ref m) if m.usage.is_some()) {
+                last_usage_seq = record.seq;
+            }
             if let SessionEvent::ContextCompacted(c) = &record.event {
+                last_compaction_seq = record.seq;
                 let (Some(first), Some(last)) = (c.spans.first(), c.spans.last()) else {
                     continue;
                 };
@@ -376,6 +410,13 @@ impl Turn {
                 ));
             }
         }
+
+        // A provider count only describes this message list if it was taken
+        // after the last compaction. One taken before it is a measurement of a
+        // conversation that has since been summarized away, and trusting it
+        // would re-trigger compaction on every check until a completion
+        // refreshed the figure — the compaction loop this guards against.
+        let usage_is_current = last_usage_seq > last_compaction_seq;
 
         for record in records {
             if let Some(i) = notes.iter().position(|(seq, _)| *seq == record.seq) {
@@ -398,9 +439,13 @@ impl Turn {
                 }
                 SessionEvent::AssistantMessage(msg) => {
                     // The last one wins: this ends up holding what the provider
-                    // charged for the most recent request.
+                    // charged for the most recent request, and the boundary it
+                    // was charged at.
                     if let Some(usage) = &msg.usage {
-                        self.context_tokens = usage.prompt_tokens;
+                        if usage_is_current {
+                            self.context_tokens = usage.prompt_tokens;
+                            self.billed_to = self.messages.len();
+                        }
                     }
                     let reply = Reply {
                         text: msg.content,
@@ -448,12 +493,32 @@ impl Turn {
     /// Summarizes the oldest low-value stretch of the conversation when the
     /// context has grown past its threshold.
     ///
-    /// Runs before the turn rather than after it, so the turn about to happen is
-    /// the one that benefits. A failure is not fatal: the conversation simply
-    /// stays long, which is worse than compacting and better than not answering.
+    /// Called before *every* completion, not once at the head of the turn. The
+    /// head-of-turn-only version could only ever be triggered by a new user
+    /// message, which is the wrong trigger: a turn does not stay the size it
+    /// started at. An agentic turn is where context actually grows — twenty
+    /// iterations of file reads and command output — and that growth used to be
+    /// entirely invisible to the check, so a long turn could run the context
+    /// straight past the window and start failing requests, with the next user
+    /// message arriving too late to be the thing that saves it.
+    ///
+    /// A failure is not fatal: the conversation simply stays long, which is
+    /// worse than compacting and better than not answering.
     fn maybe_compact(&mut self) {
         let policy = compaction::Policy::load();
-        if !policy.should_compact(self.context_tokens) {
+        if !policy.enabled {
+            return;
+        }
+        // Queued nudge text is in the log already but not yet in `messages`.
+        // Compaction ends by rehydrating from the log, which would pick it up —
+        // and `flush_pending` would then add it a second time. Skipping here
+        // costs nothing: `pending` is emptied once the assistant turn it arrived
+        // during is on the list, and the next iteration checks again.
+        if !self.pending.is_empty() {
+            return;
+        }
+        let context_tokens = self.context_estimate();
+        if !policy.should_compact(context_tokens) {
             return;
         }
 
@@ -461,7 +526,7 @@ impl Turn {
             &self.session_id,
             &self.messages,
             &self.origins,
-            self.context_tokens,
+            context_tokens,
             &policy,
         ) else {
             return;
@@ -487,17 +552,6 @@ impl Turn {
             LogLevel::Info,
             &format!("compaction: {replaced} messages replaced by a summary"),
         );
-    }
-
-    /// Whether the user stopped the turn before it got as far as its first
-    /// completion.
-    ///
-    /// Compaction is the only thing that runs before that point and the only
-    /// thing that takes long enough for a stop to land during it. Without this
-    /// the loop's first checkpoint is *after* a completion, so a turn stopped
-    /// during compaction still paid for a full model call before noticing.
-    fn stopped_before_starting(&mut self) -> bool {
-        matches!(self.drain_inbox(), Interrupt::Cancelled)
     }
 
     /// The base prompt, the mode's own instructions, and the skills this
@@ -904,7 +958,27 @@ impl Turn {
             self.prompt_tokens += u.prompt_tokens;
             self.completion_tokens += u.completion_tokens;
             self.cost_usd += u.cost_usd;
+            // What the provider just charged for is exactly the message list as
+            // it stood when the request went out — this is called before the
+            // reply is pushed, so `len()` is that boundary. Everything appended
+            // after it is unbilled and gets estimated instead.
+            self.context_tokens = u.prompt_tokens;
+            self.billed_to = self.messages.len();
         }
+    }
+
+    /// The size of the context as it stands right now.
+    ///
+    /// The provider's count for the last request, plus an estimate of
+    /// everything appended since. The second term is the whole reason
+    /// compaction can fire mid-turn: a turn's context growth is tool results,
+    /// and no request has been priced with them in it yet, so a check that
+    /// looked only at `context_tokens` saw the same number all turn and a turn
+    /// that ran away could sail past the window without ever compacting.
+    fn context_estimate(&self) -> u32 {
+        let billed_to = self.billed_to.min(self.messages.len());
+        self.context_tokens
+            .saturating_add(compaction::estimate(&self.messages[billed_to..]))
     }
 
     fn note(&self, text: &str) {

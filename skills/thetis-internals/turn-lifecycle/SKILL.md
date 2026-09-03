@@ -21,17 +21,24 @@ export is `handle-turn(session-id)`.
 3. **`retrieve_skills_once`** — If the session has no pinned skills, rank the
    corpus against the first user message and pin the result. Then rehydrate
    again, because the system prompt is now different.
-4. **`maybe_compact`** — See the `compaction` child skill.
+4. **`route_tools_once`** — Decide and pin this conversation's tool groups.
+   Strictly after skill retrieval, whose `tool-group:` tags feed it.
 5. **The loop**, for each iteration:
-   a. `stream_completion` — Send `model`, `messages` and `tools`. Read chunks
+   a. `flush_pending`, then **`maybe_compact`**, then drain the inbox for a
+      cancel — all before the counter moves. Compaction is checked *every*
+      iteration, not once per turn, because a turn's context grows as its tool
+      results pile up. See the `compaction` child skill.
+   b. `stream_completion` — Send `model`, `messages` and `tools`. Read chunks
       until `Finished`. Each `Delta` chunk goes to the browser immediately with
       `emit_output`, and also into the reply text.
-   b. Append an `AssistantMessage` event **before** you act on it. The log must
+   c. Append an `AssistantMessage` event **before** you act on it. The log must
       be true even if a tool traps.
-   c. `record_usage` — Add the prompt tokens, completion tokens and cost.
-   d. If there are no tool calls, drain the inbox. `None` stops the turn.
+   d. `record_usage` — Add the prompt tokens, completion tokens and cost, and
+      record `billed_to`, the message-list length the provider just priced.
+      Compaction estimates everything past it.
+   e. If there are no tool calls, drain the inbox. `None` stops the turn.
       `Nudged` continues it. `Cancelled` stops it.
-   e. If there are tool calls, dispatch each one, then drain the inbox for a
+   f. If there are tool calls, dispatch each one, then drain the inbox for a
       cancel.
 6. Return `TurnStats`: iterations, tokens, cost, the tools used, and
    `stopped_by`.
