@@ -73,6 +73,26 @@ pub async fn run() -> Result<()> {
     // design: it checks node, installs the pinned Playwright if the vendored
     // copy is missing, and reports through the tools rather than stopping boot.
     crate::browser::spawn(cfg.clone());
+    // Before anything is resumed: a sub-agent recorded as running cannot be,
+    // because nothing has started yet. Those rows are the wreckage of whatever
+    // restart brought us here, and nothing else will ever clear them — a child
+    // session is not a conversation, so the resume scan below does not look at
+    // it. Left alone they are something a parent can wait on until the wait cap
+    // expires, every time, forever.
+    if let Some(store) = grip.local_store() {
+        match crate::subagents::Subagents::new(store)
+            .fail_orphans("its turn died with an orchestrator restart and was never resumed")
+        {
+            Ok(swept) if !swept.is_empty() => {
+                tracing::info!(
+                    count = swept.len(),
+                    "settled sub-agents orphaned by a restart"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not sweep orphaned sub-agents"),
+        }
+    }
     {
         let grip = grip.clone();
         tokio::spawn(async move {
