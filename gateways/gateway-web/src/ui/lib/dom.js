@@ -2,17 +2,6 @@
 
 export const $ = (id) => document.getElementById(id);
 
-/* The agent's configured name, for anywhere the UI speaks of the agent rather
- * than of the harness. The harness is always Thetis; the agent is whatever
- * agent.name says, so the two must not be conflated in the wording.
- *
- * Read once: the value is substituted into the document at serve time and
- * cannot change without a reload. The fallback matters only if the attribute is
- * missing, which means the page was served by something that does not
- * substitute — the built-in default is the right guess there. */
-export const AGENT_NAME =
-  document.documentElement.dataset.agentName?.trim() || "Thetis";
-
 /** Creates an element. Children may be nodes or strings (inserted as text). */
 export function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
@@ -59,22 +48,6 @@ export function icon(paths, { size = 16, fill = "none", width = 1.7 } = {}) {
 export function clear(node) {
   node.replaceChildren();
   return node;
-}
-
-/* Hides or shows any element, including an SVG.
- *
- * `hidden` is an IDL attribute of `HTMLElement`, and `SVGElement` does not
- * inherit it — so `svg.hidden = true` quietly sets an ordinary JS property and
- * the element stays on screen. That is exactly how an avatar's <img> and its
- * fallback <svg> mark both ended up visible at once: the image was shown and
- * the mark was "hidden" by an assignment that did nothing.
- *
- * Going through the attribute works on every element, and is what the house
- * rule about hiding with `hidden` actually means. */
-export function setHidden(node, hide) {
-  if (!node) return;
-  if (hide) node.setAttribute("hidden", "");
-  else node.removeAttribute("hidden");
 }
 
 /** Closes a menu when the next click lands outside it. */

@@ -1,12 +1,11 @@
 ---
 name = "Staging a WIT contract change"
 brief = "Change wit/thetis.wit without breaking every guest: host impls first, restart, then the contract."
-when_to_use = "Use when adding or changing an interface, record or function in wit/thetis.wit. Also use when a guest starts failing at instantiation rather than at compile time, which is the signature of a contract mismatch, or when a new host call returns 'unknown store method' from a tree where the arm is plainly present."
-tags = ["wit", "contract", "self-mod", "ordering", "tool-group:selfmod", "tool-group:shell"]
+when_to_use = "Use when adding or changing an interface, record or function in wit/thetis.wit. Also use when a guest starts failing at instantiation rather than at compile time, which is the signature of a contract mismatch."
+tags = ["wit", "contract", "self-mod", "ordering"]
 children = "none"
-version = 3
+version = 1
 ---
-# Staging a WIT contract change
 
 The WIT contract is shared by the orchestrator and every guest. A guest is
 matched against it structurally at instantiation, so a mismatch is not a compile
@@ -37,41 +36,6 @@ mentions it.
 
 Doing steps 4 and 1 in the other order gives you a window where nothing
 instantiates.
-
-## Which process actually answers the call
-
-Restarting is necessary but not always sufficient, because
-`restart_orchestrator` restarts **your worker only**. Some host calls are not
-served by the worker at all:
-
-| The host code you added | Runs in | Live after your restart? |
-|---|---|---|
-| An `impl <iface>::Host for HostState` method | your worker | yes |
-| The linker registration in `runtime.rs` | your worker | yes |
-| A `store.*` arm in `persist::serve_store_call` | the **gateway** | **no — needs a merge** |
-
-`Persist::Remote` sends every `store.*` method over IPC to the gateway process,
-which is running *trunk's* binary. So a new arm you just wrote compiles, passes
-its unit tests, is present in your tree — and still comes back as:
-
-```
-unknown store method store.conversations
-```
-
-That is not a bug in the arm. It is the same boundary that makes a UI change
-invisible until merged, and the fix is the same: merge, or accept that the
-end-to-end path cannot be exercised from the branch that adds it.
-
-Two consequences for how you verify:
-
-- **Do not debug the arm** when you see `unknown store method`. Check
-  `ps -o lstart=,args= -p $(pgrep -d, -f thetis)` first: if the gateway's start
-  time predates your build, that message is expected.
-- **Test across the wire instead.** `persist.rs`'s test module pairs a
-  `GatewaySide` handler with a `Persist::Remote` over a `UnixStream::pair()`,
-  which exercises exactly the path that fails live — serialisation of the params
-  and the return value included. A test through `Persist::Local` proves nothing
-  about it.
 
 ## Removing from the contract
 

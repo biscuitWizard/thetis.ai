@@ -340,11 +340,7 @@ function usageBlocks() {
           el("span", {}, `$${(t.cost || 0).toFixed(4)}`),
           el("span", {}, `${fmtK(t.prompt_tokens || 0)} → ${fmtK(t.completion_tokens || 0)} tok`),
           el("span", {}, t.iterations > 1 ? `${t.iterations} steps` : "1 step"),
-          /* Same as the transcript's footer: ending by asking is normal, so it
-           * gets no warning colour. Only genuine anomalies are flagged. */
-          t.stopped_by && t.stopped_by !== "stop" && t.stopped_by !== "asked"
-            ? el("span", { class: "ctx-stop" }, t.stopped_by)
-            : null
+          t.stopped_by && t.stopped_by !== "stop" ? el("span", { class: "ctx-stop" }, t.stopped_by) : null
         )
       )
   );

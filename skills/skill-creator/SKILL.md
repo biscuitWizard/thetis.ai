@@ -5,9 +5,8 @@ when_to_use = "Use when creating a new skill, editing an existing one, deciding 
 universal = true
 tags = ["skills", "authoring", "retrieval", "meta"]
 children = "auto"
-version = 2
+version = 1
 ---
-# Writing skills
 
 A skill is procedural knowledge that survives the conversation that produced it.
 Writing one is cheap; writing one that actually gets used takes attention to the
@@ -46,38 +45,20 @@ version = 1
 ```
 
 - **`name`** — human-readable, for display.
-- **`brief`** — hard cap 200 characters, but **aim under 160**. What this skill
-  does, in one line. This is the L0 text and the highest-value string in the
-  file; past 160 it stops reading as a line and truncates in tool output.
-- **`when_to_use`** — hard cap 1024 characters, **aim under 400**. The trigger
-  conditions. Say what situations it applies to *and* what it does not cover; a
-  boundary is what stops it firing on everything adjacent.
+- **`brief`** — max 200 characters, hard limit. What this skill does, in one
+  line. This is the L0 text and the highest-value string in the file.
+- **`when_to_use`** — max 1024 characters. The trigger conditions. Say what
+  situations it applies to *and* what it does not cover; a boundary is what stops
+  it firing on everything adjacent.
 - **`universal`** — in every prompt. Capped at 20 across the corpus. Spend these
   on things that apply to almost any task, never on domain specifics.
 - **`tags`** — retrieval terms, and the lexical fallback's only real signal.
 - **`children`** — `"auto"` adopts nested directories, or list ids explicitly.
-- **`status`** / **`superseded_by`** — retire a skill instead of deleting it when
-  anything references it, so the id keeps resolving and every referrer gets told
-  where to go.
 - **`version`** — bump when the body changes meaningfully.
 
 Every field, with its exact limits and defaults, is in
 `references/frontmatter.md`. Fetch it when writing frontmatter rather than
 guessing at a cap.
-
-## Linking to other skills
-
-Cross-references are checked, so write them as links rather than as prose:
-
-```markdown
-The landed-hit pipeline is in [combat-damage](skill:torchship/npc-and-life/combat-damage).
-```
-
-Always the full id — bare names like `action` or `effect` recur across topics and
-are ambiguous to exactly the reader who is following the link. A link matching no
-skill is an error, and an umbrella that fails to link one of its own children is
-an error too. The full set of body rules, with examples, is in
-`references/house-style.md`; fetch it before writing or editing a body.
 
 ## Writing a brief that gets retrieved
 
@@ -118,11 +99,6 @@ procedure, not an essay.
 - **No preamble.** No "this skill will teach you". Start at the first instruction.
 - **Say what to do when it fails.** A procedure with no failure branch gets
   abandoned at the first error.
-- **One `# Title`** as the first non-blank line, `##` below it. Enforced.
-- **A verification snippet** a reader can paste to confirm the thing still works,
-  and a short **Known gaps** section saying what is deliberately unimplemented.
-  Without the latter, a reader cannot tell what they broke from what was never
-  built.
 
 ## Deciding to nest
 
@@ -137,8 +113,7 @@ Split when either holds:
 When you split, the parent becomes a dispatch table — it says what each child
 covers and when to reach for it, and holds whatever is common. It does not
 duplicate their content. A child that is always read together with its parent
-should not have been split out. The parent must **link every child**, which the
-linter checks: a leaf the umbrella does not mention is a leaf nobody opens.
+should not have been split out.
 
 Do not nest for tidiness. Three related skills at the top level are cheaper to
 retrieve than a parent plus three children, because the parent absorbs its
@@ -169,6 +144,3 @@ children's rank and you get one result where you wanted three.
 | Fires on unrelated tasks | No negative boundary | Add exclusions to `when_to_use` |
 | Fetched and ignored | Body is prose | Convert to numbered steps |
 | Child never surfaces alone | Parent absorbs its rank | Merge back, or make the child's trigger genuinely distinct |
-| Lint says a link matches no skill | The target was renamed, or the id is misspelled | Fix the link; the id in the error is what was searched for |
-| Lint says a link is ambiguous | A bare leaf name shared across topics | Spell the full id |
-| Lint says the body omits a child | Umbrella bullets drifted behind the directory | Add a line per missing child, with when to reach for it |

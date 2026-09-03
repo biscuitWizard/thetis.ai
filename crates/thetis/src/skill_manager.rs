@@ -9,7 +9,7 @@
 //! and `host_api` maps them, which keeps the whole thing testable without
 //! standing up a component.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -54,12 +54,6 @@ pub struct Card {
     pub children: Vec<String>,
     pub universal: bool,
     pub resources: Vec<String>,
-    /// Ids of neighbouring skills, from frontmatter `related`.
-    pub related: Vec<String>,
-    /// "active" or "retired". Empty means active and unstated.
-    pub status: String,
-    /// For a retired skill, the id that replaced it. Empty otherwise.
-    pub superseded_by: String,
     /// Retrieval score; 0.0 when the card was not produced by ranking.
     pub score: f64,
     /// How this card was selected: dense, lexical, parent-of-match,
@@ -145,13 +139,8 @@ impl SkillManager {
         fresh
     }
 
-    /// Drops the cached tree.
-    ///
-    /// Called after any write through this manager, and by the filesystem host
-    /// functions when a write, edit or deletion lands inside the skills
-    /// directory. Note that nothing watches that directory: a change made by a
-    /// human with an editor, or by another process, is not noticed until
-    /// something calls this or the worker restarts.
+    /// Drops the cached tree. Called after any write, and by the watcher when
+    /// the skills directory changes underneath us.
     pub fn invalidate(&self) {
         if let Ok(mut g) = self.tree.write() {
             *g = None;
@@ -325,7 +314,9 @@ impl SkillManager {
     /// One skill's body, or one of its resource files.
     pub fn fetch(&self, id: &str, resource: &str, offset: usize, limit: usize) -> Result<Body> {
         let tree = self.tree();
-        let skill = tree.get(id).ok_or_else(|| anyhow!("no such skill: {id}"))?;
+        let skill = tree
+            .get(id)
+            .ok_or_else(|| anyhow!("no such skill: {id}"))?;
 
         let (name, text) = if resource.is_empty() {
             (String::new(), skill.body.clone())
@@ -501,9 +492,6 @@ impl SkillManager {
                 .collect(),
             universal: s.universal,
             resources: s.resources.clone(),
-            related: s.related.clone(),
-            status: s.status.clone(),
-            superseded_by: s.superseded_by.clone(),
             score,
             how: how.to_string(),
         }
@@ -644,7 +632,7 @@ impl SkillManager {
                     return Err(anyhow!(
                         "{} has no existing ancestor to check",
                         path.display()
-                    ));
+                    ))
                 }
             }
         }
@@ -791,7 +779,7 @@ mod tests {
 
     fn skill_md(name: &str, brief: &str) -> String {
         format!(
-            "---\nname = \"{name}\"\nbrief = \"{brief}\"\nwhen_to_use = \"When testing.\"\n---\n\n# {name}\n\nBody of {name}.\n"
+            "---\nname = \"{name}\"\nbrief = \"{brief}\"\nwhen_to_use = \"When testing.\"\n---\n\nBody of {name}.\n"
         )
     }
 
@@ -881,21 +869,13 @@ mod tests {
     async fn upsert_creates_then_replaces_and_reports_which() {
         let (mgr, _d) = fixture();
 
-        let first = mgr
-            .upsert("demo", "", &skill_md("Demo", "A demo skill."))
-            .unwrap();
+        let first = mgr.upsert("demo", "", &skill_md("Demo", "A demo skill.")).unwrap();
         assert!(first.created, "the first write creates");
         assert_eq!(first.id, "demo");
         assert_eq!(first.path, "demo/SKILL.md");
-        assert!(
-            first.diagnostics.is_empty(),
-            "clean skill lints clean: {:?}",
-            first.diagnostics
-        );
+        assert!(first.diagnostics.is_empty(), "clean skill lints clean: {:?}", first.diagnostics);
 
-        let second = mgr
-            .upsert("demo", "", &skill_md("Demo", "Reworded brief."))
-            .unwrap();
+        let second = mgr.upsert("demo", "", &skill_md("Demo", "Reworded brief.")).unwrap();
         assert!(!second.created, "the second write replaces");
 
         // The cache was invalidated, so the new brief is what is served.
@@ -907,9 +887,7 @@ mod tests {
     fn upsert_reports_a_skill_that_fails_to_parse() {
         let (mgr, _d) = fixture();
         // Frontmatter that is not TOML: the file lands but nothing discovers it.
-        let out = mgr
-            .upsert("broken", "", "---\nthis: is: yaml\n---\nbody")
-            .unwrap();
+        let out = mgr.upsert("broken", "", "---\nthis: is: yaml\n---\nbody").unwrap();
         assert!(
             out.diagnostics.iter().any(|d| d.severity == "error"),
             "a skill that does not parse must come back as an error: {:?}",
@@ -921,18 +899,14 @@ mod tests {
     fn upsert_refuses_to_write_outside_the_skills_directory() {
         let (mgr, _d) = fixture();
         for bad in ["../escape", "/etc/nope", "a/../../b"] {
-            assert!(
-                mgr.upsert(bad, "", "x").is_err(),
-                "{bad:?} should be refused"
-            );
+            assert!(mgr.upsert(bad, "", "x").is_err(), "{bad:?} should be refused");
         }
     }
 
     #[tokio::test]
     async fn a_resource_round_trips_through_upsert_and_fetch() {
         let (mgr, _d) = fixture();
-        mgr.upsert("demo", "", &skill_md("Demo", "A demo."))
-            .unwrap();
+        mgr.upsert("demo", "", &skill_md("Demo", "A demo.")).unwrap();
         mgr.upsert("demo", "references/format.md", "# Format\n\nDetail.\n")
             .unwrap();
 
@@ -948,8 +922,7 @@ mod tests {
     #[test]
     fn fetching_an_unknown_skill_or_resource_is_an_error() {
         let (mgr, _d) = fixture();
-        mgr.upsert("demo", "", &skill_md("Demo", "A demo."))
-            .unwrap();
+        mgr.upsert("demo", "", &skill_md("Demo", "A demo.")).unwrap();
 
         assert!(mgr.fetch("nope", "", 0, 0).is_err());
         // Refused even though the traversal would resolve, because the resource
@@ -997,10 +970,8 @@ mod tests {
     #[test]
     fn removing_a_parent_needs_the_recursive_flag() {
         let (mgr, _d) = fixture();
-        mgr.upsert("parent", "", &skill_md("Parent", "A parent."))
-            .unwrap();
-        mgr.upsert("parent/child", "", &skill_md("Child", "A child."))
-            .unwrap();
+        mgr.upsert("parent", "", &skill_md("Parent", "A parent.")).unwrap();
+        mgr.upsert("parent/child", "", &skill_md("Child", "A child.")).unwrap();
 
         let refused = mgr.remove("parent", false);
         assert!(refused.is_err(), "a parent with children needs the flag");
@@ -1020,10 +991,8 @@ mod tests {
     #[test]
     fn removing_recursively_takes_the_subtree() {
         let (mgr, _d) = fixture();
-        mgr.upsert("parent", "", &skill_md("Parent", "A parent."))
-            .unwrap();
-        mgr.upsert("parent/child", "", &skill_md("Child", "A child."))
-            .unwrap();
+        mgr.upsert("parent", "", &skill_md("Parent", "A parent.")).unwrap();
+        mgr.upsert("parent/child", "", &skill_md("Child", "A child.")).unwrap();
 
         mgr.remove("parent", true).unwrap();
         assert!(mgr.tree().get("parent").is_none());
@@ -1044,9 +1013,7 @@ mod tests {
         mgr.upsert("a", "", &skill_md("A", "First.")).unwrap();
         mgr.upsert("b", "", &skill_md("B", "Second.")).unwrap();
 
-        mgr.pin("s1", &["b".to_string(), "a".to_string()])
-            .await
-            .unwrap();
+        mgr.pin("s1", &["b".to_string(), "a".to_string()]).await.unwrap();
         let ids: Vec<String> = mgr.pinned("s1").await.into_iter().map(|c| c.id).collect();
         assert_eq!(ids, vec!["b", "a"], "pin order is preserved");
 
@@ -1063,11 +1030,7 @@ mod tests {
         let (mgr, _d) = fixture();
         mgr.upsert("a", "", &skill_md("A", "First.")).unwrap();
 
-        assert!(
-            mgr.pin("s1", &["a".to_string(), "ghost".to_string()])
-                .await
-                .is_err()
-        );
+        assert!(mgr.pin("s1", &["a".to_string(), "ghost".to_string()]).await.is_err());
         // Nothing was stored: a partial pin would be worse than none.
         assert!(mgr.pinned("s1").await.is_empty());
     }
@@ -1077,18 +1040,12 @@ mod tests {
         let (mgr, _d) = fixture();
         mgr.upsert("a", "", &skill_md("A", "First.")).unwrap();
         mgr.upsert("b", "", &skill_md("B", "Second.")).unwrap();
-        mgr.pin("s1", &["a".to_string(), "b".to_string()])
-            .await
-            .unwrap();
+        mgr.pin("s1", &["a".to_string(), "b".to_string()]).await.unwrap();
 
         mgr.remove("b", false).unwrap();
 
         let ids: Vec<String> = mgr.pinned("s1").await.into_iter().map(|c| c.id).collect();
-        assert_eq!(
-            ids,
-            vec!["a"],
-            "the dead pin is skipped, the live one stays"
-        );
+        assert_eq!(ids, vec!["a"], "the dead pin is skipped, the live one stays");
     }
 
     #[tokio::test]
@@ -1128,8 +1085,7 @@ mod tests {
             &skill_md("Being brief", "Answer in as few words as possible."),
         )
         .unwrap();
-        mgr.upsert("third", "", &skill_md("Third", "Unrelated filler."))
-            .unwrap();
+        mgr.upsert("third", "", &skill_md("Third", "Unrelated filler.")).unwrap();
 
         // Limit below the corpus size, or the ranker short-circuits.
         let hits = mgr.search("how do I undo a bad revision", 2).await;
@@ -1149,12 +1105,9 @@ mod tests {
     #[tokio::test]
     async fn retrieve_pins_what_it_found() {
         let (mgr, _d) = fixture();
-        mgr.upsert("a", "", &skill_md("Alpha", "Rollback a revision."))
-            .unwrap();
-        mgr.upsert("b", "", &skill_md("Beta", "Something else entirely."))
-            .unwrap();
-        mgr.upsert("c", "", &skill_md("Gamma", "More filler text."))
-            .unwrap();
+        mgr.upsert("a", "", &skill_md("Alpha", "Rollback a revision.")).unwrap();
+        mgr.upsert("b", "", &skill_md("Beta", "Something else entirely.")).unwrap();
+        mgr.upsert("c", "", &skill_md("Gamma", "More filler text.")).unwrap();
 
         let found = mgr.retrieve("s1", "rollback a revision", 2).await;
         assert!(!found.is_empty(), "the matching card should be found");
@@ -1179,10 +1132,7 @@ mod tests {
         mgr.upsert("p", "", &skill_md("P", "Parent.")).unwrap();
         mgr.upsert("p/c", "", &skill_md("C", "Child.")).unwrap();
 
-        let cards = mgr
-            .pin("s1", &["p".to_string(), "p/c".to_string()])
-            .await
-            .unwrap();
+        let cards = mgr.pin("s1", &["p".to_string(), "p/c".to_string()]).await.unwrap();
         assert_eq!(cards[0].children, vec!["p/c".to_string()]);
         assert_eq!(cards[0].parent, "");
         assert_eq!(cards[1].parent, "p");
@@ -1192,14 +1142,10 @@ mod tests {
     #[test]
     fn all_lists_each_parent_immediately_before_its_children() {
         let (mgr, _d) = fixture();
-        mgr.upsert("beta", "", &skill_md("Beta", "Second root."))
-            .unwrap();
-        mgr.upsert("alpha", "", &skill_md("Alpha", "First root."))
-            .unwrap();
-        mgr.upsert("alpha/two", "", &skill_md("Two", "Second child."))
-            .unwrap();
-        mgr.upsert("alpha/one", "", &skill_md("One", "First child."))
-            .unwrap();
+        mgr.upsert("beta", "", &skill_md("Beta", "Second root.")).unwrap();
+        mgr.upsert("alpha", "", &skill_md("Alpha", "First root.")).unwrap();
+        mgr.upsert("alpha/two", "", &skill_md("Two", "Second child.")).unwrap();
+        mgr.upsert("alpha/one", "", &skill_md("One", "First child.")).unwrap();
 
         let ids: Vec<String> = mgr.all().into_iter().map(|c| c.id).collect();
         assert_eq!(ids, vec!["alpha", "alpha/one", "alpha/two", "beta"]);
@@ -1241,14 +1187,7 @@ mod tests {
             safe_join(base, "references/format.md").unwrap(),
             base.join("references/format.md")
         );
-        for bad in [
-            "../outside.md",
-            "/etc/passwd",
-            ".",
-            "./x",
-            ".git/config",
-            "",
-        ] {
+        for bad in ["../outside.md", "/etc/passwd", ".", "./x", ".git/config", ""] {
             assert!(safe_join(base, bad).is_err(), "{bad:?} should be refused");
         }
     }
@@ -1273,9 +1212,6 @@ mod tests {
             "demo/SKILL.md"
         );
         // A path outside the root is shown whole rather than mangled.
-        assert_eq!(
-            display_relative(Path::new("/other/x.md"), root),
-            "/other/x.md"
-        );
+        assert_eq!(display_relative(Path::new("/other/x.md"), root), "/other/x.md");
     }
 }

@@ -7,13 +7,13 @@
 //! is also broadcast to every tab watching the session.
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::bindings::branch::BranchState;
 use crate::branches::Branches;
 use crate::grip::{Grip, RenderedFrame, Role};
-use crate::workers::{PENDING_BASE_KEY, WorkerRouter, call_session};
+use crate::workers::{call_session, WorkerRouter, PENDING_BASE_KEY};
 
 /// True when this frame type belongs to the branch protocol.
 pub fn handles(frame_type: &str) -> bool {
@@ -37,18 +37,16 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
         Ok(replies) => replies,
         Err(e) => {
             let op = frame_type.trim_start_matches("branch-").to_string();
-            vec![
-                json!({
-                    "type": "branch-result",
-                    "session": session,
-                    "op": op,
-                    "ok": false,
-                    "state": "error",
-                    "conflicts": [],
-                    "message": format!("{e:#}"),
-                })
-                .to_string(),
-            ]
+            vec![json!({
+                "type": "branch-result",
+                "session": session,
+                "op": op,
+                "ok": false,
+                "state": "error",
+                "conflicts": [],
+                "message": format!("{e:#}"),
+            })
+            .to_string()]
         }
     }
 }
@@ -77,14 +75,8 @@ async fn dispatch(
             let limit = frame.get("limit").and_then(Value::as_u64).unwrap_or(50);
             let live = router.live_sessions().await.contains(&session.to_string());
             let commits: Value = if live {
-                call_session(
-                    grip,
-                    &router,
-                    session,
-                    "branch.log",
-                    json!({ "limit": limit }),
-                )
-                .await?
+                call_session(grip, &router, session, "branch.log", json!({ "limit": limit }))
+                    .await?
             } else {
                 let store = grip.local_store().context("gateway only")?;
                 let branches = Branches::new(grip.cfg.clone(), store.clone());
@@ -100,7 +92,8 @@ async fn dispatch(
                         // all — the client cannot tell the two apart.
                         let mut out = Vec::with_capacity(commits.len());
                         for c in commits {
-                            let on_trunk = root.is_ancestor(&c.rev, &trunk).await.unwrap_or(false);
+                            let on_trunk =
+                                root.is_ancestor(&c.rev, &trunk).await.unwrap_or(false);
                             out.push(json!({
                                 "rev": c.rev,
                                 "subject": c.subject,
@@ -114,14 +107,12 @@ async fn dispatch(
                     None => json!([]),
                 }
             };
-            Ok(vec![
-                json!({
-                    "type": "branch-log",
-                    "session": session,
-                    "commits": commits,
-                })
-                .to_string(),
-            ])
+            Ok(vec![json!({
+                "type": "branch-log",
+                "session": session,
+                "commits": commits,
+            })
+            .to_string()])
         }
 
         // Everything a commit graph needs, computed from shared refs alone —
@@ -168,18 +159,16 @@ async fn dispatch(
                 })
             };
 
-            Ok(vec![
-                json!({
-                    "type": "branch-graph",
-                    "session": session,
-                    "trunk_name": trunk_name,
-                    "branch_name": branch_name,
-                    "base": base,
-                    "trunk": trunk_commits.iter().map(commit_json).collect::<Vec<_>>(),
-                    "branch": branch_commits.iter().map(commit_json).collect::<Vec<_>>(),
-                })
-                .to_string(),
-            ])
+            Ok(vec![json!({
+                "type": "branch-graph",
+                "session": session,
+                "trunk_name": trunk_name,
+                "branch_name": branch_name,
+                "base": base,
+                "trunk": trunk_commits.iter().map(commit_json).collect::<Vec<_>>(),
+                "branch": branch_commits.iter().map(commit_json).collect::<Vec<_>>(),
+            })
+            .to_string()])
         }
 
         "branch-trunk-log" => {
@@ -198,9 +187,7 @@ async fn dispatch(
                     })
                 })
                 .collect();
-            Ok(vec![
-                json!({ "type": "branch-trunk-log", "commits": commits }).to_string(),
-            ])
+            Ok(vec![json!({ "type": "branch-trunk-log", "commits": commits }).to_string()])
         }
 
         // The user picked a starting revision before their first message.
@@ -223,14 +210,7 @@ async fn dispatch(
                     .with_context(|| format!("'{revision}' does not name a trunk revision"))?;
             }
             store.kv_put(session, PENDING_BASE_KEY, revision)?;
-            Ok(vec![result_frame(
-                session,
-                "base",
-                true,
-                "clean",
-                &[],
-                "starting point set",
-            )])
+            Ok(vec![result_frame(session, "base", true, "clean", &[], "starting point set")])
         }
 
         "branch-merge" => {
@@ -266,14 +246,7 @@ async fn dispatch(
 
         "branch-update" => {
             let state: BranchState = serde_json::from_value(
-                call_session(
-                    grip,
-                    &router,
-                    session,
-                    "branch.update",
-                    json!({ "session": session }),
-                )
-                .await?,
+                call_session(grip, &router, session, "branch.update", json!({ "session": session })).await?,
             )?;
             let ok = state.state != "conflict";
             Ok(vec![
@@ -295,14 +268,8 @@ async fn dispatch(
                 .and_then(Value::as_str)
                 .context("missing 'rev'")?;
             let state: BranchState = serde_json::from_value(
-                call_session(
-                    grip,
-                    &router,
-                    session,
-                    "branch.reset",
-                    json!({ "session": session, "rev": rev }),
-                )
-                .await?,
+                call_session(grip, &router, session, "branch.reset", json!({ "session": session, "rev": rev }))
+                    .await?,
             )?;
             Ok(vec![
                 result_frame(session, "reset", true, &state.state, &[], &state.detail),
@@ -324,14 +291,7 @@ async fn dispatch(
 
         "branch-abort" => {
             let state: BranchState = serde_json::from_value(
-                call_session(
-                    grip,
-                    &router,
-                    session,
-                    "branch.abort",
-                    json!({ "session": session }),
-                )
-                .await?,
+                call_session(grip, &router, session, "branch.abort", json!({ "session": session })).await?,
             )?;
             Ok(vec![
                 result_frame(session, "abort", true, &state.state, &[], &state.detail),
@@ -372,18 +332,20 @@ async fn status_frame(
         let state: BranchState = serde_json::from_value(
             call_session(grip, router, session, "branch.status", json!({})).await?,
         )?;
-        let recent: Value =
-            call_session(grip, router, session, "branch.log", json!({ "limit": 3 }))
-                .await
-                .unwrap_or(Value::Array(Vec::new()));
+        let recent: Value = call_session(
+            grip,
+            router,
+            session,
+            "branch.log",
+            json!({ "limit": 3 }),
+        )
+        .await
+        .unwrap_or(Value::Array(Vec::new()));
         (state, recent)
     } else {
         // Refs only. No dirtiness or conflict detail without the worktree's
         // worker, but position is exact.
-        let trunk = root
-            .current_branch()
-            .await
-            .unwrap_or_else(|_| "main".into());
+        let trunk = root.current_branch().await.unwrap_or_else(|_| "main".into());
         let (ahead, behind) = root
             .ahead_behind(&row.branch_ref, &trunk)
             .await
@@ -437,7 +399,11 @@ async fn status_frame(
 
 /// Broadcasts a fresh status to every tab watching the session, returning it
 /// so the asking socket gets it first.
-async fn broadcast_status(grip: &Arc<Grip>, router: &Arc<WorkerRouter>, session: &str) -> String {
+async fn broadcast_status(
+    grip: &Arc<Grip>,
+    router: &Arc<WorkerRouter>,
+    session: &str,
+) -> String {
     match status_frame(grip, router, session).await {
         Ok(frame) => {
             let _ = grip.frames_tx.send(RenderedFrame {
@@ -461,7 +427,11 @@ async fn broadcast_status(grip: &Arc<Grip>, router: &Arc<WorkerRouter>, session:
 
 /// Trunk moved: every live conversation's behind-count just changed. Pushed,
 /// never pulled — the panel updates without polling.
-async fn push_status_to_live_sessions(grip: &Arc<Grip>, router: &Arc<WorkerRouter>, except: &str) {
+async fn push_status_to_live_sessions(
+    grip: &Arc<Grip>,
+    router: &Arc<WorkerRouter>,
+    except: &str,
+) {
     for session in router.live_sessions().await {
         if session == except {
             continue;

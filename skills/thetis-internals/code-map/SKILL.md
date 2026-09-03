@@ -3,9 +3,9 @@ name = "Where to find things in the source"
 brief = "A map of the Thetis repository: which orchestrator module owns which behaviour, the guest source trees, and what the dev kit refuses to let you write."
 when_to_use = "Use when you must find the file that owns a behaviour, before you read or patch anything: the host imports, the build pipeline, the branch machinery, the prompt cache, the store, the web layer, the terminal, or a guest source tree. Use it also to check whether a path is writable by the dev kit. Not a substitute for list_code and read_code, which give the current truth."
 universal = false
-tags = ["source map", "repository layout", "files", "modules", "orchestrator", "crates", "where is", "host_api", "pipeline", "tool-group:selfmod"]
+tags = ["source map", "repository layout", "files", "modules", "orchestrator", "crates", "where is", "host_api", "pipeline"]
 related = ["careful-surgery"]
-version = 4
+version = 3
 ---
 
 # Where to find things in the source
@@ -71,7 +71,7 @@ Grouped by concern.
 | `branches.rs` | The branch registry: which conversation runs which branch and checkout. |
 | `merge.rs` | Gateway-side merging. The branch is squashed to one commit, then trunk fast-forwards; only a human triggers it. |
 | `buildcache.rs` | Content-addressed artifacts plus smoke verdicts, keyed by tree oid. |
-| `publish.rs` | The publish boundary: the filtered history that becomes `main` on the remote, and the pre-push guard. Local `main` is trunk and never leaves the machine. |
+| `publish.rs` | The publish boundary: the filtered `public` branch and the pre-push guard. |
 | `revisions.rs` | The retired revision registry, kept read-only for migration. |
 | `watchdog.rs` | Liveness probes and the circuit breaker. Repeated traps reset an aspect's source to the branch's last green build. |
 | `watcher.rs` | Hot reload. A human edit goes through the same pipeline as your own. |
@@ -84,10 +84,8 @@ Grouped by concern.
 | File | Owns |
 |---|---|
 | `store.rs` | Sessions, event logs, the KV store, spend accounting, the branch registry. |
-| `session.rs` | One tokio task for each active session. This makes concurrent input safe. Also settles a sub-agent when its turn ends. |
-| `subagents.rs` | The sub-agent registry: parentage, state, the depth guard and the fan-out cap. See `thetis-internals/delegation`. |
-| `delegation.rs` | Spawning a child session, the wait predicates, cancellation, and tagging a child's frames. |
-| `llm.rs` | The chat-completions client, across every configured OpenAI-compatible provider. The request's `model` picks the endpoint via `Config::resolve_model`, and is rewritten to that provider's own name for it. Reassembles partial tool-call deltas, so you only see complete calls. |
+| `session.rs` | One tokio task for each active session. This makes concurrent input safe. |
+| `llm.rs` | The OpenRouter client. It reassembles partial tool-call deltas, so you only see complete calls. |
 | `cache.rs` | Prompt cache breakpoints. Applied host-side, so you cannot break caching by rewriting your loop. |
 | `config.rs` | The three configuration layers and the `Secret` type. |
 | `settings.rs` | Runtime reads and writes of the config file, through `toml_edit`, with the comments kept. |
@@ -123,30 +121,6 @@ ui/views/*.js      sidebar, transcript, composer, picker, panel
 
 A new file needs one line in `assets.rs`. A new client action needs one function
 in `handlers.rs` and one entry in its dispatch table.
-
-### Seeing your own UI changes
-
-The gateway component does two jobs, and only one of them is yours while you
-work:
-
-- **Rendering** — turning events into transcript frames — runs in *your*
-  worker, from your build. Change it and your own conversation shows it at
-  once.
-- **Serving the interface** — the HTML, CSS and JavaScript a browser loads —
-  runs in the gateway process, from **trunk's** build. Your version of those
-  files reaches no browser until your work is merged.
-
-So a UI edit compiles green and appears to do nothing. It is not broken and you
-have not misunderstood it — you are simply not the one serving that file yet.
-
-Open **`/preview/<your session id>/`** to see your own build. It serves your
-interface against the real running system: the websocket, the workspace routes
-and everything else stay live, so you are looking at your UI driving real
-conversations rather than an empty copy. The page is served from the build
-cache, so let the dev kit rebuild `gateway:web` first and then reload.
-
-Do not start a second Thetis to look at a UI change. It was the only way once;
-it is not any more.
 
 ## What the dev kit lets you write
 
@@ -185,4 +159,4 @@ privileges of the orchestrator.
 |---|---|
 | A file is not where this map says | Run `list_code` for the aspect, or `list_path`. This map can be stale; the tools cannot. |
 | A dev-kit write is refused | Read the message. It names the rule: path confinement, or which protected list matched. |
-| You must change the kernel or the contract | The dev kit cannot reach them. Edit with `write_path`, then `restart_orchestrator` — it rebuilds the orchestrator for you in the background and reports here; a build that fails restarts nothing. Never run cargo on the kernel yourself. Only this conversation's runtime restarts, and a broken kernel falls back. For the contract, read `careful-surgery/contract-changes` first. |
+| You must change the kernel or the contract | The dev kit cannot reach them. Edit with `write_path`, build with `cargo build --release -p thetis` in a terminal, then `restart_orchestrator` — only this conversation's runtime restarts, and a broken kernel falls back. For the contract, read `careful-surgery/contract-changes` first. |

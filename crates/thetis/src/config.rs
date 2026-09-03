@@ -17,7 +17,6 @@
 //! so it cannot reach a log through an incidental `{:?}`.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,196 +47,14 @@ impl Secret {
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_empty() {
-            "Secret(empty)"
-        } else {
-            "Secret(***)"
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Origin {
-    pub scheme: String,
-    pub authority: String,
-}
-
-#[derive(Clone)]
-pub struct UserSpec {
-    pub id: String,
-    pub name: String,
-    pub role: String,
-    pub password_hash: Secret,
-    pub discord_id: String,
-    pub policy: std::sync::Arc<crate::policy::EffectivePolicy>,
-}
-
-impl std::fmt::Debug for UserSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UserSpec")
-            .field("id", &self.id)
-            .field("name", &self.name)
-            .field("role", &self.role)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AuthSettings {
-    pub users_mode: bool,
-    pub session_ttl: Duration,
-    pub claim_unowned: String,
-    pub lockout_after: u32,
-    pub lockout: Duration,
-    pub users: Vec<UserSpec>,
-    pub roles: BTreeMap<String, std::sync::Arc<crate::policy::EffectivePolicy>>,
-    pub discord_policy: std::sync::Arc<crate::policy::EffectivePolicy>,
-    pub local_policy: std::sync::Arc<crate::policy::EffectivePolicy>,
-}
-impl AuthSettings {
-    /// A user by id, matched without regard to case.
-    ///
-    /// Ids are validated as lowercase, so two of them can never differ by case
-    /// alone and this cannot be ambiguous. It exists because the id is what
-    /// somebody types into a login form, and they type their name the way they
-    /// write it: an account created as `bitmuse` was unreachable for anyone who
-    /// typed `bitMuse`, with "invalid credentials" as the only explanation.
-    pub fn user(&self, id: &str) -> Option<&UserSpec> {
-        self.users.iter().find(|u| u.id.eq_ignore_ascii_case(id))
-    }
-    pub fn owner_for_discord(&self, discord_id: &str, fallback: &str) -> String {
-        self.users
-            .iter()
-            .find(|u| !u.discord_id.is_empty() && u.discord_id == discord_id)
-            .map(|u| u.id.clone())
-            .unwrap_or_else(|| fallback.to_string())
-    }
-
-    pub fn policy_for(&self, owner: &str) -> std::sync::Arc<crate::policy::EffectivePolicy> {
-        self.user(owner)
-            .map(|u| u.policy.clone())
-            .unwrap_or_else(|| {
-                if owner.starts_with("discord:") {
-                    return self.discord_policy.clone();
-                }
-                if self.users_mode {
-                    let mut fallback = self.local_policy.as_ref().clone();
-                    fallback.admin = false;
-                    fallback.read_only = true;
-                    fallback.see_all_sessions = false;
-                    fallback.denied.insert(crate::policy::Cap::Transcripts);
-                    fallback.denied.insert(crate::policy::Cap::Delegation);
-                    fallback.denied.insert(crate::policy::Cap::WorkspaceWrite);
-                    std::sync::Arc::new(fallback)
-                } else {
-                    self.local_policy.clone()
-                }
-            })
+        f.write_str(if self.0.is_empty() { "Secret(empty)" } else { "Secret(***)" })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
-    /// How the model is named everywhere inside Thetis: in the picker, in a
-    /// session's stored model, in `THETIS_MODEL`.
     pub id: String,
     pub label: String,
-    /// Which `[[providers]]` entry serves it. Empty means `llm.provider`.
-    pub provider: String,
-    /// What goes in the request's `model` field, when that differs from `id`.
-    /// A local llama.cpp server usually wants a bare name where the picker
-    /// wants something namespaced, so the two are allowed to differ.
-    pub wire_model: String,
-}
-
-impl ModelSpec {
-    /// The name to put on the wire for this model.
-    pub fn wire(&self) -> &str {
-        if self.wire_model.is_empty() {
-            &self.id
-        } else {
-            &self.wire_model
-        }
-    }
-}
-
-/// The id of the provider synthesized from `[llm]`, and the default when
-/// nothing names one.
-pub const DEFAULT_PROVIDER_ID: &str = "openrouter";
-
-/// One OpenAI-compatible endpoint: OpenRouter, a local llama.cpp server, an
-/// OpenAI-shaped gateway of any kind.
-#[derive(Debug, Clone)]
-pub struct ProviderSpec {
-    pub id: String,
-    pub label: String,
-    /// One or more interchangeable base URLs, without trailing slashes.
-    /// `/chat/completions` and `/embeddings` are appended to one of them.
-    ///
-    /// More than one entry means replicas of the same model: several
-    /// llama-server processes on different ports, or different machines.
-    /// Requests are handed out round-robin, so a provider scales by gaining
-    /// entries here rather than by being duplicated under a new id — the
-    /// model ids in the picker do not change when you add capacity.
-    ///
-    /// Never empty; `base_url()` is always safe.
-    pub base_urls: Vec<String>,
-    /// Absent means send no `Authorization` header at all, which is what an
-    /// unauthenticated local server wants — an empty bearer token is rejected
-    /// by some and silently mishandled by others.
-    pub api_key: Option<Secret>,
-    /// Extra headers on every request to this provider.
-    pub headers: Vec<(String, String)>,
-}
-
-impl ProviderSpec {
-    /// The first endpoint. Use this for identity and for display; use
-    /// `url()` to actually address the provider, so replicas are used.
-    pub fn base_url(&self) -> &str {
-        self.base_urls
-            .first()
-            .map(String::as_str)
-            .unwrap_or_default()
-    }
-
-    /// How many interchangeable endpoints serve this provider.
-    pub fn replicas(&self) -> usize {
-        self.base_urls.len()
-    }
-
-    /// A request URL against a specific replica, chosen by `index` modulo the
-    /// number of endpoints. The caller owns the counter, so the rotation is
-    /// shared across a whole process rather than restarting per request.
-    pub fn url_for(&self, path: &str, index: usize) -> String {
-        let base = if self.base_urls.is_empty() {
-            ""
-        } else {
-            self.base_urls[index % self.base_urls.len()].as_str()
-        };
-        format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
-    }
-
-    /// A request URL against the first endpoint, for callers with no counter.
-    pub fn url(&self, path: &str) -> String {
-        self.url_for(path, 0)
-    }
-
-    /// OpenRouter attributes requests with these; nobody else wants them.
-    pub fn is_openrouter(&self) -> bool {
-        self.base_url().contains("openrouter.ai")
-    }
-}
-
-/// A model request resolved to the endpoint that will serve it.
-#[derive(Debug, Clone)]
-pub struct ResolvedModel<'a> {
-    /// The name to send as `model`.
-    pub wire_model: String,
-    pub provider: &'a ProviderSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -254,74 +71,6 @@ pub struct ModeSpec {
     /// should do instead - it just meets the gap and works around it. This is
     /// where a mode says what it is for.
     pub prompt: String,
-}
-
-/// A named kind of agent a parent may delegate to.
-///
-/// A profile is a *bundle* of the things that make one agent different from
-/// another — which model thinks, which mode constrains it, and what standing
-/// instruction it starts from. Bundling them is what makes delegation legible
-/// at the call site: `agent = "reviewer"` says what the child is for, where
-/// three separate overrides only say how it is configured.
-///
-/// Profiles are configuration rather than code because the useful ones are
-/// discovered by use. The research on orchestrator-worker systems is consistent
-/// that a cheap fast worker under an expensive lead is the arrangement that
-/// pays, and that is a two-line config change here.
-#[derive(Debug, Clone)]
-pub struct AgentProfile {
-    pub id: String,
-    pub label: String,
-    /// Shown to the spawning agent, so it can choose between profiles.
-    pub description: String,
-    /// Model id from `[[models]]`. Empty inherits the parent's.
-    pub model: String,
-    /// Mode id from `[[modes]]`. Empty inherits the grip default.
-    pub mode: String,
-    /// Prepended to the child's task briefing. This is the profile's character:
-    /// "you review, you do not edit", "you search widely and cite".
-    pub prompt: String,
-}
-
-/// Delegation policy: whether an agent may spawn sub-agents, and how far.
-#[derive(Debug, Clone)]
-pub struct SubagentSettings {
-    /// Master switch. Off withholds the delegation tools entirely.
-    pub enabled: bool,
-    /// Live children one parent may have at once. The multi-agent failure
-    /// literature names unbounded fan-out explicitly, and a cap on *live*
-    /// children rather than on total spawns is the one that bounds cost without
-    /// bounding usefulness.
-    pub max_children: usize,
-    /// Ceiling on a single `wait` call, in seconds. A parent that waits forever
-    /// is indistinguishable from a hung turn.
-    pub max_wait_secs: u64,
-    /// How much of a child's answer is spliced into the parent's tool result.
-    /// The point of delegation is that the parent pays for the conclusion, so
-    /// this is deliberately far smaller than a context window.
-    pub max_result_bytes: usize,
-    /// Mode a child runs in when neither the profile nor the call names one.
-    pub default_mode: String,
-    pub profiles: Vec<AgentProfile>,
-}
-
-impl Default for SubagentSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_children: 8,
-            max_wait_secs: 1800,
-            max_result_bytes: 24_576,
-            default_mode: String::new(),
-            profiles: Vec::new(),
-        }
-    }
-}
-
-impl SubagentSettings {
-    pub fn profile(&self, id: &str) -> Option<&AgentProfile> {
-        self.profiles.iter().find(|p| p.id == id)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -348,16 +97,7 @@ pub struct BuildSettings {
     pub command: String,
     pub target: String,
     pub profile: String,
-    /// Cargo target directory for guest builds, resolved against the config's
-    /// own root — so each worktree compiles into its own.
-    ///
-    /// Deliberately not shared between checkouts. Cargo only rewrites an output
-    /// when the copy it is building is dirty, so one shared directory let two
-    /// branches serve each other's artifacts, and the workaround for that
-    /// (dirtying a source file before every build) fed the file watcher a fake
-    /// edit and span cargo forever. Dependencies are still compiled once per
-    /// worktree rather than once per fleet; cross-branch reuse comes from the
-    /// content-addressed build cache in `paths.artifacts`, which is shared.
+    /// Shared cargo target directory, so guests compile their dependencies once.
     pub target_dir: PathBuf,
     /// Pass `--locked` when a lockfile exists, keeping resolution reproducible.
     pub locked: bool,
@@ -482,9 +222,6 @@ pub struct SkillSettings {
     pub retrieve_limit: usize,
     /// Embedding model. Must honour the `dimensions` parameter.
     pub embedding_model: String,
-    /// Which provider serves embeddings. Empty routes by the model id, exactly
-    /// as a chat model does.
-    pub embedding_provider: String,
     /// Vector width requested from the provider.
     pub embedding_dimensions: u32,
     /// Opening-message prefix that gets embedded as the retrieval query.
@@ -499,47 +236,9 @@ impl Default for SkillSettings {
             retrieval_enabled: true,
             retrieve_limit: 10,
             embedding_model: "openai/text-embedding-3-small".into(),
-            embedding_provider: String::new(),
             embedding_dimensions: 1536,
             max_query_chars: 2000,
             max_universal: 20,
-        }
-    }
-}
-
-/// How the tool surface is scoped to a conversation.
-///
-/// Tools are grouped, and a group is admitted to a session's surface only when
-/// something indicates it is wanted: it is always-on, a retrieved skill points
-/// at it, or its tags match the opening message. The research this implements is
-/// consistent that a large flat tool list costs both tokens and *accuracy* —
-/// but also that a naive filter can lose, so the default is off and the
-/// measurement it needs is always on.
-#[derive(Debug, Clone)]
-pub struct ToolGroupSettings {
-    /// Master switch. Off means every tool is offered, exactly as before, and
-    /// only the per-turn accounting runs.
-    pub grouping_enabled: bool,
-    /// Log the token cost of the tool block and which tools were actually
-    /// called, each turn. Independent of `grouping_enabled` on purpose: the
-    /// baseline is what makes the change judgeable.
-    pub accounting_enabled: bool,
-    /// Groups admitted for every session regardless of routing, beyond the ones
-    /// that declare themselves always-on in code.
-    pub always_on: Vec<String>,
-    /// Minimum lexical score for the opening message to admit a group on tag
-    /// evidence alone. Deliberately generous: a group wrongly admitted costs
-    /// tokens, while one wrongly withheld costs a capability.
-    pub route_threshold: f64,
-}
-
-impl Default for ToolGroupSettings {
-    fn default() -> Self {
-        Self {
-            grouping_enabled: false,
-            accounting_enabled: true,
-            always_on: Vec::new(),
-            route_threshold: 0.15,
         }
     }
 }
@@ -566,20 +265,6 @@ pub struct TerminalSettings {
     pub default_timeout: Duration,
     pub max_output_bytes: usize,
     pub idle_timeout: Duration,
-    /// Whether a session may be opened against a registered ssh host.
-    ///
-    /// Separate from `enabled` because it is a wider boundary: a local shell
-    /// reaches this machine, a remote one reaches whatever the keys on this
-    /// machine can reach. The host registry is not a substitute for this
-    /// switch — turning it off disables remote sessions with the hosts still
-    /// defined.
-    pub ssh_enabled: bool,
-    pub ssh_program: String,
-    /// How long a new remote session has to answer its first command before it
-    /// is declared unusable and torn down.
-    pub ssh_connect_timeout: Duration,
-    /// How long `send` waits for a reply before returning what arrived.
-    pub send_settle: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -601,63 +286,6 @@ pub struct ControlSettings {
 /// start if that mode is missing or is not read-only, because
 /// `read_only()` in the agent treats an unknown mode as full access -- so a
 /// typo here would otherwise hand a public chat surface the dev kit.
-/// The headless browser sidecar that backs the `web-browser-*` tools.
-///
-/// Tool components are wasm and cannot spawn processes, so none of them can
-/// drive Playwright directly. The kernel runs one Node sidecar on loopback and
-/// the tools speak JSON to it; this is where that process is configured.
-///
-/// Headless is not a setting. There is no display on a host running Thetis, and
-/// a headed browser would simply hang, so the sidecar hardcodes it.
-#[derive(Debug, Clone)]
-pub struct BrowserSettings {
-    pub enabled: bool,
-    /// Loopback port. Never bound on a public interface.
-    pub port: u16,
-    /// The sidecar's directory, holding `package.json` and `server.js`.
-    pub service_dir: PathBuf,
-    /// `node` and `npm` binaries. Empty means look on PATH.
-    pub node: String,
-    pub npm: String,
-    /// The playwright version to install and check for.
-    pub playwright_version: String,
-    /// Whether boot may run `npm install`. Off means verify and warn only.
-    pub auto_install: bool,
-    pub install_timeout: Duration,
-    pub startup_timeout: Duration,
-    /// Default per-operation timeout inside the browser.
-    pub default_timeout_ms: u64,
-    /// How long an unused browser context is kept.
-    pub idle_timeout_secs: u64,
-    /// Characters of accessibility snapshot returned before trimming.
-    pub snapshot_chars: usize,
-    /// Where screenshots and PDFs are written.
-    pub artifact_dir: PathBuf,
-}
-
-impl BrowserSettings {
-    /// The loopback base URL tools are told to call.
-    pub fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    pub fn node_bin(&self) -> &str {
-        if self.node.trim().is_empty() {
-            "node"
-        } else {
-            self.node.trim()
-        }
-    }
-
-    pub fn npm_bin(&self) -> &str {
-        if self.npm.trim().is_empty() {
-            "npm"
-        } else {
-            self.npm.trim()
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct DiscordSettings {
     pub enabled: bool,
@@ -718,8 +346,6 @@ pub struct Config {
     pub tools: std::collections::BTreeMap<String, toml::Value>,
     pub paths: Paths,
     pub bind_addr: SocketAddr,
-    pub public_origin: Option<Origin>,
-    pub auth: AuthSettings,
     /// Gateway aspect that serves the browser UI.
     pub primary_gateway: String,
     pub admin_enabled: bool,
@@ -731,26 +357,8 @@ pub struct Config {
     pub request_timeout: Duration,
     pub max_retries: u32,
     pub models: Vec<ModelSpec>,
-    /// Every configured endpoint. Always non-empty: the first entry is the one
-    /// built from `[llm]`, so a config that names no provider behaves exactly
-    /// as it did before providers existed.
-    pub providers: Vec<ProviderSpec>,
-    /// Which provider serves a model that does not name one.
-    pub default_provider: String,
 
     // --- agent loop --------------------------------------------------------
-    /// What the agent calls itself: in its system prompt, in the web UI's
-    /// brand, and as the Discord bot's username.
-    ///
-    /// Deliberately separate from the harness, which is always called Thetis.
-    /// The two were the same word for a long time and it made every sentence
-    /// about either one ambiguous.
-    pub agent_name: String,
-    /// An image to show as the agent's avatar in the web UI, beside the brand.
-    ///
-    /// A URL or a `data:` URI. Empty means the built-in mark, which is drawn as
-    /// an SVG and tints itself with the accent colour.
-    pub agent_avatar: String,
     pub system_prompt: String,
     pub max_iterations: u32,
     pub modes: Vec<ModeSpec>,
@@ -773,8 +381,6 @@ pub struct Config {
     pub context: ContextSettings,
     pub cache: CacheSettings,
     pub skills: SkillSettings,
-    pub tool_groups: ToolGroupSettings,
-    pub subagents: SubagentSettings,
     pub build: BuildSettings,
     pub wasi: WasiSettings,
     pub watchdog: WatchdogSettings,
@@ -783,79 +389,12 @@ pub struct Config {
     pub terminal: TerminalSettings,
     pub control: ControlSettings,
     pub discord: DiscordSettings,
-    pub browser: BrowserSettings,
     pub sandbox_available: bool,
 }
 
 impl Config {
     pub fn db_path(&self) -> PathBuf {
         self.paths.data.join("thetis.redb")
-    }
-
-    /// A provider by id, or `None` when nothing is configured under that name.
-    pub fn provider(&self, id: &str) -> Option<&ProviderSpec> {
-        self.providers.iter().find(|p| p.id == id)
-    }
-
-    /// The provider used when a model names none. Falls back to the first
-    /// configured one, which always exists.
-    pub fn fallback_provider(&self) -> &ProviderSpec {
-        self.provider(&self.default_provider)
-            .or_else(|| self.providers.first())
-            .expect("providers is never empty")
-    }
-
-    /// Works out which endpoint serves a model id, and under what name.
-    ///
-    /// Three ways a model reaches a provider, in order:
-    ///
-    /// 1. a `provider = "..."` prefix on the id (`local/qwen3` where `local`
-    ///    is a configured provider), which is how a model can be used without
-    ///    being listed in `[[models]]` at all;
-    /// 2. a matching `[[models]]` entry naming a provider;
-    /// 3. the default provider, which is OpenRouter unless changed.
-    ///
-    /// A prefix that is not a configured provider is left alone — `anthropic/`
-    /// in an OpenRouter id must not be mistaken for a provider name.
-    pub fn resolve_model(&self, model: &str) -> ResolvedModel<'_> {
-        let model = model.trim();
-
-        if let Some(spec) = self.models.iter().find(|m| m.id == model) {
-            if !spec.provider.is_empty() {
-                if let Some(provider) = self.provider(&spec.provider) {
-                    return ResolvedModel {
-                        wire_model: spec.wire().to_string(),
-                        provider,
-                    };
-                }
-                tracing::warn!(
-                    model = %model,
-                    provider = %spec.provider,
-                    "model names an unconfigured provider; using the default"
-                );
-            }
-            return ResolvedModel {
-                wire_model: spec.wire().to_string(),
-                provider: self.fallback_provider(),
-            };
-        }
-
-        // Not listed: an id may still address a provider by prefix.
-        if let Some((prefix, rest)) = model.split_once('/') {
-            if !rest.is_empty() {
-                if let Some(provider) = self.provider(prefix) {
-                    return ResolvedModel {
-                        wire_model: rest.to_string(),
-                        provider,
-                    };
-                }
-            }
-        }
-
-        ResolvedModel {
-            wire_model: model.to_string(),
-            provider: self.fallback_provider(),
-        }
     }
 
     /// An aspect's source directory relative to the checkout root — the path
@@ -871,18 +410,6 @@ impl Config {
     /// name process-wide ground truth, not per-checkout state.
     pub fn build_lock_path(&self) -> PathBuf {
         self.paths.data.join("build.lock")
-    }
-
-    /// The cross-process lock for orchestrator builds.
-    ///
-    /// Separate from the guest build lock: a kernel build is minutes of four
-    /// cores and gigabytes of target directory, while a guest build is
-    /// seconds, so making them queue behind each other would stall every
-    /// conversation's edit-compile loop. Also in the shared data directory,
-    /// because the point is to serialize across *workers*, each of which is
-    /// its own process with its own in-process mutex.
-    pub fn kernel_build_lock_path(&self) -> PathBuf {
-        self.paths.data.join("kernel-build.lock")
     }
 
     /// Source directory for an aspect.
@@ -956,23 +483,6 @@ impl Config {
         }
         if let Some(table) = merged.as_mut() {
             self.inline_file_secrets(table);
-        }
-        // The browser tools need to know where the sidecar is and hold the
-        // token for it. Both are runtime facts — the port is settings-derived
-        // and the token is generated fresh each boot — so they are injected
-        // here rather than written into a file a user would have to keep in
-        // step. A value the user did set explicitly still wins.
-        if tool.starts_with("web-browser") {
-            let table = merged.get_or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-            if let toml::Value::Table(t) = table {
-                t.entry("endpoint".to_string())
-                    .or_insert_with(|| toml::Value::String(self.browser.base_url()));
-                t.entry("token".to_string()).or_insert_with(|| {
-                    toml::Value::String(crate::browser::token(self).to_string())
-                });
-                t.entry("enabled".to_string())
-                    .or_insert_with(|| toml::Value::Boolean(self.browser.enabled));
-            }
         }
         merged
             .and_then(|v| serde_json::to_string(&v).ok())
@@ -1071,10 +581,16 @@ impl Config {
 
             match outcome {
                 Ok(contents) => {
-                    table.insert(format!("{stem}_contents"), toml::Value::String(contents));
+                    table.insert(
+                        format!("{stem}_contents"),
+                        toml::Value::String(contents),
+                    );
                 }
                 Err(error) => {
-                    table.insert(format!("{stem}_contents_error"), toml::Value::String(error));
+                    table.insert(
+                        format!("{stem}_contents_error"),
+                        toml::Value::String(error),
+                    );
                 }
             }
         }
@@ -1108,16 +624,10 @@ mod spec {
     #[serde(default)]
     pub struct File {
         pub server: Server,
-        pub auth: Auth,
-        pub roles: Vec<Role>,
-        pub users: Vec<User>,
         pub paths: Paths,
         pub skills: Skills,
-        pub tool_groups: ToolGroups,
-        pub subagents: Subagents,
         pub llm: Llm,
         pub agent: Agent,
-        pub providers: Vec<Provider>,
         pub models: Vec<Model>,
         pub modes: Vec<Mode>,
         pub budgets: Budgets,
@@ -1132,7 +642,6 @@ mod spec {
         pub terminal: Terminal,
         pub control: Control,
         pub discord: Discord,
-        pub browser: Browser,
         pub wasi: Wasi,
         /// Free-form per-tool settings. Shapes are up to each tool, so this is
         /// carried as-is rather than being given a schema here.
@@ -1141,57 +650,10 @@ mod spec {
 
     #[derive(Debug, Deserialize)]
     #[serde(default)]
-    pub struct Auth {
-        pub mode: String,
-        pub session_ttl_hours: u64,
-        pub claim_unowned: String,
-        pub discord_role: String,
-        pub lockout_after: u32,
-        pub lockout_secs: u64,
-    }
-    impl Default for Auth {
-        fn default() -> Self {
-            Self {
-                mode: "local".into(),
-                session_ttl_hours: 720,
-                claim_unowned: String::new(),
-                discord_role: String::new(),
-                lockout_after: 5,
-                lockout_secs: 60,
-            }
-        }
-    }
-    #[derive(Debug, Deserialize)]
-    pub struct Role {
-        pub id: String,
-        #[serde(default)]
-        pub description: String,
-        #[serde(flatten)]
-        pub policy: crate::policy::PolicyLayer,
-    }
-    #[derive(Deserialize)]
-    pub struct User {
-        pub id: String,
-        #[serde(default)]
-        pub name: String,
-        pub role: String,
-        #[serde(default)]
-        pub password_hash: String,
-        #[serde(default)]
-        pub password_env: String,
-        #[serde(default)]
-        pub discord_id: String,
-        #[serde(default)]
-        pub overrides: crate::policy::PolicyLayer,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(default)]
     pub struct Server {
         pub bind: String,
         pub primary_gateway: String,
         pub admin_enabled: bool,
-        pub public_origin: String,
     }
     impl Default for Server {
         fn default() -> Self {
@@ -1199,7 +661,6 @@ mod spec {
                 bind: "127.0.0.1:7777".into(),
                 primary_gateway: "web".into(),
                 admin_enabled: true,
-                public_origin: String::new(),
             }
         }
     }
@@ -1243,7 +704,6 @@ mod spec {
         pub retrieval_enabled: bool,
         pub retrieve_limit: usize,
         pub embedding_model: String,
-        pub embedding_provider: String,
         pub embedding_dimensions: u32,
         pub max_query_chars: usize,
         pub max_universal: usize,
@@ -1255,30 +715,9 @@ mod spec {
                 retrieval_enabled: d.retrieval_enabled,
                 retrieve_limit: d.retrieve_limit,
                 embedding_model: d.embedding_model,
-                embedding_provider: d.embedding_provider,
                 embedding_dimensions: d.embedding_dimensions,
                 max_query_chars: d.max_query_chars,
                 max_universal: d.max_universal,
-            }
-        }
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(default)]
-    pub struct ToolGroups {
-        pub grouping_enabled: bool,
-        pub accounting_enabled: bool,
-        pub always_on: Vec<String>,
-        pub route_threshold: f64,
-    }
-    impl Default for ToolGroups {
-        fn default() -> Self {
-            let d = super::ToolGroupSettings::default();
-            Self {
-                grouping_enabled: d.grouping_enabled,
-                accounting_enabled: d.accounting_enabled,
-                always_on: d.always_on,
-                route_threshold: d.route_threshold,
             }
         }
     }
@@ -1291,9 +730,6 @@ mod spec {
         pub api_key: String,
         pub request_timeout_secs: u64,
         pub max_retries: u32,
-        /// Which `[[providers]]` entry serves a model that names none. Empty
-        /// means the one built from this section.
-        pub provider: String,
     }
     impl Default for Llm {
         fn default() -> Self {
@@ -1303,33 +739,8 @@ mod spec {
                 api_key: String::new(),
                 request_timeout_secs: 180,
                 max_retries: 3,
-                provider: String::new(),
             }
         }
-    }
-
-    /// One OpenAI-compatible endpoint. No `Debug`: it holds an API key.
-    #[derive(Deserialize)]
-    pub struct Provider {
-        pub id: String,
-        #[serde(default)]
-        pub label: String,
-        /// A single endpoint. Give this or `base_urls`, not both.
-        #[serde(default)]
-        pub base_url: String,
-        /// Interchangeable replicas of the same model, used round-robin. This
-        /// is how a provider scales: adding a port here adds capacity without
-        /// changing any model id.
-        #[serde(default)]
-        pub base_urls: Vec<String>,
-        /// Literal key, or empty for an unauthenticated endpoint. A value of
-        /// the form `env:NAME` is read from that environment variable instead,
-        /// so a real key need not sit in the file.
-        #[serde(default)]
-        pub api_key: String,
-        /// Extra request headers, e.g. `{ "X-Org" = "acme" }`.
-        #[serde(default)]
-        pub headers: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1337,11 +748,6 @@ mod spec {
     pub struct Agent {
         pub max_iterations: u32,
         pub default_mode: String,
-        /// What the agent calls itself. Empty falls back to the default.
-        pub name: String,
-        /// Image URL or `data:` URI for the agent's avatar. Empty draws the
-        /// built-in mark instead.
-        pub avatar: String,
         /// Inline prompt. Ignored when `system_prompt_file` is set.
         pub system_prompt: String,
         /// Path to a prompt file, relative to the project root.
@@ -1352,8 +758,6 @@ mod spec {
             Self {
                 max_iterations: 32,
                 default_mode: "agent".into(),
-                name: String::new(),
-                avatar: String::new(),
                 system_prompt: String::new(),
                 system_prompt_file: String::new(),
             }
@@ -1361,21 +765,15 @@ mod spec {
     }
 
     #[derive(Debug, Deserialize)]
-
+    
     pub struct Model {
         pub id: String,
         #[serde(default)]
         pub label: String,
-        /// Which provider serves it. Empty means the default one.
-        #[serde(default)]
-        pub provider: String,
-        /// What to send as `model` when it differs from `id`.
-        #[serde(default)]
-        pub wire_model: String,
     }
 
     #[derive(Debug, Deserialize)]
-
+    
     pub struct Mode {
         pub id: String,
         #[serde(default)]
@@ -1384,45 +782,6 @@ mod spec {
         pub description: String,
         #[serde(default)]
         pub read_only: bool,
-        #[serde(default)]
-        pub prompt: String,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(default)]
-    pub struct Subagents {
-        pub enabled: bool,
-        pub max_children: usize,
-        pub max_wait_secs: u64,
-        pub max_result_bytes: usize,
-        pub default_mode: String,
-        pub profiles: Vec<AgentProfile>,
-    }
-    impl Default for Subagents {
-        fn default() -> Self {
-            let d = super::SubagentSettings::default();
-            Self {
-                enabled: d.enabled,
-                max_children: d.max_children,
-                max_wait_secs: d.max_wait_secs,
-                max_result_bytes: d.max_result_bytes,
-                default_mode: d.default_mode,
-                profiles: Vec::new(),
-            }
-        }
-    }
-
-    #[derive(Debug, Deserialize)]
-    pub struct AgentProfile {
-        pub id: String,
-        #[serde(default)]
-        pub label: String,
-        #[serde(default)]
-        pub description: String,
-        #[serde(default)]
-        pub model: String,
-        #[serde(default)]
-        pub mode: String,
         #[serde(default)]
         pub prompt: String,
     }
@@ -1487,7 +846,7 @@ mod spec {
                 // Deliberately below any real window: the point is to compact
                 // well before the provider starts refusing, not at the cliff.
                 window_tokens: 200_000,
-                compact_threshold: 1.0,
+                compact_threshold: 0.6,
                 compact_target: 0.25,
                 // Empty means "whatever the session is using".
                 summary_model: String::new(),
@@ -1652,10 +1011,6 @@ mod spec {
         pub default_timeout_ms: u64,
         pub max_output_bytes: usize,
         pub idle_timeout_secs: u64,
-        pub ssh_enabled: bool,
-        pub ssh_program: String,
-        pub ssh_connect_timeout_ms: u64,
-        pub send_settle_ms: u64,
     }
     impl Default for Terminal {
         fn default() -> Self {
@@ -1668,65 +1023,6 @@ mod spec {
                 default_timeout_ms: 30_000,
                 max_output_bytes: 65_536,
                 idle_timeout_secs: 1_800,
-                // On by default, and the reason is that it grants nothing on
-                // its own: a remote session needs a host in the registry, and
-                // adding one is a deliberate act. Nobody's reach widens until
-                // they define somewhere to reach.
-                ssh_enabled: true,
-                ssh_program: "ssh".into(),
-                // A connect, an auth handshake and a shell start, over a link
-                // that may be slow. Generous, because the failure it guards is
-                // a session that never works at all.
-                ssh_connect_timeout_ms: 25_000,
-                send_settle_ms: 400,
-            }
-        }
-    }
-
-    /// The headless browser sidecar. See [`super::BrowserSettings`].
-    #[derive(Debug, Deserialize)]
-    #[serde(default)]
-    pub struct Browser {
-        pub enabled: bool,
-        pub port: u16,
-        pub service_dir: String,
-        pub node: String,
-        pub npm: String,
-        pub playwright_version: String,
-        pub auto_install: bool,
-        pub install_timeout_secs: u64,
-        pub startup_timeout_secs: u64,
-        pub default_timeout_ms: u64,
-        pub idle_timeout_secs: u64,
-        pub snapshot_chars: usize,
-        pub artifact_dir: String,
-    }
-    impl Default for Browser {
-        fn default() -> Self {
-            Self {
-                enabled: true,
-                // Loopback only, and well clear of the usual dev-server ports.
-                port: 39412,
-                service_dir: "services/playwright-sidecar".into(),
-                // Empty means "find it on PATH".
-                node: String::new(),
-                npm: String::new(),
-                // Pinned deliberately: this version's browser build is the one
-                // the install step checks for, so a floating version would mean
-                // an unexpected browser download on some later boot.
-                playwright_version: "1.61.0".into(),
-                auto_install: true,
-                // A cold `npm install` fetches playwright; a warm one is
-                // instant. This bounds only the cold case.
-                install_timeout_secs: 300,
-                startup_timeout_secs: 45,
-                default_timeout_ms: 15_000,
-                idle_timeout_secs: 900,
-                // A tool result is capped at 32 KB and a snapshot is only part
-                // of one, so leave room for the rest of the response.
-                snapshot_chars: 12_000,
-                // Inside `workspace` so the wasm guests' preopen can reach it.
-                artifact_dir: "workspace/browser".into(),
             }
         }
     }
@@ -1838,9 +1134,7 @@ impl Env {
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, current: T) -> T {
-    env_string(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(current)
+    env_string(key).and_then(|v| v.parse().ok()).unwrap_or(current)
 }
 
 /// A comma-separated environment list, as the Discord allowlists are given.
@@ -2037,8 +1331,8 @@ impl Config {
             }
         }
 
-        let (file, unknown) =
-            parse_file(merged).with_context(|| format!("parsing {}", config_path.display()))?;
+        let (file, unknown) = parse_file(merged)
+            .with_context(|| format!("parsing {}", config_path.display()))?;
         if !unknown.is_empty() {
             tracing::warn!(
                 keys = %unknown.join(", "),
@@ -2066,12 +1360,17 @@ impl Config {
             root.to_path_buf(),
             root.join("thetis.toml"),
             file,
-            Env::None,
+            Env::Process,
         )?;
         Ok(())
     }
 
-    fn assemble(root: PathBuf, config_path: PathBuf, file: spec::File, env: Env) -> Result<Self> {
+    fn assemble(
+        root: PathBuf,
+        config_path: PathBuf,
+        file: spec::File,
+        env: Env,
+    ) -> Result<Self> {
         // A worker's config is rooted at its worktree, but some paths name
         // state the whole fleet shares. The gateway pins those over the
         // environment at spawn, so a branch cannot retarget them by editing
@@ -2096,42 +1395,10 @@ impl Config {
             worktrees: resolve(&root, &file.paths.worktrees),
         };
 
-        // The WASI preopens, resolved once: they are needed twice over, because
-        // the shared workspace is both what guests get as `/workspace` and
-        // something the host-side file tools must be able to reach. A worker's
-        // gateway pins the real directory over the environment, so a branch
-        // cannot point its own workspace somewhere private.
-        let wasi_dirs: Vec<PathBuf> = match env.string("THETIS_WORKSPACE_DIR") {
-            Some(dir) => vec![PathBuf::from(dir)],
-            None => file.wasi.dirs.iter().map(|d| resolve(&root, d)).collect(),
-        };
-
         let bind_raw = env.string("THETIS_BIND").unwrap_or(file.server.bind);
-        let public_origin_raw = env
-            .string("THETIS_PUBLIC_ORIGIN")
-            .unwrap_or(file.server.public_origin.clone());
-        let public_origin = if public_origin_raw.trim().is_empty() {
-            None
-        } else {
-            let (scheme, authority) = public_origin_raw
-                .split_once("://")
-                .context("server.public_origin must be scheme://authority")?;
-            Some(Origin {
-                scheme: scheme.into(),
-                authority: authority.trim_end_matches('/').into(),
-            })
-        };
         let bind_addr: SocketAddr = bind_raw
             .parse()
             .with_context(|| format!("`{bind_raw}` is not a valid host:port"))?;
-
-        // What the agent calls itself, as distinct from the harness running it.
-        let agent_name = resolve_agent_name(env.string("THETIS_AGENT_NAME"), &file.agent.name);
-        let agent_avatar = env
-            .string("THETIS_AGENT_AVATAR")
-            .unwrap_or(file.agent.avatar)
-            .trim()
-            .to_string();
 
         // A prompt file wins over an inline prompt; neither means the built-in.
         let system_prompt = match env.string("THETIS_SYSTEM_PROMPT") {
@@ -2144,10 +1411,6 @@ impl Config {
             None if !file.agent.system_prompt.is_empty() => file.agent.system_prompt,
             None => default_system_prompt().to_string(),
         };
-        // `{agent_name}` is substituted wherever it appears, in a custom prompt
-        // as much as in the built-in one, so renaming the agent does not mean
-        // hand-editing a prompt file as well.
-        let system_prompt = system_prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name);
 
         let models = match env.string("THETIS_MODELS") {
             Some(raw) => parse_models_env(&raw),
@@ -2155,124 +1418,20 @@ impl Config {
                 .models
                 .into_iter()
                 .map(|m| ModelSpec {
-                    label: if m.label.is_empty() {
-                        m.id.clone()
-                    } else {
-                        m.label
-                    },
+                    label: if m.label.is_empty() { m.id.clone() } else { m.label },
                     id: m.id,
-                    provider: m.provider,
-                    wire_model: m.wire_model,
                 })
                 .collect(),
             None => builtin_models(),
         };
 
-        // `[llm]` is always a provider, so every existing config keeps working
-        // and the `[[providers]]` list is purely additive.
-        let llm_api_key = resolve_api_key(env.string("OPENROUTER_API_KEY"), &file.llm.api_key);
-        let llm_base = env
-            .string("OPENROUTER_BASE_URL")
-            .unwrap_or(file.llm.base_url);
-        let mut providers = vec![ProviderSpec {
-            id: DEFAULT_PROVIDER_ID.to_string(),
-            label: "OpenRouter".into(),
-            base_urls: vec![llm_base.clone()],
-            api_key: llm_api_key.clone(),
-            headers: Vec::new(),
-        }];
-        for p in file.providers {
-            let id = p.id.trim().to_string();
-            if id.is_empty() {
-                anyhow::bail!("a [[providers]] entry has no id");
-            }
-            // `base_url` and `base_urls` are the same field, one endpoint or
-            // several. Accept either spelling and normalize to the list.
-            let mut base_urls: Vec<String> = Vec::new();
-            if !p.base_url.trim().is_empty() {
-                base_urls.push(p.base_url.trim().to_string());
-            }
-            for url in &p.base_urls {
-                let url = url.trim();
-                if url.is_empty() {
-                    anyhow::bail!("provider `{id}` has an empty entry in base_urls");
-                }
-                if !base_urls.iter().any(|existing| existing == url) {
-                    base_urls.push(url.to_string());
-                }
-            }
-            if base_urls.is_empty() {
-                anyhow::bail!("provider `{id}` has no base_url");
-            }
-            let api_key = resolve_provider_key(env, &p.api_key);
-            let spec = ProviderSpec {
-                label: if p.label.is_empty() {
-                    id.clone()
-                } else {
-                    p.label
-                },
-                id: id.clone(),
-                base_urls,
-                api_key,
-                headers: p.headers.into_iter().collect(),
-            };
-            // A [[providers]] entry named `openrouter` replaces the synthesized
-            // one rather than sitting unreachable behind it.
-            match providers.iter_mut().find(|existing| existing.id == id) {
-                Some(existing) => *existing = spec,
-                None => providers.push(spec),
-            }
-        }
-
-        let default_provider = env
-            .string("THETIS_PROVIDER")
-            .unwrap_or(file.llm.provider)
-            .trim()
-            .to_string();
-        let default_provider = if default_provider.is_empty() {
-            DEFAULT_PROVIDER_ID.to_string()
-        } else {
-            if !providers.iter().any(|p| p.id == default_provider) {
-                anyhow::bail!(
-                    "llm.provider `{default_provider}` is not one of the configured providers ({})",
-                    providers
-                        .iter()
-                        .map(|p| p.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            default_provider
-        };
-
-        // A model naming a provider that does not exist would only fail at
-        // request time, long after the mistake was made.
-        for m in &models {
-            if !m.provider.is_empty() && !providers.iter().any(|p| p.id == m.provider) {
-                anyhow::bail!(
-                    "model `{}` names provider `{}`, which is not configured ({})",
-                    m.id,
-                    m.provider,
-                    providers
-                        .iter()
-                        .map(|p| p.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-        }
-
-        let mut modes: Vec<ModeSpec> = if file.modes.is_empty() {
+        let modes: Vec<ModeSpec> = if file.modes.is_empty() {
             builtin_modes()
         } else {
             file.modes
                 .into_iter()
                 .map(|m| ModeSpec {
-                    label: if m.label.is_empty() {
-                        m.id.clone()
-                    } else {
-                        m.label
-                    },
+                    label: if m.label.is_empty() { m.id.clone() } else { m.label },
                     id: m.id,
                     description: m.description,
                     read_only: m.read_only,
@@ -2280,15 +1439,8 @@ impl Config {
                 })
                 .collect()
         };
-        // A mode prompt is appended to the system prompt, so it gets the same
-        // substitution — otherwise `{agent_name}` would reach the model raw.
-        for mode in &mut modes {
-            mode.prompt = mode.prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name);
-        }
 
-        let default_mode = env
-            .string("THETIS_DEFAULT_MODE")
-            .unwrap_or(file.agent.default_mode);
+        let default_mode = env.string("THETIS_DEFAULT_MODE").unwrap_or(file.agent.default_mode);
         if !modes.iter().any(|m| m.id == default_mode) {
             anyhow::bail!(
                 "default_mode `{default_mode}` is not one of the configured modes ({})",
@@ -2300,262 +1452,59 @@ impl Config {
             );
         }
 
-        let all_model_ids = models.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
-        let all_mode_ids = modes.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
-        let base = crate::policy::EffectivePolicy::unrestricted(
-            &models,
-            &env.string("THETIS_MODEL").unwrap_or(file.llm.model.clone()),
-            &modes,
-            &default_mode,
-            file.subagents.max_children,
-        );
-        let local_policy = std::sync::Arc::new(base.clone());
-        // A role starts from the whole catalogue but from *no* authority: it
-        // is an administrator only if it says so. Resolving roles from the
-        // unrestricted base made every role an admin unless it wrote
-        // `admin = false`, which is the opposite of what a `reader` role
-        // means and what the "at least one admin" check below assumes.
-        let role_base = crate::policy::EffectivePolicy {
-            admin: false,
-            see_all_sessions: false,
-            ..base.clone()
-        };
-        let mut auth_roles = BTreeMap::new();
-        for r in &file.roles {
-            anyhow::ensure!(
-                !r.id.is_empty() && !auth_roles.contains_key(&r.id),
-                "role ids must be unique and non-empty"
-            );
-            let p = crate::policy::resolve(
-                &role_base,
-                &[&r.policy],
-                &format!("role `{}`", r.id),
-                &all_model_ids,
-                &all_mode_ids,
-            )?;
-            auth_roles.insert(r.id.clone(), std::sync::Arc::new(p));
-        }
-        let users_mode = match env
-            .string("THETIS_AUTH_MODE")
-            .unwrap_or(file.auth.mode.clone())
-            .as_str()
-        {
-            "local" => false,
-            "users" => true,
-            v => anyhow::bail!("auth.mode must be `local` or `users`, not `{v}`"),
-        };
-        let mut auth_users = Vec::new();
-        for u in file.users {
-            anyhow::ensure!(
-                !u.id.is_empty()
-                    && u.id.len() <= 64
-                    && u.id
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c)),
-                "invalid user id `{}`: use lowercase letters, digits, dot, underscore \
-                 or hyphen, up to 64 characters",
-                u.id
-            );
-            anyhow::ensure!(
-                !auth_users.iter().any(|x: &UserSpec| x.id == u.id),
-                "duplicate user `{}`",
-                u.id
-            );
-            let rp = auth_roles
-                .get(&u.role)
-                .with_context(|| format!("user `{}` names missing role `{}`", u.id, u.role))?;
-            let convenience_env = format!(
-                "THETIS_USER_{}_PASSWORD_HASH",
-                u.id.chars()
-                    .map(|c| if c.is_ascii_alphanumeric() {
-                        c.to_ascii_uppercase()
-                    } else {
-                        '_'
-                    })
-                    .collect::<String>()
-            );
-            let env_hash = if !u.password_env.is_empty() {
-                env.string(&u.password_env)
-            } else {
-                env.string(&convenience_env)
-            };
-            anyhow::ensure!(
-                (!u.password_hash.is_empty()) ^ env_hash.is_some(),
-                "user `{}` needs exactly one password source",
-                u.id
-            );
-            let policy = crate::policy::resolve(
-                rp,
-                &[&u.overrides],
-                &format!("user `{}`", u.id),
-                &all_model_ids,
-                &all_mode_ids,
-            )?;
-            let name = if u.name.is_empty() {
-                u.id.clone()
-            } else {
-                u.name
-            };
-            auth_users.push(UserSpec {
-                id: u.id,
-                name,
-                role: u.role,
-                password_hash: Secret::new(env_hash.unwrap_or(u.password_hash)),
-                discord_id: u.discord_id,
-                policy: std::sync::Arc::new(policy),
-            });
-        }
-        if users_mode {
-            anyhow::ensure!(
-                !auth_users.is_empty(),
-                "auth.mode = \"users\" but no [[users]] are configured; run `thetis hash-password` and add one"
-            );
-            anyhow::ensure!(
-                auth_users.iter().any(|u| u.policy.admin),
-                "users mode needs an admin user"
-            );
-            anyhow::ensure!(
-                auth_users.iter().any(|u| u.id == file.auth.claim_unowned),
-                "auth.claim_unowned must name a user"
-            );
-            anyhow::ensure!(
-                bind_addr.ip().is_loopback() || public_origin.is_some(),
-                "users mode bound off loopback needs server.public_origin"
-            );
-        }
-        let discord_policy = if file.auth.discord_role.is_empty() {
-            let mut policy = (*local_policy).clone();
-            policy.admin = false;
-            policy.read_only = true;
-            policy.see_all_sessions = false;
-            policy.denied.extend([
-                crate::policy::Cap::Transcripts,
-                crate::policy::Cap::Delegation,
-                crate::policy::Cap::WorkspaceWrite,
-            ]);
-            std::sync::Arc::new(policy)
-        } else {
-            auth_roles
-                .get(&file.auth.discord_role)
-                .cloned()
-                .with_context(|| {
-                    format!(
-                        "auth.discord_role names missing role `{}`",
-                        file.auth.discord_role
-                    )
-                })?
-        };
-        let auth = AuthSettings {
-            users_mode,
-            session_ttl: Duration::from_secs(file.auth.session_ttl_hours * 3600),
-            claim_unowned: if file.auth.claim_unowned.is_empty() {
-                "local".into()
-            } else {
-                file.auth.claim_unowned
-            },
-            lockout_after: file.auth.lockout_after,
-            lockout: Duration::from_secs(file.auth.lockout_secs),
-            users: auth_users,
-            roles: auth_roles,
-            discord_policy,
-            local_policy,
-        };
-
-        // Delegation profiles. Validated here rather than at spawn time: a
-        // profile naming a model or mode that does not exist is a typo in the
-        // config, and finding it at startup is far better than finding it when
-        // an agent tries to delegate mid-turn.
-        let mut profiles: Vec<AgentProfile> = Vec::new();
-        for p in file.subagents.profiles {
-            if p.id.is_empty() {
-                anyhow::bail!("every [[subagents.profiles]] entry needs an id");
-            }
-            if !p.model.is_empty() && !models.iter().any(|m| m.id == p.model) {
-                anyhow::bail!(
-                    "agent profile `{}` names model `{}`, which is not in [[models]]",
-                    p.id,
-                    p.model
-                );
-            }
-            if !p.mode.is_empty() && !modes.iter().any(|m| m.id == p.mode) {
-                anyhow::bail!(
-                    "agent profile `{}` names mode `{}`, which is not in [[modes]]",
-                    p.id,
-                    p.mode
-                );
-            }
-            profiles.push(AgentProfile {
-                label: if p.label.is_empty() {
-                    p.id.clone()
-                } else {
-                    p.label
-                },
-                id: p.id,
-                description: p.description,
-                model: p.model,
-                mode: p.mode,
-                prompt: p.prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name),
-            });
-        }
-        let subagent_default_mode = if file.subagents.default_mode.is_empty() {
-            default_mode.clone()
-        } else {
-            file.subagents.default_mode
-        };
-        if !modes.iter().any(|m| m.id == subagent_default_mode) {
-            anyhow::bail!(
-                "subagents.default_mode `{subagent_default_mode}` is not one of the configured modes"
-            );
-        }
-
         let config = Self {
             paths,
             bind_addr,
-            public_origin,
-            auth,
-            primary_gateway: env
-                .string("THETIS_GATEWAY")
+            primary_gateway: env.string("THETIS_GATEWAY")
                 .unwrap_or(file.server.primary_gateway),
             admin_enabled: env.parse("THETIS_ADMIN", file.server.admin_enabled),
 
-            openrouter_api_key: llm_api_key,
-            openrouter_base: llm_base,
-            model: env.string("THETIS_MODEL").unwrap_or(file.llm.model),
-            request_timeout: Duration::from_secs(
-                env.parse("THETIS_REQUEST_TIMEOUT_SECS", file.llm.request_timeout_secs),
+            openrouter_api_key: resolve_api_key(
+                env.string("OPENROUTER_API_KEY"),
+                &file.llm.api_key,
             ),
+            openrouter_base: env.string("OPENROUTER_BASE_URL").unwrap_or(file.llm.base_url),
+            model: env.string("THETIS_MODEL").unwrap_or(file.llm.model),
+            request_timeout: Duration::from_secs(env.parse(
+                "THETIS_REQUEST_TIMEOUT_SECS",
+                file.llm.request_timeout_secs,
+            )),
             max_retries: env.parse("THETIS_MAX_RETRIES", file.llm.max_retries),
             models,
-            providers,
-            default_provider,
 
-            agent_name,
-            agent_avatar,
             system_prompt,
             max_iterations: env.parse("THETIS_MAX_ITERATIONS", file.agent.max_iterations),
             modes,
             default_mode,
 
-            wasm_slice: Duration::from_secs(
-                env.parse("THETIS_WASM_SLICE_SECS", file.budgets.wasm_slice_secs),
-            ),
-            tool_budget: Duration::from_secs(
-                env.parse("THETIS_TOOL_BUDGET_SECS", file.budgets.tool_secs),
-            ),
-            probe_budget: Duration::from_secs(
-                env.parse("THETIS_PROBE_BUDGET_SECS", file.budgets.probe_secs),
-            ),
+            wasm_slice: Duration::from_secs(env.parse(
+                "THETIS_WASM_SLICE_SECS",
+                file.budgets.wasm_slice_secs,
+            )),
+            tool_budget: Duration::from_secs(env.parse(
+                "THETIS_TOOL_BUDGET_SECS",
+                file.budgets.tool_secs,
+            )),
+            probe_budget: Duration::from_secs(env.parse(
+                "THETIS_PROBE_BUDGET_SECS",
+                file.budgets.probe_secs,
+            )),
 
-            agent_memory_bytes: env.parse("THETIS_AGENT_MEM_MB", file.limits.agent_memory_mb) << 20,
-            tool_memory_bytes: env.parse("THETIS_TOOL_MEM_MB", file.limits.tool_memory_mb) << 20,
-            gateway_memory_bytes: env.parse("THETIS_GATEWAY_MEM_MB", file.limits.gateway_memory_mb)
+            agent_memory_bytes: env.parse("THETIS_AGENT_MEM_MB", file.limits.agent_memory_mb)
                 << 20,
+            tool_memory_bytes: env.parse("THETIS_TOOL_MEM_MB", file.limits.tool_memory_mb) << 20,
+            gateway_memory_bytes: env.parse(
+                "THETIS_GATEWAY_MEM_MB",
+                file.limits.gateway_memory_mb,
+            ) << 20,
             session_spend_limit_usd: env.parse(
                 "THETIS_SESSION_SPEND_LIMIT_USD",
                 file.limits.session_spend_limit_usd,
             ),
-            max_tool_output_bytes: env
-                .parse("THETIS_MAX_TOOL_OUTPUT", file.limits.max_tool_output_bytes),
+            max_tool_output_bytes: env.parse(
+                "THETIS_MAX_TOOL_OUTPUT",
+                file.limits.max_tool_output_bytes,
+            ),
             max_attachment_bytes: env.parse(
                 "THETIS_MAX_ATTACHMENT_BYTES",
                 file.limits.max_attachment_bytes,
@@ -2564,13 +1513,10 @@ impl Config {
 
             context: ContextSettings {
                 enabled: env.parse("THETIS_COMPACT", file.context.enabled),
-                window: env
-                    .parse("THETIS_CONTEXT_WINDOW", file.context.window_tokens)
-                    .max(1),
-                compact_threshold: file.context.compact_threshold.clamp(0.05, 1.0),
+                window: env.parse("THETIS_CONTEXT_WINDOW", file.context.window_tokens).max(1),
+                compact_threshold: file.context.compact_threshold.clamp(0.05, 0.99),
                 compact_target: file.context.compact_target.clamp(0.01, 0.95),
-                summary_model: env
-                    .string("THETIS_SUMMARY_MODEL")
+                summary_model: env.string("THETIS_SUMMARY_MODEL")
                     .unwrap_or(file.context.summary_model),
                 keep_head: file.context.keep_head,
                 keep_tail: file.context.keep_tail,
@@ -2584,58 +1530,29 @@ impl Config {
             },
 
             skills: SkillSettings {
-                retrieval_enabled: env
-                    .parse("THETIS_SKILL_RETRIEVAL", file.skills.retrieval_enabled),
+                retrieval_enabled: env.parse(
+                    "THETIS_SKILL_RETRIEVAL",
+                    file.skills.retrieval_enabled,
+                ),
                 // A limit of zero would disable the L1 block by accident; use
                 // `retrieval_enabled = false` to mean that on purpose.
                 retrieve_limit: file.skills.retrieve_limit.clamp(1, 50),
-                embedding_model: env
-                    .string("THETIS_EMBEDDING_MODEL")
+                embedding_model: env.string("THETIS_EMBEDDING_MODEL")
                     .unwrap_or(file.skills.embedding_model),
-                embedding_provider: env
-                    .string("THETIS_EMBEDDING_PROVIDER")
-                    .unwrap_or(file.skills.embedding_provider),
                 embedding_dimensions: file.skills.embedding_dimensions.clamp(64, 4096),
                 max_query_chars: file.skills.max_query_chars.clamp(64, 32_768),
                 max_universal: file.skills.max_universal.min(20),
             },
 
-            tool_groups: ToolGroupSettings {
-                grouping_enabled: env
-                    .parse("THETIS_TOOL_GROUPING", file.tool_groups.grouping_enabled),
-                accounting_enabled: file.tool_groups.accounting_enabled,
-                always_on: file.tool_groups.always_on,
-                route_threshold: file.tool_groups.route_threshold.clamp(0.0, 1.0),
-            },
-
-            subagents: SubagentSettings {
-                enabled: env.parse("THETIS_SUBAGENTS", file.subagents.enabled),
-                // Zero would mean "no children at all", which is what
-                // `enabled = false` is for; clamped so a stray 0 cannot
-                // silently disable delegation.
-                max_children: file.subagents.max_children.clamp(1, 64),
-                max_wait_secs: file.subagents.max_wait_secs.clamp(1, 21_600),
-                max_result_bytes: file.subagents.max_result_bytes.clamp(1_024, 1_048_576),
-                default_mode: subagent_default_mode,
-                profiles,
-            },
-
             build: BuildSettings {
-                command: env
-                    .string("THETIS_BUILD_COMMAND")
-                    .unwrap_or(file.build.command),
-                target: env
-                    .string("THETIS_BUILD_TARGET")
-                    .unwrap_or(file.build.target),
-                profile: env
-                    .string("THETIS_BUILD_PROFILE")
-                    .unwrap_or(file.build.profile),
+                command: env.string("THETIS_BUILD_COMMAND").unwrap_or(file.build.command),
+                target: env.string("THETIS_BUILD_TARGET").unwrap_or(file.build.target),
+                profile: env.string("THETIS_BUILD_PROFILE").unwrap_or(file.build.profile),
                 target_dir: shared("THETIS_TARGET_DIR", resolve(&root, &file.build.target_dir)),
                 locked: file.build.locked,
                 extra_args: file.build.extra_args,
                 timeout: Duration::from_secs(
-                    env.parse("THETIS_BUILD_TIMEOUT_SECS", file.build.timeout_secs)
-                        .max(1),
+                    env.parse("THETIS_BUILD_TIMEOUT_SECS", file.build.timeout_secs).max(1),
                 ),
                 allowed_crates: file.build.allowed_crates,
             },
@@ -2645,7 +1562,10 @@ impl Config {
                 dns: env.parse("THETIS_WASI_DNS", file.wasi.dns),
                 env: env.parse("THETIS_WASI_ENV", file.wasi.env),
                 stdio: env.parse("THETIS_WASI_STDIO", file.wasi.stdio),
-                dirs: wasi_dirs.clone(),
+                dirs: match env.string("THETIS_WORKSPACE_DIR") {
+                    Some(dir) => vec![PathBuf::from(dir)],
+                    None => file.wasi.dirs.iter().map(|d| resolve(&root, d)).collect(),
+                },
             },
 
             watchdog: WatchdogSettings {
@@ -2664,33 +1584,14 @@ impl Config {
 
             filesystem: FilesystemSettings {
                 enabled: env.parse("THETIS_FILESYSTEM", file.filesystem.enabled),
-                roots: {
-                    let mut roots: Vec<PathBuf> = if file.filesystem.roots.is_empty() {
-                        vec![root.clone()]
-                    } else {
-                        file.filesystem
-                            .roots
-                            .iter()
-                            .map(|r| resolve(&root, r))
-                            .collect()
-                    };
-                    // The shared workspace is always reachable. It is the one
-                    // directory every guest already has as a WASI preopen and
-                    // every conversation and branch shares, so having the host
-                    // file tools refuse it was incoherent: an agent could write
-                    // there through a tool component but not read it back with
-                    // `read_path`, and in a mode where the terminal is withheld
-                    // it could not reach it at all. Granting it here takes away
-                    // no confinement that was doing work — the authority was
-                    // already handed out at the preopen — and it is appended
-                    // rather than prepended so relative paths still resolve
-                    // against the project root.
-                    for dir in &wasi_dirs {
-                        if !roots.iter().any(|r| r == dir) {
-                            roots.push(dir.clone());
-                        }
-                    }
-                    roots
+                roots: if file.filesystem.roots.is_empty() {
+                    vec![root.clone()]
+                } else {
+                    file.filesystem
+                        .roots
+                        .iter()
+                        .map(|r| resolve(&root, r))
+                        .collect()
                 },
                 max_read_bytes: file.filesystem.max_read_bytes,
                 protected: file.filesystem.protected,
@@ -2713,16 +1614,6 @@ impl Config {
                 default_timeout: Duration::from_millis(file.terminal.default_timeout_ms),
                 max_output_bytes: file.terminal.max_output_bytes,
                 idle_timeout: Duration::from_secs(file.terminal.idle_timeout_secs),
-                ssh_enabled: env.parse("THETIS_TERMINAL_SSH", file.terminal.ssh_enabled),
-                ssh_program: if file.terminal.ssh_program.is_empty() {
-                    "ssh".into()
-                } else {
-                    file.terminal.ssh_program
-                },
-                ssh_connect_timeout: Duration::from_millis(
-                    file.terminal.ssh_connect_timeout_ms.max(1_000),
-                ),
-                send_settle: Duration::from_millis(file.terminal.send_settle_ms),
             },
 
             control: ControlSettings {
@@ -2734,26 +1625,22 @@ impl Config {
             discord: DiscordSettings {
                 enabled: env.parse("DISCORD_ENABLED", file.discord.enabled),
                 // The environment wins, so the token need never be on disk.
-                bot_token: env
-                    .string("DISCORD_BOT_TOKEN")
-                    .or_else(|| {
-                        Some(file.discord.bot_token.clone()).filter(|t| !t.trim().is_empty())
-                    })
+                bot_token: env.string("DISCORD_BOT_TOKEN")
+                    .or_else(|| Some(file.discord.bot_token.clone()).filter(|t| !t.trim().is_empty()))
                     .map(Secret::new),
                 mode: env.string("DISCORD_MODE").unwrap_or(file.discord.mode),
-                allowed_users: env
-                    .list("DISCORD_ALLOWED_USERS")
+                allowed_users: env.list("DISCORD_ALLOWED_USERS")
                     .unwrap_or(file.discord.allowed_users),
-                admin_users: env
-                    .list("DISCORD_ADMIN_USERS")
+                admin_users: env.list("DISCORD_ADMIN_USERS")
                     .unwrap_or(file.discord.admin_users),
                 allow_all_users: env.parse("DISCORD_ALLOW_ALL_USERS", file.discord.allow_all_users),
                 require_mention: env.parse("DISCORD_REQUIRE_MENTION", file.discord.require_mention),
-                free_response_channels: env
-                    .list("DISCORD_FREE_RESPONSE_CHANNELS")
+                free_response_channels: env.list("DISCORD_FREE_RESPONSE_CHANNELS")
                     .unwrap_or(file.discord.free_response_channels),
-                ignore_no_mention: env
-                    .parse("DISCORD_IGNORE_NO_MENTION", file.discord.ignore_no_mention),
+                ignore_no_mention: env.parse(
+                    "DISCORD_IGNORE_NO_MENTION",
+                    file.discord.ignore_no_mention,
+                ),
                 group_sessions_per_user: env.parse(
                     "DISCORD_GROUP_SESSIONS_PER_USER",
                     file.discord.group_sessions_per_user,
@@ -2761,27 +1648,9 @@ impl Config {
                 stream_edit_interval: Duration::from_millis(
                     file.discord.stream_edit_interval_ms.max(250),
                 ),
-                pairing_code_ttl: Duration::from_secs(file.discord.pairing_code_ttl_secs.max(30)),
-            },
-
-            browser: BrowserSettings {
-                enabled: env.parse("THETIS_BROWSER_ENABLED", file.browser.enabled),
-                port: env.parse("THETIS_BROWSER_PORT", file.browser.port),
-                service_dir: resolve(&root, &file.browser.service_dir),
-                node: env
-                    .string("THETIS_BROWSER_NODE")
-                    .unwrap_or(file.browser.node),
-                npm: env.string("THETIS_BROWSER_NPM").unwrap_or(file.browser.npm),
-                playwright_version: env
-                    .string("THETIS_BROWSER_PLAYWRIGHT_VERSION")
-                    .unwrap_or(file.browser.playwright_version),
-                auto_install: env.parse("THETIS_BROWSER_AUTO_INSTALL", file.browser.auto_install),
-                install_timeout: Duration::from_secs(file.browser.install_timeout_secs.max(30)),
-                startup_timeout: Duration::from_secs(file.browser.startup_timeout_secs.max(5)),
-                default_timeout_ms: file.browser.default_timeout_ms.max(1_000),
-                idle_timeout_secs: file.browser.idle_timeout_secs,
-                snapshot_chars: file.browser.snapshot_chars.max(500),
-                artifact_dir: resolve(&root, &file.browser.artifact_dir),
+                pairing_code_ttl: Duration::from_secs(
+                    file.discord.pairing_code_ttl_secs.max(30),
+                ),
             },
 
             sandbox_available: env.parse("THETIS_SANDBOX", file.sandbox.enabled),
@@ -2811,26 +1680,6 @@ fn resolve_api_key(from_env: Option<String>, from_file: &str) -> Option<Secret> 
         .map(Secret::new)
 }
 
-/// A provider's key, with `env:NAME` indirection.
-///
-/// Empty stays empty and means *send no auth header*, which is what a local
-/// llama.cpp server wants. `env:NAME` that is unset is also empty rather than
-/// an error: an unauthenticated endpoint is a perfectly good outcome, and a
-/// wrong key fails loudly at the first request anyway.
-fn resolve_provider_key(env: Env, raw: &str) -> Option<Secret> {
-    let raw = raw.trim();
-    let value = match raw.strip_prefix("env:") {
-        Some(name) => env.string(name.trim()).unwrap_or_default(),
-        None => raw.to_string(),
-    };
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(Secret::new(value))
-    }
-}
-
 /// `THETIS_MODELS` is a comma-separated list of `id=Label` pairs; a bare id
 /// uses itself as the label.
 fn parse_models_env(raw: &str) -> Vec<ModelSpec> {
@@ -2838,18 +1687,15 @@ fn parse_models_env(raw: &str) -> Vec<ModelSpec> {
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            let (id, label) = match entry.split_once('=') {
-                Some((id, label)) => (id.trim().to_string(), label.trim().to_string()),
-                None => (entry.to_string(), entry.to_string()),
-            };
-            ModelSpec {
-                id,
-                label,
-                // An env-declared model routes by id prefix, if at all.
-                provider: String::new(),
-                wire_model: String::new(),
-            }
+        .map(|entry| match entry.split_once('=') {
+            Some((id, label)) => ModelSpec {
+                id: id.trim().to_string(),
+                label: label.trim().to_string(),
+            },
+            None => ModelSpec {
+                id: entry.to_string(),
+                label: entry.to_string(),
+            },
         })
         .collect();
 
@@ -2874,15 +1720,17 @@ fn builtin_models() -> Vec<ModelSpec> {
     .map(|(id, label)| ModelSpec {
         id: id.to_string(),
         label: label.to_string(),
-        provider: String::new(),
-        wire_model: String::new(),
     })
     .collect()
 }
 
 /// PowerShell on Windows, a POSIX shell elsewhere.
 fn default_shell() -> &'static str {
-    if cfg!(windows) { "powershell" } else { "sh" }
+    if cfg!(windows) {
+        "powershell"
+    } else {
+        "sh"
+    }
 }
 
 fn default_shell_args() -> Vec<String> {
@@ -2923,34 +1771,8 @@ fn builtin_modes() -> Vec<ModeSpec> {
     ]
 }
 
-/// What the agent calls itself when nothing says otherwise.
-pub const DEFAULT_AGENT_NAME: &str = "Thetis";
-
-/// Picks the agent's name: the environment, then the file, then the default.
-///
-/// Split out as a pure function so the precedence can be tested without
-/// mutating the process environment, which is shared by every test in the
-/// binary and by the live conversations this process is serving.
-///
-/// Blank or whitespace at either layer means "not set" rather than "no name":
-/// an empty name would produce `You are , an agent...` and read as a bug in the
-/// harness rather than a mistake in the config.
-fn resolve_agent_name(from_env: Option<String>, from_file: &str) -> String {
-    from_env
-        .filter(|n| !n.trim().is_empty())
-        .or_else(|| Some(from_file.to_string()).filter(|n| !n.trim().is_empty()))
-        .unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string())
-        .trim()
-        .to_string()
-}
-
-/// Substituted for the configured agent name anywhere in a system or mode
-/// prompt. A custom prompt gets this too, so a rename reaches it without the
-/// author having to hardcode the name.
-pub const AGENT_NAME_PLACEHOLDER: &str = "{agent_name}";
-
 fn default_system_prompt() -> &'static str {
-    "You are {agent_name}, an agent running inside a self-modifying WebAssembly grip named Thetis.
+    "You are Thetis, an agent running inside a self-modifying WebAssembly grip.
 
 You are unusual: your own agentic loop, your tools, and the chat interface you \
 are speaking through are all WebAssembly components that you can rewrite while \
@@ -2989,176 +1811,6 @@ mod tests {
         )
     }
 
-    /// A users-mode config with one administrator.
-    fn one_user(id: &str) -> String {
-        format!(
-            r#"
-[auth]
-mode = "users"
-claim_unowned = "{id}"
-[[roles]]
-id = "admin"
-admin = true
-[[users]]
-id = "{id}"
-name = "Someone"
-role = "admin"
-password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2g"
-"#
-        )
-    }
-
-    // The id is what somebody types into a login form, and they type their name
-    // the way they write it. An account created as `bitmuse` answered `bitMuse`
-    // with "invalid credentials" and no hint that the two were the same
-    // account. Ids are validated lowercase, so two can never differ by case
-    // alone and matching loosely cannot be ambiguous.
-    #[test]
-    fn signing_in_ignores_the_case_of_the_id() {
-        let cfg = from_toml(&one_user("bitmuse")).unwrap();
-        for typed in ["bitmuse", "bitMuse", "BitMuse", "BITMUSE"] {
-            assert!(
-                cfg.auth.user(typed).is_some(),
-                "`{typed}` has to reach the one account there is"
-            );
-        }
-        assert!(cfg.auth.user("someoneelse").is_none());
-    }
-
-    // The rule itself, and a message that says what it is. "invalid user id
-    // `bitMuse`" left the reader to guess which character was the problem.
-    #[test]
-    fn an_id_that_is_not_lowercase_is_refused_with_the_rule() {
-        let err = from_toml(&one_user("bitMuse")).unwrap_err().to_string();
-        assert!(err.contains("invalid user id"), "{err}");
-        assert!(err.contains("lowercase"), "the message has to say why: {err}");
-    }
-
-    #[test]
-    fn a_user_gets_the_whole_catalogue_unless_something_narrows_it() {
-        let cfg = from_toml(&one_user("bitmuse")).unwrap();
-        let policy = &cfg.auth.user("bitmuse").unwrap().policy;
-        assert!(!policy.models_restricted);
-        assert_eq!(
-            policy.models.len(),
-            cfg.models.len(),
-            "switching on accounts must not quietly cost somebody their models"
-        );
-    }
-
-    #[test]
-    fn users_mode_validates_accounts_and_resolves_policy() {
-        let cfg = from_toml(
-            r#"
-            [auth]
-            mode = "users"
-            claim_unowned = "alice"
-
-            [[roles]]
-            id = "admin"
-            admin = true
-            deny_capabilities = ["ssh"]
-
-            [[users]]
-            id = "alice"
-            name = "Alice"
-            role = "admin"
-            password_hash = "not-a-real-hash"
-            "#,
-        )
-        .unwrap();
-        let alice = cfg.auth.user("alice").unwrap();
-        assert_eq!(alice.name, "Alice");
-        assert!(alice.policy.admin);
-        assert!(alice.policy.denies(crate::policy::Cap::Ssh));
-    }
-
-    /// A role is an administrator only when it says so. Every role used to
-    /// inherit `admin = true` from the unrestricted base, so a `reader` could
-    /// open `/admin` and write global settings.
-    #[test]
-    fn a_role_that_does_not_claim_admin_is_not_one() {
-        let cfg = from_toml(
-            r#"
-            [auth]
-            mode = "users"
-            claim_unowned = "alice"
-
-            [[roles]]
-            id = "admin"
-            admin = true
-
-            [[roles]]
-            id = "reader"
-            read_only = true
-
-            [[users]]
-            id = "alice"
-            role = "admin"
-            password_hash = "x"
-
-            [[users]]
-            id = "bob"
-            role = "reader"
-            password_hash = "y"
-            [users.overrides]
-            see_all_sessions = true
-            "#,
-        )
-        .unwrap();
-        let bob = cfg.auth.user("bob").unwrap();
-        assert!(!bob.policy.admin, "reader is not an administrator");
-        assert!(bob.policy.read_only);
-        assert!(bob.policy.see_all_sessions, "an override can still grant see-all");
-        assert!(!bob.policy.denied.is_empty() || bob.policy.denies(crate::policy::Cap::Terminal));
-        assert!(cfg.auth.user("alice").unwrap().policy.admin);
-        // The local-mode principal keeps its authority.
-        assert!(cfg.auth.local_policy.admin);
-
-        // And a users-mode config whose only role never claims admin is
-        // refused, rather than silently making everyone one.
-        let err = from_toml(
-            r#"
-            [auth]
-            mode = "users"
-            claim_unowned = "bob"
-            [[roles]]
-            id = "reader"
-            read_only = true
-            [[users]]
-            id = "bob"
-            role = "reader"
-            password_hash = "y"
-            "#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("admin"), "{err}");
-    }
-
-    #[test]
-    fn users_mode_rejects_incomplete_account_configuration() {
-        let no_users = from_toml("[auth]\nmode = \"users\"\nclaim_unowned = \"admin\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(no_users.contains("no [[users]]"), "{no_users}");
-
-        let missing_role = from_toml(
-            r#"
-            [auth]
-            mode = "users"
-            claim_unowned = "alice"
-            [[users]]
-            id = "alice"
-            role = "ghost"
-            password_hash = "x"
-            "#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(missing_role.contains("role `ghost`"), "{missing_role}");
-    }
-
     #[test]
     fn runs_with_no_configuration_at_all() {
         let cfg = from_toml("").unwrap();
@@ -3167,222 +1819,6 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFz
         assert_eq!(cfg.modes.len(), 2);
         assert!(cfg.mode("plan").unwrap().read_only);
         assert!(!cfg.mode("agent").unwrap().read_only);
-    }
-
-    /// The shared workspace is every agent's common ground and is handed to
-    /// every guest as a preopen, so the host file tools must be able to reach
-    /// it whatever `filesystem.roots` says — including when a deployment sets
-    /// roots explicitly and forgets it.
-    #[test]
-    fn the_workspace_is_always_a_filesystem_root() {
-        let cfg = from_toml("").unwrap();
-        let ws = cfg.wasi.dirs[0].clone();
-        assert_eq!(ws, PathBuf::from("/proj/workspace"));
-        assert!(
-            cfg.filesystem.roots.contains(&ws),
-            "{:?}",
-            cfg.filesystem.roots
-        );
-
-        // Explicit roots that omit the workspace still get it.
-        let cfg = from_toml("[filesystem]\nroots = [\"/elsewhere\"]\n").unwrap();
-        assert_eq!(cfg.filesystem.roots[0], PathBuf::from("/elsewhere"));
-        assert!(
-            cfg.filesystem
-                .roots
-                .contains(&PathBuf::from("/proj/workspace")),
-            "{:?}",
-            cfg.filesystem.roots
-        );
-
-        // Relative paths still resolve against the project root, not the
-        // workspace: the workspace is appended, never prepended.
-        let cfg = from_toml("").unwrap();
-        assert_eq!(cfg.filesystem.roots[0], PathBuf::from("/proj"));
-
-        // And it is not duplicated when it is already named.
-        let cfg = from_toml("[filesystem]\nroots = [\"workspace\"]\n").unwrap();
-        assert_eq!(
-            cfg.filesystem
-                .roots
-                .iter()
-                .filter(|r| **r == PathBuf::from("/proj/workspace"))
-                .count(),
-            1,
-            "{:?}",
-            cfg.filesystem.roots
-        );
-    }
-
-    /// The agent's name defaults to the harness's, which is what made the two
-    /// easy to conflate in the first place.
-    #[test]
-    fn the_agent_is_named_thetis_by_default() {
-        let cfg = from_toml("").unwrap();
-        assert_eq!(cfg.agent_name, "Thetis");
-        assert!(
-            cfg.system_prompt.starts_with("You are Thetis,"),
-            "the placeholder should have been substituted, got: {:?}",
-            &cfg.system_prompt[..40.min(cfg.system_prompt.len())]
-        );
-    }
-
-    #[test]
-    fn naming_the_agent_renames_it_in_the_built_in_prompt() {
-        let cfg = from_toml(
-            r#"
-            [agent]
-            name = "Ada"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.agent_name, "Ada");
-        assert!(cfg.system_prompt.starts_with("You are Ada,"));
-        // The harness keeps its own name in the same sentence.
-        assert!(cfg.system_prompt.contains("grip named Thetis"));
-    }
-
-    /// The point of the placeholder: a custom prompt should not have to
-    /// hardcode the name to follow a rename.
-    #[test]
-    fn a_custom_prompt_gets_the_placeholder_substituted() {
-        let cfg = from_toml(
-            r#"
-            [agent]
-            name = "Ada"
-            system_prompt = "You are {agent_name}. Greet as {agent_name}."
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.system_prompt, "You are Ada. Greet as Ada.");
-        assert!(
-            !cfg.system_prompt.contains("{agent_name}"),
-            "no placeholder may reach the model raw"
-        );
-    }
-
-    #[test]
-    fn a_mode_prompt_gets_the_placeholder_too() {
-        let cfg = from_toml(
-            r#"
-            [agent]
-            name = "Ada"
-
-            [[modes]]
-            id = "agent"
-            label = "Agent"
-            prompt = "You are {agent_name} in agent mode."
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.mode("agent").unwrap().prompt,
-            "You are Ada in agent mode."
-        );
-    }
-
-    /// Scoping must default to off. An empty config that silently narrowed the
-    /// tool surface would change every existing deployment's behaviour on
-    /// upgrade, which is exactly what the research says not to do blind.
-    #[test]
-    fn tool_grouping_is_off_by_default_but_accounting_is_on() {
-        let cfg = from_toml("").unwrap();
-        assert!(!cfg.tool_groups.grouping_enabled);
-        assert!(
-            cfg.tool_groups.accounting_enabled,
-            "the baseline measurement is what makes enabling grouping judgeable"
-        );
-        assert!(cfg.tool_groups.always_on.is_empty());
-        assert_eq!(cfg.tool_groups.route_threshold, 0.15);
-    }
-
-    #[test]
-    fn tool_group_settings_round_trip_from_toml() {
-        let cfg = from_toml(
-            r#"
-            [tool_groups]
-            grouping_enabled = true
-            accounting_enabled = false
-            always_on = ["shell", "web"]
-            route_threshold = 0.4
-            "#,
-        )
-        .unwrap();
-        assert!(cfg.tool_groups.grouping_enabled);
-        assert!(!cfg.tool_groups.accounting_enabled);
-        assert_eq!(cfg.tool_groups.always_on, vec!["shell", "web"]);
-        assert_eq!(cfg.tool_groups.route_threshold, 0.4);
-    }
-
-    /// A threshold above 1.0 would admit nothing on tag evidence and a negative
-    /// one would admit everything; both are silent misconfigurations, so they
-    /// are clamped rather than trusted.
-    #[test]
-    fn an_out_of_range_route_threshold_is_clamped() {
-        let high = from_toml("[tool_groups]\nroute_threshold = 9.0\n").unwrap();
-        assert_eq!(high.tool_groups.route_threshold, 1.0);
-        let low = from_toml("[tool_groups]\nroute_threshold = -3.0\n").unwrap();
-        assert_eq!(low.tool_groups.route_threshold, 0.0);
-    }
-
-    #[test]
-    fn the_agent_has_no_avatar_unless_one_is_configured() {
-        // Empty is meaningful: it selects the built-in mark.
-        assert_eq!(from_toml("").unwrap().agent_avatar, "");
-    }
-
-    #[test]
-    fn an_avatar_can_be_a_url_or_a_data_uri() {
-        let cfg = from_toml(
-            r#"
-            [agent]
-            avatar = "  https://example.com/ada.png  "
-            "#,
-        )
-        .unwrap();
-        // Trimmed, because stray whitespace in an attribute value is a broken
-        // image rather than a helpful error.
-        assert_eq!(cfg.agent_avatar, "https://example.com/ada.png");
-
-        let cfg = from_toml(
-            r#"
-            [agent]
-            avatar = "data:image/png;base64,iVBORw0KGgo="
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.agent_avatar, "data:image/png;base64,iVBORw0KGgo=");
-    }
-
-    /// An empty or whitespace name is a mistake, not a request for a nameless
-    /// agent: falling through to the default keeps the prompt grammatical.
-    #[test]
-    fn a_blank_name_falls_back_to_the_default() {
-        let cfg = from_toml(
-            r#"
-            [agent]
-            name = "   "
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.agent_name, "Thetis");
-    }
-
-    #[test]
-    fn the_environment_names_the_agent_over_the_file() {
-        // Tested through the pure resolver rather than by setting a process
-        // variable: this binary's tests share one environment, and so do the
-        // conversations this process is serving.
-        assert_eq!(resolve_agent_name(Some("Ada".into()), "Grace"), "Ada");
-        assert_eq!(resolve_agent_name(None, "Grace"), "Grace");
-        assert_eq!(resolve_agent_name(None, ""), "Thetis");
-
-        // Blank at either layer defers instead of yielding a nameless agent.
-        assert_eq!(resolve_agent_name(Some("  ".into()), "Grace"), "Grace");
-        assert_eq!(resolve_agent_name(Some("  ".into()), "  "), "Thetis");
-
-        // Whitespace from a copy-paste is trimmed, not carried into the prompt.
-        assert_eq!(resolve_agent_name(None, "  Ada  "), "Ada");
     }
 
     #[test]
@@ -3431,10 +1867,7 @@ endpoint = 0
 ";
         let value: toml::Value = toml::from_str(text).unwrap();
         let (_, unknown) = parse_file(value).unwrap();
-        assert!(
-            unknown.iter().any(|k| k.contains("telemetry")),
-            "{unknown:?}"
-        );
+        assert!(unknown.iter().any(|k| k.contains("telemetry")), "{unknown:?}");
     }
 
     #[test]
@@ -3463,227 +1896,6 @@ max_universal = 3
         assert_eq!(file.skills.embedding_dimensions, 256);
         assert_eq!(file.skills.max_query_chars, 99);
         assert_eq!(file.skills.max_universal, 3);
-    }
-
-    /// The config a llama.cpp user would write: one extra provider, one model
-    /// pointed at it, OpenRouter left exactly as it was.
-    const LOCAL_PROVIDER: &str = r#"
-        [llm]
-        model = "anthropic/claude-sonnet-4.5"
-        api_key = "sk-or-test"
-
-        [[providers]]
-        id = "local"
-        label = "llama.cpp"
-        base_url = "http://127.0.0.1:8080/v1"
-
-        [[models]]
-        id = "anthropic/claude-sonnet-4.5"
-        label = "Claude Sonnet 4.5"
-
-        [[models]]
-        id = "local/qwen3-30b"
-        label = "Qwen3 30B (local)"
-        provider = "local"
-        wire_model = "qwen3-30b-a3b"
-    "#;
-
-    #[test]
-    fn openrouter_is_always_a_provider_even_with_none_configured() {
-        let cfg = from_toml("[llm]\napi_key = \"sk-or-test\"\n").unwrap();
-        assert_eq!(cfg.providers.len(), 1);
-        assert_eq!(cfg.default_provider, DEFAULT_PROVIDER_ID);
-
-        let provider = cfg.fallback_provider();
-        assert_eq!(provider.base_url(), "https://openrouter.ai/api/v1");
-        assert!(provider.is_openrouter());
-        assert_eq!(provider.api_key.as_ref().unwrap().expose(), "sk-or-test");
-    }
-
-    #[test]
-    fn a_local_provider_serves_the_model_that_names_it() {
-        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
-
-        let local = cfg.resolve_model("local/qwen3-30b");
-        assert_eq!(local.provider.id, "local");
-        assert_eq!(
-            local.provider.url("chat/completions"),
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
-        // The picker's id and the name on the wire are allowed to differ.
-        assert_eq!(local.wire_model, "qwen3-30b-a3b");
-        // No key configured means no Authorization header at all, which is what
-        // an unauthenticated local server needs.
-        assert!(local.provider.api_key.is_none());
-        assert!(!local.provider.is_openrouter());
-
-        // Adding a provider must not move anything that was already working.
-        let remote = cfg.resolve_model("anthropic/claude-sonnet-4.5");
-        assert_eq!(remote.provider.id, DEFAULT_PROVIDER_ID);
-        assert_eq!(remote.wire_model, "anthropic/claude-sonnet-4.5");
-    }
-
-    #[test]
-    fn an_unlisted_model_can_still_address_a_provider_by_prefix() {
-        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
-        let resolved = cfg.resolve_model("local/some-gguf-i-just-loaded");
-        assert_eq!(resolved.provider.id, "local");
-        // The prefix is the routing instruction, so it comes off the wire name.
-        assert_eq!(resolved.wire_model, "some-gguf-i-just-loaded");
-    }
-
-    #[test]
-    fn a_vendor_prefix_is_not_mistaken_for_a_provider() {
-        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
-        // `anthropic` is a vendor within OpenRouter, not a configured provider,
-        // so the id must reach the wire whole.
-        let resolved = cfg.resolve_model("anthropic/claude-opus-4.1");
-        assert_eq!(resolved.provider.id, DEFAULT_PROVIDER_ID);
-        assert_eq!(resolved.wire_model, "anthropic/claude-opus-4.1");
-    }
-
-    #[test]
-    fn a_local_provider_can_be_made_the_default() {
-        let cfg = from_toml(
-            r#"
-            [llm]
-            model = "qwen3-30b"
-            provider = "local"
-
-            [[providers]]
-            id = "local"
-            base_url = "http://127.0.0.1:8080/v1"
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(cfg.default_provider, "local");
-        let resolved = cfg.resolve_model("qwen3-30b");
-        assert_eq!(resolved.provider.id, "local");
-        assert_eq!(resolved.wire_model, "qwen3-30b");
-        // A label falls back to the id rather than showing blank in the picker.
-        assert_eq!(cfg.provider("local").unwrap().label, "local");
-    }
-
-    #[test]
-    fn a_provider_key_can_come_from_the_environment() {
-        // `env:` indirection keeps a real key out of the file.
-        std::env::set_var("THETIS_TEST_PROVIDER_KEY", "sk-local-abc");
-        let cfg = Config::assemble(
-            PathBuf::from("/proj"),
-            PathBuf::from("/proj/thetis.toml"),
-            toml::from_str(
-                r#"
-                [[providers]]
-                id = "vllm"
-                base_url = "http://gpu.internal:8000/v1"
-                api_key = "env:THETIS_TEST_PROVIDER_KEY"
-                "#,
-            )
-            .unwrap(),
-            Env::Process,
-        )
-        .unwrap();
-        std::env::remove_var("THETIS_TEST_PROVIDER_KEY");
-
-        assert_eq!(
-            cfg.provider("vllm")
-                .unwrap()
-                .api_key
-                .as_ref()
-                .unwrap()
-                .expose(),
-            "sk-local-abc"
-        );
-    }
-
-    #[test]
-    fn an_unset_env_key_leaves_a_provider_unauthenticated_rather_than_failing() {
-        let cfg = from_toml(
-            r#"
-            [[providers]]
-            id = "local"
-            base_url = "http://127.0.0.1:8080/v1"
-            api_key = "env:DEFINITELY_NOT_SET_THETIS_TEST"
-            "#,
-        )
-        .unwrap();
-        assert!(cfg.provider("local").unwrap().api_key.is_none());
-    }
-
-    #[test]
-    fn extra_headers_are_carried_per_provider() {
-        let cfg = from_toml(
-            r#"
-            [[providers]]
-            id = "gw"
-            base_url = "http://gw.internal/v1"
-            headers = { "X-Org" = "acme" }
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.provider("gw").unwrap().headers,
-            vec![("X-Org".to_string(), "acme".to_string())]
-        );
-    }
-
-    #[test]
-    fn a_model_naming_a_provider_that_does_not_exist_is_rejected_at_load() {
-        // Otherwise the mistake surfaces as a confusing 404 mid-conversation.
-        let err = from_toml(
-            r#"
-            [[models]]
-            id = "x"
-            provider = "typo"
-            "#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("typo"), "{err}");
-    }
-
-    #[test]
-    fn a_default_provider_that_does_not_exist_is_rejected_at_load() {
-        let err = from_toml("[llm]\nprovider = \"nope\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("nope"), "{err}");
-    }
-
-    #[test]
-    fn a_provider_named_openrouter_replaces_the_synthesized_one() {
-        // Overriding the built-in entry must not leave two under one id, where
-        // the second would be unreachable.
-        let cfg = from_toml(
-            r#"
-            [[providers]]
-            id = "openrouter"
-            base_url = "http://proxy.internal/v1"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.providers.len(), 1);
-        assert_eq!(
-            cfg.fallback_provider().base_url(),
-            "http://proxy.internal/v1"
-        );
-    }
-
-    #[test]
-    fn a_base_url_with_a_trailing_slash_does_not_double_it() {
-        let cfg = from_toml(
-            r#"
-            [[providers]]
-            id = "local"
-            base_url = "http://127.0.0.1:8080/v1/"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.provider("local").unwrap().url("chat/completions"),
-            "http://127.0.0.1:8080/v1/chat/completions"
-        );
     }
 
     #[test]
@@ -3739,10 +1951,7 @@ max_universal = 3
 
         assert_eq!(cfg.paths.data, PathBuf::from("/proj/var/state"));
         assert_eq!(cfg.paths.artifacts, PathBuf::from("/srv/thetis/artifacts"));
-        assert_eq!(
-            cfg.aspect_source_dir(&Aspect::Agent),
-            PathBuf::from("/proj/components/brain")
-        );
+        assert_eq!(cfg.aspect_source_dir(&Aspect::Agent), PathBuf::from("/proj/components/brain"));
         // The crate name follows the directory, so renaming it needs no code change.
         assert_eq!(cfg.aspect_crate_name(&Aspect::Agent), "brain");
         assert_eq!(cfg.aspect_wasm_filename(&Aspect::Agent), "brain.wasm");
@@ -3765,10 +1974,7 @@ max_universal = 3
             cfg.aspect_source_dir(&Aspect::gateway("web")),
             PathBuf::from("/proj/surfaces/ui-web")
         );
-        assert_eq!(
-            cfg.aspect_wasm_filename(&Aspect::gateway("web")),
-            "ui_web.wasm"
-        );
+        assert_eq!(cfg.aspect_wasm_filename(&Aspect::gateway("web")), "ui_web.wasm");
         assert_eq!(
             cfg.aspect_source_dir(&Aspect::tool("weather")),
             PathBuf::from("/proj/plugins/plugin-weather")
@@ -3852,10 +2058,7 @@ max_universal = 3
             "#,
         )
         .unwrap();
-        assert_eq!(
-            cfg.openrouter_api_key.as_ref().unwrap().expose(),
-            "sk-from-file"
-        );
+        assert_eq!(cfg.openrouter_api_key.as_ref().unwrap().expose(), "sk-from-file");
     }
 
     #[test]
@@ -3939,19 +2142,13 @@ max_universal = 3
 
     #[test]
     fn a_hyphenated_tool_inherits_its_group_block() {
-        // The group is fictional on purpose. An earlier version of this test
-        // used `notion`, and a real `NOTION_TOKEN` in the environment then
-        // overrode the file it asserts on — correct behaviour, since the
-        // environment beats the file, but it made the test fail wherever a
-        // credential was configured. Every env-sensitive test here uses a
-        // `zz*` scope no real deployment sets.
         let cfg = from_toml(
             r#"
-[tools.zzgroupsvc]
+[tools.notion]
 token = "secret"
 version = "2026-03-11"
 
-[tools.zzgroupsvc-search]
+[tools.notion-search]
 page_size = 25
 version = "2025-09-03"
 "#,
@@ -3959,7 +2156,7 @@ version = "2025-09-03"
         .unwrap();
 
         let seen: serde_json::Value =
-            serde_json::from_str(&cfg.tool_config_json("zzgroupsvc-search")).unwrap();
+            serde_json::from_str(&cfg.tool_config_json("notion-search")).unwrap();
         // Group key inherited, and the specific block wins where both name one.
         assert_eq!(seen["token"], "secret");
         assert_eq!(seen["page_size"], 25);
@@ -3967,7 +2164,7 @@ version = "2025-09-03"
 
         // A sibling with no block of its own still gets the shared credential.
         let sibling: serde_json::Value =
-            serde_json::from_str(&cfg.tool_config_json("zzgroupsvc-comment-add")).unwrap();
+            serde_json::from_str(&cfg.tool_config_json("notion-comment-add")).unwrap();
         assert_eq!(sibling["token"], "secret");
         assert!(sibling.get("page_size").is_none());
 
@@ -3989,29 +2186,27 @@ version = "2025-09-03"
             key_path.to_string_lossy()
         ))
         .unwrap();
-        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), file, Env::None).unwrap();
+        let cfg = Config::assemble(
+            dir.clone(),
+            dir.join("thetis.toml"),
+            file,
+            Env::None,
+        )
+        .unwrap();
 
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
-        assert!(
-            seen["private_key_contents"]
-                .as_str()
-                .unwrap()
-                .contains("BEGIN RSA PRIVATE KEY")
-        );
+        assert!(seen["private_key_contents"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN RSA PRIVATE KEY"));
         // The path itself is still visible, for error messages that name it.
-        assert!(
-            seen["private_key_path"]
-                .as_str()
-                .unwrap()
-                .ends_with("app.pem")
-        );
+        assert!(seen["private_key_path"].as_str().unwrap().ends_with("app.pem"));
 
         // A path that cannot be read reports why, rather than looking unset.
         let missing: spec::File =
             toml::from_str("[tools.zzkeysvc]\nprivate_key_path = \"nope.pem\"\n").unwrap();
-        let cfg =
-            Config::assemble(dir.clone(), dir.join("thetis.toml"), missing, Env::None).unwrap();
+        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), missing, Env::None).unwrap();
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         assert!(seen.get("private_key_contents").is_none());
@@ -4026,17 +2221,14 @@ version = "2025-09-03"
         // A path outside the root is refused, and says so.
         let escaping: spec::File =
             toml::from_str("[tools.zzkeysvc]\nprivate_key_path = \"/etc/hostname\"\n").unwrap();
-        let cfg =
-            Config::assemble(dir.clone(), dir.join("thetis.toml"), escaping, Env::None).unwrap();
+        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), escaping, Env::None).unwrap();
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         assert!(seen.get("private_key_contents").is_none());
-        assert!(
-            seen["private_key_contents_error"]
-                .as_str()
-                .unwrap()
-                .contains("inside the project root")
-        );
+        assert!(seen["private_key_contents_error"]
+            .as_str()
+            .unwrap()
+            .contains("inside the project root"));
 
         // A relative path resolves against the shared overlay's directory too,
         // not just the project root. This is the worktree case: a conversation
@@ -4049,8 +2241,7 @@ version = "2025-09-03"
 
         let relative: spec::File =
             toml::from_str("[tools.zzkeysvc]\nprivate_key_path = \"shared.pem\"\n").unwrap();
-        let cfg =
-            Config::assemble(dir.clone(), dir.join("thetis.toml"), relative, Env::None).unwrap();
+        let cfg = Config::assemble(dir.clone(), dir.join("thetis.toml"), relative, Env::None).unwrap();
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         std::env::remove_var("THETIS_LOCAL_CONFIG");
@@ -4119,12 +2310,10 @@ timeout = 30
 ",
         )
         .unwrap();
-        let overlay: toml::Value = toml::from_str(
-            "[tools.web-search]
+        let overlay: toml::Value =
+            toml::from_str("[tools.web-search]
 api_key = \"secret\"
-",
-        )
-        .unwrap();
+").unwrap();
 
         merge_toml(&mut base, overlay);
 
@@ -4140,20 +2329,16 @@ api_key = \"secret\"
 
     #[test]
     fn overlay_replaces_scalars_and_arrays_rather_than_merging_them() {
-        let mut base: toml::Value = toml::from_str(
-            "[build]
+        let mut base: toml::Value =
+            toml::from_str("[build]
 locked = true
 allowed_crates = [\"a\", \"b\"]
-",
-        )
-        .unwrap();
-        let overlay: toml::Value = toml::from_str(
-            "[build]
+").unwrap();
+        let overlay: toml::Value =
+            toml::from_str("[build]
 locked = false
 allowed_crates = [\"c\"]
-",
-        )
-        .unwrap();
+").unwrap();
 
         merge_toml(&mut base, overlay);
 

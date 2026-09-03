@@ -1,10 +1,9 @@
 /* The composer: text, attachments, the mode and model pickers, and the stop
  * button that appears while a turn is running. */
 
-import { $, AGENT_NAME, clear, el, icon } from "../lib/dom.js";
+import { $, clear, el, icon } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { toast } from "../lib/toast.js";
-import { mountMentions } from "./mentions.js";
 import { Picker } from "./picker.js";
 
 const X = ["M4 4l8 8", "M12 4l-8 8"];
@@ -12,7 +11,7 @@ const X = ["M4 4l8 8", "M12 4l-8 8"];
 /** Images only, and small enough that base64 in a websocket frame is sane. */
 const MAX_BYTES = 8 * 1024 * 1024;
 
-export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShowHistory, onStop, sendFrame }) {
+export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShowHistory, onStop }) {
   const form = $("composer");
   const input = $("input");
   const sendBtn = $("send");
@@ -33,7 +32,7 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
   // --- pickers --------------------------------------------------------------
 
   const modePicker = new Picker($("mode-picker"), {
-    title: `How ${AGENT_NAME} should work in this conversation`,
+    title: "How Thetis should work in this conversation",
     options: () => store.modes.map((m) => ({ id: m.id, label: m.label, note: m.description })),
     selected: () => store.mode,
     render: () => store.modeLabel(),
@@ -127,23 +126,6 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
   store.watch("models", () => modelPicker.refresh());
   store.watch("mode", () => modePicker.refresh());
   store.watch("model", () => modelPicker.refresh());
-
-  // --- @-mentions -----------------------------------------------------------
-
-  /* Files attached by typing `@path`, rather than by the paperclip. They are
-   * derived from the message text — see views/mentions.js — so they are not in
-   * `store.attachments` and no chip is drawn for them: the highlighted token in
-   * the message *is* the chip, and a second representation could disagree with
-   * it. They join the real attachment list only at submit. */
-  const mentions = mountMentions({
-    input,
-    mirror: $("input-mirror"),
-    send: (frame) => (sendFrame ? sendFrame(frame) : false),
-    onTextChange: () => {
-      autosize();
-      updateSendState();
-    },
-  });
 
   // --- attachments ----------------------------------------------------------
 
@@ -295,15 +277,9 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
     return Boolean(store.pending || store.creating);
   }
 
-  /* True while a submit is waiting on a mentioned file to be read. Declared up
-   * here rather than beside the submit handler because `updateSendState` reads
-   * it, and that runs during mount — a `let` in temporal dead zone would throw
-   * on the first draw. */
-  let reading = false;
-
   function updateSendState() {
     const hasContent = input.value.trim() !== "" || store.attachments.length > 0;
-    sendBtn.disabled = !hasContent || !store.current || locked() || reading;
+    sendBtn.disabled = !hasContent || !store.current || locked();
   }
 
   function drawLock() {
@@ -313,7 +289,7 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
       ? store.creating
         ? "Creating the conversation…"
         : "Sending…"
-      : `Message ${AGENT_NAME}…`;
+      : "Message Thetis…";
     form.classList.toggle("is-locked", busy);
     $("attach").disabled = busy;
     updateSendState();
@@ -337,62 +313,20 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
 
   // Enter sends. Sending mid-reply is allowed on purpose: the orchestrator
   // turns it into a nudge for the running turn rather than a second turn.
-  //
-  // The mention menu gets first refusal on the keys it owns — arrows, Enter,
-  // Tab, Escape — because while it is open Enter means "pick this file", not
-  // "send". It reports whether it consumed the key.
   input.addEventListener("keydown", (event) => {
-    if (mentions.handleKey(event)) {
-      event.preventDefault();
-      return;
-    }
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       form.requestSubmit();
     }
   });
 
-  /* Submitting is async because a mentioned file may not have been read yet —
-   * one typed by hand rather than picked from the menu, or picked a moment ago
-   * over a slow read. The lock is taken *before* the await, so a second Enter
-   * during the read cannot send the same message twice, and the text stays in
-   * the box until the socket has taken it. */
-  function updateReadLock() {
-    form.classList.toggle("is-locked", locked() || reading);
-    updateSendState();
-  }
-
-  form.addEventListener("submit", async (event) => {
+  form.addEventListener("submit", (event) => {
     event.preventDefault();
     const text = input.value.trim();
-    if (locked() || reading) return;
-    if (!store.current) return;
+    if (locked()) return;
+    if (!store.current || (!text && !store.attachments.length)) return;
 
-    // A message that is nothing but mentions is still a message — the files are
-    // the content — so mentions count toward "has something to send".
-    let mentioned = [];
-    if (mentions.pending(text)) {
-      reading = true;
-      updateReadLock();
-      input.placeholder = "Reading the mentioned files…";
-      try {
-        mentioned = await mentions.attachmentsFor(text);
-      } finally {
-        reading = false;
-        updateReadLock();
-        drawLock();
-      }
-      // Sending was cancelled under us, or the box was emptied while reading.
-      if (input.value.trim() !== text) return;
-    } else {
-      mentioned = await mentions.attachmentsFor(text);
-    }
-
-    if (!text && !store.attachments.length && !mentioned.length) return;
-
-    // Mentioned files go last, so the message's own words come first in the
-    // multi-part content the model sees.
-    const attachments = [...store.attachments, ...mentioned];
+    const attachments = store.attachments.slice();
     // `onSend` reports whether the frame actually reached the socket. A send
     // into a closed socket used to swallow the message silently, clearing the
     // box as if it had gone.
@@ -406,8 +340,6 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
     input.value = "";
     store.attachments.length = 0;
     store.touch("attachments");
-    mentions.close();
-    mentions.paint();
     autosize();
   });
 
@@ -420,20 +352,11 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
     }
     autosize();
     drawLock();
-    // The highlight follows the text, so text handed back needs a repaint or
-    // the mentions in it come back plain.
-    mentions.paint();
     input.focus();
   }
 
   store.watch("current", updateSendState);
   drawTray();
   drawLock();
-  return {
-    focus: () => input.focus(),
-    restore,
-    /** The @-mention machinery, so app.js can route workspace frames into it
-     *  and mark the index stale when the agent changes the tree. */
-    mentions,
-  };
+  return { focus: () => input.focus(), restore };
 }

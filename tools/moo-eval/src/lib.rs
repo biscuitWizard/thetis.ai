@@ -1,7 +1,0 @@
-wit_bindgen::generate!({ world: "tool", path: "../../wit", generate_all });
-mod moo;
-use moo::{bounded, Moo};
-use serde_json::{json,Value};
-struct Component;
-impl Guest for Component { fn describe()->ToolManifest{ToolManifest{name:"moo-eval".into(),description:"Evaluate a MOO expression through Torchship's captured web-host API. This may mutate world state. A timeout can occur after committed output; do not blindly retry mutations.".into(),args_schema_json:json!({"type":"object","properties":{"expression":{"type":"string"},"wizard":{"type":"boolean","default":false},"timeout_ms":{"type":"integer","minimum":0,"maximum":300000}},"required":["expression"],"additionalProperties":false}).to_string(),capabilities:vec!["group:moo".into(),"http".into()]}} fn invoke(_:String,args_json:String,config_json:String)->Result<String,String>{let a:Value=serde_json::from_str(&args_json).map_err(|e|e.to_string())?;let expression=a.get("expression").and_then(Value::as_str).ok_or("missing expression")?;let r=Moo::from_config(&config_json)?.captured("/v1/eval",expression,a.get("timeout_ms").and_then(Value::as_u64),a.get("wizard").and_then(Value::as_bool).unwrap_or(false))?;Ok(bounded(&json!({"success":r.success,"value":r.value,"error":r.error,"output":r.output,"timed_out":r.timed_out,"cancelled":r.cancelled}).to_string(),32000))} }
-export!(Component);

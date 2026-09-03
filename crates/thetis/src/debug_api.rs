@@ -12,7 +12,7 @@
 //! worker as a side effect of someone opening a panel.
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::grip::{Grip, Role};
@@ -23,10 +23,7 @@ const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
 
 /// True when this frame type belongs here.
 pub fn handles(frame_type: &str) -> bool {
-    frame_type == "debug-request"
-        || frame_type == "turn-cancel"
-        || frame_type == "terminals"
-        || frame_type == "terminal-close"
+    frame_type == "debug-request" || frame_type == "turn-cancel"
 }
 
 /// Handles one frame, returning the reply frames to send on this socket.
@@ -42,34 +39,19 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
         .unwrap_or_default()
         .to_string();
 
-    // Which shell, for `terminal-close`. A separate field because `id` is
-    // already spoken for by the conversation.
-    let terminal = frame
-        .get("terminal")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-
-    match dispatch(grip, &frame_type, &session, &terminal).await {
+    match dispatch(grip, &frame_type, &session).await {
         Ok(reply) => vec![reply],
-        Err(e) => vec![
-            json!({
-                "type": frame_type,
-                "session": session,
-                "ok": false,
-                "message": format!("{e:#}"),
-            })
-            .to_string(),
-        ],
+        Err(e) => vec![json!({
+            "type": frame_type,
+            "session": session,
+            "ok": false,
+            "message": format!("{e:#}"),
+        })
+        .to_string()],
     }
 }
 
-async fn dispatch(
-    grip: &Arc<Grip>,
-    frame_type: &str,
-    session: &str,
-    terminal: &str,
-) -> Result<String> {
+async fn dispatch(grip: &Arc<Grip>, frame_type: &str, session: &str) -> Result<String> {
     let Role::Gateway(router) = &grip.role else {
         anyhow::bail!("debug frames are a gateway concern");
     };
@@ -92,8 +74,8 @@ async fn dispatch(
                 })
                 .to_string());
             };
-            let captured: Value =
-                serde_json::from_str(&text).context("the stored request is not readable")?;
+            let captured: Value = serde_json::from_str(&text)
+                .context("the stored request is not readable")?;
             let reply = json!({
                 "type": "debug-request",
                 "session": session,
@@ -111,96 +93,18 @@ async fn dispatch(
         }
 
         // Stop the running turn. Politely a no-op when nothing is running.
-        //
-        // Deliberately never spawns a worker: a session with no live worker has
-        // no turn to stop, so materializing one to tell it to do nothing would
-        // be both slow and pointless.
         "turn-cancel" => {
             let Some(peer) = router.live_peer(session).await else {
                 return Ok(json!({
                     "type": "turn-cancel",
                     "session": session,
                     "ok": true,
-                    "stopped": false,
                     "message": "nothing running",
                 })
                 .to_string());
             };
-            // The worker sets its stop flag synchronously before replying, so
-            // by the time this returns the interruption is already visible to
-            // every host call that conversation has in flight.
-            let reply = peer.call("cancel", json!({ "session": session })).await?;
-            let stopped = reply
-                .get("stopped")
-                .and_then(Value::as_bool)
-                // An older worker answers `null`; it did do the cancel.
-                .unwrap_or(true);
-            Ok(json!({
-                "type": "turn-cancel",
-                "session": session,
-                "ok": true,
-                "stopped": stopped,
-            })
-            .to_string())
-        }
-
-        // The shells this conversation's sandbox is holding, each with its
-        // transcript, so a tab that has just connected can draw them without
-        // waiting for the next line of output.
-        //
-        // Never materializes a worker: a conversation with none has no shells
-        // by definition, and the honest answer is the empty list.
-        "terminals" => {
-            let Some(peer) = router.live_peer(session).await else {
-                return Ok(json!({
-                    "type": "terminals",
-                    "session": session,
-                    "ok": true,
-                    "terminals": [],
-                })
-                .to_string());
-            };
-            let reply = peer
-                .call("terminals.list", json!({ "session": session }))
-                .await?;
-            Ok(json!({
-                "type": "terminals",
-                "session": session,
-                "ok": true,
-                "terminals": reply.get("terminals").cloned().unwrap_or(json!([])),
-            })
-            .to_string())
-        }
-
-        // Closing one shell from the drawer's trash button.
-        //
-        // Like `terminals`, this never materializes a worker: with none live
-        // there is no shell to close, and spawning one in order to kill nothing
-        // would be a surprising side effect of a delete button.
-        "terminal-close" => {
-            anyhow::ensure!(!terminal.is_empty(), "missing 'terminal'");
-            let id = terminal;
-            let Some(peer) = router.live_peer(session).await else {
-                return Ok(json!({
-                    "type": "terminal-close",
-                    "session": session,
-                    "ok": true,
-                    "id": id,
-                    "note": "that sandbox is not running, so it holds no shells",
-                })
-                .to_string());
-            };
-            let reply = peer
-                .call("terminals.close", json!({ "session": session, "id": id }))
-                .await?;
-            Ok(json!({
-                "type": "terminal-close",
-                "session": session,
-                "ok": reply.get("ok").and_then(|v| v.as_bool()).unwrap_or(true),
-                "id": id,
-                "note": reply.get("note").cloned().unwrap_or(json!(null)),
-            })
-            .to_string())
+            peer.call("cancel", json!({ "session": session })).await?;
+            Ok(json!({ "type": "turn-cancel", "session": session, "ok": true }).to_string())
         }
 
         other => anyhow::bail!("unknown frame type: {other}"),

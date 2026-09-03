@@ -66,7 +66,7 @@ self-served.
 | Space | `--gap-1` 4 · `--gap-2` 8 · `--gap-3` 12 · `--gap-4` 16 · `--gap-5` 24 · `--gap-6` 32 |
 | Shadow | `--shadow-sm` · `--shadow-md` · `--shadow-lg` — floating layers only |
 | Motion | `--ease` `cubic-bezier(.2,.7,.3,1)` · `--fast` 110ms · `--med` 180ms, both 0 under `prefers-reduced-motion` |
-| Layout | `--sidebar-w` 272px · `--measure` 48rem · `--avatar-lg` 44px · `--avatar-gutter` 56px |
+| Layout | `--sidebar-w` 272px · `--measure` 48rem |
 
 Radius by role: `--r-sm` for inputs and small chips, `--r-md` for cards, buttons
 and panels' inner blocks, `--r-lg` for a message bubble, `--r-xl` for the
@@ -80,80 +80,6 @@ composer, `--r-pill` for pills and the send button.
 | Panel | `min(360px, 42vw)`; `.is-wide` `min(620px, 46vw)` |
 | Under 1100px | Panel goes `position: fixed`, floats over the chat, strip stays |
 | Under 860px | Sidebar narrows to 210px, composer hint hides |
-
-### Turn avatars
-
-A `.turn-avatar` tile per turn — `--avatar-lg` (44px), `--r-md`, cropped
-`object-position: top center` — in a gutter **outside the text column**, not
-inside the byline. Squares, not portrait crops: squares line up down the
-transcript's edge and keep a face in frame whatever the source ratio.
-
-**There is a gutter on each side: the agent left, the user right**, and each
-byline aligns to its own side (`.row.user .row-head { justify-content: flex-end }`).
-Which margin holds a picture says whose turn it is before any text is read. It
-also fixes a defect of the one-sided version: with padding on the left only, the
-whole conversation sat off-centre in the window by half a gutter. Symmetric
-padding puts it back (`column_centred` true at every width measured).
-
-**How the gutters are made, and why this way.** `--avatar-gutter` is added to
-the *left and right padding of the scroll container*, and the tile is
-`position: absolute` into its side (`right: calc(100% + var(--gap-3))` against a
-`position: relative` row; the user's overrides with `right: auto` and a matching
-`left`). Setting `left` without clearing `right` stretches the tile across the
-entire row, since both would apply.
-Every centred child of the transcript is `max-width: --measure; margin: 0 auto`,
-so shrinking the content box moves all of them together — rows, tool cards,
-meta lines, ask forms, the compaction card — with no per-element change. Seven
-`max-width: var(--measure)` rules kept working untouched. `.composer-wrap` takes
-the same left padding so the composer stays on the text's axis.
-
-Two things this gets right that are easy to get wrong:
-
-- **Padding, not margin.** Margin is slack that vanishes as the window narrows,
-  and an avatar positioned into vanished slack lands on the sidebar or the rail.
-  Reserved padding shrinks the text column instead — recoverable, and it never
-  overlaps. Verified with a rail panel docked at 1440px (`main_w` 764, both
-  gutters still 80px, `clear_of_panel` and `clear_of_sidebar` true) and down to
-  760px, nothing overflowing at any width.
-- **Out of flow, so the byline is untouched.** The tile is a child of the row,
-  not of `.row-head`, so the name still starts at the text column's left edge
-  (`head_starts_at_row` true) whether or not a face is present.
-
-At ≤860px both tokens shrink together (30px tile, 42px gutter) rather than the
-gutter being dropped — dropping it would leave the absolutely-positioned tile
-outside the row, over the sidebar. Keep `--avatar-gutter` ≥ avatar + `--gap-3`
-for the same reason.
-
-Three rows are built outside the normal `row()` path and each needs the tile
-adding by hand: the optimistic "sending" row in `showPending`, and the streaming
-row, which must keep its avatar when the final message replaces the streamed
-text. All three are worth re-checking after any change here — measured: one tile
-each, 12px gap, correct side, `showing: ["img"]` through the delta→final swap.
-
-**Measuring alignment: do not measure the flex container.** `.row-head` is a
-full-width flex row, so its rect spans the whole column whatever
-`justify-content` does — asserting on it reported *both* `head_at_left` and
-`head_at_right` true and would have passed a completely unaligned byline. Select
-the text node and measure a `Range` over it instead. And when the head holds more
-than a name — the pending row appends a "sending" flag — it is the *last* child
-that touches the right edge, so assert on the flag's box and merely that the name
-is inboard of it, not that the name itself is flush.
-
-Both roles come from `<template>` elements in `index.html`, cloned per row, so
-the markup for a face lives in one place rather than in each renderer.
-
-**The two sources differ, and that asymmetry is the whole design.** The agent's
-is `agent.avatar` from config, substituted into its template at serve time, so
-it is right on the first paint. Yours lives in the host KV store and arrives on
-a `user-avatar` frame *after* rows are on screen — so `draw()` repaints every
-`.turn-avatar.is-user` already in the DOM as well as recording the value for
-tiles minted later. Without that, an upload appears only on subsequent turns and
-a replayed transcript keeps the blank mark. Verified: a row rendered before the
-upload picked it up, `user_showing_both: 0`, and a row rendered afterwards came
-out already filled.
-
-A role with no face (a system note, a tool row) gets no tile rather than an empty
-square: `turnAvatar()` returns null and `el()` skips it.
 
 ## Component markup
 
@@ -284,53 +210,9 @@ kept — a wall of stale ones is worse than losing the oldest.
 
 `renderMarkdown(text)` returns block nodes: paragraphs, `###` headings, fenced
 code with a language strip and a copy button, inline code, bold, italic, http
-links, flat lists, blockquotes, rules, GFM pipe tables. Anything else falls
-through as text. Streaming stays plain text and is replaced by rendered markdown
-when the final `assistant` frame arrives, so a mid-stream reconnect still lands
-right.
-
-**Tables** handle two forms. The ordinary multi-line one, and the *collapsed*
-one-liner — `| a | b | |---|---| | 1 | 2 |` — which arrives when something has
-eaten the newlines, and which models emit often enough to matter. The collapsed
-form is genuinely ambiguous: `| |` is both an empty leading cell and a row
-boundary. It is resolved by counting cells against the header width
-(`chunkRows`), never by guessing. A table needs **two or more** delimiter cells
-to be recognised, so a sentence containing a pipe and a dash stays a paragraph.
-Wrap in `.md-table-wrap`, which scrolls: a nine-column table is wider than
-`--measure` and must not stretch the text column.
-
-### `lib/mermaid.js`
-
-A ```` ```mermaid ```` fence renders as a diagram. **The second approved
-exception to "no dependencies"**, after xterm — mermaid 11.17.2 is vendored at
-`ui/vendor/mermaid.js`, self-served, so the UI still reaches only its own origin.
-The operator chose vendoring over a CDN and the full library over a
-flowchart-only subset; do not relitigate either.
-
-Four things hold this together, and none is decorative:
-
-- **It is 3.5 MB, so it loads lazily** — a classic script tag on the first
-  mermaid fence, never on the startup path. Verified: a full page load fetches
-  only the 9 KB module. It is an IIFE assigning `globalThis.mermaid`, so
-  `import` would parse it and define nothing, exactly as with xterm. Build the
-  URL relative to `import.meta.url` or it 404s under `/preview/`.
-- **Rendered SVG is cached by source.** `renderMarkdown` re-runs on every
-  streaming delta, so without this a finished diagram is redrawn dozens of times
-  and flickers as the text after it arrives.
-- **The fallback is the code block**, with the source and its copy button, plus
-  a `--warn`-tinted note. The reader is never worse off than before diagrams
-  existed. This is also why the load has a **timeout**: if neither `load` nor
-  `error` fires, the promise never settles and the source is stranded behind
-  "drawing diagram…" for ever. Only a rejection surfaces the code block.
-- **It is the one place model-derived content becomes `innerHTML`**, because
-  mermaid's output *is* an SVG string. `securityLevel: "strict"` (its bundled
-  DOMPurify), `htmlLabels: false` (SVG `<text>`, no `foreignObject`), and
-  parse-before-render keep that honest. Do not remove any of the three.
-  Verified with script tags, `onerror` attributes and `javascript:` click
-  hrefs in node labels: nothing executed, against a control that did.
-
-Theme comes from `theme.css` via `getComputedStyle`, since mermaid needs
-resolved colour strings and cannot read a custom property itself.
+links, flat lists, blockquotes, rules. Anything else falls through as text.
+Streaming stays plain text and is replaced by rendered markdown when the final
+`assistant` frame arrives, so a mid-stream reconnect still lands right.
 
 ## File map
 

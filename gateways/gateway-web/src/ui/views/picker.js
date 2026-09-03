@@ -2,14 +2,6 @@
  *
  * Generic on purpose: give it options and a change handler and it renders a
  * pill with a menu. New selectors (temperature, persona, …) reuse it as-is.
- *
- * The menu opens *upward* by default, because every picker there was when this
- * was written sits in the composer at the foot of the screen. A picker in a bar
- * at the top of a pane needs the opposite, and gets it with `drop: "down"` —
- * without that the menu is drawn off the top of the viewport and none of its
- * options can be clicked. Opt-in rather than measured: which way a menu opens is
- * a property of where the pill lives, and the caller knows that without a
- * layout read.
  */
 
 import { clear, el, icon, onClickOutside } from "../lib/dom.js";
@@ -25,7 +17,6 @@ export class Picker {
    * @param {(id: string) => void} config.onSelect
    * @param {(selected) => string} config.render  text shown on the pill
    * @param {(selected) => string} [config.dotClass]  extra class for the dot
-   * @param {"up"|"down"} [config.drop]  which way the menu opens; up by default
    */
   constructor(mount, config) {
     this.mount = mount;
@@ -82,8 +73,7 @@ export class Picker {
       )
     );
 
-    const down = this.config.drop === "down";
-    return el("div", { class: `picker-menu${down ? " drops-down" : ""}`, role: "listbox" }, items);
+    return el("div", { class: "picker-menu", role: "listbox" }, items);
   }
 
   toggle() {

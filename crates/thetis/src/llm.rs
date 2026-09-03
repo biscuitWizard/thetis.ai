@@ -1,23 +1,15 @@
-//! The chat-completions client.
+//! OpenRouter client.
 //!
-//! The host owns the socket and the API keys; guests pass request JSON in and
+//! The host owns the socket and the API key; guests pass request JSON in and
 //! pull typed chunks out. Partial tool-call deltas are reassembled here so the
 //! agent only ever sees complete tool calls.
-//!
-//! Any number of OpenAI-compatible endpoints can be configured — OpenRouter, a
-//! local llama.cpp server, anything of that shape. The request's `model` field
-//! decides which one serves it (see `Config::resolve_model`), and the field is
-//! rewritten to that provider's own name for the model before the request goes
-//! out. Everything downstream of `send` is provider-agnostic: the wire format
-//! is the same, so only the URL, the auth header and the attribution headers
-//! differ.
 
 use anyhow::Result;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::bindings::types::{FinishInfo, LlmError, StreamChunk, TokenUsage, ToolCall};
@@ -32,38 +24,6 @@ pub struct LlmClient {
     /// UI's inspector. One aspect suffices: a worker serves a single session,
     /// and the durable copy is the one in the store.
     last_request: std::sync::Mutex<Option<StoredRequest>>,
-    /// Rotates over a provider's replicas. Shared by every request this client
-    /// makes, so successive calls land on different endpoints instead of each
-    /// starting at the first one.
-    next_replica: std::sync::atomic::AtomicUsize,
-    /// Where retry notices go, once someone is listening.
-    ///
-    /// The client cannot reach the store — the grip owns both, and the
-    /// dependency runs that way round — so it announces instead of writing.
-    /// Set once at startup by whoever wants the notices; unset in tests and in
-    /// the gateway, where nothing would read them.
-    retries: std::sync::OnceLock<mpsc::UnboundedSender<RetryNotice>>,
-}
-
-/// One failed attempt at a completion, announced as it is retried.
-///
-/// Exists because a stalled provider is invisible: the read timeout is a
-/// silence, the retry is a silence, and four of them in a row is twelve
-/// minutes in which a turn looks identical to a hung one. Whoever holds a
-/// session log turns these into something the person watching can read.
-#[derive(Debug, Clone)]
-pub struct RetryNotice {
-    /// The conversation the request belonged to, empty when untagged.
-    pub session: String,
-    /// Which attempt just failed, counted from 1. The log counts from 0; a
-    /// person reading a conversation does not.
-    pub attempt: u32,
-    /// How many attempts there will be in total, retries included.
-    pub attempts: u32,
-    /// How long the attempt ran before it gave up.
-    pub elapsed: Duration,
-    /// Why it failed, as the transport described it.
-    pub error: String,
 }
 
 /// A prepared request, as sent, with when it was sent.
@@ -111,120 +71,51 @@ impl StreamHandle {
     }
 }
 
-/// What a failed attempt should be called, in a few words.
-///
-/// A read timeout is the case worth naming outright: it is what a provider
-/// that accepted the request and then went quiet looks like from here, and it
-/// is indistinguishable from every other transport failure unless something
-/// says so.
-fn describe_attempt(result: &Result<reqwest::Response, reqwest::Error>) -> String {
-    match result {
-        Ok(resp) => format!("http {}", resp.status().as_u16()),
-        Err(e) if e.is_timeout() => {
-            format!("no response within the read timeout ({e})")
-        }
-        Err(e) if e.is_connect() => format!("could not connect ({e})"),
-        Err(e) => e.to_string(),
-    }
-}
-
 impl LlmClient {
     pub fn new(cfg: Arc<Config>) -> Result<Self> {
-        // `read_timeout`, not `timeout`. reqwest's `timeout` is a *total*
-        // deadline: it runs from connect until the body has finished. For a
-        // streaming completion the body only finishes when generation does, so
-        // a total deadline caps the whole answer — and a slow reasoning model
-        // that legitimately streams for longer than the limit has its
-        // connection cut mid-body, surfacing as the singularly unhelpful
-        // "error decoding response body".
-        //
-        // A read timeout instead bounds the gap *between* reads and resets on
-        // each one. That is the thing actually worth detecting — a server that
-        // has stopped talking — and it lets a slow-but-alive stream run as long
-        // as it keeps producing. Non-streaming callers restore a total deadline
-        // per request, where it is the correct shape.
         let http = reqwest::Client::builder()
-            .read_timeout(cfg.request_timeout)
+            .timeout(cfg.request_timeout)
             .build()?;
         Ok(Self {
             http,
             cfg,
             last_request: std::sync::Mutex::new(None),
-            next_replica: std::sync::atomic::AtomicUsize::new(0),
-            retries: std::sync::OnceLock::new(),
         })
-    }
-
-    /// Starts announcing retries to `tx`. The first caller wins; later ones are
-    /// ignored, so a second subscriber cannot silently displace the first.
-    pub fn on_retry(&self, tx: mpsc::UnboundedSender<RetryNotice>) {
-        let _ = self.retries.set(tx);
     }
 
     /// The most recent streaming request body, for the caller to persist.
     pub fn last_request(&self) -> Option<StoredRequest> {
-        self.last_request
-            .lock()
-            .ok()
-            .and_then(|aspect| aspect.clone())
+        self.last_request.lock().ok().and_then(|aspect| aspect.clone())
     }
 
-    /// Applies grip defaults to a guest-supplied request body, and works out
-    /// which provider is to serve it.
-    ///
-    /// The returned provider id is resolved from the request's `model` before
-    /// the field is rewritten, because the id the picker uses and the name the
-    /// endpoint knows the model by need not be the same.
-    fn prepare_body(
-        &self,
-        request_json: &str,
-        stream: bool,
-    ) -> Result<(serde_json::Value, String), LlmError> {
-        self.prepare_body_for(request_json, stream, None)
+    fn api_key(&self) -> Result<&str, LlmError> {
+        self.cfg
+            .openrouter_api_key
+            .as_ref()
+            .map(|key| key.expose())
+            .ok_or_else(|| {
+                LlmError::Auth(
+                    "no API key: set llm.api_key in thetis.toml, or OPENROUTER_API_KEY in the environment"
+                        .into(),
+                )
+            })
     }
 
-    /// As [`Self::prepare_body`], but tagged with the conversation it belongs
-    /// to so the provider can keep it on one warm cache.
-    fn prepare_body_for(
-        &self,
-        request_json: &str,
-        stream: bool,
-        session: Option<&str>,
-    ) -> Result<(serde_json::Value, String), LlmError> {
+    /// Applies grip defaults to a guest-supplied request body.
+    fn prepare_body(&self, request_json: &str, stream: bool) -> Result<serde_json::Value, LlmError> {
         let mut body: serde_json::Value = serde_json::from_str(request_json)
             .map_err(|e| LlmError::BadRequest(format!("request is not valid JSON: {e}")))?;
 
         // Scoped so the borrow ends before caching walks the same value.
-        let (model, provider_id) = {
+        let model = {
             let obj = body
                 .as_object_mut()
                 .ok_or_else(|| LlmError::BadRequest("request must be a JSON object".into()))?;
 
-            let requested = obj
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .filter(|m| !m.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| self.cfg.model.clone());
-
-            let resolved = self.cfg.resolve_model(&requested);
-            let provider_id = resolved.provider.id.clone();
-
-            obj.insert("model".into(), resolved.wire_model.clone().into());
-            obj.insert("stream".into(), stream.into());
-
-            // Sticky routing. OpenRouter fronts several replicas of a given
-            // model, and a prompt cache lives on *one* of them. Without a
-            // stable key it pins a conversation only after a first cache hit,
-            // so the early turns scatter across replicas and every one of them
-            // misses cold. Naming the conversation makes turn two land on the
-            // machine that holds turn one's cache.
-            if let Some(session) = session.filter(|s| !s.is_empty()) {
-                obj.entry("user")
-                    .or_insert_with(|| format!("thetis:{session}").into());
-                obj.entry("session_id")
-                    .or_insert_with(|| session.to_string().into());
+            if !obj.contains_key("model") {
+                obj.insert("model".into(), self.cfg.model.clone().into());
             }
+            obj.insert("stream".into(), stream.into());
             if stream {
                 // Ask for a usage record on the final chunk, which is also the
                 // only place cache hits are reported.
@@ -234,12 +125,10 @@ impl LlmClient {
                 );
             }
 
-            // Caching is decided on the *requested* id, not the wire name. The
-            // id is the vendor-namespaced one, and the vendor is what says
-            // whether breakpoints help — a direct Anthropic-compatible endpoint
-            // sending a bare `claude-...` still wants them, and a local server
-            // sending a bare model name still does not.
-            (requested, provider_id)
+            obj.get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
         };
 
         let repaired = normalize_system_roles(&mut body);
@@ -261,21 +150,6 @@ impl LlmClient {
             );
         }
 
-        let orphans = answer_orphaned_tool_calls(&mut body);
-        if orphans > 0 {
-            tracing::warn!(
-                count = orphans,
-                "answered tool calls the log left unresolved; a turn was interrupted \
-                 between a call and its result, and a request carrying one is not merely \
-                 rejected — the provider accepts it and never replies"
-            );
-        }
-
-        // Only the private marker goes. The prefix is deliberately left
-        // append-only: mutating it mid-array is what used to invalidate the
-        // prompt cache on every turn a tool failed. See `strip_private_markers`.
-        strip_private_markers(&mut body);
-
         // Last, and only once the model is settled: which provider is about to
         // serve this decides whether breakpoints help or merely cost writes.
         let marked = crate::cache::apply(&mut body, &model, &self.cfg.cache);
@@ -283,89 +157,27 @@ impl LlmClient {
             tracing::debug!(%model, breakpoints = marked, "prompt cache breakpoints applied");
         }
 
-        Ok((body, provider_id))
+        Ok(body)
     }
 
     async fn send(
         &self,
         body: &serde_json::Value,
-        provider_id: &str,
-        streaming: bool,
     ) -> Result<reqwest::Response, LlmError> {
-        self.send_for(body, provider_id, streaming, None).await
-    }
-
-    /// As [`Self::send`], but keeps one conversation on one replica.
-    async fn send_for(
-        &self,
-        body: &serde_json::Value,
-        provider_id: &str,
-        streaming: bool,
-        session: Option<&str>,
-    ) -> Result<reqwest::Response, LlmError> {
-        let provider = self
-            .cfg
-            .provider(provider_id)
-            .unwrap_or_else(|| self.cfg.fallback_provider());
-        // Which replica serves this. A rotating counter spreads load evenly,
-        // which is right for throughput and wrong for caching: the prompt cache
-        // is per-endpoint, so a conversation that rotates pays a full cache
-        // write on every turn. Hashing the session id instead pins one
-        // conversation to one endpoint — still spread across conversations,
-        // because different ids hash differently, but stable within one. The
-        // retry path below keeps stepping to the next replica, so a dead
-        // endpoint is still escaped.
-        let slot = match session.filter(|s| !s.is_empty()) {
-            Some(session) => {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                session.hash(&mut hasher);
-                hasher.finish() as usize
-            }
-            None => self
-                .next_replica
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        };
-
-        // A local server usually has no key, and an empty bearer token is
-        // worse than none: some endpoints reject it outright. OpenRouter, by
-        // contrast, cannot serve anything without one, so say so early rather
-        // than letting it come back as an opaque 401.
-        if provider.api_key.is_none() && provider.is_openrouter() {
-            return Err(LlmError::Auth(
-                "no API key: set llm.api_key in thetis.toml, or OPENROUTER_API_KEY in the environment"
-                    .into(),
-            ));
-        }
+        let url = format!("{}/chat/completions", self.cfg.openrouter_base);
+        let key = self.api_key()?;
 
         let mut attempt = 0;
         loop {
-            // Each retry advances to the next replica, so a single dead or
-            // overloaded endpoint is stepped over rather than hammered. With
-            // one endpoint this is the old behaviour exactly.
-            let url = provider.url_for("chat/completions", slot + attempt as usize);
-
-            let mut req = self.http.post(&url);
-            if !streaming {
-                // A non-streaming call has a bounded body, so a total deadline
-                // is meaningful and is what the setting has always meant.
-                req = req.timeout(self.cfg.request_timeout);
-            }
-            if let Some(key) = &provider.api_key {
-                req = req.bearer_auth(key.expose());
-            }
-            if provider.is_openrouter() {
-                req = req
-                    .header("HTTP-Referer", "https://github.com/thetis")
-                    .header("X-Title", "Thetis");
-            }
-            for (name, value) in &provider.headers {
-                req = req.header(name.as_str(), value.as_str());
-            }
-
-            let started = Instant::now();
-            let result = req.json(body).send().await;
-            let elapsed = started.elapsed();
+            let result = self
+                .http
+                .post(&url)
+                .bearer_auth(key)
+                .header("HTTP-Referer", "https://github.com/thetis")
+                .header("X-Title", "Thetis")
+                .json(body)
+                .send()
+                .await;
 
             let retryable = match &result {
                 Ok(resp) => {
@@ -378,32 +190,7 @@ impl LlmClient {
             if retryable && attempt < self.cfg.max_retries {
                 // Exponential backoff with a little jitter from the attempt index.
                 let delay = Duration::from_millis(400 * (1 << attempt) + (attempt as u64 * 37));
-                // What actually went wrong, which this line used to omit
-                // entirely: four identical warnings could be a dead socket, a
-                // 503 or a provider that accepted the request and never
-                // answered, and the log could not tell you which.
-                let why = describe_attempt(&result);
-                tracing::warn!(
-                    attempt,
-                    ?delay,
-                    elapsed_s = elapsed.as_secs(),
-                    provider = %provider.id,
-                    %url,
-                    replicas = provider.replicas(),
-                    error = %why,
-                    "llm request failed, retrying"
-                );
-                if let Some(tx) = self.retries.get() {
-                    let _ = tx.send(RetryNotice {
-                        session: session.unwrap_or_default().to_string(),
-                        // The log counts attempts from zero; a person reading a
-                        // conversation counts from one.
-                        attempt: attempt + 1,
-                        attempts: self.cfg.max_retries + 1,
-                        elapsed,
-                        error: why,
-                    });
-                }
+                tracing::warn!(attempt, ?delay, "llm request failed, retrying");
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 continue;
@@ -417,10 +204,6 @@ impl LlmClient {
 
             let detail = resp.text().await.unwrap_or_default();
             let detail = detail.chars().take(600).collect::<String>();
-            // Which endpoint refused matters as soon as there is more than
-            // one: "404 model not found" reads very differently against a
-            // local server than against OpenRouter.
-            let detail = format!("[{}] {detail}", provider.id);
             return Err(match status.as_u16() {
                 401 | 403 => LlmError::Auth(detail),
                 429 => LlmError::RateLimited(detail),
@@ -432,18 +215,8 @@ impl LlmClient {
 
     /// Non-streaming completion; returns the raw provider JSON.
     pub async fn chat(&self, request_json: &str) -> Result<String, LlmError> {
-        self.chat_for(request_json, None).await
-    }
-
-    /// As [`Self::chat`], tagged with the conversation. Compaction's summary
-    /// calls go through here, and they share the session's prefix.
-    pub async fn chat_for(
-        &self,
-        request_json: &str,
-        session: Option<&str>,
-    ) -> Result<String, LlmError> {
-        let (body, provider) = self.prepare_body_for(request_json, false, session)?;
-        let resp = self.send_for(&body, &provider, false, session).await?;
+        let body = self.prepare_body(request_json, false)?;
+        let resp = self.send(&body).await?;
         resp.text()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))
@@ -452,17 +225,7 @@ impl LlmClient {
     /// Opens a streaming completion. Chunks are pumped into the returned handle
     /// by a background task.
     pub async fn open_stream(&self, request_json: &str) -> Result<StreamHandle, LlmError> {
-        self.open_stream_for(request_json, None).await
-    }
-
-    /// As [`Self::open_stream`], tagged with the conversation so successive
-    /// turns reuse one provider's warm prompt cache.
-    pub async fn open_stream_for(
-        &self,
-        request_json: &str,
-        session: Option<&str>,
-    ) -> Result<StreamHandle, LlmError> {
-        let (body, provider) = self.prepare_body_for(request_json, true, session)?;
+        let body = self.prepare_body(request_json, true)?;
         // Streaming requests are the turns themselves (compaction goes through
         // `chat`), so this is the one the inspector wants.
         let body = Arc::new(body);
@@ -475,7 +238,7 @@ impl LlmClient {
                 body: body.clone(),
             });
         }
-        let resp = self.send_for(&body, &provider, true, session).await?;
+        let resp = self.send(&body).await?;
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
@@ -489,11 +252,7 @@ impl LlmClient {
                         }
                     }
                     Err(e) => {
-                        // Mid-body failure. `describe_reqwest` because
-                        // reqwest's own Display for a decode error is just
-                        // "error decoding response body", which says nothing
-                        // about the cause.
-                        pump.abort(LlmError::Transport(describe_reqwest(&e))).await;
+                        let _ = pump.send(Err(LlmError::Transport(e.to_string()))).await;
                         return;
                     }
                 }
@@ -501,55 +260,7 @@ impl LlmClient {
             pump.finish().await;
         });
 
-        Ok(StreamHandle {
-            rx,
-            finished: false,
-        })
-    }
-}
-
-/// A reqwest error as something a person can act on.
-///
-/// `reqwest::Error`'s own `Display` is frequently a dead end — a broken stream
-/// renders as bare "error decoding response body", with the actual cause (a
-/// closed connection, a read timeout, an upstream reset) hidden in the source
-/// chain. Walk the chain and append what it says, and classify the shapes worth
-/// naming outright.
-fn describe_reqwest(e: &reqwest::Error) -> String {
-    let mut parts = vec![e.to_string()];
-
-    if e.is_timeout() {
-        // With `read_timeout` this means the server stopped sending, not that
-        // the answer was too long, so say which knob is relevant.
-        parts.push(
-            "the server stopped sending data (read timeout; see llm.request_timeout_secs)".into(),
-        );
-    }
-    if e.is_body() {
-        parts.push("the response body ended early".into());
-    }
-
-    let mut source = std::error::Error::source(e);
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if !text.is_empty() && !parts.iter().any(|p| p == &text) {
-            parts.push(text);
-        }
-        source = std::error::Error::source(cause);
-    }
-
-    parts.join(": ")
-}
-
-/// The message inside an `LlmError`, for logging.
-fn describe(e: &LlmError) -> &str {
-    match e {
-        LlmError::Auth(m)
-        | LlmError::RateLimited(m)
-        | LlmError::BadRequest(m)
-        | LlmError::ModelError(m)
-        | LlmError::Budget(m)
-        | LlmError::Transport(m) => m,
+        Ok(StreamHandle { rx, finished: false })
     }
 }
 
@@ -571,10 +282,6 @@ struct SsePump {
     model: String,
     finish_reason: String,
     done: bool,
-    /// Whether any answer text has been handed to the consumer. Reasoning does
-    /// not count: it is never part of the persisted message, so a stream that
-    /// broke during the thinking phase has produced nothing to salvage.
-    streamed_text: bool,
 }
 
 impl SsePump {
@@ -587,53 +294,11 @@ impl SsePump {
             model: String::new(),
             finish_reason: String::new(),
             done: false,
-            streamed_text: false,
         }
     }
 
     async fn send(&self, item: Result<StreamChunk, LlmError>) -> bool {
         self.tx.send(item).await.is_ok()
-    }
-
-    /// Whether anything usable has arrived: text already streamed to the user,
-    /// or tool calls accumulated.
-    fn has_partial_work(&self) -> bool {
-        self.streamed_text || !self.tool_calls.is_empty()
-    }
-
-    /// Ends a stream that broke part-way through.
-    ///
-    /// A transport failure after some of the answer has arrived is not the same
-    /// as a failure to get an answer at all. The user has already watched text
-    /// appear, and a bare `Err` throws it away and fails the turn — which is
-    /// what "transport error: error decoding response body" looked like from
-    /// the outside.
-    ///
-    /// So when there is partial work, close the stream as `finished` with an
-    /// explicit reason instead. The agent keeps what it has, the transcript
-    /// stays true, and any tool calls that did complete still run. When there
-    /// is nothing to salvage, the error is the whole story and is passed
-    /// through unchanged.
-    async fn abort(&mut self, err: LlmError) {
-        if !self.has_partial_work() {
-            let _ = self.send(Err(err)).await;
-            return;
-        }
-        tracing::warn!(
-            error = %describe(&err),
-            streamed_text = self.streamed_text,
-            tool_calls = self.tool_calls.len(),
-            "completion stream broke mid-body; keeping what arrived"
-        );
-        // A truncated tool call is worse than none: half-parsed arguments
-        // would be dispatched as if complete. Only keep calls whose arguments
-        // are valid JSON on their own.
-        self.tool_calls.retain(|_, acc| {
-            acc.arguments.trim().is_empty()
-                || serde_json::from_str::<serde_json::Value>(&acc.arguments).is_ok()
-        });
-        self.finish_reason = "error".to_string();
-        self.finish().await;
     }
 
     /// Returns false when the consumer has gone away.
@@ -706,20 +371,7 @@ impl SsePump {
 
         if let Some(delta) = choice.delta {
             if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
-                self.streamed_text = true;
                 if !self.send(Ok(StreamChunk::Delta(content))).await {
-                    return false;
-                }
-            }
-            // Reasoning models send their thinking here. Two spellings are in
-            // the wild: `reasoning_content` (DeepSeek, llama.cpp) and
-            // `reasoning` (OpenRouter's normalization). Take whichever came.
-            if let Some(thought) = delta
-                .reasoning_content
-                .or(delta.reasoning)
-                .filter(|c| !c.is_empty())
-            {
-                if !self.send(Ok(StreamChunk::Reasoning(thought))).await {
                     return false;
                 }
             }
@@ -821,12 +473,6 @@ struct SseChoice {
 struct SseDelta {
     #[serde(default)]
     content: Option<String>,
-    /// DeepSeek and llama.cpp spell it this way.
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    /// OpenRouter normalizes it to this.
-    #[serde(default)]
-    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<SseToolCall>>,
 }
@@ -952,566 +598,9 @@ fn dedupe_tool_results(body: &mut serde_json::Value) -> usize {
     before - messages.len()
 }
 
-/// What an interrupted call is told, when nothing else ever told it.
-const ORPHANED_CALL_RESULT: &str =
-    "Interrupted: this call never returned, because Thetis restarted while it was running. \
-     Run it again if the result still matters.";
-
-/// Gives every `tool_call` without a result one, returning how many it wrote.
-///
-/// The mirror of [`dedupe_tool_results`], and the more dangerous half. A tool
-/// call with *two* results is rejected with a 400 you can read; a tool call
-/// with *none* is accepted by OpenRouter and then never answered at all — the
-/// request is fully sent and acked, and not one byte comes back. Thetis sees a
-/// read timeout, retries the identical body three more times, and twelve
-/// minutes later fails the turn with "transport error". Nothing in that says
-/// what is wrong, and it repeats on every turn, forever, because the flaw is in
-/// the stored log rather than in anything the turn does.
-///
-/// One conversation reached that state exactly as you would expect: a kernel
-/// rebuild restarted the worker between a `wait` call and its result, the
-/// interrupted-turn repair that exists to synthesize the missing result was
-/// skipped, and the next user message landed straight after the unanswered
-/// call. Both of those are fixed at their sources. This is here because the
-/// cost of the shape reaching a provider is so far out of proportion to the
-/// mistake that makes it — and because no fix upstream can repair the logs
-/// already written.
-///
-/// The result is inserted immediately after the assistant message that made
-/// the call, which is the only position the schema allows.
-fn answer_orphaned_tool_calls(body: &mut serde_json::Value) -> usize {
-    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return 0;
-    };
-
-    let answered: std::collections::HashSet<String> = messages
-        .iter()
-        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
-        .filter_map(|m| m.get("tool_call_id").and_then(serde_json::Value::as_str))
-        .map(str::to_string)
-        .collect();
-
-    // Right to left, so an insertion never moves an index still to be visited.
-    let mut written = 0;
-    for i in (0..messages.len()).rev() {
-        if messages[i].get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let missing: Vec<String> = messages[i]
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .map(|calls| {
-                calls
-                    .iter()
-                    .filter_map(|c| c.get("id").and_then(serde_json::Value::as_str))
-                    .filter(|id| !answered.contains(*id))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for id in missing.into_iter().rev() {
-            messages.insert(
-                i + 1,
-                serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": ORPHANED_CALL_RESULT,
-                }),
-            );
-            written += 1;
-        }
-    }
-    written
-}
-
-/// Strips the host-only `thetis_tool_ok` marker, which the guest sets on every
-/// tool result and no provider must ever see.
-///
-/// Returns how many markers were removed.
-///
-/// # Why this no longer trims failed tool rounds
-///
-/// It used to. The guest annotates failures so that old, low-value failed
-/// call/result pairs could be dropped here, before cache breakpoints were
-/// chosen, to save context. That was a net *loss*, for two compounding reasons.
-///
-/// Prompt caching is a pure prefix match: a single changed byte invalidates
-/// every cache entry from that point on. The old rule preserved only the
-/// *newest* failed pair — and "newest" moves. The turn after a new failure
-/// arrived, the previously-protected pair was suddenly eligible and vanished
-/// from the *middle* of the prefix, invalidating the whole suffix and forcing it
-/// to be re-written at Anthropic's 1.25x cache-write premium. Tool failures are
-/// routine in an agentic loop, so this fired continually.
-///
-/// Removal also shifted every later index, and `cache::breakpoint_positions`
-/// places its anchors positionally. The anchors that exist precisely to stay
-/// valid across the 20-block lookback were themselves knocked off their marks.
-///
-/// The arithmetic is decisive. A cached token reads at roughly 0.1x the input
-/// price, so keeping a stale failed result costs 0.1x in perpetuity; evicting it
-/// forces a re-write at 1.25x. Trimming to save context cost more than it saved
-/// on any conversation long enough for the saving to matter.
-///
-/// So the message prefix is now append-only, which is the property caching
-/// rewards. Shedding context is compaction's job — it summarizes whole rounds
-/// and records the fact, rather than silently rewriting history under the cache.
-fn strip_private_markers(body: &mut serde_json::Value) -> usize {
-    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return 0;
-    };
-
-    let mut stripped = 0;
-    for message in messages.iter_mut() {
-        if let Some(obj) = message.as_object_mut() {
-            if obj.remove("thetis_tool_ok").is_some() {
-                stripped += 1;
-            }
-        }
-    }
-    stripped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A client with OpenRouter plus one local llama.cpp-style provider, which
-    /// is the arrangement the multi-provider support exists for.
-    fn two_provider_client() -> LlmClient {
-        let mut cfg = Config::load().expect("the shipped config loads");
-        cfg.model = "anthropic/claude-sonnet-4.5".into();
-        cfg.providers = vec![
-            crate::config::ProviderSpec {
-                id: "openrouter".into(),
-                label: "OpenRouter".into(),
-                base_urls: vec!["https://openrouter.ai/api/v1".into()],
-                api_key: Some(crate::config::Secret::new("sk-or-test")),
-                headers: Vec::new(),
-            },
-            crate::config::ProviderSpec {
-                id: "local".into(),
-                label: "llama.cpp".into(),
-                base_urls: vec!["http://127.0.0.1:8080/v1".into()],
-                api_key: None,
-                headers: Vec::new(),
-            },
-        ];
-        cfg.default_provider = "openrouter".into();
-        cfg.models = vec![crate::config::ModelSpec {
-            id: "local/qwen3".into(),
-            label: "Qwen3 (local)".into(),
-            provider: "local".into(),
-            wire_model: "qwen3-30b-a3b".into(),
-        }];
-        LlmClient::new(Arc::new(cfg)).expect("client builds")
-    }
-
-    /// A one-shot stand-in for a local llama.cpp server: accepts one request,
-    /// hands back the raw bytes it received, and replies with a minimal SSE
-    /// stream. Enough to prove which URL was hit, with which body, and with
-    /// which headers — the three things provider routing has to get right, and
-    /// the three things no unit test on `prepare_body` alone can show.
-    async fn stub_server() -> (String, tokio::task::JoinHandle<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut received = Vec::new();
-            let mut buf = [0u8; 4096];
-            // Read until the body is in hand. Content-Length is present, so
-            // the headers tell us when to stop.
-            loop {
-                let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
-                    .await
-                    .unwrap();
-                if n == 0 {
-                    break;
-                }
-                received.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&received);
-                if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                    let want: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            l.strip_prefix("content-length: ")
-                                .or_else(|| l.strip_prefix("Content-Length: "))
-                        })
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    if body.len() >= want {
-                        break;
-                    }
-                }
-            }
-            let response = "HTTP/1.1 200 OK\r\n\
-                            Content-Type: text/event-stream\r\n\
-                            Connection: close\r\n\r\n\
-                            data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
-                            data: [DONE]\n\n";
-            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
-                .await
-                .unwrap();
-            let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
-            String::from_utf8_lossy(&received).into_owned()
-        });
-        (format!("http://127.0.0.1:{port}/v1"), handle)
-    }
-
-    #[tokio::test]
-    async fn a_local_provider_really_is_called_with_no_auth_header() {
-        let (base_url, server) = stub_server().await;
-
-        let mut cfg = Config::load().expect("the shipped config loads");
-        cfg.providers = vec![
-            crate::config::ProviderSpec {
-                id: "openrouter".into(),
-                label: "OpenRouter".into(),
-                base_urls: vec!["https://openrouter.ai/api/v1".into()],
-                api_key: Some(crate::config::Secret::new("sk-or-must-not-be-sent")),
-                headers: Vec::new(),
-            },
-            crate::config::ProviderSpec {
-                id: "local".into(),
-                label: "llama.cpp".into(),
-                base_urls: vec![base_url.clone()],
-                api_key: None,
-                headers: vec![("X-Test".into(), "yes".into())],
-            },
-        ];
-        cfg.default_provider = "openrouter".into();
-        cfg.models = vec![crate::config::ModelSpec {
-            id: "local/deepseek".into(),
-            label: "DeepSeek (local)".into(),
-            provider: "local".into(),
-            wire_model: "deepseek-v4-flash".into(),
-        }];
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
-
-        let mut stream = client
-            .open_stream(
-                r#"{"model":"local/deepseek","messages":[{"role":"user","content":"hi"}]}"#,
-            )
-            .await
-            .expect("the local provider answers");
-
-        // The stream still parses, so nothing about routing disturbed the SSE path.
-        let first = stream.next().await.unwrap();
-        assert!(
-            matches!(first, StreamChunk::Delta(ref d) if d == "hi"),
-            "{first:?}"
-        );
-
-        let request = server.await.unwrap();
-        let (head, body) = request.split_once("\r\n\r\n").unwrap();
-        let head = head.to_ascii_lowercase();
-
-        // The local provider's own path was hit, not OpenRouter's.
-        assert!(head.starts_with("post /v1/chat/completions"), "{head}");
-        // No key configured means no header at all — and certainly not the
-        // OpenRouter key belonging to a different provider.
-        assert!(!head.contains("authorization"), "{head}");
-        assert!(!request.contains("sk-or-must-not-be-sent"));
-        // OpenRouter's attribution headers are not sent to someone else's server.
-        assert!(!head.contains("http-referer"), "{head}");
-        assert!(!head.contains("x-title"), "{head}");
-        // The provider's own extra headers are.
-        assert!(head.contains("x-test: yes"), "{head}");
-
-        // And the endpoint was asked for the name it knows, not the picker's id.
-        let sent: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
-        assert_eq!(sent["model"], "deepseek-v4-flash");
-        assert_eq!(sent["stream"], true);
-    }
-
-    #[test]
-    fn replicas_are_handed_out_in_rotation() {
-        let provider = crate::config::ProviderSpec {
-            id: "local".into(),
-            label: "pool".into(),
-            base_urls: vec![
-                "http://127.0.0.1:8080/v1".into(),
-                "http://127.0.0.1:8081/v1".into(),
-                "http://127.0.0.1:8082/v1".into(),
-            ],
-            api_key: None,
-            headers: Vec::new(),
-        };
-        assert_eq!(provider.replicas(), 3);
-
-        // Successive slots walk the pool and wrap.
-        let seen: Vec<String> = (0..4)
-            .map(|i| provider.url_for("chat/completions", i))
-            .collect();
-        assert_eq!(seen[0], "http://127.0.0.1:8080/v1/chat/completions");
-        assert_eq!(seen[1], "http://127.0.0.1:8081/v1/chat/completions");
-        assert_eq!(seen[2], "http://127.0.0.1:8082/v1/chat/completions");
-        assert_eq!(seen[3], seen[0], "the rotation wraps");
-
-        // `base_url()` stays the first one, so identity and display are stable
-        // no matter which replica a given request used.
-        assert_eq!(provider.base_url(), "http://127.0.0.1:8080/v1");
-    }
-
-    #[test]
-    fn a_single_endpoint_provider_always_uses_it() {
-        // The scaling change must not perturb the one-endpoint case: whatever
-        // slot the counter has reached, there is only one place to go.
-        let provider = crate::config::ProviderSpec {
-            id: "openrouter".into(),
-            label: "OpenRouter".into(),
-            base_urls: vec!["https://openrouter.ai/api/v1".into()],
-            api_key: None,
-            headers: Vec::new(),
-        };
-        for i in [0usize, 1, 7, 1000] {
-            assert_eq!(
-                provider.url_for("chat/completions", i),
-                "https://openrouter.ai/api/v1/chat/completions"
-            );
-        }
-    }
-
-    /// A server that accepts the request, reads it, and then says nothing at
-    /// all — the failure that started this: OpenRouter took a 320KB prompt,
-    /// acked every byte, and returned zero.
-    async fn silent_server() -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let mut held = Vec::new();
-            loop {
-                let Ok((socket, _)) = listener.accept().await else {
-                    return;
-                };
-                // Held, not dropped: closing would be a connection error, and
-                // the case under test is a socket that stays open and quiet.
-                held.push(socket);
-            }
-        });
-        (format!("http://127.0.0.1:{port}/v1"), handle)
-    }
-
-    // Twelve minutes of silence, in miniature. Four attempts against a
-    // provider that never answers used to produce four log lines that did not
-    // say why and nothing at all in the conversation, so the only evidence a
-    // person ever saw was the transport error at the end.
-    #[tokio::test]
-    async fn a_provider_that_never_answers_is_retried_and_announced() {
-        let (base, _server) = silent_server().await;
-
-        let mut cfg = Config::load().expect("the shipped config loads");
-        cfg.max_retries = 2;
-        cfg.request_timeout = Duration::from_millis(300);
-        cfg.providers = vec![crate::config::ProviderSpec {
-            id: "local".into(),
-            label: "quiet".into(),
-            base_urls: vec![base],
-            api_key: None,
-            headers: Vec::new(),
-        }];
-        cfg.default_provider = "local".into();
-        cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        client.on_retry(tx);
-
-        let outcome = client
-            .open_stream_for(
-                r#"{"model":"local/x","messages":[{"role":"user","content":"hi"}]}"#,
-                Some("conv-1"),
-            )
-            .await;
-        match outcome {
-            Ok(_) => panic!("a provider that never answers cannot produce a stream"),
-            Err(e) => assert!(
-                matches!(e, LlmError::Transport(_)),
-                "a silent provider is a transport failure: {e:?}"
-            ),
-        }
-
-        // One notice per retry — the attempts before the last, which has no
-        // retry to announce.
-        let mut notices = Vec::new();
-        while let Ok(notice) = rx.try_recv() {
-            notices.push(notice);
-        }
-        assert_eq!(notices.len(), 2, "two retries, two notices: {notices:?}");
-        assert_eq!(notices[0].attempt, 1);
-        assert_eq!(notices[1].attempt, 2);
-        assert!(
-            notices.iter().all(|n| n.attempts == 3),
-            "the total has to include the first attempt: {notices:?}"
-        );
-        assert!(
-            notices.iter().all(|n| n.session == "conv-1"),
-            "a notice nobody can file against a conversation is not worth sending"
-        );
-        // The distinction the log used to lose entirely.
-        assert!(
-            notices[0].error.contains("read timeout"),
-            "a silent provider must not read as a connection failure: {}",
-            notices[0].error
-        );
-    }
-
-    #[tokio::test]
-    async fn a_dead_replica_is_stepped_over_on_retry() {
-        // Two endpoints, the first of which is not listening. The retry should
-        // advance to the second and succeed, rather than retrying the corpse.
-        let (live_base, server) = stub_server().await;
-        let dead_base = {
-            // Bind and drop, so the port is almost certainly unused.
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = l.local_addr().unwrap().port();
-            drop(l);
-            format!("http://127.0.0.1:{port}/v1")
-        };
-
-        let mut cfg = Config::load().expect("the shipped config loads");
-        cfg.max_retries = 3;
-        cfg.providers = vec![crate::config::ProviderSpec {
-            id: "local".into(),
-            label: "pool".into(),
-            base_urls: vec![dead_base, live_base],
-            api_key: None,
-            headers: Vec::new(),
-        }];
-        cfg.default_provider = "local".into();
-        cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
-
-        let mut stream = client
-            .open_stream(r#"{"model":"local/x","messages":[{"role":"user","content":"hi"}]}"#)
-            .await
-            .expect("the live replica answers after the dead one fails");
-        let first = stream.next().await.unwrap();
-        assert!(
-            matches!(first, StreamChunk::Delta(ref d) if d == "hi"),
-            "{first:?}"
-        );
-
-        // The live server really was the one that served it.
-        let request = server.await.unwrap();
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .starts_with("post /v1/chat/completions")
-        );
-    }
-
-    #[test]
-    fn a_request_is_routed_to_the_provider_its_model_names() {
-        let client = two_provider_client();
-        let (body, provider) = client
-            .prepare_body(r#"{"model":"local/qwen3","messages":[]}"#, true)
-            .unwrap();
-
-        assert_eq!(provider, "local");
-        // The picker's id never reaches the endpoint; its own name for the
-        // model does.
-        assert_eq!(body["model"], "qwen3-30b-a3b");
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["stream_options"]["include_usage"], true);
-    }
-
-    #[test]
-    fn an_openrouter_model_is_unaffected_by_the_extra_provider() {
-        let client = two_provider_client();
-        let (body, provider) = client
-            .prepare_body(
-                r#"{"model":"anthropic/claude-opus-4.1","messages":[]}"#,
-                false,
-            )
-            .unwrap();
-        assert_eq!(provider, "openrouter");
-        assert_eq!(body["model"], "anthropic/claude-opus-4.1");
-        assert_eq!(body["stream"], false);
-    }
-
-    #[test]
-    fn a_request_with_no_model_falls_back_to_the_configured_default() {
-        let client = two_provider_client();
-        let (body, provider) = client.prepare_body(r#"{"messages":[]}"#, false).unwrap();
-        assert_eq!(provider, "openrouter");
-        assert_eq!(body["model"], "anthropic/claude-sonnet-4.5");
-    }
-
-    #[test]
-    fn an_unlisted_model_reaches_a_local_provider_by_prefix() {
-        // Loading a new gguf should not require editing [[models]] first.
-        let client = two_provider_client();
-        let (body, provider) = client
-            .prepare_body(r#"{"model":"local/mistral-small","messages":[]}"#, false)
-            .unwrap();
-        assert_eq!(provider, "local");
-        assert_eq!(body["model"], "mistral-small");
-    }
-
-    /// The cache lives on one replica, so the whole point is that the same
-    /// conversation resolves to the same endpoint every turn.
-    #[test]
-    fn one_conversation_stays_on_one_replica() {
-        let client = two_provider_client();
-        let provider = client.cfg.provider("local").unwrap();
-        let slot_for = |session: &str| -> String {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            session.hash(&mut hasher);
-            provider.url_for("chat/completions", hasher.finish() as usize)
-        };
-        assert_eq!(
-            slot_for("conv-abc"),
-            slot_for("conv-abc"),
-            "the same session must resolve to the same endpoint on every turn"
-        );
-    }
-
-    /// Without a session the old rotation must survive: that is what spreads
-    /// load for callers that have no conversation to be sticky about.
-    #[test]
-    fn a_request_with_no_session_still_rotates() {
-        let client = two_provider_client();
-        let first = client
-            .next_replica
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let second = client
-            .next_replica
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_ne!(first, second, "the rotation counter still advances");
-    }
-
-    /// The session tag has to actually reach the wire, or sticky routing is
-    /// left to OpenRouter's guesswork.
-    #[test]
-    fn a_session_is_named_on_the_wire_for_sticky_routing() {
-        let client = two_provider_client();
-        let (body, _) = client
-            .prepare_body_for(
-                r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#,
-                true,
-                Some("conv-384b4729"),
-            )
-            .unwrap();
-        assert_eq!(body["session_id"], "conv-384b4729");
-        assert_eq!(body["user"], "thetis:conv-384b4729");
-    }
-
-    /// A request with no session must look exactly as it always did, so
-    /// nothing downstream sees a new field it did not expect.
-    #[test]
-    fn a_request_without_a_session_gains_no_routing_fields() {
-        let client = two_provider_client();
-        let (body, _) = client
-            .prepare_body(
-                r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#,
-                true,
-            )
-            .unwrap();
-        assert!(body.get("session_id").is_none());
-        assert!(body.get("user").is_none());
-    }
 
     fn roles(body: &serde_json::Value) -> Vec<String> {
         body["messages"]
@@ -1540,10 +629,7 @@ mod tests {
             ["system", "user", "assistant", "user", "user"]
         );
         // The text is untouched; only where it is allowed to sit changed.
-        assert_eq!(
-            body["messages"][3]["content"],
-            "Interrupted: Thetis restarted."
-        );
+        assert_eq!(body["messages"][3]["content"], "Interrupted: Thetis restarted.");
     }
 
     #[test]
@@ -1559,10 +645,7 @@ mod tests {
         ]});
 
         assert_eq!(normalize_system_roles(&mut body), 0);
-        assert_eq!(
-            roles(&body),
-            ["system", "user", "system", "assistant", "system"]
-        );
+        assert_eq!(roles(&body), ["system", "user", "system", "assistant", "system"]);
     }
 
     #[test]
@@ -1577,453 +660,10 @@ mod tests {
         assert_eq!(roles(&body)[2], "user");
     }
 
-    /// The private marker must never reach a provider: it is not a field any
-    /// of them accept, and a strict endpoint rejects the request outright.
-    #[test]
-    fn the_private_tool_marker_never_reaches_a_provider() {
-        let mut body = serde_json::json!({ "messages": [
-            { "role": "system", "content": "prompt" },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "bad", "function": { "name": "x", "arguments": "{}" } },
-                { "id": "good", "function": { "name": "y", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "bad", "content": "failed", "thetis_tool_ok": false },
-            { "role": "tool", "tool_call_id": "good", "content": "worked", "thetis_tool_ok": true },
-        ]});
-
-        assert_eq!(strip_private_markers(&mut body), 2);
-        let messages = body["messages"].as_array().unwrap();
-        assert!(
-            messages.iter().all(|m| m.get("thetis_tool_ok").is_none()),
-            "the host-only marker must be gone"
-        );
-    }
-
-    /// Failed rounds stay in the request. They cost 0.1x as cached tokens;
-    /// evicting them would re-write the suffix at the 1.25x write premium.
-    #[test]
-    fn failed_tool_rounds_are_kept_so_the_prefix_stays_cacheable() {
-        let mut body = serde_json::json!({ "messages": [
-            { "role": "system", "content": "prompt" },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "bad", "function": { "name": "x", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "bad", "content": "failed", "thetis_tool_ok": false },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "latest", "function": { "name": "z", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "latest", "content": "also failed", "thetis_tool_ok": false }
-        ]});
-
-        strip_private_markers(&mut body);
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 5, "no message is dropped");
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "bad");
-        assert_eq!(messages[2]["content"], "failed");
-    }
-
-    /// The regression this whole change exists for.
-    ///
-    /// Turn N ends with one failed round; turn N+1 appends another. The bytes
-    /// the provider saw on turn N must still be a prefix of what it sees on
-    /// turn N+1 — otherwise every cache entry from the divergence onward is
-    /// invalidated and re-written at a premium. The old rule broke exactly
-    /// this: the first failed pair was protected on turn N as the "newest",
-    /// then dropped from the middle on turn N+1.
-    #[test]
-    fn a_new_failure_leaves_the_earlier_prefix_byte_identical() {
-        let turn_n = serde_json::json!([
-            { "role": "system", "content": "prompt" },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "f1", "function": { "name": "x", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "f1", "content": "first failure", "thetis_tool_ok": false }
-        ]);
-
-        // The same conversation one round later, as the log would replay it.
-        let turn_n_plus_1 = serde_json::json!([
-            { "role": "system", "content": "prompt" },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "f1", "function": { "name": "x", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "f1", "content": "first failure", "thetis_tool_ok": false },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "f2", "function": { "name": "y", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "f2", "content": "second failure", "thetis_tool_ok": false }
-        ]);
-
-        let mut first = serde_json::json!({ "messages": turn_n });
-        let mut second = serde_json::json!({ "messages": turn_n_plus_1 });
-        strip_private_markers(&mut first);
-        strip_private_markers(&mut second);
-
-        let first = first["messages"].as_array().unwrap();
-        let second = second["messages"].as_array().unwrap();
-
-        assert!(second.len() > first.len(), "the later turn only grew");
-        for (i, earlier) in first.iter().enumerate() {
-            assert_eq!(
-                serde_json::to_string(earlier).unwrap(),
-                serde_json::to_string(&second[i]).unwrap(),
-                "message {i} changed between turns, which invalidates the cache from here on"
-            );
-        }
-    }
-
-    #[test]
-    fn a_lone_failed_tool_pair_is_preserved() {
-        let mut body = serde_json::json!({ "messages": [
-            { "role": "system", "content": "prompt" },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "only", "function": { "name": "git-whoami", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "only", "content": "fix your credentials", "thetis_tool_ok": false }
-        ]});
-
-        assert_eq!(strip_private_markers(&mut body), 1);
-        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
-        assert!(body["messages"][2].get("thetis_tool_ok").is_none());
-    }
-
     #[test]
     fn a_request_without_messages_is_not_a_problem() {
         let mut body = serde_json::json!({ "model": "x" });
         assert_eq!(normalize_system_roles(&mut body), 0);
-    }
-
-    /// The shape a local DeepSeek-style model actually streams: a long think
-    /// in `reasoning_content`, then a short answer in `content`. The two must
-    /// come out as different chunk kinds, because only the answer is persisted
-    /// and replayed to the model.
-    #[tokio::test]
-    async fn reasoning_is_kept_apart_from_the_answer() {
-        let chunks = drain(concat!(
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Okay\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\", so\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"pine\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"apple\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        ))
-        .await;
-
-        let answer: String = chunks
-            .iter()
-            .filter_map(|c| match c {
-                StreamChunk::Delta(d) => Some(d.as_str()),
-                _ => None,
-            })
-            .collect();
-        let thinking: String = chunks
-            .iter()
-            .filter_map(|c| match c {
-                StreamChunk::Reasoning(r) => Some(r.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(answer, "pineapple", "the answer carries no reasoning");
-        assert_eq!(thinking, "Okay, so");
-    }
-
-    /// OpenRouter normalizes the same field to `reasoning`. Both spellings
-    /// must land in the same place, or reasoning silently vanishes depending
-    /// on which provider served the request.
-    #[tokio::test]
-    async fn openrouters_spelling_of_reasoning_is_understood() {
-        let chunks = drain(concat!(
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        ))
-        .await;
-        assert!(
-            chunks
-                .iter()
-                .any(|c| matches!(c, StreamChunk::Reasoning(r) if r == "hmm")),
-            "{chunks:?}"
-        );
-    }
-
-    /// A model that sends no reasoning at all must stream exactly as before.
-    #[tokio::test]
-    async fn a_response_without_reasoning_gains_no_chunks() {
-        let chunks = drain(concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        ))
-        .await;
-        assert!(
-            !chunks
-                .iter()
-                .any(|c| matches!(c, StreamChunk::Reasoning(_)))
-        );
-    }
-
-    /// A slow reasoning model can stream for longer than the timeout while
-    /// never actually stalling. `ClientBuilder::timeout` is a deadline on the
-    /// *whole* request including the body, so it used to cut such a stream off
-    /// mid-answer — surfacing as "error decoding response body". A read timeout
-    /// resets on each read, so a trickle keeps the connection alive and only a
-    /// genuine stall trips it.
-    ///
-    /// This drives a real socket that trickles for well over the configured
-    /// timeout, so it fails if the timeout shape ever regresses.
-    #[tokio::test]
-    async fn a_slow_stream_is_not_cut_off_while_it_is_still_sending() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Trickles 8 deltas 60ms apart: 480ms total body, far beyond the
-        // 150ms timeout below, but never a 150ms gap.
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut scratch = vec![0u8; 8192];
-            let _ = sock.read(&mut scratch).await;
-            sock.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                  Transfer-Encoding: chunked\r\n\r\n",
-            )
-            .await
-            .unwrap();
-            for i in 0..8 {
-                let body =
-                    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{i}\"}}}}]}}\n\n");
-                sock.write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
-                    .await
-                    .unwrap();
-                sock.flush().await.unwrap();
-                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            }
-            sock.write_all(b"0\r\n\r\n").await.unwrap();
-            sock.flush().await.unwrap();
-        });
-
-        let mut cfg = Config::load().expect("the shipped config loads");
-        cfg.request_timeout = Duration::from_millis(150);
-        cfg.max_retries = 0;
-        cfg.providers = vec![crate::config::ProviderSpec {
-            id: "slow".into(),
-            label: "Slow".into(),
-            base_urls: vec![format!("http://127.0.0.1:{port}/v1")],
-            api_key: None,
-            headers: Vec::new(),
-        }];
-        cfg.default_provider = "slow".into();
-        cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
-        let mut handle = client
-            .open_stream(r#"{"model":"slow/trickle","messages":[{"role":"user","content":"hi"}]}"#)
-            .await
-            .expect("the stream should open");
-
-        let mut text = String::new();
-        let mut error = None;
-        loop {
-            match handle.next().await {
-                Ok(StreamChunk::Delta(d)) => text.push_str(&d),
-                Ok(StreamChunk::Finished(_)) => break,
-                Err(e) => {
-                    error = Some(e);
-                    break;
-                }
-                Ok(_) => {}
-            }
-        }
-
-        assert!(error.is_none(), "a trickling stream was cut off: {error:?}");
-        assert_eq!(text, "01234567", "the whole answer should arrive");
-    }
-
-    /// The other side of the same coin: a server that goes quiet must still be
-    /// given up on, or a wedged endpoint would hang the turn forever.
-    #[tokio::test]
-    async fn a_stalled_stream_does_eventually_give_up() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Sends one delta, then holds the connection open saying nothing.
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut scratch = vec![0u8; 8192];
-            let _ = sock.read(&mut scratch).await;
-            sock.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                  Transfer-Encoding: chunked\r\n\r\n",
-            )
-            .await
-            .unwrap();
-            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"stuck\"}}]}\n\n";
-            sock.write_all(format!("{:x}\r\n{}\r\n", body.len(), body).as_bytes())
-                .await
-                .unwrap();
-            sock.flush().await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        });
-
-        let mut cfg = Config::load().expect("the shipped config loads");
-        cfg.request_timeout = Duration::from_millis(150);
-        cfg.max_retries = 0;
-        cfg.providers = vec![crate::config::ProviderSpec {
-            id: "stall".into(),
-            label: "Stall".into(),
-            base_urls: vec![format!("http://127.0.0.1:{port}/v1")],
-            api_key: None,
-            headers: Vec::new(),
-        }];
-        cfg.default_provider = "stall".into();
-        cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
-        let mut handle = client
-            .open_stream(r#"{"model":"stall/wedged","messages":[{"role":"user","content":"hi"}]}"#)
-            .await
-            .expect("the stream should open");
-
-        let mut text = String::new();
-        let mut reason = None;
-        loop {
-            match handle.next().await {
-                Ok(StreamChunk::Delta(d)) => text.push_str(&d),
-                Ok(StreamChunk::Finished(f)) => {
-                    reason = Some(f.reason);
-                    break;
-                }
-                Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-
-        // The delta that did arrive is kept, and the stall is reported as a
-        // break rather than a clean stop.
-        assert_eq!(text, "stuck");
-        assert_eq!(reason.as_deref(), Some("error"));
-    }
-
-    /// Feeds a stream that breaks part-way through, and reports what the
-    /// consumer saw.
-    async fn drain_aborted(sse: &str) -> Vec<Result<StreamChunk, LlmError>> {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut pump = SsePump::new(tx);
-        for piece in sse.as_bytes().chunks(7) {
-            pump.feed(piece).await;
-        }
-        // Whatever reqwest would have handed us mid-body.
-        pump.abort(LlmError::Transport("error decoding response body".into()))
-            .await;
-        drop(pump);
-        let mut out = Vec::new();
-        while let Some(item) = rx.recv().await {
-            out.push(item);
-        }
-        out
-    }
-
-    /// The reported bug: a stream that dies after some of the answer has been
-    /// shown must not throw that answer away. The turn should end, not fail.
-    #[tokio::test]
-    async fn a_broken_stream_keeps_the_text_that_already_arrived() {
-        let items = drain_aborted(concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"half an \"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
-        ))
-        .await;
-
-        assert!(
-            items.iter().all(|i| i.is_ok()),
-            "a salvageable stream must not surface an error: {items:?}"
-        );
-        let text: String = items
-            .iter()
-            .filter_map(|i| match i {
-                Ok(StreamChunk::Delta(d)) => Some(d.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(text, "half an answer");
-
-        // It ends as finished, but honestly: the reason says it broke.
-        let reason = items.iter().find_map(|i| match i {
-            Ok(StreamChunk::Finished(f)) => Some(f.reason.clone()),
-            _ => None,
-        });
-        assert_eq!(reason.as_deref(), Some("error"));
-    }
-
-    /// With nothing to salvage the error is the whole story, and hiding it
-    /// behind an empty "finished" would turn a failure into a silent no-op.
-    #[tokio::test]
-    async fn a_stream_that_breaks_before_anything_arrives_still_errors() {
-        let items = drain_aborted("").await;
-        assert!(
-            matches!(items.first(), Some(Err(LlmError::Transport(_)))),
-            "{items:?}"
-        );
-    }
-
-    /// Reasoning is not the answer: it is never persisted, so a break during
-    /// the thinking phase has produced nothing to keep and must still fail.
-    #[tokio::test]
-    async fn a_break_during_reasoning_is_not_salvageable() {
-        let items = drain_aborted(
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
-        )
-        .await;
-        assert!(
-            items
-                .iter()
-                .any(|i| matches!(i, Err(LlmError::Transport(_)))),
-            "{items:?}"
-        );
-    }
-
-    /// A tool call cut off mid-arguments must be dropped, not dispatched: half
-    /// a JSON object is not a request anyone should act on.
-    #[tokio::test]
-    async fn a_truncated_tool_call_is_discarded_rather_than_dispatched() {
-        let items = drain_aborted(concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"working\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
-            "\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
-        ))
-        .await;
-
-        let calls: Vec<ToolCall> = items
-            .iter()
-            .filter_map(|i| match i {
-                Ok(StreamChunk::ToolCalls(v)) => Some(v.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        assert!(
-            calls.is_empty(),
-            "truncated arguments must not survive: {calls:?}"
-        );
-    }
-
-    /// A complete tool call that happens to be followed by a broken connection
-    /// is still good, and re-running the turn without it would lose work.
-    #[tokio::test]
-    async fn a_complete_tool_call_survives_a_later_break() {
-        let items = drain_aborted(concat!(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
-            "\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n\n",
-        ))
-        .await;
-
-        let calls: Vec<ToolCall> = items
-            .iter()
-            .filter_map(|i| match i {
-                Ok(StreamChunk::ToolCalls(v)) => Some(v.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
-        assert_eq!(calls.len(), 1, "{items:?}");
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments_json, "{\"path\":\"a\"}");
     }
 
     async fn drain(sse: &str) -> Vec<StreamChunk> {
@@ -2140,11 +780,9 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
                    data: [DONE]\n";
         let chunks = drain(sse).await;
-        assert!(
-            chunks
-                .iter()
-                .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok"))
-        );
+        assert!(chunks
+            .iter()
+            .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok")));
     }
 
     #[test]
@@ -2170,98 +808,5 @@ mod tests {
         assert_eq!(call_1[0]["content"], "real result");
         // Untouched when already coherent.
         assert_eq!(dedupe_tool_results(&mut body), 0);
-    }
-
-    // The exact shape that hung a conversation: a restart landed between a
-    // `wait` call and its result, and the next user message went straight
-    // after the unanswered call. OpenRouter accepted that request and never
-    // answered it — 4 x 180s, then "transport error", on every turn forever.
-    #[test]
-    fn a_tool_call_the_log_never_answered_is_answered_here() {
-        let mut body = serde_json::json!({
-            "messages": [
-                { "role": "system", "content": "s" },
-                { "role": "assistant", "tool_calls": [{ "id": "call_wait" }] },
-                { "role": "user", "content": "Continue" },
-            ]
-        });
-        assert_eq!(answer_orphaned_tool_calls(&mut body), 1);
-
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 4);
-        // Immediately after the call that made it: the only position the
-        // schema allows.
-        assert_eq!(messages[2]["role"], "tool");
-        assert_eq!(messages[2]["tool_call_id"], "call_wait");
-        assert_eq!(messages[3]["content"], "Continue");
-        // Idempotent, so it does not grow the prefix on every turn.
-        assert_eq!(answer_orphaned_tool_calls(&mut body), 0);
-    }
-
-    #[test]
-    fn an_assistant_message_with_several_unanswered_calls_gets_one_result_each() {
-        let mut body = serde_json::json!({
-            "messages": [
-                { "role": "assistant", "tool_calls": [
-                    { "id": "a" }, { "id": "b" }, { "id": "c" },
-                ]},
-                { "role": "tool", "tool_call_id": "b", "content": "b came back" },
-                { "role": "user", "content": "Continue" },
-            ]
-        });
-        assert_eq!(answer_orphaned_tool_calls(&mut body), 2);
-        let messages = body["messages"].as_array().unwrap();
-        let ids: Vec<_> = messages
-            .iter()
-            .filter(|m| m["role"] == "tool")
-            .map(|m| m["tool_call_id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids.len(), 3, "every call needs exactly one result: {ids:?}");
-        // The real result is untouched; only the gaps are filled.
-        assert!(messages
-            .iter()
-            .any(|m| m["tool_call_id"] == "b" && m["content"] == "b came back"));
-    }
-
-    // Two interrupted rounds far apart: inserting for the later one must not
-    // disturb the position of the earlier.
-    #[test]
-    fn results_land_next_to_their_own_call_however_many_there_are() {
-        let mut body = serde_json::json!({
-            "messages": [
-                { "role": "assistant", "tool_calls": [{ "id": "first" }] },
-                { "role": "user", "content": "one" },
-                { "role": "assistant", "tool_calls": [{ "id": "second" }] },
-                { "role": "user", "content": "two" },
-            ]
-        });
-        assert_eq!(answer_orphaned_tool_calls(&mut body), 2);
-        let m = body["messages"].as_array().unwrap();
-        let roles: Vec<_> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
-        assert_eq!(
-            roles,
-            ["assistant", "tool", "user", "assistant", "tool", "user"]
-        );
-        assert_eq!(m[1]["tool_call_id"], "first");
-        assert_eq!(m[4]["tool_call_id"], "second");
-    }
-
-    // A coherent log must come through completely untouched — this runs on
-    // every request, and moving a message would invalidate the prompt cache
-    // from that point on.
-    #[test]
-    fn a_coherent_conversation_is_left_exactly_as_it_was() {
-        let mut body = serde_json::json!({
-            "messages": [
-                { "role": "system", "content": "s" },
-                { "role": "assistant", "tool_calls": [{ "id": "call_1" }] },
-                { "role": "tool", "tool_call_id": "call_1", "content": "done" },
-                { "role": "assistant", "content": "all good" },
-                { "role": "user", "content": "next" },
-            ]
-        });
-        let before = body.clone();
-        assert_eq!(answer_orphaned_tool_calls(&mut body), 0);
-        assert_eq!(body, before);
     }
 }

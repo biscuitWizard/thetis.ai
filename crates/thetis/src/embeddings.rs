@@ -10,7 +10,7 @@
 //! answers by falling back to BM25. Skills must keep working with the network
 //! unplugged, so nothing in this module is allowed to be load-bearing.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -55,39 +55,10 @@ impl Embedder {
         self.cfg.skills.embedding_dimensions
     }
 
-    /// Which endpoint serves embeddings, and under what model name.
-    ///
-    /// `skills.embedding_provider` names one outright; otherwise the model id
-    /// routes the same way a chat model does, so `local/nomic-embed-text` goes
-    /// to a llama.cpp server without any further configuration.
-    fn endpoint(&self) -> crate::config::ResolvedModel<'_> {
-        let configured = self.cfg.skills.embedding_provider.trim();
-        if !configured.is_empty() {
-            if let Some(provider) = self.cfg.provider(configured) {
-                return crate::config::ResolvedModel {
-                    wire_model: self.model().to_string(),
-                    provider,
-                };
-            }
-            tracing::warn!(
-                provider = %configured,
-                "skills.embedding_provider is not configured; routing by model id instead"
-            );
-        }
-        self.cfg.resolve_model(self.model())
-    }
-
     /// True when a provider call could succeed. Checked before spending time on
     /// cache lookups that would only be followed by a failed fetch.
-    ///
-    /// A key is required only where the endpoint requires one: a local server
-    /// serving embeddings unauthenticated is perfectly usable.
     pub fn available(&self) -> bool {
-        if !self.cfg.skills.retrieval_enabled {
-            return false;
-        }
-        let endpoint = self.endpoint();
-        endpoint.provider.api_key.is_some() || !endpoint.provider.is_openrouter()
+        self.cfg.openrouter_api_key.is_some() && self.cfg.skills.retrieval_enabled
     }
 
     /// Returns a vector per skill, in the order given, fetching whatever the
@@ -183,28 +154,23 @@ impl Embedder {
 
     /// One `POST /embeddings`, returning vectors in request order.
     async fn fetch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let endpoint = self.endpoint();
-        let provider = endpoint.provider;
-        if provider.api_key.is_none() && provider.is_openrouter() {
-            return Err(anyhow!("no API key"));
-        }
+        let key = self
+            .cfg
+            .openrouter_api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("no API key"))?;
 
-        let url = provider.url("embeddings");
+        let url = format!("{}/embeddings", self.cfg.openrouter_base);
         let body = serde_json::json!({
-            "model": endpoint.wire_model,
+            "model": self.model(),
             "input": texts,
             "dimensions": self.dimensions(),
         });
 
-        let mut request = self.http.post(&url);
-        if let Some(key) = &provider.api_key {
-            request = request.bearer_auth(key.expose());
-        }
-        for (name, value) in &provider.headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-
-        let response = request
+        let response = self
+            .http
+            .post(&url)
+            .bearer_auth(key.expose())
             .json(&body)
             .send()
             .await

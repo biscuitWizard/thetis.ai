@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::aspect::Aspect;
 use crate::grip::Grip;
 use crate::pipeline;
+use crate::aspect::Aspect;
 
 pub struct Breakers {
     /// aspect key -> failure timestamps, newest last
@@ -81,7 +81,9 @@ pub async fn report_failure(grip: &Arc<Grip>, aspect: &Aspect, detail: &str) -> 
         }
         Err(e) => {
             // Nothing to fall back to. Say so loudly rather than pretending.
-            let text = format!("{aspect} kept failing ({detail}) and could not be reset: {e:#}");
+            let text = format!(
+                "{aspect} kept failing ({detail}) and could not be reset: {e:#}"
+            );
             tracing::error!("{text}");
             Some(text)
         }
@@ -182,9 +184,6 @@ mod tests {
         b.clear(&aspect);
 
         assert_eq!(b.failure_count(&aspect), 0);
-        assert!(
-            !b.record_failure(&aspect),
-            "counting restarts after recovery"
-        );
+        assert!(!b.record_failure(&aspect), "counting restarts after recovery");
     }
 }

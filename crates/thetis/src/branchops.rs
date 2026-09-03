@@ -9,7 +9,7 @@
 //! Merging to trunk is deliberately not here: trunk only ever moves in the
 //! gateway, by fast-forward, on a human's say-so.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use std::sync::Arc;
 
 use crate::bindings::branch::{BranchState, CommitInfo};
@@ -30,7 +30,8 @@ pub fn trunk_ref() -> String {
 }
 
 fn git(grip: &Arc<Grip>) -> Result<&crate::gitctl::GitCtl> {
-    grip.git
+    grip
+        .git
         .as_ref()
         .ok_or_else(|| anyhow!("this process has no checkout"))
 }
@@ -40,10 +41,7 @@ pub async fn status(grip: &Arc<Grip>) -> Result<BranchState> {
     let branch = git.current_branch().await?;
     let head = git.head().await?;
     let trunk = git.rev_parse(&trunk_ref()).await?.unwrap_or_default();
-    let (ahead, behind) = git
-        .ahead_behind("HEAD", &trunk_ref())
-        .await
-        .unwrap_or((0, 0));
+    let (ahead, behind) = git.ahead_behind("HEAD", &trunk_ref()).await.unwrap_or((0, 0));
     let merging = git.merge_in_progress().await?;
     let conflicts = if merging {
         git.unmerged_paths().await?
@@ -216,7 +214,8 @@ pub async fn complete_merge(
 
     grip.suppress_watch_all(grip.cfg.watchdog.watch_suppression);
     let head = git.commit_merge(&message).await?;
-    let rebuilt = refresh_everything(grip, &before, session_id, "resolved trunk update").await;
+    let rebuilt =
+        refresh_everything(grip, &before, session_id, "resolved trunk update").await;
     grip.skills.invalidate();
     append_op(
         grip,
@@ -319,13 +318,7 @@ async fn refresh_branch_kernel(
     let cause = cause.to_string();
     tokio::spawn(async move {
         match crate::control::build_kernel(&grip.cfg).await {
-            // A build already running is the build this wanted. It will
-            // restart on its own when it lands, so saying anything here would
-            // only contradict it.
-            Ok(crate::control::KernelBuild::Busy(why)) => {
-                tracing::info!(%why, "a kernel build was already running; leaving it to finish");
-            }
-            Ok(crate::control::KernelBuild::Built(_)) => {
+            Ok(_) => {
                 if let Err(e) = crate::control::request_restart(
                     &grip,
                     &format!(
@@ -368,7 +361,11 @@ async fn refresh_branch_kernel(
 /// inline, a merge touching `wit/` (which invalidates *every* aspect's cache key
 /// at once) reliably blew the deadline and reported a failure for an update
 /// that had in fact landed.
-async fn refresh_changed_aspects(grip: &Arc<Grip>, before: &str, session_id: &str) -> String {
+async fn refresh_changed_aspects(
+    grip: &Arc<Grip>,
+    before: &str,
+    session_id: &str,
+) -> String {
     let mut refreshed: Vec<String> = Vec::new();
     // Kept for the cache-hit path's own failures; compiles report through the log.
     let failed: Vec<String> = Vec::new();

@@ -6,7 +6,7 @@
 use crate::thetis::grip::session as host;
 use crate::thetis::grip::skills_view as view;
 use crate::thetis::grip::sys;
-use crate::thetis::grip::types::{Attachment, SessionEvent};
+use crate::thetis::grip::types::Attachment;
 use crate::render;
 use crate::{GatewayAction, OutboundEvent};
 use serde_json::{json, Value};
@@ -26,7 +26,7 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
     let previous = frame.get("previous").and_then(Value::as_str);
 
     match kind {
-        "hello" => vec![catalog(), sessions(), user_avatar()],
+        "hello" => vec![catalog(), sessions()],
         "list" => vec![sessions()],
         "catalog" => vec![catalog()],
 
@@ -86,19 +86,6 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
             None => vec![error("tools requires an id")],
         },
 
-        // Overriding which tool groups this conversation offers the model.
-        // Replies with the whole `tools` frame rather than an acknowledgement,
-        // so the panel redraws from what the store now actually holds instead
-        // of from what the client hoped it wrote.
-        "tool-groups-set" => match id {
-            Some(session) => set_tool_groups(session, frame),
-            None => vec![error("tool-groups-set requires an id")],
-        },
-        "tool-groups-reset" => match id {
-            Some(session) => reset_tool_groups(session),
-            None => vec![error("tool-groups-reset requires an id")],
-        },
-
         "set-model" => match (id, frame.get("model").and_then(Value::as_str)) {
             (Some(session), Some(model)) => {
                 host::set_session_model(session, model);
@@ -113,32 +100,6 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
         // instead, which means a slug typed here is selectable in the same
         // breath - and `set-session-model` accepts any slug, so it works.
         "models" => vec![catalog()],
-
-        // The user's own avatar, shown beside the conversation. Kept in the KV
-        // store rather than config for the same reason the model overlay is:
-        // `thetis.toml` is read only at startup, so a picture chosen here could
-        // not appear until a restart. The agent's avatar is the opposite case —
-        // it is identity, set by whoever configures the installation, and is
-        // substituted into the markup at serve time.
-        "user-avatar" => vec![user_avatar()],
-        "user-avatar-set" => set_user_avatar(frame, id),
-
-        // The plan document. `plan-read` is what the plan tab draws from;
-        // `plan-execute` is the Execute button, which is a mode switch, an
-        // optional model switch and a submit in one click.
-        "plan" => match id {
-            Some(session) => vec![plan(session)],
-            None => vec![error("plan requires an id")],
-        },
-        "plan-execute" => match id {
-            Some(session) => execute_plan(session, frame),
-            None => vec![error("plan-execute requires an id")],
-        },
-        "todo" => match id {
-            Some(session) => vec![todos(session)],
-            None => vec![error("todo requires an id")],
-        },
-
         "model-save" => save_model(frame, id),
         "model-remove" => remove_model(frame, id),
         "model-restore" => restore_model(frame, id),
@@ -149,7 +110,8 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
 
 // --- the model catalogue ----------------------------------------------------
 
-/// Where this user's model-catalogue overlay is kept.
+/// Where the overlay is kept. Global scope: the catalogue is a property of the
+/// installation, not of one conversation.
 const MODEL_KEY: &str = "gateway.web.models";
 /// Ceiling on stored entries, so a runaway client cannot grow the record without
 /// bound. Well past any plausible hand-curated list.
@@ -167,7 +129,7 @@ struct Entry {
 }
 
 fn load_overlay() -> Vec<Entry> {
-    let raw = sys::kv_get("user", MODEL_KEY).unwrap_or_default();
+    let raw = sys::kv_get("global", MODEL_KEY).unwrap_or_default();
     serde_json::from_str::<Value>(&raw)
         .ok()
         .as_ref()
@@ -206,7 +168,7 @@ fn save_overlay(entries: &[Entry]) {
             "id": e.id, "label": e.label, "hidden": e.hidden,
         })).collect::<Vec<_>>(),
     });
-    sys::kv_put("user", MODEL_KEY, &payload.to_string());
+    sys::kv_put("global", MODEL_KEY, &payload.to_string());
 }
 
 /// A model as the picker and the inspector see it.
@@ -456,68 +418,6 @@ fn restore_model(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
     catalog_replies(session)
 }
 
-// --- the user's avatar ------------------------------------------------------
-
-/// Where the user's picture is kept. Global scope: it is the person using the
-/// installation, not a property of one conversation.
-const USER_AVATAR_KEY: &str = "gateway.web.user_avatar";
-
-/// Ceiling on the stored value, in characters. A `data:` URI is base64, so this
-/// is roughly a 1.5 MB image — generous for a portrait, and far enough under the
-/// 16 MiB websocket cap that the frame carrying it can never be the thing that
-/// trips it. The client downscales before uploading; this is the backstop.
-const MAX_AVATAR_CHARS: usize = 2_000_000;
-
-/// The stored picture, or an empty string when there is none. Empty is a real
-/// answer rather than a missing one: it selects the drawn fallback mark.
-pub fn user_avatar() -> GatewayAction {
-    reply(json!({
-        "type": "user-avatar",
-        "avatar": sys::kv_get("user", USER_AVATAR_KEY).unwrap_or_default(),
-    }))
-}
-
-/// Stores a new picture, or clears it when `avatar` is empty.
-///
-/// Replies with the whole `user-avatar` frame, and broadcasts it to every tab on
-/// the open conversation, so a second window is not left showing the old face.
-fn set_user_avatar(frame: &Value, session: Option<&str>) -> Vec<GatewayAction> {
-    let raw = frame
-        .get("avatar")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim();
-
-    if raw.chars().count() > MAX_AVATAR_CHARS {
-        return vec![error(
-            "that image is too large — pick one under about 1.5 MB",
-        )];
-    }
-    // Only a `data:` image or an http(s) URL. Anything else — `javascript:`
-    // above all — would end up in a `src` attribute, so it is refused here
-    // rather than trusted to the client's own escaping.
-    let allowed = raw.is_empty()
-        || raw.starts_with("data:image/")
-        || raw.starts_with("https://")
-        || raw.starts_with("http://");
-    if !allowed {
-        return vec![error("an avatar must be an image file or an http(s) URL")];
-    }
-
-    sys::kv_put("user", USER_AVATAR_KEY, raw);
-
-    let mut actions = vec![user_avatar()];
-    if let Some(session) = session {
-        if let GatewayAction::Reply(frame) = user_avatar() {
-            actions.push(GatewayAction::Broadcast(crate::BroadcastFrame {
-                session_id: session.to_string(),
-                frame,
-            }));
-        }
-    }
-    actions
-}
-
 // --- frames -----------------------------------------------------------------
 
 /// What the pickers offer, and what the models inspector shows.
@@ -537,8 +437,6 @@ pub fn catalog() -> GatewayAction {
 
     reply(json!({
         "type": "catalog",
-        "restricted": sys::config_get("policy_models_restricted")
-            .as_deref() == Some("true"),
         "models": merged.iter().filter(|m| !m.hidden).map(entry).collect::<Vec<_>>(),
         "models_hidden": merged.iter().filter(|m| m.hidden).map(entry).collect::<Vec<_>>(),
         "modes": sys::list_modes().iter().map(|m| json!({
@@ -601,482 +499,45 @@ fn skills(session_id: &str) -> GatewayAction {
     }))
 }
 
-// --- tool groups ------------------------------------------------------------
-//
-// The agent owns the group table and the routing; this reads both out of the KV
-// store rather than asking, and writes the pin back to override.
-//
-// Why the store and not a call: `available-tools` asks the agent directly, but
-// it routes through `workers::call_session`, so it needs a live worker. Workers
-// are the shortest-lived thing in the system, and opening a panel must not
-// spawn one — a group inspector that did would be empty for exactly the stopped
-// and archived conversations someone is most likely to be inspecting. The agent
-// publishes its table once per turn instead.
-//
-// These four literals are the seam between two components that cannot share a
-// constant. Their definitions, with the reasoning, are in
-// `agents/agent-core/src/groups.rs`; a rename there means a grep for them here.
-const TABLE_KEY: &str = "__tool_group_table";
-const PIN_KEY: &str = "__tool_groups";
-const WHY_KEY: &str = "__tool_groups_why";
-const REASON_MANUAL: &str = "manual";
-
-
-/// The published group table, or `None` before the agent has ever run a turn.
-fn group_table() -> Option<Value> {
-    serde_json::from_str(&sys::kv_get("global", TABLE_KEY)?).ok()
+/// The domain a tool belongs to, so the surface can be shown grouped by what a
+/// tool touches rather than as one long flat list. Derived from the name —
+/// names are stable and already domain-scoped — with a plain "Other" fallback
+/// for anything unrecognised, such as a new component or a connected MCP tool.
+fn tool_group(name: &str) -> &'static str {
+    match name {
+        "read_file" | "write_file" | "read_path" | "write_path" | "list_path"
+        | "delete_path" | "edit_path" | "search_files" | "find_files" => "Files",
+        "exec" => "Shell",
+        "remember" | "recall" => "Memory",
+        "list_config" | "read_config" | "set_config" | "config-probe" => "Configuration",
+        "new_tool" | "read_code" | "write_code" | "patch_code" | "list_code"
+        | "add_dependency" | "remove_dependency" | "list_dependencies"
+        | "restart_orchestrator" => "Code & tools",
+        "update_from_trunk" | "reset_branch" | "complete_merge" | "abort_merge" => {
+            "Version control"
+        }
+        _ if name.starts_with("terminal_") => "Shell",
+        _ if name.starts_with("skill_") => "Skills",
+        _ if name.starts_with("branch_") => "Version control",
+        _ if name.starts_with("web-") || name.starts_with("web_") => "Web",
+        _ if name.starts_with("notion-") => "Notion",
+        _ => "Other",
+    }
 }
 
-/// The pinned active set for a conversation. Empty means never routed, which is
-/// not the same as routed to nothing — with no pin the agent offers everything.
-fn pinned_groups(session_id: &str) -> Vec<String> {
-    sys::kv_get(session_id, PIN_KEY)
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Why each active group is active, as written during routing.
-fn group_reasons(session_id: &str) -> Value {
-    let mut out = serde_json::Map::new();
-    for line in sys::kv_get(session_id, WHY_KEY).unwrap_or_default().lines() {
-        if let Some((id, reason)) = line.split_once('=') {
-            let id = id.trim();
-            if !id.is_empty() {
-                out.insert(id.to_string(), json!(reason.trim()));
-            }
-        }
-    }
-    Value::Object(out)
-}
-
-/// Which group a tool belongs to, according to the agent's published table.
-///
-/// Mirrors `groups::component_group`: a component's own `group:<id>` capability
-/// wins, then the name-prefix convention, then the ungrouped fallback. Built-in
-/// membership is a straight table lookup.
-///
-/// This replaced a second, name-derived grouping that used to live here with
-/// different ids and different boundaries — so the panel grouped tools one way
-/// while the agent scoped them another, and neither knew about the other. There
-/// is one table now, and it is the one that decides what the model sees.
-fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
-    let ungrouped = table
-        .get("ungrouped")
-        .and_then(Value::as_str)
-        .unwrap_or("extra");
-    let groups = table.get("groups").and_then(Value::as_array);
-
-    if let Some(groups) = groups {
-        for group in groups {
-            let members = group.get("members").and_then(Value::as_array);
-            let hit = members.is_some_and(|m| m.iter().any(|v| v.as_str() == Some(name)));
-            if hit {
-                return group
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(ungrouped)
-                    .to_string();
-            }
-        }
-    }
-
-    let known = |id: &str| {
-        groups.is_some_and(|gs| {
-            gs.iter()
-                .any(|g| g.get("id").and_then(Value::as_str) == Some(id))
-        })
-    };
-
-    for cap in capabilities {
-        if let Some(id) = cap.strip_prefix("group:") {
-            let id = id.trim();
-            return if known(id) { id } else { ungrouped }.to_string();
-        }
-    }
-    // Order matters: the first match wins, so `web-browser-` must precede
-    // `web-`, or the browser tools would be filed under web search. Kept in
-    // step with PREFIX_RULES in agents/agent-core/src/groups.rs.
-    for (prefix, id) in [
-        ("bq-", "bigquery"),
-        ("notion-", "notion"),
-        ("web-browser-", "browser"),
-        ("web-", "web"),
-        ("git-", "github"),
-        ("moo-", "moo"),
-    ] {
-        if name.starts_with(prefix) && known(id) {
-            return id.to_string();
-        }
-    }
-    ungrouped.to_string()
-}
-
-/// Exactly the tools the agent would offer for this conversation's mode, each
-/// tagged with its group, plus the group table and what is currently attached.
-///
-/// `available_tools` still answers what the agent would offer, so the tool list
-/// cannot drift from reality. The group state is layered on top from the store.
+/// Exactly the tools the agent would offer for this conversation's mode.
 fn tools(session_id: &str) -> GatewayAction {
-    let table = group_table();
-    let pinned = pinned_groups(session_id);
-    let enabled = table
-        .as_ref()
-        .and_then(|t| t.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    // With scoping off, or before any routing has happened, every group is
-    // attached — that is exactly what the agent does with no pin.
-    let all_ids: Vec<String> = table
-        .as_ref()
-        .and_then(|t| t.get("groups"))
-        .and_then(Value::as_array)
-        .map(|gs| {
-            gs.iter()
-                .filter_map(|g| g.get("id").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let active: Vec<String> = if !enabled || pinned.is_empty() {
-        all_ids.clone()
-    } else {
-        pinned.clone()
-    };
-
-    // Whether the panel knows enough to claim a tool is being withheld.
-    //
-    // Before the agent's first turn there is no published table, so every tool
-    // resolves to the ungrouped fallback and matches no active id — which the
-    // naive reading turns into "0 of 75 tools attached", the exact opposite of
-    // the truth, since an unrouted conversation is offered everything. The
-    // fallback has to fail towards "attached": an unmarked tool that is in fact
-    // withheld is a missing hint, while a tool marked withheld that is really
-    // in the prompt is the panel lying about the thing it exists to report.
-    let known = enabled && table.is_some();
-
-    let tools: Vec<Value> = host::available_tools(session_id)
-        .iter()
-        .map(|t| {
-            let group = table
-                .as_ref()
-                .map(|tb| tool_group_id(tb, &t.name, &t.capabilities))
-                .unwrap_or_else(|| "extra".to_string());
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "schema": t.args_schema_json,
-                "capabilities": t.capabilities,
-                "group": group,
-                // Whether this tool's definition is actually in the prompt.
-                // `available_tools` reports the mode-filtered surface; scoping
-                // narrows it further, and that difference is the thing the
-                // panel exists to show.
-                "attached": !known || active.iter().any(|a| *a == group),
-            })
-        })
-        .collect();
-
     reply(json!({
         "type": "tools",
         "session": session_id,
-        "tools": tools,
-        "groups": table.as_ref().and_then(|t| t.get("groups")).cloned().unwrap_or(json!([])),
-        "active": active,
-        "reasons": group_reasons(session_id),
-        "grouping": enabled,
-        // Distinguishes "the user has overridden or the agent has routed" from
-        // "nothing has decided yet", which the active set alone cannot say.
-        "routed": !pinned.is_empty(),
+        "tools": host::available_tools(session_id).iter().map(|t| json!({
+            "name": t.name,
+            "description": t.description,
+            "schema": t.args_schema_json,
+            "capabilities": t.capabilities,
+            "group": tool_group(&t.name),
+        })).collect::<Vec<_>>(),
     }))
-}
-
-/// Whether the published table marks a group as always attached.
-fn always_on(table: Option<&Value>, id: &str) -> bool {
-    table
-        .and_then(|t| t.get("groups"))
-        .and_then(Value::as_array)
-        .and_then(|gs| {
-            gs.iter()
-                .find(|g| g.get("id").and_then(Value::as_str) == Some(id))
-        })
-        .and_then(|g| g.get("always_on"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// Overrides which groups this conversation offers the model.
-///
-/// Writes the pin the agent reads. Deliberately not validated here beyond
-/// dropping unknown ids: `groups::read_pin` repairs the pin on every read —
-/// forcing always-on groups back in — so the invariant that `tool_search`
-/// survives is enforced by the component that depends on it, not by this one.
-/// A gateway bug therefore cannot strand a conversation without an escape
-/// hatch.
-fn set_tool_groups(session_id: &str, frame: &Value) -> Vec<GatewayAction> {
-    let Some(wanted) = frame.get("groups").and_then(Value::as_array) else {
-        return vec![error("tool-groups-set requires a groups array")];
-    };
-    // The table is published on the agent's first turn, so a conversation that
-    // has never run one has no group vocabulary to check against. That used to
-    // be a hard error, which made the buttons dead on exactly the conversation
-    // someone is most likely to be setting up by hand. Refuse only when there
-    // is genuinely nothing to validate against.
-    let table = group_table();
-    let known: Vec<String> = table
-        .as_ref()
-        .and_then(|t| t.get("groups"))
-        .and_then(Value::as_array)
-        .map(|gs| {
-            gs.iter()
-                .filter_map(|g| g.get("id").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if known.is_empty() {
-        return vec![error(
-            "the agent has not published its tool groups yet — send a message first",
-        )];
-    }
-
-    // Kept in table order, so the tool block the agent builds from this is
-    // byte-identical whatever order the client sent, and the provider's prompt
-    // cache is not missed by a reordering alone.
-    //
-    // Always-on groups are written in whether or not they were asked for. Two
-    // reasons: the agent forces them back on read anyway, so omitting them
-    // would make the panel disagree with the prompt; and an empty pin means
-    // "never routed", not "routed to nothing" — so a request for no groups at
-    // all would silently read as a reset and attach everything, the opposite of
-    // what was asked. With the floor written, the pin is never empty.
-    let chosen: Vec<String> = known
-        .iter()
-        .filter(|id| {
-            let asked = wanted
-                .iter()
-                .any(|w| w.as_str().map(|w| w == id.as_str()).unwrap_or(false));
-            asked || always_on(table.as_ref(), id)
-        })
-        .cloned()
-        .collect();
-
-    sys::kv_put(session_id, PIN_KEY, &chosen.join("\n"));
-
-    // Reasons are rewritten wholesale: a group the user removed and re-added
-    // must not still claim it arrived by tag match. Always-on groups are
-    // labelled as such even though the agent will re-add them regardless, so
-    // the panel can explain why they cannot be switched off.
-    let why: String = chosen
-        .iter()
-        .map(|id| {
-            let reason = if always_on(table.as_ref(), id) {
-                "always-on"
-            } else {
-                REASON_MANUAL
-            };
-            format!("{id}={reason}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    sys::kv_put(session_id, WHY_KEY, &why);
-
-    vec![tools(session_id)]
-}
-
-/// Clears the override, letting the agent route this conversation again from
-/// its own evidence on the next turn.
-fn reset_tool_groups(session_id: &str) -> Vec<GatewayAction> {
-    sys::kv_put(session_id, PIN_KEY, "");
-    sys::kv_put(session_id, WHY_KEY, "");
-    vec![tools(session_id)]
-}
-
-// --- the plan document ------------------------------------------------------
-//
-// The agent writes the plan into its session KV scope; this reads it out for the
-// plan tab. Read straight from the store rather than asked of the agent, for the
-// same reason the tool-group panel is: asking the agent needs a live worker, and
-// the plan tab must draw on a reload of a conversation that is sitting idle.
-//
-// `PLAN_KEY` is duplicated from `agents/agent-core/src/plan.rs` — separate
-// components cannot share a constant. Grep for the literal if you change it.
-const PLAN_KEY: &str = "__plan";
-
-
-/// The plan as the tab needs it: the document, plus enough for the tab to say
-/// whether what it is showing is current.
-fn plan(session_id: &str) -> GatewayAction {
-    let stored = sys::kv_get(session_id, PLAN_KEY)
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
-
-    let field = |key: &str| {
-        stored
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
-    let body = field("body");
-
-    reply(json!({
-        "type": "plan",
-        "session": session_id,
-        "title": field("title"),
-        "body": body,
-        "revision": stored.get("revision").and_then(Value::as_u64).unwrap_or(0),
-        "updated_ms": stored.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
-        // The modes the Execute dropdown may switch into, and the models it may
-        // pick. Sent with the plan so the tab needs no second round trip, and so
-        // it can never offer a mode that would refuse to carry the plan out.
-        "modes": executable_modes(),
-        "models": model_options(),
-        "has_plan": !body.trim().is_empty(),
-    }))
-}
-
-// --- the todo list -----------------------------------------------------------
-// Mirrored from agents/agent-core/src/todos.rs: separate components cannot
-// share a constant, so grep for this literal when changing the storage format.
-const TODO_KEY: &str = "__todos";
-
-fn todos(session_id: &str) -> GatewayAction {
-    let stored = sys::kv_get(session_id, TODO_KEY)
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
-    let items = stored.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
-    let done = items.iter().filter(|item| item.get("status").and_then(Value::as_str) == Some("completed")).count();
-    let total = items.len();
-    reply(json!({
-        "type": "todo",
-        "session": session_id,
-        "items": items,
-        "revision": stored.get("revision").and_then(Value::as_u64).unwrap_or(0),
-        "updated_ms": stored.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
-        "done": done,
-        "total": total,
-        "has_todos": total > 0,
-    }))
-}
-
-/// Modes that can actually execute: the ones that are not read-only.
-///
-/// Asked of the host rather than hardcoded, because a mode is a configuration
-/// entry and this gateway must not have its own list. If configuration somehow
-/// has no writable mode, the list comes back empty and the tab says so — better
-/// than offering a button that would hand the plan to a mode unable to act.
-fn executable_modes() -> Vec<Value> {
-    sys::list_modes()
-        .into_iter()
-        .filter(|m| !m.read_only)
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "label": if m.label.trim().is_empty() { m.id.clone() } else { m.label.clone() },
-            })
-        })
-        .collect()
-}
-
-/// The model picker's options for the Execute dropdown, from the same merged
-/// catalogue the composer's picker uses, so the two never disagree.
-fn model_options() -> Vec<Value> {
-    merged_models()
-        .into_iter()
-        .filter(|m| !m.hidden)
-        .map(|m| json!({ "id": m.id, "label": m.label }))
-        .collect()
-}
-
-/// The Execute button: switch mode, optionally switch model, then submit.
-///
-/// The submitted message names the plan and tells the agent to read it with
-/// `plan_read` rather than carrying a copy of the body. That matters: the plan
-/// may be long, it is already addressable, and a pasted copy would be a second
-/// version of the document that starts going stale the moment a step is revised.
-/// Which mode a click on Execute should switch the conversation into.
-///
-/// Split out from `execute_plan` and given `(id, read_only)` pairs rather than
-/// the host's own type so it can be tested: this is the one branchy part of the
-/// path, and every branch of it is a refusal the user sees on the tab.
-///
-/// An unknown mode is refused rather than passed through. `set-session-mode`
-/// accepts anything, and the agent then treats an unrecognised mode as writable
-/// — a fail-open worth one check to avoid, since the click means "go and do
-/// this". An empty request means the tab offered no choice, which is the
-/// first-load case, so the first writable mode stands in.
-fn choose_mode(modes: &[(String, bool)], requested: &str) -> Result<String, String> {
-    if requested.is_empty() {
-        return modes
-            .iter()
-            .find(|(_, read_only)| !read_only)
-            .map(|(id, _)| id.clone())
-            .ok_or_else(|| "no writable mode is configured".to_string());
-    }
-    match modes.iter().find(|(id, _)| id == requested) {
-        Some((id, false)) => Ok(id.clone()),
-        Some((id, true)) => Err(format!(
-            "mode '{id}' is read-only, so it cannot carry a plan out"
-        )),
-        None => Err(format!("unknown mode '{requested}'")),
-    }
-}
-
-fn execute_plan(session_id: &str, frame: &Value) -> Vec<GatewayAction> {
-    let stored = sys::kv_get(session_id, PLAN_KEY)
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null);
-    let body = stored
-        .get("body")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if body.trim().is_empty() {
-        return vec![error("there is no plan to execute yet")];
-    }
-
-    let requested = frame.get("mode").and_then(Value::as_str).unwrap_or("");
-    let modes: Vec<(String, bool)> = sys::list_modes()
-        .into_iter()
-        .map(|m| (m.id, m.read_only))
-        .collect();
-    let mode = match choose_mode(&modes, requested) {
-        Ok(mode) => mode,
-        Err(message) => return vec![error(message)],
-    };
-
-    host::set_session_mode(session_id, &mode);
-    if let Some(model) = slug_of(frame, "model") {
-        host::set_session_model(session_id, &model);
-    }
-
-    let note = frame
-        .get("note")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let mut message = String::from(
-        "Execute the plan. Read it with `plan_read` first — it is the authority, not this \
-         message, and it may have been revised since it was written. Work through it in order. \
-         As each step lands, mark it done in the plan with `plan_edit` so the plan tab shows \
-         where you are; if a step turns out to be wrong, revise it there and say why rather \
-         than quietly doing something else.",
-    );
-    if !note.is_empty() {
-        message.push_str("\n\nFrom the user, alongside the plan:\n");
-        message.push_str(note);
-    }
-
-    host::submit(session_id, &message, &[]);
-    vec![
-        session_settings(session_id),
-        sessions(),
-        reply(json!({ "type": "accepted", "session": session_id })),
-    ]
 }
 
 fn session_settings(session_id: &str) -> GatewayAction {
@@ -1089,47 +550,9 @@ fn session_settings(session_id: &str) -> GatewayAction {
     }))
 }
 
-/// Prefix of the system note the host writes when an agent spawns a sub-agent.
-/// The remainder is the child's session id, a space, then its label. Defined in
-/// `crates/thetis/src/delegation.rs` as `SPAWN_NOTE`; the two must agree.
-const SPAWN_NOTE: &str = "subagent:spawned ";
-
-/// Replays a conversation, sub-agents included.
-///
-/// A sub-agent is a session of its own, so its turns are in its own log and not
-/// in the parent's. Live, that does not matter: the worker re-addresses a
-/// child's frames to the conversation the user is watching and tags them, so
-/// they arrive as they happen. But a reload asks only for the parent's events,
-/// and without this the sub-agent blocks would silently disappear from a
-/// transcript that had them a moment earlier — the reader would be left unable
-/// to tell whether work had happened at all.
-///
-/// The parent's log names its children in a spawn note, so that note is the
-/// index: for each one, the child's own events are read, tagged the way the
-/// live path tags them, and merged in. The merge is by timestamp, because two
-/// logs have unrelated sequence numbers and interleaving by time is what puts a
-/// child's work where the reader saw it happen.
 fn history(session_id: &str) -> GatewayAction {
     let meta = host::get_session(session_id);
-    let own = host::events(session_id, 0);
-
-    // (child id, label), in spawn order.
-    let children: Vec<(String, String)> = own
-        .iter()
-        .filter_map(|record| match &record.event {
-            SessionEvent::SystemNote(text) => text.strip_prefix(SPAWN_NOTE),
-            _ => None,
-        })
-        .map(|rest| match rest.split_once(' ') {
-            Some((id, label)) => (id.to_string(), label.to_string()),
-            None => (rest.to_string(), String::new()),
-        })
-        .collect();
-
-    // Timestamp first so the merge is by time; the parent's own events sort
-    // ahead of a child's at the same millisecond, which keeps a spawn note
-    // above the block it opened.
-    let mut rows: Vec<(u64, u8, Value)> = own
+    let events: Vec<Value> = host::events(session_id, 0)
         .iter()
         .filter_map(|record| {
             render::event(&OutboundEvent {
@@ -1138,31 +561,8 @@ fn history(session_id: &str) -> GatewayAction {
                 ts_ms: record.ts_ms,
                 event: record.event.clone(),
             })
-            .map(|frame| (record.ts_ms, 0u8, frame))
         })
         .collect();
-
-    for (child_id, label) in &children {
-        for record in host::events(child_id, 0) {
-            let Some(mut frame) = render::event(&OutboundEvent {
-                session_id: session_id.to_string(),
-                seq: Some(record.seq),
-                ts_ms: record.ts_ms,
-                event: record.event.clone(),
-            }) else {
-                continue;
-            };
-            if let Some(obj) = frame.as_object_mut() {
-                obj.insert("agent".into(), json!(child_id));
-                obj.insert("agent_label".into(), json!(label));
-                obj.insert("agent_parent".into(), json!(session_id));
-            }
-            rows.push((record.ts_ms, 1u8, frame));
-        }
-    }
-
-    rows.sort_by_key(|(ts, tier, _)| (*ts, *tier));
-    let events: Vec<Value> = rows.into_iter().map(|(_, _, frame)| frame).collect();
 
     reply(json!({
         "type": "history",
@@ -1243,80 +643,4 @@ fn parse_attachments(frame: &Value) -> Vec<Attachment> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Tests for the parts of this module that are pure. Most of it talks to the
-/// host and cannot run here, but the plan's mode choice is exactly the kind of
-/// branching that is worth pinning: every arm of it is a refusal the user reads
-/// on the plan tab, and `cargo test` in this directory runs natively.
-#[cfg(test)]
-mod tests {
-    use super::choose_mode;
-
-    fn modes() -> Vec<(String, bool)> {
-        vec![
-            ("agent".into(), false),
-            ("plan".into(), true),
-            ("chat".into(), true),
-        ]
-    }
-
-    #[test]
-    fn a_writable_mode_is_taken_as_asked() {
-        assert_eq!(choose_mode(&modes(), "agent").unwrap(), "agent");
-    }
-
-    /// Executing *into* plan mode would withhold every tool that could carry the
-    /// plan out, so the click has to be refused rather than half-honoured.
-    #[test]
-    fn a_read_only_mode_is_refused_by_name() {
-        let err = choose_mode(&modes(), "plan").unwrap_err();
-        assert!(err.contains("plan"), "{err}");
-        assert!(err.contains("read-only"), "{err}");
-    }
-
-    /// The fail-open this check exists to prevent: the host accepts any mode
-    /// string, and the agent treats one it does not recognise as writable.
-    #[test]
-    fn an_unknown_mode_is_refused_rather_than_passed_through() {
-        let err = choose_mode(&modes(), "wishful").unwrap_err();
-        assert!(err.contains("unknown mode"), "{err}");
-        assert!(err.contains("wishful"), "{err}");
-    }
-
-    /// No choice offered — the first-load case, before a `plan` frame has told
-    /// the tab which modes exist.
-    #[test]
-    fn no_request_falls_back_to_the_first_writable_mode() {
-        assert_eq!(choose_mode(&modes(), "").unwrap(), "agent");
-    }
-
-    /// Order matters for that fallback: it must skip read-only modes rather
-    /// than taking whatever is listed first.
-    #[test]
-    fn the_fallback_skips_a_read_only_mode_listed_first() {
-        let ordered = vec![
-            ("plan".into(), true),
-            ("chat".into(), true),
-            ("wild".into(), false),
-        ];
-        assert_eq!(choose_mode(&ordered, "").unwrap(), "wild");
-    }
-
-    /// Configuration with nothing writable in it. The tab disables Execute for
-    /// this case, but the handler must not rely on the client to do so.
-    #[test]
-    fn with_no_writable_mode_at_all_it_refuses() {
-        let all_read_only = vec![("plan".into(), true), ("chat".into(), true)];
-        assert!(choose_mode(&all_read_only, "").is_err());
-        assert!(choose_mode(&all_read_only, "plan").is_err());
-    }
-
-    /// An empty mode list is what a host that failed to load configuration
-    /// returns. It must be a refusal, not a panic on `[0]`.
-    #[test]
-    fn an_empty_mode_list_refuses_instead_of_panicking() {
-        assert!(choose_mode(&[], "").is_err());
-        assert!(choose_mode(&[], "agent").is_err());
-    }
 }

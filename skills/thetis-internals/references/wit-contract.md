@@ -46,14 +46,11 @@ allow-list, not the whole configuration; the snapshot reference lists the keys.
 
 ### `session`
 
-`events`, `append`, `emit-output`, `emit-reasoning`, `poll-inbox`,
-`list-sessions`, `get-session`, `create-session`, `rename-session`,
-`archive-session`, `submit`, `set-session-mode`, `set-session-model`,
-`available-tools`.
+`events`, `append`, `emit-output`, `poll-inbox`, `list-sessions`, `get-session`,
+`create-session`, `rename-session`, `archive-session`, `submit`,
+`set-session-mode`, `set-session-model`, `available-tools`.
 
 `emit-output` streams a fragment to connected clients without persisting it.
-`emit-reasoning` does the same for a reasoning fragment, kept separate so
-thinking is never spliced into the assistant message.
 `available-tools` asks the agent itself, so the Tools panel cannot drift from
 what the agent really offers.
 

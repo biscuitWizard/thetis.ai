@@ -25,31 +25,14 @@
 //! records. The originals are simply still there, so the store is unnecessary.
 
 use crate::thetis::grip::llm;
-use crate::thetis::grip::session as host;
 use crate::thetis::grip::sys;
-use crate::thetis::grip::types::{
-    Compaction, CompactionProgress, InboxItem, LogLevel, SeqSpan,
-};
+use crate::thetis::grip::types::{Compaction, LogLevel, SeqSpan};
 use serde_json::{json, Value};
 
 /// Tokens per character, near enough. Only used to rank and total messages
 /// against each other; the trigger itself uses the provider's own count.
 fn est_tokens(value: &Value) -> u32 {
     ((char_count(value) + 3) / 4) as u32
-}
-
-/// The estimated size of a stretch of the message list.
-///
-/// The trigger prefers the provider's own count, but there are two moments in a
-/// turn where no such count exists: messages appended since the last completion
-/// — tool results, which are where a turn's context growth actually comes from —
-/// and the list immediately after a compaction, when the newest figure in the
-/// log still describes the conversation as it was *before* the summary. This is
-/// what fills both gaps.
-pub fn estimate(messages: &[Value]) -> u32 {
-    messages
-        .iter()
-        .fold(0u32, |acc, m| acc.saturating_add(est_tokens(m)))
 }
 
 /// Every character reachable in a message, including nested tool calls.
@@ -98,7 +81,7 @@ impl Policy {
         Self {
             enabled: sys::config_get("compact_enabled").as_deref() != Some("false"),
             window: num("context_window", 200_000.0) as u32,
-            threshold: num("compact_threshold", 1.0),
+            threshold: num("compact_threshold", 0.6),
             target: num("compact_target", 0.25),
             summary_model: sys::config_get("summary_model").unwrap_or_default(),
             keep_head: num("keep_head", 4.0) as usize,
@@ -116,7 +99,7 @@ impl Policy {
 
     /// Whether a context this size is worth compacting.
     pub fn should_compact(&self, context_tokens: u32) -> bool {
-        self.enabled && context_tokens > 0 && context_tokens >= self.trigger_tokens()
+        self.enabled && context_tokens > 0 && context_tokens > self.trigger_tokens()
     }
 }
 
@@ -258,33 +241,16 @@ so rather than resolving it. Here is the span:
 
 ";
 
-/// One span of the conversation, flattened and ready to summarize.
-///
-/// Selection is separated from summarizing deliberately. Choosing what to shed
-/// is pure and instant; summarizing is several model calls that can take tens of
-/// seconds altogether. Handing the caller a list of jobs lets it report
-/// progress between them and check whether the user has pressed stop — neither
-/// of which was possible while the whole thing was one opaque function.
-pub struct SpanJob {
-    /// The span as plain text, with the instructions not yet attached.
-    transcript: String,
-    /// The log sequences this span covers, inclusive.
-    pub first_seq: u64,
-    pub last_seq: u64,
-    /// How many messages it stands for.
-    pub messages: u32,
-}
-
 /// One summary, from a separate and usually cheaper model.
 ///
 /// A failure here returns `None` and the span is left alone: an unsummarized
 /// span costs context, while a wrong summary costs correctness.
-pub fn summarize(job: &SpanJob, model: &str) -> Option<String> {
+fn summarize(messages: &[Value], span: Round, model: &str) -> Option<String> {
     let request = json!({
         "model": model,
         "messages": [{
             "role": "user",
-            "content": format!("{SUMMARY_INSTRUCTIONS}{}", job.transcript),
+            "content": format!("{SUMMARY_INSTRUCTIONS}{}", transcript(messages, span)),
         }],
     });
 
@@ -320,181 +286,17 @@ pub fn note(summary: &str, replaced: u32, first_seq: u64, last_seq: u64) -> Valu
     })
 }
 
-/// The one place a progress frame is built, so every phase reports the same
-/// fields and the surface can rely on them.
-fn report(
-    session_id: &str,
-    policy: &Policy,
-    context_tokens: u32,
-    phase: &str,
-    span: u32,
-    spans: u32,
-    messages: u32,
-    detail: &str,
-) {
-    host::emit_compaction_progress(
-        session_id,
-        &CompactionProgress {
-            phase: phase.to_string(),
-            span,
-            spans,
-            messages,
-            tokens_before: context_tokens,
-            tokens_target: policy.target_tokens(),
-            model: policy.summary_model.clone(),
-            detail: detail.to_string(),
-        },
-    );
-}
-
-/// Whether the user has pressed stop while compaction is running.
-///
-/// Compaction is not part of the conversation, so anything it finds in the
-/// inbox has to be put back for the turn loop to act on: a nudge consumed here
-/// would be silently lost, and a cancel consumed here would leave the loop
-/// thinking the turn is fine. The host re-synthesizes a cancel on every later
-/// poll, so only a nudge needs actually carrying — which the caller does by
-/// draining the inbox itself once compaction is out of the way.
-fn stop_requested(session_id: &str, carried: &mut Vec<String>) -> bool {
-    let mut cancelled = false;
-    for item in host::poll_inbox(session_id) {
-        match item {
-            InboxItem::Cancel => cancelled = true,
-            InboxItem::Nudge(text) => carried.push(text),
-            InboxItem::Control(_) => {}
-        }
-    }
-    cancelled
-}
-
-/// What compaction decided to do, before any summarizing has happened.
-pub struct Plan {
-    pub jobs: Vec<SpanJob>,
-    pub tokens_before: u32,
-}
-
-impl Plan {
-    /// Total messages every span stands for.
-    pub fn messages(&self) -> u32 {
-        self.jobs.iter().map(|j| j.messages).sum()
-    }
-}
-
-/// Summarizes a plan, reporting progress and stopping if the user asks.
-///
-/// Returns the `Compaction` to record, plus any nudge text that arrived while
-/// this was running and must be handed back to the turn loop. `None` means
-/// nothing usable came out — every span failed, or the user stopped it — and in
-/// that case no `ContextCompacted` event should be written at all: a partial
-/// compaction is fine, but an empty one that claims to stand for messages is
-/// not.
-pub fn run(session_id: &str, plan: Plan, policy: &Policy) -> (Option<Compaction>, Vec<String>) {
-    let total = plan.jobs.len() as u32;
-    let tokens_before = plan.tokens_before;
-    let mut carried: Vec<String> = Vec::new();
-
-    let mut summaries = Vec::new();
-    let mut covered = Vec::new();
-    let mut replaced = 0u32;
-
-    for (i, job) in plan.jobs.iter().enumerate() {
-        // Checked before each call rather than only after the batch: a stop
-        // pressed during span one must not be answered by four more summary
-        // calls. The host also fails the call itself now, but a guest that
-        // relied on that alone would still make every request.
-        if stop_requested(session_id, &mut carried) {
-            report(
-                session_id,
-                policy,
-                tokens_before,
-                "cancelled",
-                i as u32,
-                total,
-                replaced,
-                "you stopped this turn; keeping what was summarized so far",
-            );
-            break;
-        }
-
-        report(
-            session_id,
-            policy,
-            tokens_before,
-            "summarizing",
-            i as u32 + 1,
-            total,
-            replaced,
-            &format!(
-                "summarizing span {} of {total} ({} messages, events {}-{})",
-                i + 1,
-                job.messages,
-                job.first_seq,
-                job.last_seq
-            ),
-        );
-
-        let Some(summary) = summarize(job, &policy.summary_model) else {
-            continue;
-        };
-        summaries.push(format!(
-            "### events {}-{}\n\n{summary}",
-            job.first_seq, job.last_seq
-        ));
-        covered.push(SeqSpan {
-            from_seq: job.first_seq,
-            through_seq: job.last_seq,
-        });
-        replaced += job.messages;
-    }
-
-    if covered.is_empty() {
-        report(
-            session_id,
-            policy,
-            tokens_before,
-            "failed",
-            0,
-            total,
-            0,
-            "nothing was summarized; the conversation is unchanged",
-        );
-        return (None, carried);
-    }
-
-    report(
-        session_id,
-        policy,
-        tokens_before,
-        "finished",
-        total,
-        total,
-        replaced,
-        &format!("{replaced} messages now stand summarized"),
-    );
-
-    (
-        Some(Compaction {
-            spans: covered,
-            summary: summaries.join("\n\n"),
-            messages_replaced: replaced,
-            tokens_before,
-        }),
-        carried,
-    )
-}
-
-/// Works out what to shed, without summarizing any of it.
+/// Works out what to shed and summarizes it.
 ///
 /// `origins` maps each message to the log sequence it came from, so the result
 /// can be recorded against the log rather than against this particular
 /// rebuilding of it. Returns `None` when there is nothing worth doing.
 pub fn plan(
-    session_id: &str,
     messages: &[Value],
     origins: &[u64],
     context_tokens: u32,
     policy: &Policy,
-) -> Option<Plan> {
+) -> Option<Compaction> {
     // The two lists are indexed together below. Drifting apart would mean
     // recording a summary against the wrong part of the log, so refuse rather
     // than guess - and a panic here would trap the whole turn.
@@ -505,21 +307,6 @@ pub fn plan(
         );
         return None;
     }
-
-    // Announced before the selection walk, not after it. Selection is fast, but
-    // this frame is also what tells the surface that a compaction is starting at
-    // all — and the surface needs to know that before the first summary call,
-    // which is the part that takes the time.
-    report(
-        session_id,
-        policy,
-        context_tokens,
-        "planning",
-        0,
-        0,
-        0,
-        "choosing what to summarize",
-    );
 
     let (lo, hi) = eligible_middle(messages, policy.keep_head, policy.keep_tail)?;
     let rounds = rounds(messages, lo, hi);
@@ -545,37 +332,33 @@ pub fn plan(
         ),
     );
 
-    // Sequence 0 means "no source in the log": the system prompt, and nudge
-    // text folded into a turn already running. Recording a span that starts
-    // there would cover the log from its very beginning, silently summarizing
-    // away the whole conversation. It should be impossible: a seq-0 push is
-    // always a `user` message and `rounds` never puts one in a span. The check
-    // stays because the cost of being wrong is the entire history, and mid-turn
-    // compaction now runs at points where those pushes have happened.
-    if spans
-        .iter()
-        .any(|s| origins[s.start] == 0 || origins[s.end] == 0)
-    {
-        sys::log(
-            LogLevel::Error,
-            "compaction: a span has no log sequence; skipping rather than \
-             recording one that would cover the whole log",
-        );
+    let mut summaries = Vec::new();
+    let mut covered = Vec::new();
+    let mut replaced = 0u32;
+
+    for span in spans {
+        let Some(summary) = summarize(messages, span, &policy.summary_model) else {
+            continue;
+        };
+        let (first, last) = (origins[span.start], origins[span.end]);
+        summaries.push(format!(
+            "### events {first}-{last}\n\n{summary}"
+        ));
+        covered.push(SeqSpan {
+            from_seq: first,
+            through_seq: last,
+        });
+        replaced += (span.end - span.start + 1) as u32;
+    }
+
+    if covered.is_empty() {
         return None;
     }
 
-    let jobs: Vec<SpanJob> = spans
-        .into_iter()
-        .map(|span| SpanJob {
-            transcript: transcript(messages, span),
-            first_seq: origins[span.start],
-            last_seq: origins[span.end],
-            messages: (span.end - span.start + 1) as u32,
-        })
-        .collect();
-
-    Some(Plan {
-        jobs,
+    Some(Compaction {
+        spans: covered,
+        summary: summaries.join("\n\n"),
+        messages_replaced: replaced,
         tokens_before: context_tokens,
     })
 }
@@ -729,21 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn the_trigger_can_be_the_full_window() {
-        let policy = Policy {
-            enabled: true,
-            window: 1000,
-            threshold: 1.0,
-            target: 0.25,
-            summary_model: String::new(),
-            keep_head: 4,
-            keep_tail: 30,
-        };
-        assert!(!policy.should_compact(999));
-        assert!(policy.should_compact(1000));
-    }
-
-    #[test]
     fn a_disabled_policy_never_triggers() {
         let policy = Policy {
             enabled: false,
@@ -755,83 +523,6 @@ mod tests {
             keep_tail: 30,
         };
         assert!(!policy.should_compact(999));
-    }
-
-    /// The progress card shows this number, so it has to be the sum of what the
-    /// spans actually stand for and not the number of spans.
-    #[test]
-    fn a_plan_reports_the_messages_its_spans_stand_for() {
-        let plan = Plan {
-            tokens_before: 120_000,
-            jobs: vec![
-                SpanJob {
-                    transcript: "a".into(),
-                    first_seq: 3,
-                    last_seq: 10,
-                    messages: 8,
-                },
-                SpanJob {
-                    transcript: "b".into(),
-                    first_seq: 14,
-                    last_seq: 19,
-                    messages: 6,
-                },
-            ],
-        };
-        assert_eq!(plan.messages(), 14);
-        assert_eq!(plan.jobs.len(), 2, "two spans, fourteen messages");
-    }
-
-    /// The mid-turn trigger rests on this: growth that no completion has been
-    /// charged for yet still has to show up as growth.
-    #[test]
-    fn estimating_a_list_grows_as_the_list_grows() {
-        let small = vec![assistant("ok")];
-        let big = vec![assistant("ok"), tool(&"x".repeat(4000))];
-        let (a, b) = (estimate(&small), estimate(&big));
-        assert!(b > a, "adding a large tool result must raise the estimate");
-        // Four characters to the token, so a 4000-char result is ~1000.
-        assert!(
-            (900..=1100).contains(&(b - a)),
-            "a 4000-character result should estimate near 1000 tokens, got {}",
-            b - a
-        );
-    }
-
-    #[test]
-    fn estimating_an_empty_list_is_zero() {
-        // `context_estimate` slices from the billed boundary, which is the whole
-        // list when a completion has just landed. That slice must contribute
-        // nothing rather than panicking or inventing a figure.
-        assert_eq!(estimate(&[]), 0);
-    }
-
-    /// A turn whose context has grown past the trigger since the last completion
-    /// must compact, even though the provider's own figure has not moved. This is
-    /// the bug: the count alone was checked once per turn and never budged, so a
-    /// runaway agentic turn sailed past the window.
-    #[test]
-    fn unbilled_growth_can_cross_the_trigger_on_its_own() {
-        let policy = Policy {
-            enabled: true,
-            window: 1000,
-            threshold: 0.6,
-            target: 0.25,
-            summary_model: String::new(),
-            keep_head: 4,
-            keep_tail: 30,
-        };
-        // What the last request was charged: comfortably under the 600 trigger.
-        let billed = 500u32;
-        assert!(!policy.should_compact(billed), "not yet worth compacting");
-
-        // Two big tool results land mid-turn. Nothing re-prices the request.
-        let unbilled = vec![tool(&"x".repeat(2000)), tool(&"y".repeat(2000))];
-        let combined = billed + estimate(&unbilled);
-        assert!(
-            policy.should_compact(combined),
-            "≈{combined} tokens is over the trigger and must compact mid-turn"
-        );
     }
 
     #[test]

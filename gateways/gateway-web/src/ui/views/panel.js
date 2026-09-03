@@ -87,56 +87,6 @@ export function section(spec) {
 /** The name the skills panel has always used for it. */
 export const skillSection = section;
 
-/** A section whose rows fold away behind its heading.
- *
- * The same heading, count and note as `section`, but as a disclosure holding
- * the rows themselves. Panels with many long rows per group — Tools, where a
- * dozen groups of paragraph-length descriptions made the list unscannable —
- * open collapsed, so the reader picks a domain before reading any prose.
- *
- * @param {object} spec              title, count, note, and `open`
- * @param {Node[]} rows              the group's cards
- * @param {(open:boolean)=>void} [spec.onToggle]  told when the user folds it,
- *   so the caller can remember the state across a redraw
- * @param {Node[]} [spec.aside]      status and controls for the group itself,
- *   laid out on the heading row. A control here must stop its own click from
- *   reaching the summary, or pressing it would fold the group as a side effect.
- * @param {string} [spec.mono]       render the title in the mono face, for a
- *   title that is a literal identifier rather than a display name
- */
-export function collapsibleSection(spec, rows) {
-  const head = el(
-    "summary",
-    { class: "panel-group-summary" },
-    el(
-      "div",
-      { class: "panel-section-head" },
-      el(
-        "h3",
-        { class: `panel-section-title${spec.mono ? " mono is-literal" : ""}` },
-        spec.title
-      ),
-      typeof spec.count === "number"
-        ? el("span", { class: "panel-section-count" }, String(spec.count))
-        : null,
-      spec.aside && spec.aside.length
-        ? el("div", { class: "panel-section-aside" }, spec.aside.filter(Boolean))
-        : null
-    ),
-    spec.note && el("p", { class: "panel-section-note" }, spec.note)
-  );
-
-  const node = el(
-    "details",
-    { class: "panel-group", open: spec.open === true },
-    head,
-    el("div", { class: "panel-group-body" }, rows.filter(Boolean))
-  );
-
-  if (spec.onToggle) node.addEventListener("toggle", () => spec.onToggle(node.open));
-  return node;
-}
-
 /** A lint diagnostic. These were counted in the subtitle but never shown, so a
  *  broken skill reported itself as a number and nothing more. */
 export function skillDiagnostic(diag) {
@@ -483,52 +433,26 @@ export function commitItem(commit, { isHead, onReset } = {}) {
   );
 }
 
-/** A tool: what it does, how it is provided, and its arguments.
- *
- * The description is a sibling of the head rather than a child of the heading:
- * inside it, the badge column stole a third of the width and a paragraph of
- * prose wrapped into a ragged gutter. The name and its badges share the top
- * line; the prose gets the whole card. */
+/** A tool: what it does, how it is provided, and its arguments. */
 export function toolItem(tool) {
   const badges = (tool.capabilities || []).map((cap) =>
     el("span", { class: `badge is-${cap.replace(/[^a-z]/gi, "-")}` }, cap)
   );
 
-  // `attached === false` means the tool exists and is permitted in this mode,
-  // but its group is not in the active set, so its definition is not in the
-  // prompt. Dimming the card says that without hiding the tool: a withheld tool
-  // is still callable — naming it admits its group — and hiding it would make
-  // the panel a worse answer to "what can this conversation do" than the flat
-  // list it replaced.
-  const detached = tool.attached === false;
-
   return el(
     "article",
-    { class: `card${detached ? " is-detached" : ""}` },
+    { class: "card" },
     el(
       "div",
       { class: "card-head" },
-      el("div", { class: "card-heading" }, el("h3", { class: "card-title mono" }, tool.name)),
-      badges.length || detached
-        ? el(
-            "div",
-            { class: "badges" },
-            detached
-              ? el(
-                  "span",
-                  {
-                    class: "badge is-detached",
-                    title:
-                      "Not in the prompt: this tool's group is not attached. Calling it anyway attaches the group.",
-                  },
-                  "not loaded"
-                )
-              : null,
-            ...badges
-          )
-        : null
+      el(
+        "div",
+        { class: "card-heading" },
+        el("h3", { class: "card-title mono" }, tool.name),
+        tool.description && el("p", { class: "card-desc" }, tool.description)
+      ),
+      badges.length ? el("div", { class: "badges" }, badges) : null
     ),
-    tool.description ? el("p", { class: "card-desc" }, tool.description) : null,
     el(
       "details",
       { class: "card-more" },
@@ -536,107 +460,6 @@ export function toolItem(tool) {
       el("pre", { class: "card-pre" }, formatSchema(tool.schema))
     )
   );
-}
-
-/* Why a tool group is attached, in words rather than the store's shorthand.
- *
- * These come from `REASON_*` in agents/agent-core/src/groups.rs and mean
- * nothing on their own, so each gets a plain reading and the reasoning on
- * hover — the same treatment the skills panel gives the ranker's `how`. An
- * unrecognised reason renders as itself rather than being dropped: the two
- * components share a vocabulary, not a type.
- */
-const GROUP_REASON = {
-  "always-on": {
-    label: "always on",
-    hint: "Almost every task needs this group, so it is attached without evidence and cannot be detached.",
-  },
-  configured: {
-    label: "configured",
-    hint: "Named in tool_groups.always_on in the config file, so this deployment attaches it unconditionally.",
-  },
-  skill: {
-    label: "from a skill",
-    hint: "A skill retrieved for this conversation carries a tool-group: tag pointing here. The strongest signal available.",
-  },
-  tag: {
-    label: "word match",
-    hint: "The opening message used words this group is tagged with.",
-  },
-  search: {
-    label: "agent asked",
-    hint: "The agent called tool_search and attached this group itself, mid-conversation.",
-  },
-  manual: {
-    label: "you attached it",
-    hint: "Attached by hand from this panel, overriding the routing.",
-  },
-};
-
-/** The status and controls for one tool group, for `collapsibleSection`'s aside.
- *
- * @param {object} group     the published table entry: id, brief, tags, always_on
- * @param {object} opts
- * @param {boolean} opts.attached
- * @param {string} [opts.reason]
- * @param {boolean} opts.locked      always-on: shown, not offered as a switch
- * @param {(attach:boolean)=>void} opts.onToggle
- */
-export function toolGroupAside(group, opts) {
-  const { attached, reason, locked, onToggle } = opts;
-  const nodes = [];
-
-  if (attached && reason) {
-    const meta = GROUP_REASON[reason];
-    nodes.push(
-      el(
-        "span",
-        { class: "pill", title: meta ? meta.hint : `Reason recorded as "${reason}".` },
-        meta ? meta.label : reason
-      )
-    );
-  }
-
-  // An always-on group gets no switch, and says why instead of failing quietly
-  // when pressed. `core` holds tool_search, the route by which every detached
-  // group is recovered, so detaching it would remove the escape hatch itself.
-  if (locked) {
-    nodes.push(
-      el(
-        "span",
-        {
-          class: "pill pill-on",
-          title:
-            "This group is always attached. It holds the tools every task needs — including tool_search, which is how a detached group gets attached again.",
-        },
-        "locked on"
-      )
-    );
-    return nodes;
-  }
-
-  nodes.push(
-    el(
-      "button",
-      {
-        type: "button",
-        class: `ghost-btn sm${attached ? "" : " is-primary"}`,
-        title: attached
-          ? `Remove ${group.id} from the prompt. The agent can still attach it by calling one of its tools.`
-          : `Add ${group.id} to the prompt for this conversation.`,
-        onClick: (event) => {
-          // The button lives inside a <summary>, so without this the click
-          // folds the group as a side effect of pressing it.
-          event.preventDefault();
-          event.stopPropagation();
-          onToggle(!attached);
-        },
-      },
-      attached ? "Detach" : "Attach"
-    )
-  );
-
-  return nodes;
 }
 
 /** Renders a JSON Schema as a readable argument list rather than raw JSON. */

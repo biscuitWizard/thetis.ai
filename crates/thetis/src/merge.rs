@@ -10,17 +10,13 @@
 //! update, which is the right granularity to recover *inside* the branch and
 //! the wrong granularity for trunk — one merge used to add dozens of lines to
 //! trunk's log, none of which named the work. So the branch is collapsed onto
-//! trunk as a single commit, listing what it absorbed; then trunk fast-forwards
-//! to it as before. Its subject line comes from a model call over the branch's
-//! commit subjects and its diffstat — the conversation's title names what was
-//! first asked for, not what landed — held to one line under 200 characters,
-//! and falling back to the title if the call fails, so a merge never depends
-//! on the provider being up.
+//! trunk as a single commit, titled after the conversation, listing what it
+//! absorbed; then trunk fast-forwards to it as before.
 //!
 //! Merging is user-only. The agent can prepare (update from trunk, resolve
 //! conflicts), but nothing in the agent's tool surface reaches this module.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -28,7 +24,7 @@ use crate::bindings::branch::BranchState;
 use crate::branches::Branches;
 use crate::grip::Grip;
 use crate::pipeline;
-use crate::workers::{WorkerRouter, call_session};
+use crate::workers::{call_session, WorkerRouter};
 
 /// The result of asking for a merge: either trunk moved, or the branch is
 /// left holding conflicts for someone to resolve.
@@ -73,14 +69,7 @@ pub async fn merge_to_trunk(
     // the branch's worktree, where a conflict can sit safely.
     if !root.is_ancestor(&trunk, &row.branch_ref).await? {
         let state: BranchState = serde_json::from_value(
-            call_session(
-                grip,
-                router,
-                session_id,
-                "branch.update",
-                json!({ "session": session_id }),
-            )
-            .await?,
+            call_session(grip, router, session_id, "branch.update", json!({ "session": session_id })).await?,
         )?;
         if state.state == "conflict" {
             return Ok(MergeResult::Conflicts(state));
@@ -199,22 +188,13 @@ pub async fn merge_to_trunk(
     )
     .await;
 
+    // Everyone loads the page from trunk's build; pick up the one that just
+    // landed. Content addressing means the branch already built it.
+    crate::roles::gateway::load_ui_gateway(grip).await;
+
     // The guest aspects are hot-swappable; the kernel is not. If this merge moved
     // the orchestrator's own source, trunk's binary is now older than trunk.
-    //
-    // Kernel first, and exclusively: the kernel is the host half of the WIT, so
-    // once it has moved, a guest built from trunk's contract is keyed and
-    // linked against a binary this process is not. Loading the UI here would at
-    // best miss the cache and at worst smoke-test against a contract that is
-    // about to stop existing. The process that restarts loads the UI itself.
-    let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
-    if crate::control::kernel_source_moved(&root, &from, "HEAD").await {
-        refresh_trunk_kernel(grip, &from, Some(session_id)).await;
-    } else {
-        // Everyone loads the page from trunk's build; pick up the one that just
-        // landed. Content addressing means the branch already built it.
-        crate::roles::gateway::load_ui_gateway(grip).await;
-    }
+    refresh_trunk_kernel(grip, &from, session_id).await;
 
     Ok(MergeResult::Merged { from, to })
 }
@@ -264,25 +244,19 @@ async fn squash_branch(
         .map(|meta| meta.title)
         .filter(|t| !t.trim().is_empty() && t != crate::store::DEFAULT_TITLE)
         .unwrap_or_else(|| row.branch_ref.clone());
-    let fallback: String = clamp_subject(&title);
+    let subject: String = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(72)
+        .collect();
 
     // Oldest first reads as a narrative of the conversation's work.
     let mut body = String::new();
     for commit in commits.iter().rev().take(60) {
         body.push_str(&format!("  {}\n", commit.subject));
     }
-
-    // The subject is what trunk's log shows, so it is worth a model call: the
-    // conversation's title is whatever the first message happened to be about,
-    // while the branch's own commits and diffstat say what actually landed.
-    let oldest_first: Vec<crate::gitctl::CommitInfo> = commits.iter().rev().cloned().collect();
-    let subject = match summarize_subject(grip, branches, row, trunk, &title, &oldest_first).await {
-        Ok(line) => line,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not summarize the branch for its commit subject; using the conversation title");
-            fallback
-        }
-    };
     if commits.len() > 60 {
         body.push_str(&format!("  … and {} more\n", commits.len() - 60));
     }
@@ -322,116 +296,8 @@ async fn squash_branch(
     Ok(Some(squashed))
 }
 
-/// Trunk's log is read at a glance, so a subject line is held to one line and
-/// under 200 characters — the limit the whole squashed-subject path obeys,
-/// whether the line came from a model or from the conversation's title.
-const SUBJECT_LIMIT: usize = 199;
-
-/// One line, whitespace collapsed, no markdown fencing or leading bullet, cut
-/// to `SUBJECT_LIMIT` characters at a word boundary where possible.
-fn clamp_subject(raw: &str) -> String {
-    let line = raw
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("```"))
-        .unwrap_or("")
-        .trim_start_matches(['-', '*', '#', '>', ' '])
-        .trim_matches('"')
-        .trim();
-    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= SUBJECT_LIMIT {
-        return collapsed;
-    }
-    let cut: String = collapsed.chars().take(SUBJECT_LIMIT).collect();
-    match cut.rsplit_once(' ') {
-        // Only respect the word boundary if it does not throw away the line.
-        Some((head, _)) if head.chars().count() >= SUBJECT_LIMIT / 2 => {
-            head.trim_end_matches(&[',', ';', ':', '-'][..]).to_string()
-        }
-        _ => cut,
-    }
-}
-
-/// Asks the model for the squashed commit's subject line.
-///
-/// The evidence is the branch's own commit subjects and its diffstat against
-/// trunk: between them they say what changed and where, which the conversation
-/// title often does not. Any failure — no API key, a provider error, an empty
-/// answer — is the caller's cue to fall back to the title, so this never
-/// blocks a merge.
-async fn summarize_subject(
-    grip: &Arc<Grip>,
-    branches: &Branches,
-    row: &crate::branches::BranchRow,
-    trunk: &str,
-    title: &str,
-    commits: &[crate::gitctl::CommitInfo],
-) -> Result<String> {
-    let root = branches.root_git();
-    let stat = root
-        .diff_stat(trunk, &row.branch_ref, 40)
-        .await
-        .unwrap_or_default();
-
-    let subjects = commits
-        .iter()
-        .take(80)
-        .map(|c| format!("- {}", c.subject))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let model = if grip.cfg.context.summary_model.is_empty() {
-        grip.cfg.model.clone()
-    } else {
-        grip.cfg.context.summary_model.clone()
-    };
-
-    let prompt = format!(
-        "Write the subject line for a squashed git commit that merges a branch to trunk.\n\n\
-         Rules:\n\
-         - One line, imperative mood, under {SUBJECT_LIMIT} characters.\n\
-         - Say what the branch changed and where, concretely. No ticket ids, no \
-           trailing period, no quotes, no markdown.\n\
-         - Prefer the substance of the work over process noise (checkpoints, \
-           rebuilds, trunk updates).\n\
-         - Reply with the line and nothing else.\n\n\
-         Conversation title: {title}\n\n\
-         Commits on the branch, oldest first:\n{subjects}\n\n\
-         Diffstat against trunk:\n{stat}\n"
-    );
-
-    let request = serde_json::json!({
-        "model": model,
-        "max_tokens": 200,
-        "messages": [{ "role": "user", "content": prompt }],
-    });
-
-    let raw = grip
-        .llm
-        .chat(&request.to_string())
-        .await
-        .map_err(|e| anyhow!("{e:?}"))?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
-    let text = parsed["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default();
-    let subject = clamp_subject(text);
-    if subject.is_empty() {
-        bail!("the model returned no usable subject line");
-    }
-    tracing::info!(%model, %subject, "summarized the branch for its squashed commit subject");
-    Ok(subject)
-}
-
-/// Rebuilds trunk's orchestrator binary after an update moved its source, and
+/// Rebuilds trunk's orchestrator binary after a merge moved its source, and
 /// restarts the gateway onto it.
-///
-/// Both ways trunk moves need this: a conversation merging, and an operator
-/// pulling in what another checkout published. The latter used only to print
-/// advice, which left the running binary older than the contract on trunk —
-/// and since a guest built from the newer WIT imports host functions the older
-/// binary does not export, every such guest then failed to instantiate. That
-/// is invisible until the next restart, at which point nothing loads at all.
 ///
 /// Guest components hot-swap, so a merge of agent, gateway or tool code takes
 /// effect on its own. Native code cannot: the gateway process, and every worker
@@ -441,30 +307,21 @@ async fn summarize_subject(
 /// The whole system goes away for a moment, so the order is strict: build,
 /// probe, only then restart. A build or probe failure leaves trunk serving the
 /// binary it already had and files an incident in the conversation that merged
-/// — the source is on trunk either way, so this is staleness, not loss. An
-/// operator-initiated refresh passes no session and reports to the journal.
+/// — the source is on trunk either way, so this is staleness, not loss.
 ///
 /// Runs detached: the build takes minutes and the browser's merge request must
 /// not wait on it.
-pub(crate) async fn refresh_trunk_kernel(
-    grip: &Arc<Grip>,
-    before: &str,
-    session_id: Option<&str>,
-) {
+async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) {
     let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
     if !crate::control::kernel_source_moved(&root, before, "HEAD").await {
         return;
     }
 
     let grip = grip.clone();
-    let session = session_id.map(str::to_string);
+    let session = session_id.to_string();
     tokio::spawn(async move {
-        // A merge names the conversation that made it, and the incident shows
-        // up in that transcript. An operator pulling from the admin page has no
-        // conversation, so for that caller the journal is the whole record.
-        let incident = |grip: Arc<Grip>, session: Option<String>, text: String| async move {
+        let incident = |grip: Arc<Grip>, session: String, text: String| async move {
             tracing::warn!(%text, "trunk's kernel was not refreshed");
-            let Some(session) = session else { return };
             let _ = grip
                 .append_event(
                     &session,
@@ -473,36 +330,28 @@ pub(crate) async fn refresh_trunk_kernel(
                 .await;
         };
 
-        let starting = "This update moved the orchestrator's own source, so trunk's binary is \
-                        being rebuilt. Thetis will restart onto it once it builds and answers \
-                        its startup probe.";
-        tracing::info!("{starting}");
-        if let Some(session) = &session {
-            let _ = grip
-                .append_event(
-                    session,
-                    crate::bindings::types::SessionEvent::Incident(starting.to_string()),
-                )
-                .await;
-        }
+        let _ = grip
+            .append_event(
+                &session,
+                crate::bindings::types::SessionEvent::Incident(
+                    "This merge moved the orchestrator's own source, so trunk's binary is \
+                     being rebuilt. Thetis will restart onto it once it builds and answers \
+                     its startup probe."
+                        .to_string(),
+                ),
+            )
+            .await;
 
         let built = match crate::control::build_kernel(&grip.cfg).await {
-            Ok(crate::control::KernelBuild::Built(path)) => path,
-            // Contention, not failure. The build already going covers this
-            // merge too, so the announcement above stays true and this adds
-            // nothing.
-            Ok(crate::control::KernelBuild::Busy(why)) => {
-                tracing::info!(%why, "a kernel build was already running; leaving it to finish");
-                return;
-            }
+            Ok(path) => path,
             Err(e) => {
                 incident(
                     grip.clone(),
                     session,
                     format!(
-                        "The update landed on trunk, but rebuilding trunk's orchestrator \
+                        "The merge landed on trunk, but rebuilding trunk's orchestrator \
                          binary failed, so Thetis is still running the one built before \
-                         it: {e:#}"
+                         the merge: {e:#}"
                     ),
                 )
                 .await;
@@ -553,9 +402,10 @@ pub(crate) async fn refresh_trunk_kernel(
 
         if let Err(e) = crate::control::request_restart(
             &grip,
-            "trunk moved the orchestrator's own code; restarting on the rebuilt kernel",
+            "a merge to trunk moved the orchestrator's own code; restarting on the \
+             rebuilt kernel",
             true,
-            session.as_deref(),
+            Some(&session),
         )
         .await
         {
@@ -629,49 +479,4 @@ pub async fn resolve_in_conversation(
 pub async fn ref_ahead_behind(branches: &Branches, branch_ref: &str) -> Result<(u64, u64)> {
     let trunk = branches.root_git().current_branch().await?;
     branches.root_git().ahead_behind(branch_ref, &trunk).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_models_chattier_habits_are_stripped() {
-        // Preamble line, a fence, a bullet and quotes: all things a model adds
-        // and none of which belong in a git subject.
-        let raw = "```\n- \"Add a diffstat helper to gitctl\"\n```\nHope that helps!";
-        assert_eq!(clamp_subject(raw), "Add a diffstat helper to gitctl");
-    }
-
-    #[test]
-    fn whitespace_is_collapsed_to_one_line() {
-        assert_eq!(clamp_subject("  Fix   the\tpump  "), "Fix the pump");
-    }
-
-    #[test]
-    fn an_overlong_line_is_cut_at_a_word_boundary_under_the_limit() {
-        let long = "Summarize ".repeat(60);
-        let out = clamp_subject(&long);
-        assert!(
-            out.chars().count() <= SUBJECT_LIMIT,
-            "got {} chars",
-            out.chars().count()
-        );
-        assert!(out.chars().count() < 200);
-        assert!(!out.ends_with(' '));
-        // Cut on a boundary, so no word is left half-written.
-        assert!(out.ends_with("Summarize"), "got {out:?}");
-    }
-
-    #[test]
-    fn a_single_enormous_word_is_still_cut_to_the_limit() {
-        let out = clamp_subject(&"x".repeat(500));
-        assert_eq!(out.chars().count(), SUBJECT_LIMIT);
-    }
-
-    #[test]
-    fn nothing_usable_yields_nothing_so_the_caller_falls_back() {
-        assert_eq!(clamp_subject("```\n```"), "");
-        assert_eq!(clamp_subject("   "), "");
-    }
 }

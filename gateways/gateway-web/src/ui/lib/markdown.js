@@ -4,15 +4,11 @@
  * building nodes (never innerHTML from model output) is what makes rendering
  * model text safe. Covers what the agent actually writes — paragraphs,
  * headings, fenced code with a copy button, inline code, bold, italic, links,
- * flat lists, blockquotes, rules and pipe tables. Anything fancier renders as
- * plain text, which is exactly what the old transcript did for everything.
- *
- * A ```mermaid fence is the one exception to the DOM-building rule; see
- * `mermaid.js` for what keeps that safe and why it is worth it.
+ * flat lists, blockquotes and rules. Anything fancier renders as plain text,
+ * which is exactly what the old transcript did for everything.
  */
 
 import { el } from "./dom.js";
-import { isMermaid, mermaidBlock } from "./mermaid.js";
 
 /** Renders markdown to an array of block nodes. */
 export function renderMarkdown(text) {
@@ -51,23 +47,7 @@ export function renderMarkdown(text) {
       flush();
       const body = [];
       while (++i < lines.length && !/^```\s*$/.test(lines[i])) body.push(lines[i]);
-      const code = body.join("\n");
-      const lang = fence[1];
-      // A mermaid fence draws a diagram, and falls back to exactly this code
-      // block if the library or the source will not cooperate.
-      blocks.push(
-        isMermaid(lang) ? mermaidBlock(code, () => codeBlock(code, lang)) : codeBlock(code, lang)
-      );
-      continue;
-    }
-
-    // Pipe tables. Checked before headings and the paragraph fallthrough, so a
-    // table interrupts whatever came before it.
-    const table = tableAt(lines, i);
-    if (table) {
-      flush();
-      blocks.push(table.node);
-      i += table.consumed;
+      blocks.push(codeBlock(body.join("\n"), fence[1]));
       continue;
     }
 
@@ -147,164 +127,6 @@ function codeBlock(code, lang) {
     el("div", { class: "md-code-head" }, el("span", { class: "md-code-lang" }, lang || "text"), button),
     el("pre", {}, el("code", {}, code))
   );
-}
-
-/* --- tables -----------------------------------------------------------------
- *
- * GFM pipe tables: a header row, a delimiter row that sets each column's
- * alignment, then body rows until the first line without a pipe.
- *
- * Also handles the *collapsed* form, where a whole table arrives on a single
- * line because it came through something that ate the newlines:
- * `| a | b | |---|---| | 1 | 2 |`. That form is genuinely ambiguous — an empty
- * leading cell and a row boundary are both spelled `| |` — so it is resolved by
- * counting cells against the header's width rather than by guessing. See
- * `splitCollapsed` and `chunkRows`.
- */
-
-const DELIM_CELL = /^:?-+:?$/;
-
-/** Reads a table starting at `lines[start]`, or null if there is not one. */
-function tableAt(lines, start) {
-  const first = lines[start];
-  if (!first || !first.includes("|")) return null;
-
-  // The ordinary multi-line table.
-  const next = lines[start + 1];
-  if (next && next.includes("|") && splitCells(next).every((c) => DELIM_CELL.test(c.trim()))) {
-    const header = splitCells(first);
-    const align = splitCells(next).map(alignOf);
-    const rows = [];
-    let i = start + 2;
-    while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
-      rows.push(splitCells(lines[i]));
-      i++;
-    }
-    // `consumed` is how far to advance beyond `start`; the loop's own `i++`
-    // moves onto the first line this table did not claim.
-    return { node: tableNode(header, align, rows), consumed: i - start - 1 };
-  }
-
-  const collapsed = splitCollapsed(first);
-  return collapsed ? { node: tableNode(collapsed.header, collapsed.align, collapsed.rows), consumed: 0 } : null;
-}
-
-/* A table collapsed onto one line. The delimiter cells are the one unambiguous
- * landmark, so they anchor everything: what precedes them is the header, what
- * follows is the body. */
-function splitCollapsed(line) {
-  const tokens = splitCells(line);
-  const runStart = tokens.findIndex((t) => DELIM_CELL.test(t.trim()));
-  if (runStart <= 0) return null;
-  let runEnd = runStart;
-  while (runEnd + 1 < tokens.length && DELIM_CELL.test(tokens[runEnd + 1].trim())) runEnd++;
-  // Two dash cells before this is treated as a table: one is far more likely to
-  // be a paragraph that happens to contain a pipe and a dash.
-  if (runEnd === runStart) return null;
-
-  const header = tokens.slice(0, runStart);
-  // The header's last token is the pad where its closing pipe met the delimiter
-  // row's opening one. A header genuinely ending in an empty cell is rarer than
-  // that boundary, which is always present.
-  if (header.length > 1 && !header[header.length - 1].trim()) header.pop();
-
-  return {
-    header,
-    align: tokens.slice(runStart, runEnd + 1).map(alignOf),
-    rows: chunkRows(tokens.slice(runEnd + 1), header.length),
-  };
-}
-
-/* Cuts a flat run of collapsed body cells into rows of `width`.
- *
- * Each row may be preceded by one blank token — the `| |` where a row's closing
- * pipe meets the next row's opening pipe — and it is indistinguishable from an
- * empty first cell by inspection. Arithmetic settles it: if the count divides
- * evenly by `width` there are no pads, and if it instead divides by `width + 1`
- * with every stride-th token blank, there is exactly one pad per row. */
-function chunkRows(cells, width) {
-  if (!width || !cells.length) return [];
-  const padded =
-    cells.length % width !== 0 &&
-    cells.length % (width + 1) === 0 &&
-    blankEveryStride(cells, width + 1);
-  const stride = padded ? width + 1 : width;
-
-  const rows = [];
-  for (let i = 0; i < cells.length; i += stride) {
-    const row = cells.slice(i, i + stride);
-    rows.push(padded ? row.slice(1) : row);
-  }
-  return rows;
-}
-
-function blankEveryStride(cells, stride) {
-  for (let i = 0; i < cells.length; i += stride) if (cells[i].trim()) return false;
-  return true;
-}
-
-/* Splits one row into cells: outer pipes dropped, `\|` kept as a literal. */
-function splitCells(line) {
-  let text = line.trim();
-  if (text.startsWith("|")) text = text.slice(1);
-  if (text.endsWith("|") && !text.endsWith("\\|")) text = text.slice(0, -1);
-
-  const cells = [];
-  let cell = "";
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "\\" && text[i + 1] === "|") {
-      cell += "|";
-      i++;
-    } else if (text[i] === "|") {
-      cells.push(cell);
-      cell = "";
-    } else {
-      cell += text[i];
-    }
-  }
-  cells.push(cell);
-  return cells;
-}
-
-/** `:---` left, `---:` right, `:---:` centre, plain: no opinion. */
-function alignOf(cell) {
-  const text = cell.trim();
-  const left = text.startsWith(":");
-  const right = text.endsWith(":");
-  if (left && right) return "center";
-  if (right) return "right";
-  if (left) return "left";
-  return null;
-}
-
-function tableNode(header, align, rows) {
-  const width = header.length;
-  const cell = (tag, text, column) =>
-    el(tag, align[column] ? { class: `md-cell-${align[column]}` } : {}, ...inline(text.trim()));
-
-  // Wrapped, because a table wider than the 48rem measure has to scroll on its
-  // own rather than stretch the text column around it.
-  return el(
-    "div",
-    { class: "md-table-wrap" },
-    el(
-      "table",
-      { class: "md-table" },
-      el("thead", {}, el("tr", {}, header.map((text, n) => cell("th", text, n)))),
-      el(
-        "tbody",
-        {},
-        rows.map((row) => el("tr", {}, fit(row, width).map((text, n) => cell("td", text, n))))
-      )
-    )
-  );
-}
-
-/** A ragged row is padded or truncated to the header's width. */
-function fit(row, width) {
-  const cells = row.slice(0, width);
-  while (cells.length < width) cells.push("");
-  return cells;
 }
 
 function flash(button, text) {

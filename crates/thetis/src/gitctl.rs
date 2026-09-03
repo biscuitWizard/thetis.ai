@@ -8,11 +8,11 @@
 //! reimplementations diverge from the reference implementation. Output is
 //! parsed only from plumbing formats git documents as stable.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 use std::sync::Arc;
+use std::process::Output;
 use std::time::Duration;
 
 /// Local git operations never legitimately take this long; a hung git would
@@ -52,17 +52,6 @@ pub enum MergeOutcome {
     Clean { head: String },
     /// The merge stopped on conflicts, which remain in the working tree for
     /// someone — the user or the conversation — to resolve.
-    Conflict { paths: Vec<String> },
-}
-
-/// The result of a merge computed entirely in the object store.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeTree {
-    /// Merged cleanly; the id of the resulting tree.
-    Merged { tree: String },
-    /// Git could not merge these paths on its own. The tree it produced
-    /// carries conflict markers, so it is deliberately not offered here:
-    /// nothing in Thetis publishes a tree no one has looked at.
     Conflict { paths: Vec<String> },
 }
 
@@ -245,27 +234,6 @@ impl GitCtl {
         Ok(out)
     }
 
-    /// As `run_hooked`, but a non-zero exit is returned rather than raised.
-    ///
-    /// Publishing needs this: git's own wording for a refused push says
-    /// nothing about which of its several causes applies, and the caller can
-    /// only translate stderr it is still holding. Callers must check
-    /// `out.status` themselves — nothing else here reports failure.
-    pub async fn run_hooked_status(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {
-        let _guard = self.write_lock().lock_owned().await;
-        let mut cmd = self.base_cmd(true);
-        cmd.args(args);
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        crate::control::run_child(
-            cmd,
-            GIT_TIMEOUT,
-            &format!("git {} in {}", args.join(" "), self.dir.display()),
-        )
-        .await
-    }
-
     /// As `run_raw`, with extra environment — the temp-index plumbing the
     /// public export uses (`GIT_INDEX_FILE`).
     pub async fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {
@@ -430,9 +398,7 @@ impl GitCtl {
     /// name one.
     pub async fn rev_parse(&self, rev: &str) -> Result<Option<String>> {
         let spec = format!("{rev}^{{commit}}");
-        let out = self
-            .run_ok(&["rev-parse", "--verify", "--quiet", &spec])
-            .await?;
+        let out = self.run_ok(&["rev-parse", "--verify", "--quiet", &spec]).await?;
         if out.status.success() {
             Ok(Some(Self::stdout(&out)))
         } else {
@@ -444,9 +410,7 @@ impl GitCtl {
     /// the build cache uses. `None` when the path does not exist there.
     pub async fn tree_oid(&self, rev: &str, path: &str) -> Result<Option<String>> {
         let spec = format!("{rev}:{path}");
-        let out = self
-            .run_ok(&["rev-parse", "--verify", "--quiet", &spec])
-            .await?;
+        let out = self.run_ok(&["rev-parse", "--verify", "--quiet", &spec]).await?;
         if out.status.success() {
             Ok(Some(Self::stdout(&out)))
         } else {
@@ -498,8 +462,7 @@ impl GitCtl {
     /// A log over arbitrary rev-list arguments (exclusions included), with
     /// parent ids — what a commit graph draws from.
     pub async fn log_args(&self, revs: &[&str], limit: usize) -> Result<Vec<CommitInfo>> {
-        let format =
-            format!("%H{FIELD_SEP}%P{FIELD_SEP}%s{FIELD_SEP}%an{FIELD_SEP}%at{RECORD_SEP}");
+        let format = format!("%H{FIELD_SEP}%P{FIELD_SEP}%s{FIELD_SEP}%an{FIELD_SEP}%at{RECORD_SEP}");
         let max = format!("--max-count={limit}");
         let fmt = format!("--format={format}");
         let mut args = vec!["log", max.as_str(), fmt.as_str()];
@@ -527,30 +490,6 @@ impl GitCtl {
         Ok(commits)
     }
 
-    /// `git diff --stat` between two revisions, capped to `max_lines` so a
-    /// sprawling branch cannot flood a caller (or a model prompt). The final
-    /// summary line is always kept, because it carries the totals.
-    pub async fn diff_stat(&self, from: &str, to: &str, max_lines: usize) -> Result<String> {
-        let range = format!("{from}..{to}");
-        let out = self
-            .run(&["diff", "--stat=140,100", "--no-color", &range])
-            .await?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() <= max_lines {
-            return Ok(lines.join("\n"));
-        }
-        let mut kept: Vec<String> = lines[..max_lines.saturating_sub(1)]
-            .iter()
-            .map(|l| l.to_string())
-            .collect();
-        kept.push(format!("… {} more files", lines.len() - max_lines));
-        if let Some(totals) = lines.last() {
-            kept.push(totals.to_string());
-        }
-        Ok(kept.join("\n"))
-    }
-
     /// The common ancestor of two revisions — where a branch forked.
     pub async fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
         let out = self.run_ok(&["merge-base", a, b]).await?;
@@ -562,32 +501,6 @@ impl GitCtl {
     }
 
     /// Paths with unmerged index entries — the conflict list.
-    /// Tracked files that carry a conflict's signature, wherever the index
-    /// thinks they stand.
-    ///
-    /// Both halves are required — a line opening `<<<<<<< ` *and* one opening
-    /// `>>>>>>> `. A lone `=======` is a markdown heading rule as often as it
-    /// is a conflict, and refusing to commit over one would be its own kind of
-    /// stuck.
-    async fn conflict_marked_files(&self) -> Result<Vec<String>> {
-        let out = self
-            .run_ok(&["grep", "--name-only", "-z", "-I", "-e", "^<<<<<<< "])
-            .await?;
-        let mut found = Vec::new();
-        for path in String::from_utf8_lossy(&out.stdout)
-            .split('\0')
-            .filter(|p| !p.is_empty())
-        {
-            let Ok(text) = tokio::fs::read_to_string(self.dir.join(path)).await else {
-                continue;
-            };
-            if text.lines().any(|l| l.starts_with(">>>>>>> ")) {
-                found.push(path.to_string());
-            }
-        }
-        Ok(found)
-    }
-
     pub async fn unmerged_paths(&self) -> Result<Vec<String>> {
         let out = self.run(&["ls-files", "-u", "-z"]).await?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -652,60 +565,6 @@ impl GitCtl {
         Ok(MergeOutcome::Conflict { paths: conflicts })
     }
 
-    /// Three-way merge two commits in the object store alone: no working
-    /// tree, no index, no branch moved.
-    ///
-    /// This is how publishing reconciles with the remote. The checkout is a
-    /// live conversation's trunk and cannot be borrowed for a merge that may
-    /// stop halfway on conflicts, and the two sides being merged are exported
-    /// histories that are never checked out at all.
-    ///
-    /// The merge base is whatever git finds between `ours` and `theirs`, so
-    /// callers with unrelated histories graft both sides onto a base commit
-    /// first — `--merge-base` only arrived in git 2.40 and this has to work on
-    /// older ones.
-    pub async fn merge_tree(&self, ours: &str, theirs: &str) -> Result<MergeTree> {
-        let out = self
-            .run_ok(&[
-                "merge-tree",
-                "--write-tree",
-                "-z",
-                "--name-only",
-                ours,
-                theirs,
-            ])
-            .await?;
-        // `<tree>NUL` on success; on a conflict the tree is followed by one
-        // NUL-terminated path per conflicted file, then an empty field, then
-        // git's own messages.
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut fields = text.split('\0');
-        let tree = fields.next().unwrap_or_default().trim().to_string();
-        if out.status.success() {
-            if tree.is_empty() {
-                bail!(
-                    "git merge-tree wrote no tree: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            return Ok(MergeTree::Merged { tree });
-        }
-        let paths: Vec<String> = fields
-            .take_while(|f| !f.is_empty())
-            .map(str::to_string)
-            .collect();
-        if paths.is_empty() {
-            // Exit 1 with nothing named is not a conflict but a refusal —
-            // unrelated histories, a bad revision — and must not be reported
-            // as one.
-            bail!(
-                "git merge-tree {ours} {theirs} failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(MergeTree::Conflict { paths })
-    }
-
     pub async fn merge_abort(&self) -> Result<()> {
         self.run(&["merge", "--abort"]).await?;
         Ok(())
@@ -719,38 +578,23 @@ impl GitCtl {
     /// conflict markers in the files themselves. Checked before staging,
     /// because `add -A` erases the unmerged entries that say where to look.
     pub async fn commit_merge(&self, message: &str) -> Result<String> {
-        let mut unresolved: Vec<String> = Vec::new();
-        for path in self.unmerged_paths().await? {
-            let file = self.dir.join(&path);
-            // A missing file is a resolution too: deleted on purpose.
-            let Ok(text) = tokio::fs::read_to_string(&file).await else {
-                continue;
-            };
-            if text
-                .lines()
-                .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "=======")
-            {
-                unresolved.push(path);
+        let unresolved: Vec<String> = {
+            let mut found = Vec::new();
+            for path in self.unmerged_paths().await? {
+                let file = self.dir.join(&path);
+                // A missing file is a resolution too: deleted on purpose.
+                let Ok(text) = tokio::fs::read_to_string(&file).await else {
+                    continue;
+                };
+                if text.lines().any(|l| {
+                    l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "======="
+                }) {
+                    found.push(path);
+                }
             }
-        }
-
-        // And then every tracked file, not only the ones git still calls
-        // unmerged. That list is `ls-files -u`, and `git add` collapses a
-        // conflicted path to stage 0 — so a turn-end checkpoint running
-        // `add -A` while a merge sat open took the conflicted file off the
-        // list entirely, this guard was left with nothing to inspect, and the
-        // markers went into a commit. One conversation's kernel spent a day
-        // refusing to compile on `error: encountered diff marker`, which is a
-        // strange way to learn that the check meant to prevent exactly this
-        // had been looking at an empty list.
-        for path in self.conflict_marked_files().await? {
-            if !unresolved.contains(&path) {
-                unresolved.push(path);
-            }
-        }
-
+            found
+        };
         if !unresolved.is_empty() {
-            unresolved.sort();
             bail!(
                 "cannot commit merge: conflict markers remain in {}",
                 unresolved.join(", ")
@@ -865,8 +709,7 @@ impl GitCtl {
         let path_str = path
             .to_str()
             .with_context(|| format!("non-utf8 worktree path {}", path.display()))?;
-        self.run(&["worktree", "remove", "--force", path_str])
-            .await?;
+        self.run(&["worktree", "remove", "--force", path_str]).await?;
         Ok(())
     }
 
@@ -998,16 +841,14 @@ mod tests {
 
         for n in 0..4 {
             fs::write(wt_path.join(format!("f{n}.txt")), format!("{n}\n")).unwrap();
-            wt.add_all_and_commit(&format!("checkpoint {n}"))
-                .await
-                .unwrap()
-                .unwrap();
+            wt.add_all_and_commit(&format!("checkpoint {n}")).await.unwrap().unwrap();
         }
         let old_tip = wt.head().await.unwrap();
-        let tree_before =
-            String::from_utf8_lossy(&wt.run(&["rev-parse", "HEAD^{tree}"]).await.unwrap().stdout)
-                .trim()
-                .to_string();
+        let tree_before = String::from_utf8_lossy(
+            &wt.run(&["rev-parse", "HEAD^{tree}"]).await.unwrap().stdout,
+        )
+        .trim()
+        .to_string();
         assert_eq!(git.ahead_behind("conv/sq", "main").await.unwrap(), (4, 0));
 
         let keep = "refs/thetis/presquash/test";
@@ -1019,10 +860,7 @@ mod tests {
         // One commit ahead of trunk, same tree, worktree still clean.
         assert_eq!(git.ahead_behind("conv/sq", "main").await.unwrap(), (1, 0));
         let tree_after = String::from_utf8_lossy(
-            &git.run(&["rev-parse", "conv/sq^{tree}"])
-                .await
-                .unwrap()
-                .stdout,
+            &git.run(&["rev-parse", "conv/sq^{tree}"]).await.unwrap().stdout,
         )
         .trim()
         .to_string();
@@ -1034,10 +872,7 @@ mod tests {
         }
 
         // The old history is rewritten out of the branch but still reachable.
-        assert_eq!(
-            git.rev_parse(keep).await.unwrap().as_deref(),
-            Some(old_tip.as_str())
-        );
+        assert_eq!(git.rev_parse(keep).await.unwrap().as_deref(), Some(old_tip.as_str()));
         assert!(!git.is_ancestor(&old_tip, "conv/sq").await.unwrap());
 
         // And trunk takes it as a fast-forward, one line long.
@@ -1073,18 +908,11 @@ mod tests {
         let wt_path = tmp.path().join("worktrees").join("one");
         let wt = git.worktree_add(&wt_path, "conv/one").await.unwrap();
         fs::write(wt_path.join("only.txt"), "x\n").unwrap();
-        let tip = wt
-            .add_all_and_commit("the only commit")
-            .await
-            .unwrap()
-            .unwrap();
+        let tip = wt.add_all_and_commit("the only commit").await.unwrap().unwrap();
 
         // Still squashed to one commit — and the id is unchanged, so nothing
         // was rewritten for no gain.
-        let out = git
-            .squash_onto("conv/one", "main", "rewrite", None)
-            .await
-            .unwrap();
+        let out = git.squash_onto("conv/one", "main", "rewrite", None).await.unwrap();
         assert_ne!(out, tip, "one commit above trunk is still re-parented");
         assert_eq!(git.ahead_behind("conv/one", "main").await.unwrap(), (1, 0));
     }
@@ -1140,24 +968,6 @@ mod tests {
         // Committing with conflicts still unresolved is refused.
         assert!(wt.commit_merge("update from trunk").await.is_err());
 
-        // And still refused once the conflicted file has been staged. This is
-        // the case that got through: `git add` takes a path off `ls-files -u`,
-        // so a checkpoint running `add -A` during an open merge emptied the
-        // list this guard reads and the markers were committed. A conversation
-        // then could not build its own kernel until somebody removed them by
-        // hand.
-        wt.run(&["add", "-A"]).await.unwrap();
-        assert!(
-            wt.unmerged_paths().await.unwrap().is_empty(),
-            "staging is what hides the conflict from the index"
-        );
-        let err = wt
-            .commit_merge("update from trunk")
-            .await
-            .expect_err("a staged conflict is still a conflict")
-            .to_string();
-        assert!(err.contains("base.txt"), "the message has to name it: {err}");
-
         fs::write(wt_path.join("base.txt"), "resolved\n").unwrap();
         wt.commit_merge("update from trunk").await.unwrap();
         assert!(!wt.merge_in_progress().await.unwrap());
@@ -1168,36 +978,6 @@ mod tests {
         assert_eq!(
             fs::read_to_string(tmp.path().join("base.txt")).unwrap(),
             "resolved\n"
-        );
-    }
-
-    // The guard must not fire on prose. A markdown heading rule is exactly
-    // seven or more `=` on its own line, and a merge refused over one would be
-    // its own kind of stuck.
-    #[tokio::test]
-    async fn a_document_that_looks_a_bit_like_a_conflict_is_not_one() {
-        let (tmp, git) = repo().await;
-        git.branch_create("conv/w", "main").await.unwrap();
-        let wt_path = tmp.path().join("worktrees").join("w");
-        let wt = git.worktree_add(&wt_path, "conv/w").await.unwrap();
-
-        fs::write(
-            wt_path.join("README.md"),
-            "Heading\n=======\n\nSome prose about <<<<<<< markers.\n",
-        )
-        .unwrap();
-        wt.add_all_and_commit("docs").await.unwrap().unwrap();
-        fs::write(tmp.path().join("base.txt"), "trunk\n").unwrap();
-        git.add_all_and_commit("trunk edit").await.unwrap().unwrap();
-
-        let outcome = wt.merge("main", "update from trunk").await.unwrap();
-        assert!(
-            matches!(outcome, MergeOutcome::Clean { .. }),
-            "disjoint files merge cleanly"
-        );
-        assert!(
-            wt.conflict_marked_files().await.unwrap().is_empty(),
-            "an underline and a mention are not a conflict"
         );
     }
 
@@ -1278,7 +1058,10 @@ mod tests {
         git.add_all_and_commit("broken").await.unwrap().unwrap();
 
         git.checkout_paths(&green, &["tools/demo"]).await.unwrap();
-        assert_eq!(fs::read_to_string(tool.join("lib.rs")).unwrap(), "good\n");
+        assert_eq!(
+            fs::read_to_string(tool.join("lib.rs")).unwrap(),
+            "good\n"
+        );
     }
 
     #[tokio::test]
@@ -1323,11 +1106,7 @@ mod tests {
     async fn hard_reset_clean_removes_untracked_but_keeps_ignored() {
         let (tmp, git) = repo().await;
         fs::write(tmp.path().join(".gitignore"), "kept-cache/\n").unwrap();
-        let base = git
-            .add_all_and_commit("ignore file")
-            .await
-            .unwrap()
-            .unwrap();
+        let base = git.add_all_and_commit("ignore file").await.unwrap().unwrap();
 
         fs::write(tmp.path().join("base.txt"), "changed\n").unwrap();
         fs::write(tmp.path().join("untracked.txt"), "new\n").unwrap();

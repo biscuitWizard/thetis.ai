@@ -4,14 +4,14 @@
 //! wire protocol and hands plain events upward, which keeps the routing and
 //! authorization policy in `mod.rs` testable without a socket.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
+    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 
 pub const API_BASE: &str = "https://discord.com/api/v10";
@@ -92,42 +92,6 @@ impl Interaction {
     }
 }
 
-/// A button press, select-menu choice or modal submission.
-///
-/// These are the *other* two interaction types, and they are not commands: no
-/// command name arrives, and what identifies them is the `custom_id` the bot
-/// itself put on the component. They are kept separate from `Interaction` for
-/// that reason — conflating them would mean a struct whose `name` is sometimes
-/// a command and sometimes a made-up token.
-#[derive(Debug, Clone)]
-pub struct Component {
-    pub id: String,
-    pub token: String,
-    pub channel_id: String,
-    pub guild_id: Option<String>,
-    pub channel_type: Option<u64>,
-    pub user_id: String,
-    pub user_name: String,
-    /// The id the bot gave the component. This is the whole of the routing
-    /// information, so it has to encode everything the handler needs.
-    pub custom_id: String,
-    /// Select-menu selections, or a modal's text-input values in row order.
-    /// A button press has none.
-    pub values: Vec<String>,
-    /// The message the component sits on. Absent on a modal submission that
-    /// Discord did not attach one to, which is why a modal's `custom_id` also
-    /// carries the message id.
-    pub message_id: Option<String>,
-    /// True for a modal submission, false for a button or select menu.
-    pub from_modal: bool,
-}
-
-impl Component {
-    pub fn is_dm(&self) -> bool {
-        self.guild_id.is_none()
-    }
-}
-
 /// What the socket produced. `Resumed` and `Ready` are separate because only a
 /// fresh READY invalidates the session state we were holding.
 #[derive(Debug)]
@@ -135,15 +99,10 @@ pub enum Event {
     Ready {
         bot_id: String,
         application_id: String,
-        /// The bot's current Discord username, so a rename can be skipped when
-        /// it already matches and the rate limit is not spent for nothing.
-        bot_name: String,
     },
     Message(Incoming),
     /// A slash command was invoked.
     Command(Interaction),
-    /// A component on one of the bot's own messages was used.
-    Interacted(Component),
     /// The socket ended; the caller reconnects.
     Disconnected(String),
     /// The socket ended for a reason reconnecting cannot fix.
@@ -167,29 +126,13 @@ pub fn is_fatal_close(code: u16) -> bool {
 pub fn fatal_advice(code: u16) -> &'static str {
     match code {
         4004 => "the bot token was rejected; check discord.bot_token or DISCORD_BOT_TOKEN",
-        4013 | 4014 => {
-            "the gateway refused the intents; enable Message Content Intent \
+        4013 | 4014 => "the gateway refused the intents; enable Message Content Intent \
                         and Server Members Intent under Privileged Gateway Intents in the \
-                        Discord Developer Portal"
-        }
+                        Discord Developer Portal",
         4010 | 4011 => "the shard configuration is wrong for this bot",
         4012 => "the gateway API version is no longer supported by this build",
         _ => "the gateway closed the connection permanently",
     }
-}
-
-/// The names of commands Discord stored with no interaction contexts.
-///
-/// Such a command is registered as far as the API is concerned — it comes back
-/// in the 200 response and can be fetched later — but the client never offers
-/// it in the picker, so it can never be invoked. Pure, so the check that turns
-/// a silent registration failure into a warning does not need a live API.
-fn commands_without_contexts(stored: &[Value]) -> Vec<&str> {
-    stored
-        .iter()
-        .filter(|c| c.get("contexts").map(Value::is_null).unwrap_or(true))
-        .filter_map(|c| c.get("name").and_then(Value::as_str))
-        .collect()
 }
 
 fn parse_message(d: &Value) -> Option<Incoming> {
@@ -206,10 +149,16 @@ fn parse_message(d: &Value) -> Option<Incoming> {
     Some(Incoming {
         message_id: d.get("id")?.as_str()?.to_string(),
         channel_id: d.get("channel_id")?.as_str()?.to_string(),
-        guild_id: d.get("guild_id").and_then(Value::as_str).map(String::from),
+        guild_id: d
+            .get("guild_id")
+            .and_then(Value::as_str)
+            .map(String::from),
         author_id,
         author_name,
-        author_is_bot: author.get("bot").and_then(Value::as_bool).unwrap_or(false),
+        author_is_bot: author
+            .get("bot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         content: d
             .get("content")
             .and_then(Value::as_str)
@@ -233,56 +182,29 @@ fn parse_message(d: &Value) -> Option<Incoming> {
     })
 }
 
-/// The invoker of an interaction, whatever its type.
-///
-/// In a guild the user is nested under `member`; in a DM it is at the top
-/// level. Every interaction type shares that shape, so it is read once.
-fn interaction_user(d: &Value) -> Option<(String, String)> {
-    let user = d
-        .get("member")
-        .and_then(|m| m.get("user"))
-        .or_else(|| d.get("user"))?;
-    let id = user.get("id")?.as_str()?.to_string();
-    let name = user
-        .get("global_name")
-        .and_then(Value::as_str)
-        .or_else(|| user.get("username").and_then(Value::as_str))
-        .unwrap_or("someone")
-        .to_string();
-    Some((id, name))
-}
-
-/// Where an interaction happened. `channel_id` is top-level on older payloads
-/// and nested under `channel` on newer ones, so both are tried.
-fn interaction_channel(d: &Value) -> (String, Option<u64>) {
-    let id = d
-        .get("channel_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            d.get("channel")
-                .and_then(|c| c.get("id"))
-                .and_then(Value::as_str)
-        })
-        .unwrap_or_default()
-        .to_string();
-    let kind = d
-        .get("channel")
-        .and_then(|c| c.get("type"))
-        .and_then(Value::as_u64);
-    (id, kind)
-}
-
 /// Reads an APPLICATION_COMMAND interaction, or `None` for any other type.
 ///
-/// Component and modal interactions share this dispatch and are read by
-/// `parse_component` instead: only type 2 carries a command name.
+/// Component and modal interactions share this dispatch and must be ignored
+/// rather than guessed at: only type 2 carries a command name.
 fn parse_interaction(d: &Value) -> Option<Interaction> {
     const APPLICATION_COMMAND: u64 = 2;
     if d.get("type").and_then(Value::as_u64) != Some(APPLICATION_COMMAND) {
         return None;
     }
     let data = d.get("data")?;
-    let (user_id, user_name) = interaction_user(d)?;
+
+    // In a guild the invoker is under `member`; in a DM it is at the top level.
+    let user = d
+        .get("member")
+        .and_then(|m| m.get("user"))
+        .or_else(|| d.get("user"))?;
+    let user_id = user.get("id")?.as_str()?.to_string();
+    let user_name = user
+        .get("global_name")
+        .and_then(Value::as_str)
+        .or_else(|| user.get("username").and_then(Value::as_str))
+        .unwrap_or("someone")
+        .to_string();
 
     // Option values are flattened in declaration order. Every command here
     // takes at most one string, so joining is enough and lets the handler stay
@@ -303,79 +225,28 @@ fn parse_interaction(d: &Value) -> Option<Interaction> {
         })
         .unwrap_or_default();
 
-    let (channel_id, channel_type) = interaction_channel(d);
     Some(Interaction {
         id: d.get("id")?.as_str()?.to_string(),
         token: d.get("token")?.as_str()?.to_string(),
-        channel_id,
+        channel_id: d
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                d.get("channel")
+                    .and_then(|c| c.get("id"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default()
+            .to_string(),
         guild_id: d.get("guild_id").and_then(Value::as_str).map(String::from),
-        channel_type,
+        channel_type: d
+            .get("channel")
+            .and_then(|c| c.get("type"))
+            .and_then(Value::as_u64),
         user_id,
         user_name,
         name: data.get("name")?.as_str()?.to_lowercase(),
         argument,
-    })
-}
-
-/// Reads a MESSAGE_COMPONENT (type 3) or MODAL_SUBMIT (type 5) interaction.
-///
-/// `None` for anything else, including a command: the two paths are disjoint,
-/// so a payload can never be read as both.
-///
-/// Modal values are nested two deep — `components[].components[].value` — one
-/// action row per input. They are flattened into `values` in row order, which is
-/// the order they were declared, so a caller reads them positionally.
-fn parse_component(d: &Value) -> Option<Component> {
-    const MESSAGE_COMPONENT: u64 = 3;
-    const MODAL_SUBMIT: u64 = 5;
-    let kind = d.get("type").and_then(Value::as_u64)?;
-    if kind != MESSAGE_COMPONENT && kind != MODAL_SUBMIT {
-        return None;
-    }
-    let data = d.get("data")?;
-    let (user_id, user_name) = interaction_user(d)?;
-    let (channel_id, channel_type) = interaction_channel(d);
-
-    let values = if kind == MODAL_SUBMIT {
-        data.get("components")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| row.get("components").and_then(Value::as_array))
-                    .flatten()
-                    .filter_map(|c| c.get("value").and_then(Value::as_str))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        data.get("values")
-            .and_then(Value::as_array)
-            .map(|vals| {
-                vals.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-
-    Some(Component {
-        id: d.get("id")?.as_str()?.to_string(),
-        token: d.get("token")?.as_str()?.to_string(),
-        channel_id,
-        guild_id: d.get("guild_id").and_then(Value::as_str).map(String::from),
-        channel_type,
-        user_id,
-        user_name,
-        custom_id: data.get("custom_id")?.as_str()?.to_string(),
-        values,
-        message_id: d
-            .get("message")
-            .and_then(|m| m.get("id"))
-            .and_then(Value::as_str)
-            .map(String::from),
-        from_modal: kind == MODAL_SUBMIT,
     })
 }
 
@@ -415,10 +286,9 @@ impl Shard {
         };
 
         // HELLO always arrives first and carries the heartbeat interval.
-        let hello = shard
-            .read_payload()
-            .await?
-            .ok_or_else(|| anyhow!("the gateway closed before sending HELLO"))?;
+        let hello = shard.read_payload().await?.ok_or_else(|| {
+            anyhow!("the gateway closed before sending HELLO")
+        })?;
         if hello.get("op").and_then(Value::as_u64) != Some(OP_HELLO) {
             return Err(anyhow!("expected HELLO, got op {:?}", hello.get("op")));
         }
@@ -489,7 +359,7 @@ impl Shard {
         while let Some(frame) = self.socket.next().await {
             match frame.context("reading the gateway socket")? {
                 Message::Text(text) => {
-                    return Ok(Some(serde_json::from_str(&text).context("gateway JSON")?));
+                    return Ok(Some(serde_json::from_str(&text).context("gateway JSON")?))
                 }
                 Message::Close(frame) => {
                     // Keep the code separate from the prose: the caller has to
@@ -552,9 +422,7 @@ impl Shard {
                     self.send(json!({ "op": OP_HEARTBEAT, "d": seq })).await?;
                 }
                 Some(OP_RECONNECT) => {
-                    return Ok(Event::Disconnected(
-                        "the gateway asked us to reconnect".into(),
-                    ));
+                    return Ok(Event::Disconnected("the gateway asked us to reconnect".into()))
                 }
                 Some(OP_INVALID_SESSION) => {
                     // `d: false` means the session cannot be resumed, so drop
@@ -564,9 +432,7 @@ impl Shard {
                         self.session_id = None;
                         self.last_seq = None;
                     }
-                    return Ok(Event::Disconnected(
-                        "the gateway invalidated the session".into(),
-                    ));
+                    return Ok(Event::Disconnected("the gateway invalidated the session".into()));
                 }
                 Some(OP_DISPATCH) => {
                     let name = payload.get("t").and_then(Value::as_str).unwrap_or("");
@@ -592,16 +458,9 @@ impl Shard {
                                 .and_then(Value::as_str)
                                 .unwrap_or(&bot_id)
                                 .to_string();
-                            let bot_name = d
-                                .get("user")
-                                .and_then(|u| u.get("username"))
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
                             return Ok(Event::Ready {
                                 bot_id,
                                 application_id,
-                                bot_name,
                             });
                         }
                         "MESSAGE_CREATE" => {
@@ -612,12 +471,6 @@ impl Shard {
                         "INTERACTION_CREATE" => {
                             if let Some(interaction) = parse_interaction(&d) {
                                 return Ok(Event::Command(interaction));
-                            }
-                            // A button, select menu or modal. Disjoint from the
-                            // command path: only one of the two parsers can
-                            // match a given payload.
-                            if let Some(component) = parse_component(&d) {
-                                return Ok(Event::Interacted(component));
                             }
                         }
                         _ => {}
@@ -680,23 +533,6 @@ impl Rest {
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    async fn patch(&self, path: &str, body: Value) -> Result<Value> {
-        let response = self
-            .http
-            .patch(format!("{API_BASE}{path}"))
-            .header("Authorization", format!("Bot {}", self.token))
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("PATCH {path}"))?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("Discord rejected PATCH {path}: {status} {text}"));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-
     async fn put(&self, path: &str, body: Value) -> Result<Value> {
         let response = self
             .http
@@ -714,27 +550,6 @@ impl Rest {
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    /// Renames the bot user, so it appears in Discord under the configured
-    /// agent name rather than whatever the developer portal was set to.
-    ///
-    /// Best-effort by design, and the caller treats a failure as a warning. Two
-    /// things routinely make this fail and neither is worth stopping the
-    /// connector for: Discord rate-limits username changes to roughly two per
-    /// hour and answers 429, and a name already taken at that discriminator
-    /// comes back 400. In both cases the bot keeps working under its old name.
-    ///
-    /// Returns the name Discord says it now has.
-    pub async fn set_username(&self, username: &str) -> Result<String> {
-        let updated = self
-            .patch("/users/@me", json!({ "username": username }))
-            .await?;
-        Ok(updated
-            .get("username")
-            .and_then(Value::as_str)
-            .unwrap_or(username)
-            .to_string())
-    }
-
     /// Registers the slash commands, replacing whatever was registered before.
     ///
     /// A bulk overwrite rather than one create per command: it is a single
@@ -746,34 +561,15 @@ impl Rest {
     /// in the picker. Global commands can take up to an hour to appear in a
     /// guild that was already joined, which is worth saying out loud rather
     /// than leaving someone to wonder.
-    ///
-    /// The response is checked rather than merely counted. A registration that
-    /// stores `contexts: null` is accepted with a 200 and every command echoed
-    /// back, and then never appears in anyone's picker — so counting the array
-    /// reports success for a command set that cannot be invoked. That is the
-    /// exact shape of the bug that made every slash command dead on a guild,
-    /// and it survived because the only evidence was a cheerful log line. The
-    /// count returned now excludes anything Discord stored in that state, so a
-    /// silent failure shows up as a warning and a short count.
-    pub async fn register_commands(&self, application_id: &str, commands: Value) -> Result<usize> {
+    pub async fn register_commands(
+        &self,
+        application_id: &str,
+        commands: Value,
+    ) -> Result<usize> {
         let registered = self
-            .put(
-                &format!("/applications/{application_id}/commands"),
-                commands,
-            )
+            .put(&format!("/applications/{application_id}/commands"), commands)
             .await?;
-        let stored = registered.as_array().map(Vec::as_slice).unwrap_or(&[]);
-        let limbo = commands_without_contexts(stored);
-        if !limbo.is_empty() {
-            tracing::warn!(
-                commands = %limbo.join(", "),
-                "Discord stored these slash commands with no interaction contexts. \
-                 They will not appear in the command picker and no interaction will \
-                 ever arrive for them, even though the registration returned 200. \
-                 The registration payload must name `contexts` explicitly"
-            );
-        }
-        Ok(stored.len() - limbo.len())
+        Ok(registered.as_array().map(Vec::len).unwrap_or(0))
     }
 
     /// Answers an interaction: Discord shows "the application did not respond"
@@ -797,172 +593,37 @@ impl Rest {
         if ephemeral {
             data["flags"] = json!(1 << 6);
         }
-        self.interaction_callback(
-            interaction_id,
-            token,
-            json!({ "type": CHANNEL_MESSAGE_WITH_SOURCE, "data": data }),
-        )
-        .await
-    }
-
-    /// Answers a component interaction by rewriting the message it sits on.
-    ///
-    /// Type 7 is UPDATE_MESSAGE, which both acknowledges the interaction and
-    /// replaces the content and components in one request — so a used control
-    /// disappears rather than staying pressable. Passing an empty component list
-    /// is what removes the controls; omitting the field would leave them.
-    pub async fn update_interaction_message(
-        &self,
-        interaction_id: &str,
-        token: &str,
-        content: &str,
-        components: Value,
-    ) -> Result<()> {
-        const UPDATE_MESSAGE: u64 = 7;
-        self.interaction_callback(
-            interaction_id,
-            token,
-            json!({
-                "type": UPDATE_MESSAGE,
-                "data": {
-                    "content": truncate(content),
-                    "components": components,
-                    "allowed_mentions": Self::allowed_mentions(),
-                },
-            }),
-        )
-        .await
-    }
-
-    /// Answers an interaction by opening a modal.
-    ///
-    /// Type 9 is MODAL. A modal is the only way to collect free text on
-    /// Discord: text inputs are not allowed on a message, only inside a modal,
-    /// which is why a free-text answer needs a button or a menu entry to open
-    /// one rather than being typed in place.
-    ///
-    /// A modal response cannot be sent to a modal submission — Discord rejects
-    /// a modal from a modal — so this is only ever the answer to a command or a
-    /// component.
-    pub async fn open_modal(&self, interaction_id: &str, token: &str, modal: Value) -> Result<()> {
-        const MODAL: u64 = 9;
-        self.interaction_callback(
-            interaction_id,
-            token,
-            json!({ "type": MODAL, "data": modal }),
-        )
-        .await
-    }
-
-    /// Acknowledges an interaction without changing anything on screen.
-    ///
-    /// Type 6 is DEFERRED_UPDATE_MESSAGE. Needed for a submission whose visible
-    /// effect is applied by a later edit: something must reach Discord inside
-    /// three seconds or the user is told the application did not respond.
-    pub async fn ack_interaction(&self, interaction_id: &str, token: &str) -> Result<()> {
-        const DEFERRED_UPDATE_MESSAGE: u64 = 6;
-        self.interaction_callback(
-            interaction_id,
-            token,
-            json!({ "type": DEFERRED_UPDATE_MESSAGE }),
-        )
-        .await
-    }
-
-    /// The one place an interaction callback is posted.
-    ///
-    /// Callbacks are authenticated by the token *in the path*, so this endpoint
-    /// must not carry an Authorization header — sending one gets the request
-    /// rejected, and the symptom is a 401 that looks like a bad bot token.
-    async fn interaction_callback(
-        &self,
-        interaction_id: &str,
-        token: &str,
-        body: Value,
-    ) -> Result<()> {
+        // Interaction callbacks are authenticated by the token in the path, so
+        // this endpoint takes no Authorization header.
         let response = self
             .http
             .post(format!(
                 "{API_BASE}/interactions/{interaction_id}/{token}/callback"
             ))
-            .json(&body)
+            .json(&json!({ "type": CHANNEL_MESSAGE_WITH_SOURCE, "data": data }))
             .send()
             .await
             .context("answering an interaction")?;
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Discord rejected an interaction reply: {status} {text}"
-            ));
+            return Err(anyhow!("Discord rejected an interaction reply: {status} {text}"));
         }
         Ok(())
     }
 
     /// Sends a message and returns its id, so it can be edited while streaming.
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<String> {
-        self.send_with_components(channel_id, content, Value::Null)
-            .await
-    }
-
-    /// Sends a message carrying interactive components.
-    ///
-    /// Discord allows at most five action rows on a message, and the components
-    /// are the bot's own: a `custom_id` set here is what comes back on the
-    /// interaction, and it is the only routing information available, so it has
-    /// to encode everything the handler will need.
-    pub async fn send_with_components(
-        &self,
-        channel_id: &str,
-        content: &str,
-        components: Value,
-    ) -> Result<String> {
-        let mut body = json!({
+        let body = json!({
             "content": truncate(content),
             "allowed_mentions": Self::allowed_mentions(),
         });
-        if !components.is_null() {
-            body["components"] = components;
-        }
         let created: CreatedMessage = serde_json::from_value(
             self.post(&format!("/channels/{channel_id}/messages"), body)
                 .await?,
         )
         .context("Discord returned a message without an id")?;
         Ok(created.id)
-    }
-
-    /// Edits a message's text and its components together.
-    ///
-    /// Used to retire controls after a modal submission, where the update had to
-    /// be deferred: an empty component array is what takes them away.
-    pub async fn edit_with_components(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-        content: &str,
-        components: Value,
-    ) -> Result<()> {
-        let response = self
-            .http
-            .patch(format!(
-                "{API_BASE}/channels/{channel_id}/messages/{message_id}"
-            ))
-            .header("Authorization", format!("Bot {}", self.token))
-            .json(&json!({
-                "content": truncate(content),
-                "components": components,
-                "allowed_mentions": Self::allowed_mentions(),
-            }))
-            .send()
-            .await
-            .context("editing a message")?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Discord rejected an edit: {status} {text}"));
-        }
-        Ok(())
     }
 
     pub async fn edit_message(
@@ -1042,14 +703,8 @@ impl Rest {
 
 /// Discord rejects a message body over 2000 characters.
 ///
-/// This is a **backstop**, not the way long replies are handled. An agent reply
-/// is laid out across several messages by `split::paginate` before it reaches
-/// here, so a body arriving overlong means a caller that did not paginate — an
-/// ephemeral command reply, or a bug. Losing text is worse than a rejected
-/// request only just, so the cut keeps the tail, where a conclusion usually is,
-/// and says it happened.
-///
-/// If you find yourself widening this, paginate at the call site instead.
+/// Splitting into several messages would be better for long answers; this keeps
+/// the tail, which is where a conclusion usually is, and marks the cut.
 pub fn truncate(content: &str) -> String {
     const LIMIT: usize = 2000;
     if content.chars().count() <= LIMIT {
@@ -1101,28 +756,6 @@ mod tests {
         assert!(!is_fatal_close(4000));
         assert!(!is_fatal_close(1006));
         assert!(!is_fatal_close(4009));
-    }
-
-    #[test]
-    fn a_command_stored_without_contexts_is_reported_as_unusable() {
-        // This is the exact response shape that hid the bug: a 200, every
-        // command echoed back, and `contexts: null` on each one. Counting the
-        // array called that a success while the picker offered nothing.
-        let stored = vec![
-            json!({ "name": "new", "contexts": Value::Null }),
-            json!({ "name": "help", "contexts": [0, 1] }),
-            json!({ "name": "status" }),
-        ];
-        assert_eq!(commands_without_contexts(&stored), vec!["new", "status"]);
-    }
-
-    #[test]
-    fn a_fully_registered_set_reports_nothing_wrong() {
-        let stored = vec![
-            json!({ "name": "new", "contexts": [0, 1] }),
-            json!({ "name": "help", "contexts": [0] }),
-        ];
-        assert!(commands_without_contexts(&stored).is_empty());
     }
 
     #[test]
@@ -1215,13 +848,11 @@ mod tests {
         // Type 1 is Discord's PING and 3 is a message component. Treating
         // either as a command would invent a name out of nothing.
         for kind in [1, 3, 5] {
-            assert!(
-                parse_interaction(&json!({
-                    "id": "i", "token": "t", "type": kind, "channel_id": "c",
-                    "user": { "id": "u", "username": "sam" },
-                }))
-                .is_none()
-            );
+            assert!(parse_interaction(&json!({
+                "id": "i", "token": "t", "type": kind, "channel_id": "c",
+                "user": { "id": "u", "username": "sam" },
+            }))
+            .is_none());
         }
     }
 

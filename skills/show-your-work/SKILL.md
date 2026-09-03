@@ -5,9 +5,8 @@ when_to_use = "Use after any tool call that changes state: an edit, a build, a c
 universal = true
 tags = ["reporting", "verification", "honesty"]
 children = "none"
-version = 2
+version = 1
 ---
-# Show your work
 
 After doing something with a tool, report what actually happened rather than
 what you intended.

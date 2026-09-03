@@ -56,17 +56,6 @@ export function close(byUser = false) {
   drawStrip();
 }
 
-/** Takes a tab out of the strip (or puts it back). A tab the user's role
- *  cannot use — Files for someone denied the workspace — is not shown at
- *  all rather than shown and refused. Closing it if it was open. */
-export function setTabHidden(id, hidden) {
-  const tab = tabs.find((t) => t.id === id);
-  if (!tab || Boolean(tab.hidden) === Boolean(hidden)) return;
-  tab.hidden = Boolean(hidden);
-  if (hidden && current === id) close(false);
-  else drawStrip();
-}
-
 /** Activates a tab by id — the tab's own `activate` does the drawing. */
 export function show(id) {
   tabs.find((t) => t.id === id)?.activate();
@@ -120,7 +109,7 @@ export function open(config) {
 function drawStrip() {
   if (!strip) return;
   clear(strip).append(
-    ...tabs.filter((tab) => !tab.hidden).map((tab) =>
+    ...tabs.map((tab) =>
       el(
         "button",
         {
@@ -172,13 +161,6 @@ export const ICONS = {
       ["circle", { cx: "5.5", cy: "15", r: "2.2" }],
       ["circle", { cx: "14.5", cy: "10", r: "2.2" }],
       ["path", { d: "M5.5 7.2v5.6M7.7 10h4.6" }],
-    ]),
-  todo: () =>
-    svg([
-      ["rect", { x: "3", y: "3", width: "3", height: "3", rx: ".5" }],
-      ["rect", { x: "3", y: "8.5", width: "3", height: "3", rx: ".5" }],
-      ["rect", { x: "3", y: "14", width: "3", height: "3", rx: ".5" }],
-      ["path", { d: "M8.5 4.5h8M8.5 10h8M8.5 15.5h8" }],
     ]),
   files: () =>
     svg([["path", { d: "M2.5 5.5A1.5 1.5 0 0 1 4 4h3.6L9.4 6h6.6a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5v-9Z" }]]),

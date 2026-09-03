@@ -7,14 +7,12 @@
 //! the database because it never opens it.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
 use crate::ipc::Peer;
-use crate::store::{SessionProgress, Store};
-use crate::subagents::SubagentRow;
-use crate::transcripts::{ConversationSummary, SearchQuery, SearchReport, TranscriptEntry};
+use crate::store::Store;
 
 #[derive(Clone)]
 pub enum Persist {
@@ -58,75 +56,12 @@ impl Persist {
 
     // --- sessions -------------------------------------------------------------
 
-    pub async fn create_session(
-        &self,
-        title: Option<String>,
-        mode: &str,
-        owner: &str,
-    ) -> Result<SessionMeta> {
+    pub async fn create_session(&self, title: Option<String>, mode: &str) -> Result<SessionMeta> {
         delegate!(
             self,
             "store.create_session",
-            |s| s.create_session(title.clone(), mode, owner),
-            json!({ "title": title, "mode": mode, "owner": owner })
-        )
-    }
-
-    pub async fn list_sessions_owned(
-        &self,
-        owner: Option<&str>,
-        include_archived: bool,
-    ) -> Result<Vec<SessionMeta>> {
-        match self {
-            Persist::Local(store) => {
-                crate::offload::blocking(|| store.list_sessions_owned(owner, include_archived))
-            }
-            Persist::Remote(peer) => {
-                peer.call_as(
-                    "store.list_sessions",
-                    json!({"include_archived": include_archived}),
-                )
-                .await
-            }
-        }
-    }
-
-    pub async fn owner_of_root(&self, id: &str) -> Result<Option<String>> {
-        delegate!(
-            self,
-            "store.owner_of_root",
-            |s| s.owner_of_root(id),
-            json!({"id":id})
-        )
-    }
-
-    /// Resolves the policy for a session on the trusted gateway. Workers must
-    /// not derive this from the configuration in their rewritable checkout.
-    pub async fn session_policy(&self, id: &str) -> Result<crate::policy::EffectivePolicy> {
-        match self {
-            Persist::Remote(peer) => {
-                peer.call_as("store.session_policy", json!({"id": id}))
-                    .await
-            }
-            Persist::Local(_) => anyhow::bail!("session policy is resolved from gateway config"),
-        }
-    }
-
-    pub async fn get_user_spend(&self, user: &str) -> Result<f64> {
-        delegate!(
-            self,
-            "store.get_user_spend",
-            |s| s.get_user_spend(user),
-            json!({"user": user})
-        )
-    }
-
-    pub async fn add_user_spend(&self, user: &str, usd: f64) -> Result<f64> {
-        delegate!(
-            self,
-            "store.add_user_spend",
-            |s| s.add_user_spend(user, usd),
-            json!({"user": user, "usd": usd})
+            |s| s.create_session(title.clone(), mode),
+            json!({ "title": title, "mode": mode })
         )
     }
 
@@ -193,16 +128,6 @@ impl Persist {
         )
     }
 
-    /// Marks the next interruption of this session as one we asked for.
-    pub async fn expect_restart(&self, session_id: &str) -> Result<()> {
-        delegate!(
-            self,
-            "store.expect_restart",
-            |s| s.expect_restart(session_id),
-            json!({ "session": session_id })
-        )
-    }
-
     pub async fn set_no_resume(&self, session_id: &str, no_resume: bool) -> Result<()> {
         delegate!(
             self,
@@ -232,24 +157,6 @@ impl Persist {
         )
     }
 
-    /// Writes a key only if it currently holds `expected`, reporting whether it
-    /// did. One serialized transaction in the store, so a caller can use it to
-    /// claim a state transition exactly once. See [`Store::kv_swap`].
-    pub async fn kv_swap(
-        &self,
-        scope: &str,
-        key: &str,
-        expected: &str,
-        value: &str,
-    ) -> Result<bool> {
-        delegate!(
-            self,
-            "store.kv_swap",
-            |s| s.kv_swap(scope, key, expected, value),
-            json!({ "scope": scope, "key": key, "expected": expected, "value": value })
-        )
-    }
-
     pub async fn get_spend(&self, session_id: &str) -> Result<f64> {
         delegate!(
             self,
@@ -268,186 +175,13 @@ impl Persist {
         )
     }
 
-    /// Live progress for several sessions at once.
-    ///
-    /// Batched because the caller is always rendering a child list, and one
-    /// round trip per child turned a status render into twenty.
-    pub async fn session_progress(&self, session_ids: &[String]) -> Result<Vec<SessionProgress>> {
-        if session_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        delegate!(
-            self,
-            "store.session_progress",
-            |s| session_ids
-                .iter()
-                .map(|id| s.session_progress(id))
-                .collect::<Result<Vec<_>>>(),
-            json!({ "sessions": session_ids })
-        )
-    }
-
-    // --- sub-agents -----------------------------------------------------------
-
-    pub async fn register_subagent(
-        &self,
-        parent_id: &str,
-        child_id: &str,
-        label: &str,
-        task: &str,
-        agent_aspect: &str,
-        model: &str,
-        mode: &str,
-        max_children: usize,
-    ) -> Result<SubagentRow> {
-        delegate!(
-            self,
-            "store.register_subagent",
-            |s| crate::subagents::Subagents::new(s).register(
-                parent_id,
-                child_id,
-                label,
-                task,
-                agent_aspect,
-                model,
-                mode,
-                max_children
-            ),
-            json!({
-                "session": parent_id,
-                "child": child_id,
-                "label": label,
-                "task": task,
-                "agent": agent_aspect,
-                "model": model,
-                "mode": mode,
-                "max_children": max_children,
-            })
-        )
-    }
-
-    pub async fn get_subagent(&self, child_id: &str) -> Result<Option<SubagentRow>> {
-        delegate!(
-            self,
-            "store.get_subagent",
-            |s| s.get_subagent(child_id),
-            json!({ "child": child_id })
-        )
-    }
-
-    pub async fn subagents_of(&self, parent_id: &str) -> Result<Vec<SubagentRow>> {
-        delegate!(
-            self,
-            "store.subagents_of",
-            |s| s.subagents_of(parent_id),
-            json!({ "session": parent_id })
-        )
-    }
-
-    pub async fn settle_subagent(
-        &self,
-        child_id: &str,
-        result: &str,
-        cost_usd: f64,
-        stopped_by: &str,
-    ) -> Result<SubagentRow> {
-        delegate!(
-            self,
-            "store.settle_subagent",
-            |s| crate::subagents::Subagents::new(s).settle(child_id, result, cost_usd, stopped_by),
-            json!({
-                "child": child_id,
-                "result": result,
-                "cost_usd": cost_usd,
-                "stopped_by": stopped_by,
-            })
-        )
-    }
-
-    pub async fn cancel_subagent(&self, child_id: &str) -> Result<SubagentRow> {
-        delegate!(
-            self,
-            "store.cancel_subagent",
-            |s| crate::subagents::Subagents::new(s).mark_cancelled(child_id),
-            json!({ "child": child_id })
-        )
-    }
-
-    // --- transcripts ----------------------------------------------------------
-    //
-    // Read-only recall across every conversation. See `transcripts.rs` for why
-    // these are not pinned to the caller's own session the way `store.events`
-    // is, and `serve_store_call` below for the arms that serve them.
-
-    pub async fn conversations(
-        &self,
-        include_archived: bool,
-        include_subagents: bool,
-        limit: usize,
-    ) -> Result<Vec<ConversationSummary>> {
-        delegate!(
-            self,
-            "store.conversations",
-            |s| crate::transcripts::Transcripts::new(s).conversations(
-                include_archived,
-                include_subagents,
-                limit
-            ),
-            json!({
-                "include_archived": include_archived,
-                "include_subagents": include_subagents,
-                "limit": limit,
-            })
-        )
-    }
-
-    pub async fn conversation_subagents(&self, root_id: &str) -> Result<Vec<ConversationSummary>> {
-        delegate!(
-            self,
-            "store.conversation_subagents",
-            |s| crate::transcripts::Transcripts::new(s).subagents(root_id),
-            json!({ "root": root_id })
-        )
-    }
-
-    pub async fn read_transcript(
-        &self,
-        session_id: &str,
-        from_seq: u64,
-        limit: usize,
-        max_chars: usize,
-    ) -> Result<Vec<TranscriptEntry>> {
-        delegate!(
-            self,
-            "store.read_transcript",
-            |s| crate::transcripts::Transcripts::new(s)
-                .read(session_id, from_seq, limit, max_chars),
-            json!({
-                "id": session_id,
-                "from_seq": from_seq,
-                "limit": limit,
-                "max_chars": max_chars,
-            })
-        )
-    }
-
-    pub async fn search_transcripts(&self, query: &SearchQuery) -> Result<SearchReport> {
-        delegate!(
-            self,
-            "store.search_transcripts",
-            |s| crate::transcripts::Transcripts::new(s).search(query),
-            json!({ "query": query })
-        )
-    }
-
     // --- skill vectors ----------------------------------------------------------
 
     pub async fn skill_vector(&self, key: &str) -> Result<Option<Vec<u8>>> {
         match self {
             Persist::Local(s) => Ok(s.skill_vector(key)),
             Persist::Remote(peer) => {
-                peer.call_as("store.skill_vector", json!({ "key": key }))
-                    .await
+                peer.call_as("store.skill_vector", json!({ "key": key })).await
             }
         }
     }
@@ -493,27 +227,19 @@ impl Persist {
 /// session-management and shared-store methods (create/list/get/rename/
 /// archive/kv/skill-vector) stay open, because the agent legitimately manages
 /// other conversations and shared state through them.
-///
-/// The `store.conversations` / `read_transcript` / `search_transcripts` /
-/// `conversation_subagents` arms are open too, and are the one place where a
-/// worker reads a conversation that is not its own. They are read-only by
-/// construction — see `crate::transcripts` — which is what separates them from
-/// the arms above.
 pub async fn serve_store_call(
     store: &Store,
-    cfg: Option<&crate::config::Config>,
     method: &str,
     params: Value,
     caller_session: &str,
 ) -> Result<Value> {
     // Every arm below is a synchronous redb call, served on the gateway for a
     // worker that is waiting on a 60s RPC.
-    crate::offload::blocking(|| serve_store_call_inner(store, cfg, method, params, caller_session))
+    crate::offload::blocking(|| serve_store_call_inner(store, method, params, caller_session))
 }
 
 fn serve_store_call_inner(
     store: &Store,
-    cfg: Option<&crate::config::Config>,
     method: &str,
     params: Value,
     caller_session: &str,
@@ -528,71 +254,25 @@ fn serve_store_call_inner(
         Ok(serde_json::to_value(value)?)
     }
     // The session-private methods: their `session` argument must be the
-    // caller's own, or one of the sub-agents the caller spawned. An empty
-    // `caller_session` means the call did not come from a session-bound worker
-    // (the local test grip), so the check is skipped.
-    //
-    // Children are admitted because a sub-agent runs *inside* its parent's
-    // worker: that worker legitimately appends to the child's log, reads it
-    // back, and accounts for its spend. The boundary the check exists to
-    // defend — one worker cannot touch an unrelated conversation — is
-    // unchanged, because a child's root is resolved from the registry here on
-    // the gateway rather than from anything the worker says.
-    fn own_session<'v>(store: &Store, params: &'v Value, caller: &str) -> Result<&'v str> {
+    // caller's own. An empty `caller_session` means the call did not come from
+    // a session-bound worker (the local test grip), so the check is skipped.
+    fn own_session<'v>(params: &'v Value, caller: &str) -> Result<&'v str> {
         let session = get_str(params, "session")?;
-        if caller.is_empty() || session == caller {
-            return Ok(session);
+        if !caller.is_empty() && session != caller {
+            anyhow::bail!("a worker may only act on its own session");
         }
-        // A sub-agent of this caller. `root_id` comes from the gateway's own
-        // registry, so a worker cannot claim kinship it does not have.
-        if let Ok(Some(row)) = store.get_subagent(session) {
-            if row.root_id == caller {
-                return Ok(session);
-            }
-        }
-        anyhow::bail!("a worker may only act on its own session or one of its sub-agents")
+        Ok(session)
     }
-
-    fn own_owner<'v>(store: &Store, id: &'v str, owner: Option<&str>) -> Result<&'v str> {
-        if let Some(owner) = owner {
-            anyhow::ensure!(
-                store.owner_of_root(id)?.as_deref() == Some(owner),
-                "conversation belongs to another user"
-            );
-        }
-        Ok(id)
-    }
-
-    fn own_scope<'v>(store: &Store, scope: &'v str, owner: Option<&str>) -> Result<&'v str> {
-        let Some(owner) = owner else {
-            return Ok(scope);
-        };
-        if scope == "global" || scope == format!("user:{owner}") {
-            return Ok(scope);
-        }
-        anyhow::ensure!(
-            !scope.starts_with("user:"),
-            "user settings belong to another user"
-        );
-        own_owner(store, scope, Some(owner))
-    }
-
-    let caller_owner = if caller_session.is_empty() {
-        None
-    } else {
-        store.owner_of_root(caller_session)?
-    };
-    let transcripts = || crate::transcripts::Transcripts::owned(store, caller_owner.as_deref());
 
     match method {
         "store.append_event" => {
-            let session = own_session(store, &params, caller_session)?;
+            let session = own_session(&params, caller_session)?;
             let event: SessionEvent =
                 serde_json::from_value(params.get("event").cloned().unwrap_or(Value::Null))?;
             to_value(store.append_event(session, event)?)
         }
         "store.events" => {
-            let session = own_session(store, &params, caller_session)?;
+            let session = own_session(&params, caller_session)?;
             let from = params.get("from_seq").and_then(Value::as_u64).unwrap_or(0);
             to_value(store.events(session, from)?)
         }
@@ -601,233 +281,54 @@ fn serve_store_call_inner(
                 .get("title")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let requested = params
-                .get("owner")
-                .and_then(Value::as_str)
-                .unwrap_or("local");
-            let owner = caller_owner.as_deref().unwrap_or(requested);
-            to_value(store.create_session(title, get_str(&params, "mode")?, owner)?)
+            to_value(store.create_session(title, get_str(&params, "mode")?)?)
         }
-        "store.get_session" => {
-            let id = get_str(&params, "id")?;
-            if let Some(owner) = caller_owner.as_deref() {
-                anyhow::ensure!(
-                    store.owner_of_root(id)?.as_deref() == Some(owner),
-                    "conversation belongs to another user"
-                );
-            }
-            to_value(store.get_session(id)?)
-        }
-        "store.owner_of_root" => to_value(store.owner_of_root(get_str(&params, "id")?)?),
-        "store.session_policy" => {
-            let id = get_str(&params, "id")?;
-            let scoped = serde_json::json!({ "session": id });
-            own_session(store, &scoped, caller_session)?;
-            let owner = store
-                .owner_of_root(id)?
-                .ok_or_else(|| anyhow::anyhow!("conversation has no owner"))?;
-            let cfg = cfg.ok_or_else(|| anyhow::anyhow!("session policy needs gateway config"))?;
-            to_value(cfg.auth.policy_for(&owner).as_ref())
-        }
-        "store.get_user_spend" => {
-            let owner = caller_owner.as_deref().unwrap_or(get_str(&params, "user")?);
-            if caller_owner.is_some() {
-                anyhow::ensure!(
-                    get_str(&params, "user")? == owner,
-                    "cannot read another user's spend"
-                );
-            }
-            to_value(store.get_user_spend(owner)?)
-        }
-        "store.add_user_spend" => {
-            let owner = caller_owner.as_deref().unwrap_or(get_str(&params, "user")?);
-            if caller_owner.is_some() {
-                anyhow::ensure!(
-                    get_str(&params, "user")? == owner,
-                    "cannot write another user's spend"
-                );
-            }
-            let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
-            to_value(store.add_user_spend(owner, usd)?)
-        }
-        "store.list_sessions_owned" => {
-            let include = params
-                .get("include_archived")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let requested = params.get("owner").and_then(Value::as_str);
-            if let Some(caller) = caller_owner.as_deref() {
-                anyhow::ensure!(
-                    requested == Some(caller),
-                    "cannot list another user's sessions"
-                );
-            }
-            to_value(store.list_sessions_owned(requested, include)?)
-        }
+        "store.get_session" => to_value(store.get_session(get_str(&params, "id")?)?),
         "store.list_sessions" => {
             let include = params
                 .get("include_archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            to_value(store.list_sessions_owned(caller_owner.as_deref(), include)?)
+            to_value(store.list_sessions(include)?)
         }
-        "store.rename_session" => {
-            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
-            to_value(store.rename_session(id, get_str(&params, "title")?)?)
-        }
+        "store.rename_session" => to_value(
+            store.rename_session(get_str(&params, "id")?, get_str(&params, "title")?)?,
+        ),
         "store.archive_session" => {
-            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
             let archived = params
                 .get("archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            to_value(store.archive_session(id, archived)?)
+            to_value(store.archive_session(get_str(&params, "id")?, archived)?)
         }
-        "store.set_mode" => {
-            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
-            to_value(store.set_mode(id, get_str(&params, "mode")?)?)
-        }
-        "store.set_model" => {
-            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
-            to_value(store.set_model(id, get_str(&params, "model")?)?)
-        }
+        "store.set_mode" => to_value(
+            store.set_mode(get_str(&params, "id")?, get_str(&params, "mode")?)?,
+        ),
+        "store.set_model" => to_value(
+            store.set_model(get_str(&params, "id")?, get_str(&params, "model")?)?,
+        ),
         "store.clear_resume_attempts" => {
-            to_value(store.clear_resume_attempts(own_session(store, &params, caller_session)?)?)
-        }
-        "store.expect_restart" => {
-            to_value(store.expect_restart(own_session(store, &params, caller_session)?)?)
+            to_value(store.clear_resume_attempts(own_session(&params, caller_session)?)?)
         }
         "store.set_no_resume" => {
             let flag = params
                 .get("no_resume")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            to_value(store.set_no_resume(own_session(store, &params, caller_session)?, flag)?)
+            to_value(store.set_no_resume(own_session(&params, caller_session)?, flag)?)
         }
-        "store.kv_get" => {
-            let scope = own_scope(store, get_str(&params, "scope")?, caller_owner.as_deref())?;
-            to_value(store.kv_get(scope, get_str(&params, "key")?)?)
-        }
-        "store.kv_put" => {
-            let scope = own_scope(store, get_str(&params, "scope")?, caller_owner.as_deref())?;
-            to_value(store.kv_put(scope, get_str(&params, "key")?, get_str(&params, "value")?)?)
-        }
-        "store.kv_swap" => {
-            let scope = own_scope(store, get_str(&params, "scope")?, caller_owner.as_deref())?;
-            to_value(store.kv_swap(
-                scope,
-                get_str(&params, "key")?,
-                get_str(&params, "expected")?,
-                get_str(&params, "value")?,
-            )?)
-        }
-        "store.get_spend" => {
-            to_value(store.get_spend(own_session(store, &params, caller_session)?)?)
-        }
-        // Scoped per id rather than in bulk: the batch exists to save round
-        // trips, not to widen what a worker may look at.
-        "store.session_progress" => {
-            let ids: Vec<String> =
-                serde_json::from_value(params.get("sessions").cloned().unwrap_or(Value::Null))?;
-            let mut out = Vec::with_capacity(ids.len());
-            for id in &ids {
-                let scoped = json!({ "session": id });
-                let checked = own_session(store, &scoped, caller_session)?.to_string();
-                out.push(store.session_progress(&checked)?);
-            }
-            to_value(out)
-        }
+        "store.kv_get" => to_value(
+            store.kv_get(get_str(&params, "scope")?, get_str(&params, "key")?)?,
+        ),
+        "store.kv_put" => to_value(store.kv_put(
+            get_str(&params, "scope")?,
+            get_str(&params, "key")?,
+            get_str(&params, "value")?,
+        )?),
+        "store.get_spend" => to_value(store.get_spend(own_session(&params, caller_session)?)?),
         "store.add_spend" => {
             let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
-            to_value(store.add_spend(own_session(store, &params, caller_session)?, usd)?)
-        }
-        // Sub-agents. The parent is pinned to the caller on register, so a
-        // worker cannot graft a child onto somebody else's conversation; the
-        // rest key off a child id that only exists because a register call
-        // already passed that check.
-        "store.register_subagent" => {
-            let parent = own_session(store, &params, caller_session)?;
-            let max = params
-                .get("max_children")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
-            to_value(
-                crate::subagents::Subagents::new(store).register(
-                    parent,
-                    get_str(&params, "child")?,
-                    params.get("label").and_then(Value::as_str).unwrap_or(""),
-                    params.get("task").and_then(Value::as_str).unwrap_or(""),
-                    params.get("agent").and_then(Value::as_str).unwrap_or(""),
-                    params.get("model").and_then(Value::as_str).unwrap_or(""),
-                    params
-                        .get("mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("agent"),
-                    max,
-                )?,
-            )
-        }
-        "store.get_subagent" => to_value(store.get_subagent(get_str(&params, "child")?)?),
-        "store.subagents_of" => {
-            to_value(store.subagents_of(own_session(store, &params, caller_session)?)?)
-        }
-        "store.settle_subagent" => {
-            let cost = params
-                .get("cost_usd")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            to_value(
-                crate::subagents::Subagents::new(store).settle(
-                    get_str(&params, "child")?,
-                    params.get("result").and_then(Value::as_str).unwrap_or(""),
-                    cost,
-                    params
-                        .get("stopped_by")
-                        .and_then(Value::as_str)
-                        .unwrap_or("stop"),
-                )?,
-            )
-        }
-        "store.cancel_subagent" => to_value(
-            crate::subagents::Subagents::new(store).mark_cancelled(get_str(&params, "child")?)?,
-        ),
-        // Transcript recall. These four are the *only* arms that name a session
-        // and deliberately skip `own_session`, and the exemption is the feature
-        // rather than an oversight: an agent asking "have I solved this before"
-        // or "what did that sub-agent actually find" has to read logs its own
-        // session did not write.
-        //
-        // What makes that safe to grant is that none of them can write. They
-        // route to `crate::transcripts`, which holds no write path at all — a
-        // property pinned by a test in that module, because the read was widened
-        // on precisely that promise. The mutating arms above keep `own_session`
-        // untouched, so a worker still cannot forge an event into another
-        // conversation, drain its budget or unstick its turn.
-        "store.conversations" => {
-            let include_archived = params
-                .get("include_archived")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let include_subagents = params
-                .get("include_subagents")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
-            to_value(transcripts().conversations(include_archived, include_subagents, limit)?)
-        }
-        "store.conversation_subagents" => {
-            to_value(transcripts().subagents(get_str(&params, "root")?)?)
-        }
-        "store.read_transcript" => {
-            let from = params.get("from_seq").and_then(Value::as_u64).unwrap_or(0);
-            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let max_chars = params.get("max_chars").and_then(Value::as_u64).unwrap_or(0) as usize;
-            to_value(transcripts().read(get_str(&params, "id")?, from, limit, max_chars)?)
-        }
-        "store.search_transcripts" => {
-            let query: crate::transcripts::SearchQuery =
-                serde_json::from_value(params.get("query").cloned().unwrap_or(Value::Null))?;
-            to_value(transcripts().search(&query)?)
+            to_value(store.add_spend(own_session(&params, caller_session)?, usd)?)
         }
         "store.skill_vector" => to_value(store.skill_vector(get_str(&params, "key")?)),
         "store.put_skill_vector" => {
@@ -869,29 +370,7 @@ mod tests {
                 }
                 // The test grip is not a session-bound worker; an empty
                 // caller skips the own-session check.
-                serve_store_call(&store, None, &method, params, "").await
-            })
-        }
-        fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}
-    }
-
-    /// The gateway side as a *session-bound* worker sees it: every call is
-    /// pinned to `caller_session`, exactly as `roles::gateway` serves a
-    /// worker's IPC.
-    struct GatewayAs(Arc<Store>, String);
-    impl Handler for GatewayAs {
-        fn handle(
-            self: Arc<Self>,
-            method: String,
-            params: Value,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> {
-            let store = self.0.clone();
-            let caller = self.1.clone();
-            Box::pin(async move {
-                if method == "hello" {
-                    return Ok(ipc::hello_response());
-                }
-                serve_store_call(&store, None, &method, params, &caller).await
+                serve_store_call(&store, &method, params, "").await
             })
         }
         fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}
@@ -925,22 +404,16 @@ mod tests {
         let remote = Persist::Remote(wk_peer);
 
         // Create through the remote arm, read back through both.
-        let meta = remote
-            .create_session(Some("hi".into()), &"build", "local")
-            .await
-            .unwrap();
-        assert_eq!(
-            local.get_session(&meta.id).await.unwrap().unwrap().title,
-            "hi"
-        );
-        assert_eq!(
-            remote.get_session(&meta.id).await.unwrap().unwrap().mode,
-            "build"
-        );
+        let meta = remote.create_session(Some("hi".into()), "build").await.unwrap();
+        assert_eq!(local.get_session(&meta.id).await.unwrap().unwrap().title, "hi");
+        assert_eq!(remote.get_session(&meta.id).await.unwrap().unwrap().mode, "build");
 
         // Events round-trip with their WIT payload intact.
         let seq = remote
-            .append_event(&meta.id, SessionEvent::Nudge("steer left".into()))
+            .append_event(
+                &meta.id,
+                SessionEvent::Nudge("steer left".into()),
+            )
             .await
             .unwrap()
             .seq;
@@ -963,196 +436,5 @@ mod tests {
 
         // Errors cross the boundary as errors.
         assert!(remote.rename_session("nope", "t").await.is_err());
-    }
-
-    /// A worker is pinned to its session's owner, and the gateway applies that
-    /// to every arm that used to be open across the whole database.
-    ///
-    /// This is the multi-user leak the gateway side exists to close: an agent
-    /// in Alice's conversation asking for the catalogue, another session, a
-    /// transcript or a search must never see Bob's. The check lives on the
-    /// gateway side of the IPC precisely so a branch running a modified kernel
-    /// cannot undo it — which is why it is asserted across the wire and not
-    /// through the local arm.
-    #[tokio::test]
-    async fn a_worker_sees_only_its_owners_conversations() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
-
-        let alice = store
-            .create_session(Some("alice's".into()), &"agent", "alice")
-            .unwrap();
-        let bob = store
-            .create_session(Some("bob's".into()), &"agent", "bob")
-            .unwrap();
-        store
-            .append_event(&bob.id, SessionEvent::Nudge("the zebra password".into()))
-            .unwrap();
-        store
-            .append_event(&alice.id, SessionEvent::Nudge("nothing about zebras".into()))
-            .unwrap();
-
-        // A worker running Alice's conversation.
-        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
-        let (_gw_peer, gw_done) = ipc::Peer::spawn(
-            gw_stream,
-            Arc::new(GatewayAs(store.clone(), alice.id.clone())),
-        );
-        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
-        tokio::spawn(gw_done);
-        tokio::spawn(wk_done);
-        let remote = Persist::Remote(wk_peer);
-
-        // Listing, by either name the wire knows.
-        let listed = remote.list_sessions(true).await.unwrap();
-        assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![alice.id.as_str()]);
-        let listed = remote.list_sessions_owned(None, true).await.unwrap();
-        assert_eq!(listed.len(), 1, "asking for everyone's still gets only the owner's");
-        // A worker cannot name an owner at all: the remote arm drops the
-        // argument and the gateway lists for the caller's owner, so asking
-        // for bob's gets alice's.
-        let listed = remote.list_sessions_owned(Some("bob"), true).await.unwrap();
-        assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![alice.id.as_str()]);
-
-        // Fetching by id.
-        assert!(remote.get_session(&alice.id).await.unwrap().is_some());
-        assert!(remote.get_session(&bob.id).await.is_err(), "bob's is refused, not None");
-        assert_eq!(remote.owner_of_root(&alice.id).await.unwrap().as_deref(), Some("alice"));
-
-        // Recall: the catalogue, a read and a search.
-        let convs = remote.conversations(true, false, 0).await.unwrap();
-        assert!(convs.iter().any(|c| c.id == alice.id));
-        assert!(!convs.iter().any(|c| c.id == bob.id));
-        assert!(remote.read_transcript(&bob.id, 0, 0, 0).await.is_err());
-        assert!(remote.conversation_subagents(&bob.id).await.is_err());
-        let report = remote
-            .search_transcripts(&crate::transcripts::SearchQuery {
-                pattern: "zebra".into(),
-                include_archived: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(report.total_matches, 1, "{report:?}");
-        assert!(report.hits.iter().all(|h| h.session_id == alice.id));
-        let report = remote
-            .search_transcripts(&crate::transcripts::SearchQuery {
-                pattern: "zebra".into(),
-                session_id: bob.id.clone(),
-                ..Default::default()
-            })
-            .await;
-        assert!(
-            report.map(|r| r.total_matches == 0).unwrap_or(true),
-            "naming bob's conversation outright finds nothing in it"
-        );
-
-        // A session this worker creates (delegation) belongs to its owner,
-        // whatever owner the params claim.
-        let child = remote
-            .create_session(Some("child".into()), &"agent", "bob")
-            .await
-            .unwrap();
-        assert_eq!(store.owner_of(&child.id).unwrap().as_deref(), Some("alice"));
-
-        // Spend: only the owner's row is reachable, either way.
-        remote.add_user_spend("alice", 0.5).await.unwrap();
-        assert!(remote.add_user_spend("bob", 0.5).await.is_err());
-        assert!(remote.get_user_spend("bob").await.is_err());
-        assert_eq!(remote.get_user_spend("alice").await.unwrap(), 0.5);
-        assert_eq!(store.get_user_spend("bob").unwrap(), 0.0);
-
-        // User-scoped KV: only the owner's scope is reachable.
-        remote.kv_put("user:alice", "k", "mine").await.unwrap();
-        assert!(remote.kv_put("user:bob", "k", "theirs").await.is_err());
-        assert!(remote.kv_get("user:bob", "k").await.is_err());
-        assert_eq!(store.kv_get("user:alice", "k").unwrap().as_deref(), Some("mine"));
-    }
-
-    /// The transcript arms must work through the *remote* arm specifically.
-    ///
-    /// This is the test that would have caught the mistake worth recording
-    /// here: the four `store.*` transcript methods are served by the **gateway**
-    /// process, not by the worker that calls them. A worker can therefore be
-    /// running a kernel that has them while the gateway is not, and the symptom
-    /// is `unknown store method store.conversations` from a tree where the arm
-    /// is plainly present. The local arm passing proves nothing about that path,
-    /// so every method is asserted across the wire.
-    #[tokio::test]
-    async fn transcript_recall_works_across_the_worker_boundary() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
-
-        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
-        let (_gw_peer, gw_done) = ipc::Peer::spawn(gw_stream, Arc::new(GatewaySide(store.clone())));
-        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
-        tokio::spawn(gw_done);
-        tokio::spawn(wk_done);
-        let remote = Persist::Remote(wk_peer);
-
-        let parent = store
-            .create_session(Some("the parent".into()), &"agent", "local")
-            .unwrap();
-        let child = store.create_session(None, &"agent", "local").unwrap();
-        crate::subagents::Subagents::new(&store)
-            .register(
-                &parent.id,
-                &child.id,
-                "scout",
-                "go and look",
-                "",
-                "",
-                "plan",
-                0,
-            )
-            .unwrap();
-        store
-            .append_event(
-                &parent.id,
-                SessionEvent::Nudge("the redb lock was the problem".into()),
-            )
-            .unwrap();
-
-        // The catalogue.
-        let listed = remote.conversations(false, false, 0).await.unwrap();
-        assert!(listed.iter().any(|c| c.id == parent.id));
-        assert!(
-            !listed.iter().any(|c| c.id == child.id),
-            "a sub-agent is not a conversation unless asked for"
-        );
-
-        // The sub-agent tree, for a conversation that is not the caller's own —
-        // the caller here has no session at all.
-        let kids = remote.conversation_subagents(&parent.id).await.unwrap();
-        assert_eq!(kids.len(), 1);
-        assert_eq!(kids[0].label, "scout");
-
-        // A windowed read.
-        let entries = remote.read_transcript(&parent.id, 0, 0, 0).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].text.contains("redb lock"));
-
-        // And search, with the query record surviving serialisation both ways.
-        let report = remote
-            .search_transcripts(&crate::transcripts::SearchQuery {
-                pattern: "redb lock".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(report.total_matches, 1);
-        assert_eq!(report.hits[0].session_id, parent.id);
-
-        // A bad pattern is an error on the far side, not a panic or an empty
-        // result that reads as "no matches".
-        assert!(
-            remote
-                .search_transcripts(&crate::transcripts::SearchQuery {
-                    pattern: "[unclosed".into(),
-                    ..Default::default()
-                })
-                .await
-                .is_err()
-        );
     }
 }

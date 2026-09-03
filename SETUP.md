@@ -9,50 +9,6 @@ are shown.
 
 ---
 
-## Multi-user web access
-
-The default configuration uses `auth.mode = "local"`: no login page, one
-implicit administrator, and loopback-only Host/Origin checks.
-
-To enable accounts:
-
-1. Run `printf '%s\n' 'a long password' | thetis hash-password --stdin`.
-2. Put `[[roles]]` and `[[users]]` entries in `thetis.local.toml` (not the
-   tracked `thetis.toml`). Set `[auth] mode = "users"` and `claim_unowned` to
-   an administrator's user id.
-3. For remote access, set `server.bind` and `server.public_origin`, then put
-   Thetis behind a TLS reverse proxy which preserves `Host`.
-
-Or, for the common case of one administrator to start with, run
-`scripts/enable-users-auth.sh <user-id>` — it prompts for the password, writes
-the overlay, checks the configuration loads, and tells you to restart.
-
-Thetis itself serves plain HTTP and deliberately does not trust
-`X-Forwarded-*`. Do not expose it directly to the public internet. Sessions use
-an HttpOnly, SameSite=Lax cookie with sliding expiry. Conversations and recall
-are owner-scoped. The workspace remains shared between accounts; deny its
-capabilities to roles that must not see or modify it.
-
-What signing in looks like: `/login` is host-rendered (no WebAssembly in its
-path, so it works when the gateway guest is broken), the sidebar footer shows
-the account with a **log out** link, and an expired login sends the tab back to
-`/login` rather than leaving it "reconnecting…". An account whose role sets
-`see_all_sessions = true` gets a switch beside **New chat** for everyone's
-conversations; the sidebar is personal until it is pressed. `/admin` lists the
-accounts with their live logins and cumulative spend, and can sign one out
-everywhere.
-
-To check an installation end to end, run the ignored live test against it with
-two accounts (one admin, one plain user):
-
-```sh
-THETIS_WS_URL=ws://127.0.0.1:7777/ws \
-THETIS_AUTH_ADMIN=alice:password THETIS_AUTH_USER=bob:password \
-  cargo test -p thetis --test ws_auth -- --ignored --nocapture
-```
-
----
-
 ## 1. Prerequisites
 
 **Rust 1.82 or newer**, and the `wasm32-wasip2` target. That target is the only
@@ -104,14 +60,7 @@ rustup target list --installed
 You should see `wasm32-wasip2` listed. Thetis was developed against Rust 1.95.
 
 **An OpenRouter API key** from <https://openrouter.ai/keys>. Thetis talks to
-OpenAI-compatible endpoints, so any OpenRouter-supported model works.
-
-You can also point Thetis at a local server — llama.cpp, vLLM, Ollama, LM
-Studio — either instead of OpenRouter or alongside it, so local and hosted
-models sit side by side in the model picker. Add a `[[providers]]` entry to
-`thetis.toml`; the section there documents it. Note that a local model must
-support tool calling, and llama.cpp's server needs `--jinja` for that to work
-at all.
+one OpenAI-compatible endpoint, so any OpenRouter-supported model works.
 
 ---
 

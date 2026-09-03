@@ -15,39 +15,6 @@ primary_gateway = "web"
 # The host-rendered recovery console. Keep it on: it is the control surface
 # that still works when every WebAssembly guest is broken.
 admin_enabled = true
-# Required when auth.mode = "users" and bind is not loopback. TLS belongs at
-# a reverse proxy; Thetis does not trust X-Forwarded-* headers.
-# public_origin = "https://thetis.example.com"
-
-[auth]
-# "local" preserves the single implicit administrator and loopback-only access.
-# "users" requires [[roles]] and [[users]] (put password hashes in
-# thetis.local.toml; generate one with `thetis hash-password --stdin`).
-mode = "local"
-session_ttl_hours = 720
-lockout_after = 5
-lockout_secs = 60
-# In users mode these must name a configured user and role respectively.
-claim_unowned = ""
-discord_role = ""
-
-# Example role and user (normally place the user in thetis.local.toml):
-# [[roles]]
-# id = "admin"
-# admin = true
-#
-# [[users]]
-# id = "alice"
-# name = "Alice"
-# role = "admin"
-# password_hash = "$argon2id$..."
-#
-# Capability denials are hard host boundaries. `deny_tools` is hard for
-# component tools but only advisory for agent-internal built-ins; deny the
-# corresponding capability to make that restriction authoritative.
-# `deny_groups` is also soft: agent-core hides and refuses every member even
-# when attention grouping itself is disabled, but a rewritable agent is not a
-# security boundary. Use capability or `deny_tools` denials for hard limits.
 
 [paths]
 # All relative paths are resolved against the project root (the directory
@@ -67,14 +34,7 @@ tool_prefix = ""
 
 [llm]
 base_url = "https://openrouter.ai/api/v1"
-model = "openai/gpt-5.6-sol"
-# How long to wait on a silent server. For a streaming completion — which is
-# what a turn uses — this is a *read* timeout: it resets every time bytes
-# arrive, so a slow local model may generate for as long as it likes provided
-# it keeps trickling, and only a genuine stall trips it. For a non-streaming
-# call it is the total deadline for the whole request. It is deliberately not a
-# cap on total generation time: as one, it severed long answers mid-body and
-# surfaced as "transport error: error decoding response body".
+model = "anthropic/claude-opus-5"
 request_timeout_secs = 180
 max_retries = 3
 # Your OpenRouter key. OPENROUTER_API_KEY overrides this when set, so you can
@@ -84,132 +44,18 @@ max_retries = 3
 # thetis.local.toml, so point THETIS_CONFIG at one of those if this file is
 # ever going into version control.
 # api_key = "sk-or-..."
-#
-# Which provider serves a model that does not name one. Empty means the section
-# above, which is registered under the id `openrouter`. Set it to a
-# `[[providers]]` id below to run entirely against a local server.
-# THETIS_PROVIDER overrides it.
-# provider = "local"
-
-# Extra OpenAI-compatible endpoints, used beside the one above rather than
-# instead of it. llama.cpp's server, vLLM, Ollama, LM Studio, a company gateway
-# — anything that speaks `POST {base_url}/chat/completions` in the OpenAI shape.
-#
-# The [llm] section is always registered as a provider with the id
-# `openrouter`, so adding entries here changes nothing that already worked. An
-# entry whose id *is* `openrouter` replaces it, which is how you put a proxy in
-# front of everything.
-#
-# A model reaches a provider in one of two ways:
-#
-#   1. a [[models]] entry names it with `provider = "..."`;
-#   2. the model id is prefixed with the provider id — `local/qwen3-30b` goes
-#      to the provider called `local` asking for `qwen3-30b`. This needs no
-#      [[models]] entry at all, which is what you want when you have just
-#      loaded a different gguf and only mean to try it once.
-#
-# A prefix that is not a configured provider id is left alone, so an OpenRouter
-# id like `anthropic/claude-opus-5` is never mistaken for provider routing.
-# Avoid giving a provider the same id as an OpenRouter vendor for that reason.
-#
-# api_key is optional. Omitted or empty means *no* Authorization header is
-# sent, which is what an unauthenticated local server wants — an empty bearer
-# token is rejected outright by some servers. `env:NAME` reads the key from
-# that environment variable instead, so a real key need not sit on disk.
-
-# Scaling a provider: give it several endpoints with `base_urls` instead of
-# `base_url`, and requests rotate over them. They must serve the same model —
-# replicas, not different models. Each retry also steps to the next endpoint,
-# so one dead or overloaded server is walked past rather than hammered.
-#
-#   base_urls = [
-#     "http://127.0.0.1:8080/v1",
-#     "http://127.0.0.1:8081/v1",
-#   ]
-#
-# Adding capacity this way leaves every model id unchanged. Note that one
-# llama-server with `--parallel N` already serves N concurrent slots on a
-# single port; use `base_urls` for separate processes or separate machines.
-
-[[providers]]
-id = "local"
-label = "llama.cpp"
-# Whatever llama-server prints as its base; the OpenAI routes hang off it.
-# `--jinja` matters when you start the server: without it llama.cpp does not
-# apply the model's chat template, and tool calling — which Thetis depends on
-# entirely — will not work.
-base_url = "http://127.0.0.1:8080/v1"
-# api_key = "env:LLAMA_API_KEY"   # only if you started it with --api-key
-# headers = { "X-Org" = "acme" }  # sent on every request to this provider
-
-# [[providers]]
-# id = "vllm"
-# label = "vLLM (GPU box)"
-# base_url = "http://gpu.internal:8000/v1"
-# api_key = "env:VLLM_API_KEY"
 
 [agent]
 # Tool-call rounds allowed in a single turn.
 max_iterations = 32
 default_mode = "agent"
-# What the agent calls itself.
-#
-# This is the *agent's* name, not the harness's. The harness -- this process,
-# the branch and revision machinery, the version in the status bar -- is always
-# called Thetis. The agent that answers you is named here, and defaults to
-# Thetis as well, which is why the two were easy to confuse.
-#
-# Changing it renames the agent in three places: the system prompt, the brand in
-# the top left of the web UI, and the Discord bot's username. THETIS_AGENT_NAME
-# overrides it.
-#
-# The Discord rename is best-effort. Discord allows roughly two username changes
-# an hour and refuses a name already taken; either way the bot keeps working
-# under its old name and the reason is logged.
-# name = "Thetis"
-# An avatar for the agent, shown beside the brand in the top left of the web UI.
-#
-# A URL, or a `data:` URI if you would rather not depend on a remote fetch:
-#   avatar = "https://example.com/ada.png"
-#   avatar = "data:image/png;base64,iVBORw0KGgo..."
-#
-# It is rendered into a 20px rounded slot, cropped to fill, so a square image
-# looks best. Leave it empty for the built-in mark, which tints itself with the
-# UI accent colour. A URL that fails to load falls back to that mark rather than
-# showing a broken image. THETIS_AGENT_AVATAR overrides it.
-#
-# This is the web UI only -- it does not set the Discord avatar, which Discord
-# rate-limits far more aggressively than the username.
-# avatar = ""
 # The system prompt. Use `system_prompt_file` to keep it in its own file
 # (recommended once it grows), or `system_prompt` for a short inline one.
 # Leaving both empty uses the built-in prompt.
-#
-# `{agent_name}` anywhere in the prompt -- here, in a prompt file, or in a mode's
-# `prompt` below -- is replaced with the name above, so a rename reaches a custom
-# prompt without it having to hardcode the word.
 # system_prompt_file = "prompts/system.md"
 
 # Models offered in the chat surface's picker. Providers change their
 # catalogues often, so this is the first thing worth editing.
-#
-# `id` is how the model is named everywhere inside Thetis: in the picker, in a
-# session's saved choice, in THETIS_MODEL. Two optional keys route it:
-#
-#   provider    = which [[providers]] entry serves it; empty means the default.
-#   wire_model  = what to send as `model`, when that differs from `id`. A local
-#                 server usually knows a model by a bare name while the picker
-#                 wants something namespaced, so the two are allowed to differ.
-#
-# A local model listed here appears in the picker beside the hosted ones and is
-# chosen the same way:
-#
-# [[models]]
-# id = "local/qwen3-30b"
-# label = "Qwen3 30B (local)"
-# provider = "local"
-# wire_model = "qwen3-30b-a3b"
-
 [[models]]
 id = "anthropic/claude-opus-5"
 label = "Claude Opus 5"
@@ -219,27 +65,12 @@ id = "anthropic/claude-sonnet-5"
 label = "Claude Sonnet 5"
 
 [[models]]
-id = "openai/gpt-5.6-sol"
-label = "GPT-5.6 Sol"
-
-[[models]]
 id = "openai/gpt-4o"
 label = "GPT-4o"
 
 [[models]]
 id = "google/gemini-2.5-pro"
 label = "Gemini 2.5 Pro"
-
-[[models]]
-id = "z-ai/glm-5.3"
-label = "GLM 5.3"
-
-# The local llama.cpp server, offered in the picker beside the hosted models.
-[[models]]
-id = "local/deepseek-v4-flash"
-label = "DeepSeek V4 Flash (local)"
-provider = "local"
-wire_model = "deepseek-v4-flash"
 
 # Ways of working, offered per conversation. `read_only` is carried through to
 # the agent, which withholds every tool that changes something — so adding a
@@ -253,46 +84,28 @@ read_only = false
 [[modes]]
 id = "plan"
 label = "Plan"
-description = "Reads and reasons, and writes a plan document you can review and execute. Tools that would modify anything are withheld."
+description = "Reads and reasons, but makes no changes. Tools that would modify anything are withheld."
 read_only = true
 # Appended to the system prompt while this mode is active. read_only decides
 # which tools are offered; this decides what the model does with them. Without
 # it the model just finds the tools missing and works around the gap.
-#
-# The instruction to put the plan in the document rather than in the reply is
-# the load-bearing part. A plan written as prose scrolls away under the
-# investigation that produced it, and each revision reads as another copy with
-# nothing to say which one is current. The document has one current version, it
-# opens in its own tab, and the Execute button there is what hands it to an
-# agent -- so a plan that stays in the transcript cannot be executed at all.
 prompt = """
 You are in Plan mode. Every tool that would change something is withheld, so \
 you cannot edit code, run commands, or modify the running system. Read and \
 reason only.
 
-The plan belongs in the plan document, not in your reply. Write it with \
-`plan_write`, revise it with `plan_edit`, and add to it with `plan_append` as \
-each part of the shape becomes clear -- do not save it all for the end of the \
-turn. The user reads it in its own tab and presses Execute there, which hands \
-it to an agent; a plan left in the transcript cannot be executed. Your reply \
-should say what you found and what you decided, and let the document carry the \
-steps rather than repeating them.
-
-What the document should hold:
+Produce a plan, not an implementation:
 - Investigate first with the read-only tools you do have. A plan written \
 without looking at the code is a guess.
-- Numbered steps, in the order they should be done, each naming the files it \
-touches. An agent will follow these literally.
-- The decisions that are the user's to make, called out as theirs, and the \
-risks worth checking before starting.
-- The shape of code rather than the code in full. You cannot compile it here, \
-and untested code reads as more certain than it is.
+- Say what you would change, file by file, and why each change is needed.
+- Name the decisions that are the user's to make, and the risks worth checking \
+before starting.
+- Sketch the shape of code rather than writing it out in full. You cannot \
+compile it here, and untested code reads as more certain than it is.
 
-Prefer `plan_edit` to rewriting the whole document: a `plan_write` over a plan \
-the user has already read and approved silently discards the parts they agreed \
-to. If you find yourself wanting a tool that is not offered, say what you would \
+If you find yourself wanting a tool that is not offered, say what you would \
 have done with it instead of quietly working around it. When the plan is ready, \
-say so plainly and stop.
+say so plainly and stop; the user will switch to Agent mode to carry it out.
 """
 
 [[modes]]
@@ -322,94 +135,6 @@ this surface is read-only and what you would have needed, rather than working \
 around it or pretending it is done.
 """
 
-# Delegation: an agent spawning agents.
-#
-# A sub-agent is a child session. It has its own event log and its own context
-# window, but it shares the parent's worker process, branch and checkout. The
-# isolation that matters is of *context*: a child explores a subproblem and
-# hands back one answer, so the parent pays for the conclusion rather than for
-# every step that produced it. Sharing the checkout is what makes this useful
-# for code work -- a child editing files in a worktree of its own would leave
-# the parent unable to see, build or commit the result.
-#
-# Two rules are structural and not configurable:
-#   - A sub-agent cannot spawn sub-agents. One level keeps fan-out bounded and
-#     the transcript readable.
-#   - A sub-agent cannot ask a question. Its only correspondent is a parent
-#     that is itself mid-turn, so a question would wait forever.
-[subagents]
-# THETIS_SUBAGENTS overrides this. With it off, the delegation tools are not
-# offered at all rather than offered and refused.
-enabled = true
-# Ceiling on *live* children at once, not on children ever spawned: a parent
-# that fans out, waits, and fans out again is doing the right thing. This is the
-# bound against the "unbounded subagent spawn" failure mode -- an agent that can
-# start work faster than it can finish it.
-max_children = 8
-# Longest a single `wait` may block, whatever the caller asks for. A wait that
-# could run forever is indistinguishable from a hung turn, both to the person
-# watching the spinner and to the reaper deciding whether this worker is idle.
-max_wait_secs = 1800
-# A child's answer is clamped to this before it enters the parent's context.
-# The whole point of delegation is that the parent reads a conclusion rather
-# than a transcript; without a ceiling a verbose child undoes that. The parent
-# can still read the full log with `agent_transcript`.
-max_result_bytes = 24576
-# The mode children run in when neither the profile nor the spawn names one.
-# Empty falls back to agent.default_mode.
-default_mode = ""
-
-# Named agent profiles a parent may spawn. A profile bundles a model, a mode and
-# a prompt, so the parent picks a *role* rather than restating one every time.
-#
-# The parent may always override the model and the mode per spawn; a profile is
-# a default, never a restriction. Spawning with no profile gives a plain child
-# on the grip's own model and mode.
-#
-# `model` and `mode` must name entries in [[models]] and [[modes]] above, and
-# startup fails loudly if they do not -- a profile that silently fell back to
-# the default would be a slow, expensive surprise.
-#
-# The economics are the reason to bother. A cheaper model on a bounded,
-# well-specified subtask is the case where delegation pays for itself: a strong
-# model plans and reads the answers, weaker ones do the legwork in parallel.
-
-[[subagents.profiles]]
-id = "scout"
-label = "Scout"
-description = "Reads and searches. Answers a question about the code or the web without changing anything."
-model = "openai/gpt-5.6-sol"
-mode = "plan"
-prompt = """
-You are a scout. Your job is to find something out and report it accurately.
-
-Search and read as widely as the question needs, then answer in prose with the \
-evidence attached: file paths with line numbers, URLs, quoted output. A claim \
-without a citation is a guess, and your parent cannot tell the difference from \
-where it is sitting.
-
-Say plainly what you could not find. An honest gap is useful; a confident \
-answer covering a gap is worse than nothing, because it will be acted on.
-"""
-
-[[subagents.profiles]]
-id = "worker"
-label = "Worker"
-description = "Full access. Carries out a bounded implementation task in the shared checkout."
-model = "openai/gpt-5.6-sol"
-mode = "agent"
-prompt = """
-You are carrying out one bounded piece of implementation work.
-
-You share a checkout with your parent and with any sibling agents working \
-alongside you. Stay inside the files your task names. A change outside them may \
-collide with work you cannot see, and you are not the one who will notice.
-
-Verify before you report. Build it, run the test, quote the output that shows it \
-works -- your parent will act on your answer without re-checking it, so a \
-compile you did not run is a claim you should not make.
-"""
-
 # Summarizing a long conversation down, so it can keep going past the window.
 #
 # The trigger is the provider's own usage.prompt_tokens from the last turn - the
@@ -421,7 +146,7 @@ enabled = true
 # happen well before the provider starts refusing, not at the cliff edge.
 window_tokens = 200000
 # Compact when the context passes this fraction of the window...
-compact_threshold = 1.0
+compact_threshold = 0.6
 # ...and shed until it is back under this one. Summarizing stops at the first
 # round boundary that gets under the target, so a long conversation sheds what
 # it must and keeps the rest.
@@ -456,7 +181,7 @@ session_spend_limit_usd = 0.0
 # Tool and exec output is truncated to this before it reaches the model.
 max_tool_output_bytes = 32768
 max_attachment_bytes = 8388608
-max_attachments = 24
+max_attachments = 8
 
 # Prompt caching. Providers differ in kind, not just in syntax: Anthropic
 # caches nothing unless the request marks where, while OpenAI and Google cache
@@ -465,7 +190,9 @@ max_attachments = 24
 # explicit breakpoints.
 [cache]
 enabled = true
-ttl = "1h"
+# "5m" or "1h". The longer one costs twice as much to write, and is worth it
+# only if gaps between turns regularly exceed five minutes.
+ttl = "5m"
 # Spacing of the stable anchor breakpoints in the message list. A cache read
 # looks back at most twenty blocks, so a turn that runs many tools can overshoot
 # the previous mark; the anchors hold still and stay within reach. Smaller means
@@ -509,12 +236,6 @@ env = false
 stdio = false
 # Directories guests get as preopens, readable and writable. Relative paths
 # resolve against the project root, and are created if missing.
-#
-# The first one is the shared workspace: every conversation and every branch
-# sees the same directory, a guest sees it under its last path segment
-# (`/workspace`), and the host file tools accept and return that same spelling.
-# It is also added to filesystem.roots automatically, so it is readable from
-# every mode including the read-only ones.
 dirs = ["workspace"]
 
 [watchdog]
@@ -553,25 +274,7 @@ enabled = false
 [filesystem]
 enabled = true
 # Empty means the project root. Add more to widen what the agent can reach.
-#
-# The shared workspace (wasi.dirs[0], below) is always a root whatever this
-# says, and cannot be removed by leaving it out here. It is the one directory
-# every guest already gets as a preopen and every conversation and branch
-# shares, so refusing it to the host file tools only made it unreadable to
-# agents that could already write to it — and unreachable entirely in a
-# read-only mode, where the terminal is withheld. Reaching it grants no
-# authority that the preopen had not already handed out.
-#
-# "." is the project root, spelled explicitly because listing any root at all
-# replaces the default instead of adding to it. It must stay FIRST: relative
-# paths resolve against roots[0], so moving it breaks every relative path.
-#
-# The second entry is the real target of /workspace/"thirteen games", which is a
-# symlink out to /tank. The root check canonicalises before comparing — by
-# design, so a link cannot be used to escape — which means a symlink out of the
-# workspace is only followable if its target is a root in its own right.
-# Anything else symlinked into /workspace needs its target added here too.
-roots = [".", "/tank/data/Dev/games/thirteen games"]
+roots = []
 max_read_bytes = 1048576
 # Names that may not be written or deleted anywhere under a root. This keeps the
 # system from destroying its own state by accident; it is not a security
@@ -579,7 +282,7 @@ max_read_bytes = 1048576
 protected = ["data", "artifacts", ".git"]
 allow_delete = true
 
-# Shell sessions, local or over ssh. A session keeps its working directory and
+# Shell sessions on this machine. A session keeps its working directory and
 # shell state between commands.
 [terminal]
 enabled = true
@@ -592,29 +295,6 @@ max_output_bytes = 65536
 # Sessions idle longer than this are closed. 0 disables reaping.
 idle_timeout_secs = 1800
 
-# Remote sessions. `terminal_open` takes the name of a host registered with
-# `ssh_host_set`, and runs the session's shell on that machine instead of this
-# one. Turning this off withdraws the `ssh_host_*` tools and the `host`
-# argument, without touching the registry.
-#
-# The registry itself lives in `ssh-hosts.local.toml`, deliberately *not* in
-# this file and not in thetis.local.toml: `*.local.toml` is gitignored so it
-# cannot be published, and the config loader never reads it, so a malformed
-# entry cannot stop Thetis from starting. It holds the path to a private key,
-# never a key or a password — ssh runs with BatchMode on and will not prompt, so
-# a host has to authenticate by key.
-ssh_enabled = true
-# The ssh client to run. A full path pins which one.
-ssh_program = "ssh"
-# How long a new remote session has to connect and answer before it is given up
-# on. This covers DNS, the handshake and the login shell, so it is generous
-# compared with a local open.
-ssh_connect_timeout_ms = 25000
-# How long `terminal_send` waits after writing, to catch the prompt or reply
-# that the input provoked. Whatever arrives later is picked up by the next
-# `terminal_read`.
-send_settle_ms = 400
-
 # Per-tool settings. Each tool component is handed its own block as JSON when it
 # is invoked, and never sees another's or anything else here. The shape is
 # whatever that tool expects — put its API keys, endpoints and defaults here
@@ -622,22 +302,6 @@ send_settle_ms = 400
 [tools.config-probe]
 greeting = "hello from configuration"
 retries = 3
-
-[tools.moo]
-base_url = "http://10.10.10.1:7892"
-timeout_secs = 10
-request_timeout_secs = 30
-username = "Zero"
-password = "MaxPasswordLol"
-# Put credentials in gitignored thetis.local.toml or environment overlays:
-# username = "thetis-programmer"
-# password = "..."
-# wizard_username = "thetis-wizard"
-# wizard_password = "..."
-# Credentials are exchanged at /auth/connect and cached per base URL/identity.
-# moo-reconnect clears and refreshes that cache. Captured task deadlines default
-# to the daemon setting (normally 60s) and cannot exceed 300000 ms. Normal API
-# request bodies are limited to 1 MiB by mooR web-host.
 
 # The Notion tool group. Every `notion-*` tool inherits this block, so the
 # credential is named once rather than eleven times: `tool_config_json` merges
@@ -661,13 +325,8 @@ password = "MaxPasswordLol"
 version = "2026-03-11"
 timeout_secs = 30
 
-# The git tool group. Every `git-*` tool inherits this block, so the
+# The GitHub tool group. Every `github-*` tool inherits this block, so the
 # credential is named once rather than once per tool.
-#
-# Named `[tools.git]` because the group is named `git-*`: the scope a tool reads
-# is derived from its own name (`tool_config_scopes` in config.rs), so renaming
-# the tools renamed the block. An existing `[tools.github]` block is no longer
-# read by anything — move its keys here.
 #
 # The identity is a **GitHub App**, not a bot user with a personal access token.
 # An App is its own principal: it authors commits under a stable `<slug>[bot]`
@@ -686,28 +345,15 @@ timeout_secs = 30
 # so the orchestrator reads that file and inlines it — see `inline_file_secrets`
 # in crates/thetis/src/config.rs. The path must resolve inside the project root.
 #
-# Run `git-whoami` after setting this up: it exercises the whole chain and
+# Run `github-whoami` after setting this up: it exercises the whole chain and
 # names the step that failed rather than returning a bare 401.
-[tools.git]
+[tools.github]
 # app_id = "123456"
 # private_key_path = "secrets/github-app.pem"
 # Only needed when the App is installed on more than one account, where guessing
 # would risk writing to the wrong org.
 # installation_id = 12345678
 timeout_secs = 30
-
-[tools.bq]
-credentials_path = "secrets/bq-adc.json"
-project = "market-party-289715"
-location = "US"
-max_bytes_billed = 53687091200
-
-[tools.fb-retention]
-dataset = "analytics_249556675"
-credentials_path = "secrets/bq-adc.json"
-project = "market-party-289715"
-location = "US"
-max_bytes_billed = 53687091200
 
 # The Discord bot. Off until a token is set.
 #
@@ -775,57 +421,7 @@ retrieve_limit = 4
 # either re-embeds the corpus rather than comparing incomparable vectors.
 embedding_model = "openai/text-embedding-3-small"
 embedding_dimensions = 1536
-# Which provider serves embeddings. Empty routes by the model id exactly as a
-# chat model does, so `local/nomic-embed-text` would reach the `local` provider
-# on its own. Name one here when the model id has no usable prefix — a
-# llama-server started with `--embeddings` serving a bare model name, say.
-# THETIS_EMBEDDING_PROVIDER overrides it.
-# embedding_provider = "local"
 # Opening messages longer than this are clipped before embedding.
 max_query_chars = 2000
 # Refuse to load more than this many universal skills, whatever the files say.
 max_universal = 20
-
-# Task-dependent scoping of the tool surface.
-#
-# Tools are grouped by task rather than by capability, and a group reaches the
-# model only on evidence: it is always-on, a retrieved skill carries a
-# `tool-group:<id>` tag, or its tags match the opening message. `tool_search` is
-# always offered so any withheld group can be pulled in mid-conversation, and a
-# tool called from outside the active set is honoured and its group admitted —
-# scoping is a token and attention optimisation, never a permission boundary.
-# Read-only modes remain the only thing that actually withholds a capability.
-#
-# On since the accounting justified it. This deployment offers 78 tools in
-# ~17.1K tokens of definitions, past both of Anthropic's thresholds for tool
-# search being worth it (>10 tools, >10K tokens). The mechanism that matters is
-# not the count but confusability: 74% of these tools share a name stem with
-# another, and `list` spans 7 groups, `search` and `read` 5 each. Measured over
-# seven logged turns, scoping cuts the mean same-verb rival set from 4.7 to 2.1
-# (-56%), which is the failure mode MCPGauge (arXiv 2508.12566) priced at 9.5%
-# accuracy across six commercial models.
-#
-# Two things this does NOT fix. Definitions are only 19% of a ~90K mean prompt
-# here and are served from the prompt cache 95.7% of the time, so this is not
-# the lever for context pressure — conversation history is. And 78 -> ~33 tools
-# is still far above the K~7.4 optimum in 2605.24660, because route_threshold
-# below is a coarse cut rather than an adaptive one.
-#
-# To reverse: set false and restart. Watch the `tool accounting:` line for turns
-# where `tool_search` is called or a group is admitted late — those are routing
-# misses, and they are what would justify making the threshold adaptive.
-[tool_groups]
-grouping_enabled = true
-# Log, at the end of each turn, how many tool definitions were offered and how
-# many were actually called. Independent of `grouping_enabled`: the baseline is
-# what makes the change judgeable, so this is on even when nothing is scoped.
-accounting_enabled = true
-# Groups admitted for every conversation on top of those marked always-on in
-# code (core, skills, files, extra). Ids: core, skills, files, shell, ssh,
-# selfmod, branch, config, sandbox, bigquery, notion, web, github, extra.
-always_on = []
-# Minimum tag score for the opening message alone to admit a group. Scoring
-# saturates as m/(m+1), so one distinct tag match gives 0.50 and the default
-# threshold admits on a single match. Deliberately generous: a group admitted
-# needlessly costs tokens, one wrongly withheld costs a capability.
-route_threshold = 0.15

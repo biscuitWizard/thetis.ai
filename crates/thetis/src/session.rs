@@ -7,92 +7,11 @@
 //! even with several browser tabs attached.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
-use crate::bindings::types::{Attachment, InboxItem, SessionEvent, TurnStats, UserMsg};
+use crate::bindings::types::{Attachment, InboxItem, SessionEvent, UserMsg};
 use crate::grip::Grip;
-
-/// What the provider actually charged for a turn, recovered from the event log.
-///
-/// The agent accumulates these itself and reports them in `TurnStats`, but only
-/// for a turn that reaches its own `Ok` return. A turn that is stopped or that
-/// faults returns nothing, and a turn that is *resumed* after an interruption
-/// starts its counters from zero — so the agent's own totals are missing exactly
-/// the turns that cost the most. The log is not: every assistant step appends
-/// its `usage` before anything can go wrong with it, and the log is append-only.
-/// So the log is the authority here, and this reads it back.
-///
-/// `since` is the sequence of the last turn *terminator*, not of this turn's
-/// start. Anchoring on the terminator is what makes the ledger complete: a turn
-/// killed by a restart never gets a `TurnFinished` at all, so its spend has no
-/// row of its own and anchoring on `TurnStarted` would drop it for good. Counted
-/// from the last terminator instead, that orphaned spend is swept into the next
-/// turn to finish, and the invariant holds — the `TurnFinished` records of a
-/// session sum to the total usage of its assistant steps, each counted once.
-fn usage_since(events: &[crate::bindings::types::EventRecord], since: u64) -> (u32, u32, f64) {
-    let mut prompt = 0u32;
-    let mut completion = 0u32;
-    let mut cost = 0.0f64;
-    for record in events.iter().filter(|r| r.seq > since) {
-        if let SessionEvent::AssistantMessage(msg) = &record.event {
-            if let Some(u) = &msg.usage {
-                prompt = prompt.saturating_add(u.prompt_tokens);
-                completion = completion.saturating_add(u.completion_tokens);
-                cost += u.cost_usd;
-            }
-        }
-    }
-    (prompt, completion, cost)
-}
-
-/// Fills in a terminator for a turn that produced no stats of its own.
-///
-/// A stop and a fault both used to append an all-zero `TurnStats`, which the UI
-/// adds to the session ledger as written — so an interrupted turn did not merely
-/// go unrecorded, it published a zero that made the running total appear to
-/// reset. Reading the spend back out of the log instead means the number only
-/// ever moves in the direction spend moves.
-async fn stats_from_log(
-    grip: &Arc<Grip>,
-    session_id: &str,
-    since_seq: u64,
-    stopped_by: &str,
-) -> TurnStats {
-    let events = grip
-        .persist
-        .events(session_id, since_seq)
-        .await
-        .unwrap_or_default();
-    let steps = events
-        .iter()
-        .filter(|r| matches!(r.event, SessionEvent::AssistantMessage(_)))
-        .count() as u32;
-    let (prompt_tokens, completion_tokens, cost_usd) = usage_since(&events, since_seq);
-    TurnStats {
-        iterations: steps,
-        prompt_tokens,
-        completion_tokens,
-        cost_usd,
-        tools_used: Vec::new(),
-        stopped_by: stopped_by.to_string(),
-    }
-}
-
-/// The sequence of the most recent turn terminator, or 0 if this session has
-/// never finished a turn. Everything after it is spend no ledger row covers yet.
-async fn last_settled_seq(grip: &Arc<Grip>, session_id: &str) -> u64 {
-    grip.persist
-        .events(session_id, 0)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .rev()
-        .find(|r| matches!(r.event, SessionEvent::TurnFinished(_)))
-        .map(|r| r.seq)
-        .unwrap_or(0)
-}
 
 pub enum SessionMsg {
     User(UserMsg),
@@ -100,84 +19,21 @@ pub enum SessionMsg {
     /// stateless between turns, so carrying on simply means running one again:
     /// it rebuilds its context from the log, which now records the interruption.
     Resume,
-}
-
-/// A session's stop signal.
-///
-/// Cancellation cannot be a message on the actor's channel and nothing else.
-/// The thing a stop has to beat is a guest that is *already* inside a blocking
-/// host call — a terminal command, a model stream — and a queued message is not
-/// read until that call returns, which is exactly the wait the user is trying
-/// to cut short. So the state lives here instead: set synchronously by whoever
-/// handles the click, readable from any host import without a lock, and with a
-/// [`tokio::sync::Notify`] so a pending import can wake on it rather than run
-/// to its own deadline.
-///
-/// Staleness is handled by generation rather than by clearing, which removes
-/// the race a clear would have with a stop arriving beside it. `turn` counts
-/// turns; `stop_at` records the turn a stop was raised for. The flag reads as
-/// raised only while the two agree, so:
-///
-/// * a stop during turn 4 stops turn 4;
-/// * the same stop is stale the moment turn 5 begins;
-/// * a stop while nothing is running affects nothing, because the next turn
-///   bumps `turn` past it.
-#[derive(Default)]
-pub struct CancelFlag {
-    turn: AtomicU64,
-    stop_at: AtomicU64,
-    notify: tokio::sync::Notify,
-}
-
-impl CancelFlag {
-    /// Opens a new turn, making any earlier stop stale. Returns its number.
-    pub fn begin_turn(&self) -> u64 {
-        self.turn.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// Raises a stop against whatever turn is current.
-    ///
-    /// A no-op before the first turn: `stop_at` of zero never matches, so a
-    /// stop that arrives with nothing to stop cannot ambush the next turn.
-    pub fn raise(&self) {
-        let turn = self.turn.load(Ordering::SeqCst);
-        if turn == 0 {
-            return;
-        }
-        self.stop_at.store(turn, Ordering::SeqCst);
-        // Wake every import currently waiting, not just one: a turn can have
-        // several in flight, and all of them are now pointless.
-        self.notify.notify_waiters();
-    }
-
-    /// Whether the turn running right now has been stopped.
-    pub fn raised(&self) -> bool {
-        let stop_at = self.stop_at.load(Ordering::SeqCst);
-        stop_at != 0 && stop_at == self.turn.load(Ordering::SeqCst)
-    }
-
-    /// Resolves as soon as the current turn is stopped.
-    ///
-    /// Checks before waiting, so a stop raised between a caller's own check and
-    /// this call is not missed.
-    pub async fn cancelled(&self) {
-        loop {
-            // Registering interest before the check is what closes the gap: a
-            // `raise` landing after this point wakes the notified future rather
-            // than being lost between the check and the wait.
-            let waiting = self.notify.notified();
-            if self.raised() {
-                return;
-            }
-            waiting.await;
-        }
-    }
+    Cancel,
 }
 
 struct Handle {
     tx: mpsc::UnboundedSender<SessionMsg>,
     inbox: Arc<Mutex<VecDeque<InboxItem>>>,
-    cancel: Arc<CancelFlag>,
+    /// Raised by `cancel`, watched by the running turn's wasm budget.
+    ///
+    /// The inbox message below is the *graceful* path: the agent sees it at
+    /// its next `poll-inbox` checkpoint and stops tidily. But a guest inside a
+    /// long tool call — a cargo build, a streaming completion — does not reach
+    /// a checkpoint for minutes, and the Stop button was simply inert for the
+    /// whole of it. This flag is checked by the epoch deadline callback, which
+    /// fires while the guest is executing, so the turn ends either way.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -211,40 +67,27 @@ impl SessionActors {
         let _ = tx.send(SessionMsg::Resume);
     }
 
-    /// Stops the turn running for this session, if there is one.
-    ///
-    /// Everything here is done synchronously, before returning, because the
-    /// actor task may not be scheduled again until the guest's current host
-    /// call returns — and that call is the wait being cut short. Routing the
-    /// stop through the actor's channel is what used to make the button look
-    /// broken: the message sat in the queue behind the very thing it was meant
-    /// to interrupt.
-    ///
-    /// Reports whether a live session was found, so the caller can tell the
-    /// user "stopping" from "nothing was running".
-    pub fn cancel(&self, session_id: &str) -> bool {
-        let Ok(handles) = self.handles.read() else {
-            return false;
-        };
-        let Some(h) = handles.get(session_id) else {
-            return false;
-        };
-        // The flag first: it is what a blocking import checks, and what makes
-        // the stop stick even if the guest never polls its inbox again.
-        h.cancel.raise();
-        // The inbox item too, so a well-behaved guest stops at its next
-        // checkpoint with a tidy "cancelled" rather than by trapping.
-        push(&h.inbox, InboxItem::Cancel);
-        true
+    pub fn cancel(&self, session_id: &str) {
+        if let Ok(handles) = self.handles.read() {
+            if let Some(h) = handles.get(session_id) {
+                h.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = h.tx.send(SessionMsg::Cancel);
+            }
+        }
     }
 
-    /// The stop signal for a session, for host imports that want to wait on it.
-    pub fn cancel_flag(&self, session_id: &str) -> Option<Arc<CancelFlag>> {
-        self.handles
-            .read()
-            .ok()?
-            .get(session_id)
-            .map(|h| h.cancel.clone())
+    /// The flag a running turn's budget watches, cleared for a fresh turn.
+    ///
+    /// Cleared rather than merely read: a cancel that arrived between turns
+    /// must not kill the next one on sight.
+    pub fn take_cancel_flag(
+        &self,
+        session_id: &str,
+    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        let handles = self.handles.read().ok()?;
+        let flag = handles.get(session_id)?.cancel.clone();
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        Some(flag)
     }
 
     /// Takes everything queued for the running turn. Called by the agent's
@@ -262,7 +105,11 @@ impl SessionActors {
         inbox.drain(..).collect()
     }
 
-    fn ensure(&self, grip: &Arc<Grip>, session_id: &str) -> mpsc::UnboundedSender<SessionMsg> {
+    fn ensure(
+        &self,
+        grip: &Arc<Grip>,
+        session_id: &str,
+    ) -> mpsc::UnboundedSender<SessionMsg> {
         if let Ok(handles) = self.handles.read() {
             if let Some(h) = handles.get(session_id) {
                 return h.tx.clone();
@@ -280,23 +127,16 @@ impl SessionActors {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
-        let cancel = Arc::new(CancelFlag::default());
         handles.insert(
             session_id.to_string(),
             Handle {
                 tx: tx.clone(),
                 inbox: inbox.clone(),
-                cancel: cancel.clone(),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
 
-        tokio::spawn(actor(
-            grip.clone(),
-            session_id.to_string(),
-            rx,
-            inbox,
-            cancel,
-        ));
+        tokio::spawn(actor(grip.clone(), session_id.to_string(), rx, inbox));
         tx
     }
 }
@@ -306,7 +146,6 @@ async fn actor(
     session_id: String,
     mut rx: mpsc::UnboundedReceiver<SessionMsg>,
     inbox: Arc<Mutex<VecDeque<InboxItem>>>,
-    cancel: Arc<CancelFlag>,
 ) {
     // Set when a turn ends with unconsumed nudges: those are user input that
     // never reached the model, so they start a follow-up turn instead of being
@@ -317,6 +156,7 @@ async fn actor(
         if !start_immediately {
             match rx.recv().await {
                 None => return, // registry dropped; session is going away
+                Some(SessionMsg::Cancel) => continue, // nothing running to cancel
                 // Nothing to append: the log already holds the user message
                 // this turn is answering.
                 Some(SessionMsg::Resume) => {
@@ -335,25 +175,7 @@ async fn actor(
         }
         start_immediately = false;
 
-        // Anything a previous turn left unread would otherwise stop this one
-        // before it says a word. Whatever is worth carrying forward was already
-        // taken as `leftovers` at the end of that turn.
-        let _ = take_all(&inbox);
-        // Opens this turn's cancellation generation, making any earlier stop
-        // stale. Must happen before the first host call the guest can make.
-        cancel.begin_turn();
-
-        // Where the unaccounted-for spend starts: the last turn to publish a
-        // ledger row. Read before this turn's own marker so that spend left
-        // behind by a turn the restart killed is picked up here rather than
-        // lost. Nothing is double counted, because the row this turn writes
-        // moves the anchor past it.
-        let since_seq = last_settled_seq(&grip, &session_id).await;
-
-        if let Err(e) = grip
-            .append_event(&session_id, SessionEvent::TurnStarted)
-            .await
-        {
+        if let Err(e) = grip.append_event(&session_id, SessionEvent::TurnStarted).await {
             tracing::error!(session = %session_id, error = %e, "failed to log turn start");
         }
 
@@ -376,6 +198,7 @@ async fn actor(
                             .await;
                         push(&inbox, InboxItem::Nudge(msg.text));
                     }
+                    Some(SessionMsg::Cancel) => push(&inbox, InboxItem::Cancel),
                     // A turn is already running; there is nothing to resume.
                     Some(SessionMsg::Resume) => {}
                     None => {
@@ -386,76 +209,19 @@ async fn actor(
             }
         };
 
-        // Is this session a sub-agent? Read once here and used twice below: a
-        // child does not checkpoint the worktree, and a child's ending has to
-        // be reported to its parent.
-        let subagent = grip.persist.get_subagent(&session_id).await.ok().flatten();
-
         // Terminal commands and host filesystem writes bypass the build
         // pipeline's checkpoints; this sweep makes sure a turn can never end
         // with work that exists only in the working tree. Before the
         // turn-finished event on purpose: anything reacting to "the turn is
         // over" may rely on the branch log being current.
-        //
-        // Skipped for a sub-agent. Parent and children share one worktree, so a
-        // child committing at the end of its turn would sweep up whatever the
-        // parent and its siblings had half-written and label it as the child's
-        // work. The parent's own checkpoint collects all of it, correctly
-        // attributed, when the parent's turn ends.
-        if subagent.is_none() {
-            let _ = grip.commit_worktree("checkpoint: end of turn").await;
-        }
-
-        // Whether the user stopped this turn. Read before the next turn can
-        // bump the generation, and used below to tell a stop apart from a fault.
-        let stopped = cancel.raised();
-
-        // How this turn ended, in the same vocabulary the ledger uses. Taken
-        // before the match, which consumes `outcome`, so a sub-agent can be
-        // settled with the real reason rather than a guess.
-        let ended_as = match &outcome {
-            Ok(stats) => stats.stopped_by.clone(),
-            Err(_) if stopped => "cancelled".to_string(),
-            Err(_) => "error".to_string(),
-        };
+        let _ = grip.commit_worktree("checkpoint: end of turn").await;
 
         match outcome {
             Ok(stats) => {
-                // The agent's own count covers only the part of the turn it
-                // ran, which after a resume is not the whole turn. The log
-                // covers all of it, so the log's totals win and the agent's
-                // richer detail — which tools it used — is kept.
-                let mut stats = stats;
-                let from_log =
-                    stats_from_log(&grip, &session_id, since_seq, &stats.stopped_by).await;
-                stats.prompt_tokens = from_log.prompt_tokens;
-                stats.completion_tokens = from_log.completion_tokens;
-                stats.cost_usd = from_log.cost_usd;
-                stats.iterations = stats.iterations.max(from_log.iterations);
-                let _ = grip
-                    .append_event(&session_id, SessionEvent::TurnFinished(stats))
-                    .await;
+                let _ = grip.append_event(&session_id, SessionEvent::TurnFinished(stats)).await;
                 // The turn made it to the end, so a later interruption starts
                 // counting from zero again.
                 let _ = grip.persist.clear_resume_attempts(&session_id).await;
-            }
-            // A stop is the user getting what they asked for, so it ends the
-            // turn the way a normal one ends: `turn-finished`, not an incident.
-            // This is what clears "working…" in the composer — an interrupted
-            // guest usually comes back as a trap, and reporting that as an
-            // incident made a successful stop read as a crash.
-            Err(_) if stopped => {
-                tracing::info!(session = %session_id, "turn stopped by the user");
-                // A stopped turn has usually spent real money before the user
-                // hit the button, so its row reports what the log says it cost
-                // rather than zero.
-                let stats = stats_from_log(&grip, &session_id, since_seq, "cancelled").await;
-                let _ = grip
-                    .append_event(&session_id, SessionEvent::TurnFinished(stats))
-                    .await;
-                // Nothing to pick up later: the user asked for this to end.
-                let _ = grip.persist.clear_resume_attempts(&session_id).await;
-                let _ = grip.persist.set_no_resume(&session_id, true).await;
             }
             Err(err) => {
                 tracing::warn!(session = %session_id, error = %err, "turn failed");
@@ -468,11 +234,18 @@ async fn actor(
                 // else — so a failed turn used to leave it listening forever
                 // and the user got silence instead of the error. `stopped-by`
                 // carries the reason in-band rather than widening the record.
-                // Same reasoning as a stop: a turn that fails on its tenth step
-                // has been paid for nine times, and the ledger should say so.
-                let stats = stats_from_log(&grip, &session_id, since_seq, "error").await;
                 let _ = grip
-                    .append_event(&session_id, SessionEvent::TurnFinished(stats))
+                    .append_event(
+                        &session_id,
+                        SessionEvent::TurnFinished(crate::bindings::types::TurnStats {
+                            iterations: 0,
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            cost_usd: 0.0,
+                            tools_used: Vec::new(),
+                            stopped_by: "error".to_string(),
+                        }),
+                    )
                     .await;
 
                 // Only the agent's own misbehaviour counts against its breaker;
@@ -493,69 +266,12 @@ async fn actor(
             }
         }
 
-        // A parent that was stopped takes its children with it. Without this a
-        // stop looks like it worked — the spinner clears, the turn ends — while
-        // three sub-agents keep calling the model behind a conversation the user
-        // has already walked away from. Only on a stop: a turn that merely
-        // finished may well have left children running on purpose, and the
-        // parent can wait for them on its next turn.
-        if stopped && subagent.is_none() {
-            crate::delegation::cancel_all_children(&grip, &session_id).await;
-        }
-
-        // A sub-agent's turn ending is the event its parent is waiting for.
-        // After the terminator, so a parent woken by the bell and reading the
-        // child's log finds a complete one.
-        //
-        // A child does not settle on a *nudge-driven* follow-up turn — but it
-        // has none: nothing submits to a child except the spawn itself, and the
-        // parent nudges nobody. So one turn is one child's life, and this is
-        // where it is recorded.
-        if let Some(row) = &subagent {
-            let answer = crate::delegation::final_answer(&grip, &session_id).await;
-            let cost = stats_from_log(&grip, &session_id, since_seq, &ended_as)
-                .await
-                .cost_usd;
-            match grip
-                .persist
-                .settle_subagent(&row.child_id, &answer, cost, &ended_as)
-                .await
-            {
-                Ok(settled) => {
-                    // The parent's transcript gets the outcome, so a fan-out is
-                    // legible in the log without opening every child.
-                    let _ = grip
-                        .append_event(
-                            &row.parent_id,
-                            SessionEvent::SystemNote(format!(
-                                "sub-agent `{}` {}{}",
-                                settled.label,
-                                settled.state.as_str(),
-                                if settled.detail.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(": {}", settled.detail)
-                                }
-                            )),
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!(child = %row.child_id, error = %e, "could not settle the sub-agent");
-                }
-            }
-            // Last, and unconditionally: a parent asleep on this bell must wake
-            // even if settling failed, or it waits out its whole deadline over
-            // a database hiccup.
-            grip.settle_bell.ring();
-        }
-
         // Anything the agent never picked up becomes the seed of the next turn.
         let leftovers = take_all(&inbox);
-        // Unless the user stopped it. A nudge and a stop can arrive together —
-        // typing, then hitting stop — and starting a follow-up turn on the
-        // nudge would restart the work that was just cancelled.
-        if !stopped && leftovers.iter().any(|i| matches!(i, InboxItem::Nudge(_))) {
+        if leftovers
+            .iter()
+            .any(|i| matches!(i, InboxItem::Nudge(_)))
+        {
             start_immediately = true;
         }
     }
@@ -571,274 +287,5 @@ fn take_all(inbox: &Arc<Mutex<VecDeque<InboxItem>>>) -> Vec<InboxItem> {
     match inbox.lock() {
         Ok(mut q) => q.drain(..).collect(),
         Err(_) => Vec::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bindings::types::EventRecord;
-    use std::time::Duration;
-
-    fn assistant_step(seq: u64, prompt: u32, completion: u32, cost: f64) -> EventRecord {
-        EventRecord {
-            seq,
-            ts_ms: 0,
-            event: SessionEvent::AssistantMessage(crate::bindings::types::AssistantMsg {
-                content: String::new(),
-                tool_calls: Vec::new(),
-                model: "test/model".to_string(),
-                usage: Some(crate::bindings::types::TokenUsage {
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    cost_usd: cost,
-                    cached_tokens: 0,
-                    cache_write_tokens: 0,
-                }),
-            }),
-        }
-    }
-
-    #[test]
-    fn usage_is_summed_from_every_step_after_the_anchor() {
-        // The bug this guards: an interrupted turn reported zero, so the
-        // session total went backwards. Spend before the anchor belongs to an
-        // earlier ledger row and must not be counted twice.
-        let events = vec![
-            assistant_step(1, 100, 10, 0.01),
-            assistant_step(2, 200, 20, 0.02),
-            assistant_step(3, 400, 40, 0.04),
-        ];
-
-        let (prompt, completion, cost) = usage_since(&events, 0);
-        assert_eq!(prompt, 700, "every step counts when nothing has settled");
-        assert_eq!(completion, 70);
-        assert!((cost - 0.07).abs() < 1e-9);
-
-        let (prompt, completion, cost) = usage_since(&events, 2);
-        assert_eq!(prompt, 400, "only the steps after the last ledger row");
-        assert_eq!(completion, 40);
-        assert!((cost - 0.04).abs() < 1e-9);
-    }
-
-    #[test]
-    fn turns_anchored_in_sequence_sum_to_the_session_total() {
-        // The invariant the ledger rests on: however the turns are cut, each
-        // step is counted exactly once across all of them.
-        let events = vec![
-            assistant_step(1, 100, 10, 0.01),
-            assistant_step(2, 200, 20, 0.02),
-            assistant_step(4, 400, 40, 0.04),
-            assistant_step(5, 800, 80, 0.08),
-        ];
-
-        // Each row is computed when its turn ends, against the log as it stood
-        // then — so the first sees only the steps logged before it settled.
-        // Slicing is how the test reproduces that; at runtime the log simply
-        // has not grown yet.
-        let first = usage_since(&events[..2], 0);
-        // The first row settled at seq 3, which becomes the next anchor.
-        let second = usage_since(&events, 3);
-        let whole = usage_since(&events, 0);
-
-        assert_eq!(first.0, 300, "the steps before the first row settled");
-        assert_eq!(
-            second.0, 1200,
-            "the steps after it, including a resumed turn"
-        );
-        assert_eq!(
-            first.0 + second.0,
-            whole.0,
-            "the rows must sum to the session total, no gap and no overlap"
-        );
-        assert_eq!(first.1 + second.1, whole.1);
-        assert!((first.2 + second.2 - whole.2).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_step_with_no_usage_record_is_not_an_error() {
-        // A stream that dies before the final chunk carries no usage. That is a
-        // missing number, not a reason to fail or to guess.
-        let events = vec![
-            assistant_step(1, 100, 10, 0.01),
-            EventRecord {
-                seq: 2,
-                ts_ms: 0,
-                event: SessionEvent::AssistantMessage(crate::bindings::types::AssistantMsg {
-                    content: String::new(),
-                    tool_calls: Vec::new(),
-                    model: String::new(),
-                    usage: None,
-                }),
-            },
-        ];
-        let (prompt, _, cost) = usage_since(&events, 0);
-        assert_eq!(prompt, 100);
-        assert!((cost - 0.01).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_fresh_flag_is_not_raised() {
-        let flag = CancelFlag::default();
-        assert!(!flag.raised());
-    }
-
-    #[test]
-    fn a_stop_during_a_turn_stops_that_turn() {
-        let flag = CancelFlag::default();
-        flag.begin_turn();
-        assert!(!flag.raised(), "starting a turn must not stop it");
-        flag.raise();
-        assert!(flag.raised());
-    }
-
-    #[test]
-    fn a_stop_with_nothing_running_does_not_ambush_the_next_turn() {
-        // The stop button on a conversation that is not doing anything must not
-        // arm a trap for whatever the user sends next.
-        let flag = CancelFlag::default();
-        flag.raise();
-        assert!(!flag.raised(), "there was no turn to stop");
-        flag.begin_turn();
-        assert!(!flag.raised(), "the next turn must start clean");
-    }
-
-    #[test]
-    fn a_stop_does_not_leak_into_the_following_turn() {
-        let flag = CancelFlag::default();
-        flag.begin_turn();
-        flag.raise();
-        assert!(flag.raised());
-
-        // The turn ends and another begins: the old stop is spent.
-        flag.begin_turn();
-        assert!(
-            !flag.raised(),
-            "a stale stop would cancel every later turn instantly"
-        );
-    }
-
-    #[test]
-    fn a_stop_stays_raised_for_the_rest_of_its_turn() {
-        // Every host import and every guest checkpoint has to agree, however
-        // many times they ask.
-        let flag = CancelFlag::default();
-        flag.begin_turn();
-        flag.raise();
-        for _ in 0..100 {
-            assert!(flag.raised());
-        }
-    }
-
-    #[test]
-    fn repeated_stops_are_harmless() {
-        let flag = CancelFlag::default();
-        flag.begin_turn();
-        flag.raise();
-        flag.raise();
-        flag.raise();
-        assert!(flag.raised());
-        // And the generation is untouched, so the next turn still runs.
-        flag.begin_turn();
-        assert!(!flag.raised());
-    }
-
-    #[test]
-    fn turns_are_numbered_in_order() {
-        let flag = CancelFlag::default();
-        assert_eq!(flag.begin_turn(), 1);
-        assert_eq!(flag.begin_turn(), 2);
-        assert_eq!(flag.begin_turn(), 3);
-    }
-
-    #[tokio::test]
-    async fn waiting_on_a_stop_that_already_happened_returns_at_once() {
-        // The race that made the button unreliable: a blocking import checks
-        // the flag, a stop lands, and the import then waits for a notification
-        // that has already been sent. It must not block.
-        let flag = CancelFlag::default();
-        flag.begin_turn();
-        flag.raise();
-
-        tokio::time::timeout(Duration::from_secs(1), flag.cancelled())
-            .await
-            .expect("a stop already raised must not block a waiter");
-    }
-
-    #[tokio::test]
-    async fn a_waiter_wakes_when_the_stop_arrives() {
-        let flag = Arc::new(CancelFlag::default());
-        flag.begin_turn();
-
-        let waiting = tokio::spawn({
-            let flag = flag.clone();
-            async move { flag.cancelled().await }
-        });
-
-        // Let the waiter park before the stop is raised.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiting.is_finished(), "nothing has been stopped yet");
-
-        flag.raise();
-        tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("the waiter must wake on a stop")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn every_waiter_wakes_not_just_one() {
-        // A turn can have several imports in flight — a stream and a terminal
-        // command. Waking only one would leave the others waiting out their
-        // own deadlines.
-        let flag = Arc::new(CancelFlag::default());
-        flag.begin_turn();
-
-        let waiters: Vec<_> = (0..5)
-            .map(|_| {
-                let flag = flag.clone();
-                tokio::spawn(async move { flag.cancelled().await })
-            })
-            .collect();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        flag.raise();
-
-        for w in waiters {
-            tokio::time::timeout(Duration::from_secs(1), w)
-                .await
-                .expect("every waiter must wake")
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn a_waiter_ignores_a_stop_aimed_at_an_earlier_turn() {
-        let flag = Arc::new(CancelFlag::default());
-        flag.begin_turn();
-        flag.raise();
-        // Turn two: the stop above is now stale.
-        flag.begin_turn();
-
-        let waiting = tokio::spawn({
-            let flag = flag.clone();
-            async move { flag.cancelled().await }
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !waiting.is_finished(),
-            "a spent stop must not cancel the turn after it"
-        );
-        waiting.abort();
-    }
-
-    #[test]
-    fn cancel_reports_whether_there_was_a_session_to_stop() {
-        let actors = SessionActors::new();
-        assert!(
-            !actors.cancel("nobody"),
-            "an unknown session cannot be stopped"
-        );
-        assert!(actors.cancel_flag("nobody").is_none());
     }
 }

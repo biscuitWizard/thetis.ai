@@ -27,8 +27,8 @@
 //! security boundary: normalise away `..`, join to the workspace root, then
 //! confirm the result is still inside it *after* symlinks are followed.
 
-use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -48,279 +48,13 @@ pub fn handles(frame_type: &str) -> bool {
     frame_type.starts_with("workspace-")
 }
 
-// --- the path index, for @-mention search ------------------------------------
-
-/// Entries held in the search index. The real shared workspace here is tens of
-/// thousands of files across several checkouts, so this is a ceiling against a
-/// pathological tree rather than a limit anyone should meet.
-const MAX_INDEX_ENTRIES: usize = 400_000;
-/// Depth walked while indexing.
-const MAX_INDEX_DEPTH: usize = 20;
-/// How long an index is served before the next search rebuilds it. The agents
-/// are writing into this directory continuously, so a stale menu is a real
-/// hazard — but rebuilding per keystroke would walk 46k paths per character.
-const INDEX_TTL: std::time::Duration = std::time::Duration::from_secs(45);
-/// Matches returned for one search.
-const MAX_MATCHES: usize = 40;
-
-/// Directory names never walked. Every one of these is either machine-generated
-/// or a vendored dependency tree: `moor/target` alone is larger than every
-/// hand-written file in the workspace put together, and offering its contents in
-/// a mention menu would bury the files someone actually meant.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "target",
-    ".cargo",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".next",
-    ".nuxt",
-    ".svelte-kit",
-    ".turbo",
-    ".gradle",
-    ".idea",
-    ".terraform",
-    "dist-newstyle",
-    ".stack-work",
-];
-
-#[derive(Clone)]
-struct IndexEntry {
-    path: String,
-    name_lower: String,
-    path_lower: String,
-    is_dir: bool,
-    size: u64,
-}
-
-struct Index {
-    root: PathBuf,
-    built: std::time::Instant,
-    entries: Vec<IndexEntry>,
-    truncated: bool,
-}
-
-fn index_cell() -> &'static std::sync::Mutex<Option<std::sync::Arc<Index>>> {
-    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<Index>>>> =
-        std::sync::OnceLock::new();
-    CELL.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Drops the cached index, so the next search rebuilds it. Called after any
-/// mutation through this module, and by the HTTP upload route in `web.rs`,
-/// which writes files without passing through `dispatch`.
-pub fn invalidate_index() {
-    if let Ok(mut slot) = index_cell().lock() {
-        *slot = None;
-    }
-}
-
-/// The path index, rebuilt when missing, stale, or pointing at another root.
-fn path_index(cfg: &Config) -> Result<std::sync::Arc<Index>> {
-    let root = root(cfg).map(|r| canonical(&r))?;
-
-    if let Ok(slot) = index_cell().lock() {
-        if let Some(index) = slot.as_ref() {
-            if index.root == root && index.built.elapsed() < INDEX_TTL {
-                return Ok(index.clone());
-            }
-        }
-    }
-
-    let index = std::sync::Arc::new(build_index(&root));
-    if let Ok(mut slot) = index_cell().lock() {
-        *slot = Some(index.clone());
-    }
-    Ok(index)
-}
-
-/// Breadth-first walk of the workspace, skipping the generated trees.
-///
-/// Breadth-first on purpose: if the ceiling is ever hit, what survives is the
-/// shallow paths, which are the ones a person is likely to mean.
-fn build_index(root: &Path) -> Index {
-    let mut entries: Vec<IndexEntry> = Vec::new();
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
-        std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
-    let mut truncated = false;
-
-    while let Some((dir, depth)) = queue.pop_front() {
-        if entries.len() >= MAX_INDEX_ENTRIES {
-            truncated = true;
-            break;
-        }
-        let Ok(reader) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in reader.flatten() {
-            if entries.len() >= MAX_INDEX_ENTRIES {
-                truncated = true;
-                break;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            // `file_type` does not follow the link, which is what we want: a
-            // symlink is listed but never descended into, since its target may
-            // sit outside the workspace where opening it is refused anyway.
-            let file_type = entry.file_type().ok();
-            let is_link = file_type.as_ref().is_some_and(|t| t.is_symlink());
-            let is_dir = file_type.as_ref().is_some_and(|t| t.is_dir());
-            let size = if is_dir {
-                0
-            } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
-            };
-            let path = relative(root, &entry.path());
-
-            if is_dir && SKIP_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            entries.push(IndexEntry {
-                name_lower: name.to_lowercase(),
-                path_lower: path.to_lowercase(),
-                path,
-                is_dir,
-                size,
-            });
-            if is_dir && !is_link && depth + 1 < MAX_INDEX_DEPTH {
-                queue.push_back((entry.path(), depth + 1));
-            }
-        }
-    }
-
-    Index {
-        root: root.to_path_buf(),
-        built: std::time::Instant::now(),
-        entries,
-        truncated,
-    }
-}
-
-/// How well an entry answers a query, or `None` for no match.
-///
-/// Ordered so that what was meant comes first: an exact name, then a name that
-/// starts with the query, then a path prefix, then a substring, and finally a
-/// subsequence — which is what makes "gwcomp" find `gateway-web/src/composer`.
-/// Shallow paths win ties, and files beat directories, since attaching a file
-/// is the common case.
-fn score(entry: &IndexEntry, query: &str) -> Option<i32> {
-    if query.is_empty() {
-        // An `@` with nothing after it: offer the top of the tree rather than
-        // an arbitrary forty thousand files.
-        let depth = entry.path.split('/').count() as i32;
-        return if depth <= 2 {
-            Some(60 - depth * 4 + if entry.is_dir { 2 } else { 0 })
-        } else {
-            None
-        };
-    }
-
-    let base = if entry.name_lower == query {
-        1000
-    } else if entry.name_lower.starts_with(query) {
-        900
-    } else if entry.path_lower.starts_with(query) {
-        820
-    } else if entry.name_lower.contains(query) {
-        700
-    } else if entry.path_lower.contains(query) {
-        600
-    } else if subsequence(&entry.path_lower, query) {
-        400
-    } else {
-        return None;
-    };
-
-    let depth = entry.path.split('/').count() as i32;
-    let length = entry.path.chars().count() as i32;
-    Some(base - depth * 6 - length / 8 + if entry.is_dir { -4 } else { 0 })
-}
-
-/// True when every character of `needle` appears in `haystack` in order. The
-/// query is lowercased by the caller, as is the haystack.
-fn subsequence(haystack: &str, needle: &str) -> bool {
-    let mut chars = needle.chars();
-    let mut want = chars.next();
-    for got in haystack.chars() {
-        match want {
-            Some(c) if c == got => want = chars.next(),
-            Some(_) => {}
-            None => return true,
-        }
-    }
-    want.is_none()
-}
-
-/// Fuzzy path search for the composer's `@` menu.
-///
-/// This exists because the workspace is far too large to index in the browser:
-/// crawling it over `workspace-list` frames would be thousands of round trips
-/// and would still have to truncate. One frame, one bounded answer, and the
-/// walk is cached here where every tab shares it.
-fn find(cfg: &Config, query_raw: &str, dir: &str) -> Result<Value> {
-    let index = path_index(cfg)?;
-    let query = query_raw.trim().to_lowercase();
-
-    // A query with a slash in it is a path fragment, so the whole path is what
-    // it should be matched against; without one, matching the name first is
-    // what makes short queries useful.
-    let prefix = dir.trim_matches('/').to_lowercase();
-
-    let mut scored: Vec<(i32, &IndexEntry)> = index
-        .entries
-        .iter()
-        .filter(|entry| prefix.is_empty() || entry.path_lower.starts_with(&format!("{prefix}/")))
-        .filter_map(|entry| score(entry, &query).map(|s| (s, entry)))
-        .collect();
-
-    // Descending score, then the shorter path, then alphabetical — so the order
-    // is stable between keystrokes and the list does not jitter.
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(a.1.path.len().cmp(&b.1.path.len()))
-            .then(a.1.path.cmp(&b.1.path))
-    });
-
-    let total = scored.len();
-    let entries: Vec<Value> = scored
-        .into_iter()
-        .take(MAX_MATCHES)
-        .map(|(_, entry)| {
-            json!({
-                "path": entry.path,
-                "name": entry.path.rsplit('/').next().unwrap_or(&entry.path),
-                "is_dir": entry.is_dir,
-                "size": entry.size,
-                "kind": kind_of(&entry.path, entry.is_dir),
-            })
-        })
-        .collect();
-
-    Ok(json!({
-        "type": "workspace-find",
-        // Echoed so a client can discard an answer to a query it has typed
-        // past, which is most of them while someone is still typing.
-        "query": query_raw,
-        "dir": dir,
-        "entries": entries,
-        "total": total,
-        "indexed": index.entries.len(),
-        "truncated": index.truncated,
-    }))
-}
-
 // --- path handling ----------------------------------------------------------
 
 /// The shared workspace directory: the first WASI preopen, which is what every
 /// guest sees as `/workspace`.
 pub fn root(cfg: &Config) -> Result<PathBuf> {
-    cfg.wasi
+    cfg
+        .wasi
         .dirs
         .first()
         .cloned()
@@ -520,7 +254,10 @@ fn list(cfg: &Config, rel_request: &str) -> Result<Value> {
         // A folder the agents deleted under an open explorer. Say so plainly
         // rather than returning an empty listing that looks like an empty
         // folder.
-        return Err(anyhow!("'{}' no longer exists", relative(&root, &dir)));
+        return Err(anyhow!(
+            "'{}' no longer exists",
+            relative(&root, &dir)
+        ));
     }
     if !dir.is_dir() {
         return Err(anyhow!("'{}' is a file", relative(&root, &dir)));
@@ -615,8 +352,8 @@ fn read(cfg: &Config, rel_request: &str) -> Result<Value> {
         "url": raw_url(&rel),
     });
 
-    let inline_candidate =
-        meta.len() <= MAX_TEXT_BYTES && matches!(kind, "text" | "code" | "data" | "file");
+    let inline_candidate = meta.len() <= MAX_TEXT_BYTES
+        && matches!(kind, "text" | "code" | "data" | "file");
     if !inline_candidate {
         frame["text_available"] = json!(false);
         return Ok(frame);
@@ -690,9 +427,7 @@ fn delete(cfg: &Config, rel_request: &str, recursive: bool) -> Result<String> {
     if path.is_dir() {
         let count = std::fs::read_dir(&path).map(|e| e.count()).unwrap_or(0);
         if count > 0 && !recursive {
-            return Err(anyhow!(
-                "'{rel}' holds {count} entries; confirm to delete it"
-            ));
+            return Err(anyhow!("'{rel}' holds {count} entries; confirm to delete it"));
         }
         std::fs::remove_dir_all(&path).with_context(|| format!("cannot delete {rel}"))?;
         Ok(format!("deleted {rel}/"))
@@ -792,16 +527,14 @@ pub async fn handle(cfg: &Config, frame: &Value) -> Vec<String> {
     // websocket frame. Inline it holds a runtime thread for its duration.
     match crate::offload::blocking(|| dispatch(cfg, &frame_type, frame)) {
         Ok(replies) => replies,
-        Err(e) => vec![
-            json!({
-                "type": "workspace-result",
-                "op": frame_type.trim_start_matches("workspace-"),
-                "ok": false,
-                "path": frame.get("path").and_then(Value::as_str).unwrap_or_default(),
-                "message": format!("{e:#}"),
-            })
-            .to_string(),
-        ],
+        Err(e) => vec![json!({
+            "type": "workspace-result",
+            "op": frame_type.trim_start_matches("workspace-"),
+            "ok": false,
+            "path": frame.get("path").and_then(Value::as_str).unwrap_or_default(),
+            "message": format!("{e:#}"),
+        })
+        .to_string()],
     }
 }
 
@@ -815,14 +548,6 @@ fn dispatch(cfg: &Config, frame_type: &str, frame: &Value) -> Result<Vec<String>
     match frame_type {
         "workspace-list" => Ok(vec![list(cfg, &path)?.to_string()]),
         "workspace-read" => Ok(vec![read(cfg, &path)?.to_string()]),
-
-        // Fuzzy path search, for the composer's `@` menu. Read-only, and served
-        // from a cached walk — see `find`.
-        "workspace-find" => {
-            let query = frame.get("query").and_then(Value::as_str).unwrap_or("");
-            let dir = frame.get("dir").and_then(Value::as_str).unwrap_or("");
-            Ok(vec![find(cfg, query, dir)?.to_string()])
-        }
 
         // Every mutation answers with its own result *and* a fresh listing of
         // the directory it touched, so the explorer never has to guess what
@@ -862,21 +587,20 @@ fn dispatch(cfg: &Config, frame_type: &str, frame: &Value) -> Result<Vec<String>
 }
 
 /// The result frame, plus a relisting of the affected directory.
-fn mutation_replies(cfg: &Config, op: &str, path: &str, message: &str) -> Vec<String> {
-    // The tree just changed, so the cached path index is a liar. Cheaper to
-    // drop it than to work out what moved.
-    invalidate_index();
-
-    let mut replies = vec![
-        json!({
-            "type": "workspace-result",
-            "op": op,
-            "ok": true,
-            "path": path,
-            "message": message,
-        })
-        .to_string(),
-    ];
+fn mutation_replies(
+    cfg: &Config,
+    op: &str,
+    path: &str,
+    message: &str,
+) -> Vec<String> {
+    let mut replies = vec![json!({
+        "type": "workspace-result",
+        "op": op,
+        "ok": true,
+        "path": path,
+        "message": message,
+    })
+    .to_string()];
 
     // The directory to redraw is the parent of whatever was touched — except
     // for a delete of a directory, whose parent is also its own parent.
@@ -913,10 +637,7 @@ mod tests {
         assert_eq!(resolve(&cfg, "").unwrap(), root);
         assert_eq!(resolve(&cfg, "/").unwrap(), root);
         assert_eq!(resolve(&cfg, "workspace").unwrap(), root);
-        assert_eq!(
-            resolve(&cfg, "notes/todo.md").unwrap(),
-            root.join("notes/todo.md")
-        );
+        assert_eq!(resolve(&cfg, "notes/todo.md").unwrap(), root.join("notes/todo.md"));
         // The UI spells the root as "workspace/…"; that round-trips.
         assert_eq!(
             resolve(&cfg, "workspace/notes/todo.md").unwrap(),
@@ -936,7 +657,10 @@ mod tests {
         ] {
             let err = resolve(&cfg, bad).unwrap_err();
             let text = format!("{err:#}");
-            assert!(text.contains("workspace"), "{bad} gave: {text}");
+            assert!(
+                text.contains("workspace"),
+                "{bad} gave: {text}"
+            );
         }
     }
 
@@ -949,10 +673,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
         let err = resolve(&cfg, "escape").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("outside the workspace"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("outside the workspace"), "{err:#}");
     }
 
     #[test]
@@ -1029,41 +750,21 @@ mod tests {
         assert!(format!("{:#}", delete(&cfg, "notes", false).unwrap_err()).contains("confirm"));
         // Clobbering by rename.
         write(&cfg, "other.md", "x").unwrap();
-        assert!(
-            format!(
-                "{:#}",
-                rename(&cfg, "other.md", "notes/todo.md").unwrap_err()
-            )
-            .contains("already exists")
-        );
+        assert!(format!("{:#}", rename(&cfg, "other.md", "notes/todo.md").unwrap_err())
+            .contains("already exists"));
         // A folder into itself.
-        assert!(
-            format!("{:#}", rename(&cfg, "notes", "notes/inner").unwrap_err())
-                .contains("inside itself")
-        );
+        assert!(format!("{:#}", rename(&cfg, "notes", "notes/inner").unwrap_err())
+            .contains("inside itself"));
         // An existing directory as a new folder.
         assert!(format!("{:#}", mkdir(&cfg, "notes").unwrap_err()).contains("already exists"));
     }
 
     #[test]
     fn active_content_is_flagged_for_forced_download() {
-        for name in [
-            "evil.html",
-            "page.HTM",
-            "vector.svg",
-            "doc.xhtml",
-            "data.xml",
-        ] {
+        for name in ["evil.html", "page.HTM", "vector.svg", "doc.xhtml", "data.xml"] {
             assert!(is_active_content(name), "{name} must be treated as active");
         }
-        for name in [
-            "notes.md",
-            "photo.png",
-            "data.json",
-            "script.js",
-            "plain.txt",
-            "noext",
-        ] {
+        for name in ["notes.md", "photo.png", "data.json", "script.js", "plain.txt", "noext"] {
             assert!(!is_active_content(name), "{name} may preview inline");
         }
     }
@@ -1072,82 +773,6 @@ mod tests {
     fn urls_encode_awkward_names() {
         assert_eq!(raw_url("a b/c#d.txt"), "/workspace/file/a%20b/c%23d.txt");
         assert_eq!(raw_url("plain.md"), "/workspace/file/plain.md");
-    }
-
-    fn paths(frame: &Value) -> Vec<String> {
-        frame["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["path"].as_str().unwrap().to_string())
-            .collect()
-    }
-
-    /* The `@`-mention search, all in one test on purpose: the path index is a
-     * process-wide cache keyed on the workspace root, so two tests with two
-     * temp roots running in parallel would each invalidate the other's index
-     * and the assertions would depend on the interleaving. */
-    #[test]
-    fn mention_search_finds_what_was_meant() {
-        let (cfg, _d) = fixture();
-        let root = canonical(&root(&cfg).unwrap());
-        std::fs::create_dir_all(root.join("moor/crates/kernel/src")).unwrap();
-        std::fs::write(root.join("moor/crates/kernel/src/vm.rs"), "fn main() {}").unwrap();
-        std::fs::write(root.join("moor/README.md"), "# moor").unwrap();
-        // The generated trees a mention menu must never offer.
-        std::fs::create_dir_all(root.join("moor/target/debug")).unwrap();
-        std::fs::write(root.join("moor/target/debug/vm.rs"), "generated").unwrap();
-        std::fs::create_dir_all(root.join("moor/.git")).unwrap();
-        std::fs::write(root.join("moor/.git/config"), "[core]").unwrap();
-        invalidate_index();
-
-        // An exact name beats everything, and `target/` is not offered at all.
-        let found = find(&cfg, "vm.rs", "").unwrap();
-        assert_eq!(paths(&found), vec!["moor/crates/kernel/src/vm.rs"]);
-
-        // Skipped trees are absent even when asked for by name.
-        assert!(paths(&find(&cfg, "config", "").unwrap()).is_empty());
-        assert!(paths(&find(&cfg, "debug", "").unwrap()).is_empty());
-
-        // A subsequence over the whole path: "mckvm" for moor/crates/kernel/…
-        assert!(
-            paths(&find(&cfg, "mckvm", "").unwrap())
-                .contains(&"moor/crates/kernel/src/vm.rs".to_string())
-        );
-
-        // A directory prefix narrows the search to inside it.
-        let inside = find(&cfg, "md", "moor").unwrap();
-        assert_eq!(paths(&inside), vec!["moor/README.md"]);
-        assert!(paths(&find(&cfg, "todo", "moor").unwrap()).is_empty());
-
-        // An empty query offers the top of the tree rather than everything.
-        let top = find(&cfg, "", "").unwrap();
-        let top_paths = paths(&top);
-        assert!(top_paths.contains(&"moor".to_string()));
-        assert!(top_paths.contains(&"notes".to_string()));
-        assert!(!top_paths.iter().any(|p| p.split('/').count() > 2));
-
-        // The frame echoes the query, which is what lets the client drop an
-        // answer to something already typed past.
-        assert_eq!(top["query"], json!(""));
-        assert_eq!(inside["dir"], json!("moor"));
-
-        // A mutation drops the cached index, so a new file is findable at once
-        // rather than after the TTL.
-        write(&cfg, "moor/fresh.txt", "hello").unwrap();
-        mutation_replies(&cfg, "write", "moor/fresh.txt", "saved");
-        assert_eq!(
-            paths(&find(&cfg, "fresh.txt", "").unwrap()),
-            vec!["moor/fresh.txt"]
-        );
-    }
-
-    #[test]
-    fn subsequence_matches_in_order_only() {
-        assert!(subsequence("gateway-web/src/composer.js", "gwcomp"));
-        assert!(subsequence("abc", ""));
-        assert!(!subsequence("abc", "cba"));
-        assert!(!subsequence("abc", "abcd"));
     }
 
     #[test]

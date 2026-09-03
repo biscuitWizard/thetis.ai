@@ -10,7 +10,7 @@
 //! it stops the system from deleting its own database by accident, and is not
 //! a security control, because a terminal session can reach those paths anyway.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::{Component, Path, PathBuf};
 
 use crate::bindings::types::FsEntry;
@@ -22,31 +22,9 @@ use crate::config::Config;
 /// path semantics identical everywhere.
 pub(crate) fn has_drive_prefix(path: &str) -> bool {
     let first = path.split(['/', '\\']).next().unwrap_or("");
-    first.len() == 2 && first.as_bytes()[1] == b':' && first.as_bytes()[0].is_ascii_alphabetic()
-}
-
-/// Maps a guest-facing preopen path (`/workspace/...`) onto the real directory
-/// behind it.
-///
-/// A guest sees each WASI preopen under its own last path segment, so the
-/// shared workspace is `/workspace` no matter where it lives on this machine.
-/// Anything that is not such a path comes back untouched, and the result still
-/// goes through the ordinary root check afterwards — this only fixes the
-/// spelling, it grants nothing.
-fn rewrite_workspace_prefix(cfg: &Config, raw: &str) -> String {
-    for dir in &cfg.wasi.dirs {
-        let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
-            continue;
-        };
-        let prefix = format!("/{name}");
-        if raw == prefix {
-            return dir.to_string_lossy().to_string();
-        }
-        if let Some(rest) = raw.strip_prefix(&format!("{prefix}/")) {
-            return dir.join(rest).to_string_lossy().to_string();
-        }
-    }
-    raw.to_string()
+    first.len() == 2
+        && first.as_bytes()[1] == b':'
+        && first.as_bytes()[0].is_ascii_alphabetic()
 }
 
 /// Resolves a guest-supplied path against the configured roots.
@@ -68,14 +46,7 @@ pub fn resolve(cfg: &Config, raw: &str) -> Result<PathBuf> {
         .first()
         .ok_or_else(|| anyhow!("no filesystem roots are configured"))?;
 
-    // `/workspace` is what every guest sees the shared preopen as, so it is the
-    // name an agent reaches for — and taken literally it names a directory at
-    // the filesystem root that does not exist. Rewrite it to the real workspace
-    // path before anything else looks at it, so the spelling the agent knows and
-    // the spelling on disk are the same place.
-    let raw = &rewrite_workspace_prefix(cfg, raw);
-
-    let candidate = Path::new(raw.as_str());
+    let candidate = Path::new(raw);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
@@ -141,7 +112,7 @@ fn normalise(path: &Path) -> PathBuf {
 
 /// `std::fs::canonicalize` returns `\\?\` paths on Windows, which do not
 /// compare cleanly against ordinary ones.
-pub(crate) fn canonical(path: &Path) -> PathBuf {
+fn canonical(path: &Path) -> PathBuf {
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
     match text.strip_prefix(r"\\?\") {
@@ -182,28 +153,7 @@ fn require_enabled(cfg: &Config) -> Result<()> {
 }
 
 /// Shows a path relative to its root, so messages stay readable.
-///
-/// A path inside a WASI preopen is rendered with its guest prefix — a workspace
-/// file reads as `/workspace/notes.md`, not `notes.md`. That is not cosmetic:
-/// relative paths resolve against the *first* root, so a bare `notes.md`
-/// handed back from the workspace would be read again from the project root and
-/// either miss or, worse, hit a different file of the same name. Preopens are
-/// checked before the plain roots for exactly that reason.
-pub(crate) fn display(cfg: &Config, path: &Path) -> String {
-    for dir in &cfg.wasi.dirs {
-        let Ok(relative) = path.strip_prefix(dir) else {
-            continue;
-        };
-        let Some(name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
-            continue;
-        };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        return if relative.is_empty() {
-            format!("/{name}")
-        } else {
-            format!("/{name}/{relative}")
-        };
-    }
+fn display(cfg: &Config, path: &Path) -> String {
     for root in &cfg.filesystem.roots {
         if let Ok(relative) = path.strip_prefix(root) {
             return relative.to_string_lossy().replace('\\', "/");
@@ -229,7 +179,8 @@ pub fn read_file(cfg: &Config, raw: &str) -> Result<String> {
         ));
     }
 
-    std::fs::read_to_string(&path).map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))
+    std::fs::read_to_string(&path)
+        .map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))
 }
 
 pub fn write_file(cfg: &Config, raw: &str, contents: &str) -> Result<String> {
@@ -286,9 +237,7 @@ pub fn list_dir(cfg: &Config, raw: &str) -> Result<Vec<FsEntry>> {
 pub fn delete_path(cfg: &Config, raw: &str, recursive: bool) -> Result<String> {
     require_enabled(cfg)?;
     if !cfg.filesystem.allow_delete {
-        return Err(anyhow!(
-            "deleting is off; set filesystem.allow_delete to turn it on"
-        ));
+        return Err(anyhow!("deleting is off; set filesystem.allow_delete to turn it on"));
     }
 
     let path = resolve(cfg, raw)?;
@@ -296,12 +245,7 @@ pub fn delete_path(cfg: &Config, raw: &str, recursive: bool) -> Result<String> {
         return Err(anyhow!("{name} is protected and cannot be deleted"));
     }
     // Deleting a root would take the workspace with it.
-    if cfg
-        .filesystem
-        .roots
-        .iter()
-        .any(|r| canonical(r) == canonical(&path))
-    {
+    if cfg.filesystem.roots.iter().any(|r| canonical(r) == canonical(&path)) {
         return Err(anyhow!("refusing to delete a configured root"));
     }
     if !path.exists() {
@@ -474,78 +418,21 @@ fn walk(root: &Path, mut visit: impl FnMut(&Path) -> bool) -> bool {
     true
 }
 
-/// Where a walk starts, and whether it is confined to a single file.
-///
-/// `search_files` and `find_files` both take a `path`. Callers very often pass
-/// a *file* there: it reads naturally, and the alternative spelling — `path`
-/// set to the directory and `glob` to the file's name — is not the obvious one.
-/// Refusing it used to be a dead end. The error said what was wrong but not
-/// what to write instead, and a caller with no memory of its previous attempt
-/// would try another spelling of the same thing and get the same rejection, so
-/// the mistake cost several turns rather than one. A file is therefore a legal
-/// scope now, meaning "look in just this one".
-struct WalkScope {
-    /// The directory relative paths are reported against. For a single file
-    /// this is its parent, so a `glob` still matches against the file's name
-    /// rather than against the empty string.
-    root: PathBuf,
-    /// The only file the walk may visit, when the scope named a file.
-    only: Option<PathBuf>,
-}
-
-impl WalkScope {
-    /// Hands every file in the scope to `visit`; reports whether the walk ran
-    /// to completion, as [`walk`] does.
-    fn walk(&self, mut visit: impl FnMut(&Path) -> bool) -> bool {
-        match &self.only {
-            // Not `walk` over the parent with a filter: the parent may hold
-            // thousands of files, and scanning them to discard all but one
-            // would burn the scan bound and then claim the result was partial.
-            Some(one) => {
-                visit(one);
-                true
-            }
-            None => walk(&self.root, visit),
-        }
-    }
-
-    /// What to name in a message about this scope.
-    fn target(&self) -> &Path {
-        self.only.as_deref().unwrap_or(&self.root)
-    }
-}
-
-/// The scope a walk covers, defaulting to the first configured root.
-fn walk_root(cfg: &Config, path: Option<&str>) -> Result<WalkScope> {
+/// The directory a walk starts from, defaulting to the first root.
+fn walk_root(cfg: &Config, path: Option<&str>) -> Result<PathBuf> {
     match path.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => {
             let resolved = resolve(cfg, p)?;
-            if resolved.is_dir() {
-                return Ok(WalkScope {
-                    root: resolved,
-                    only: None,
-                });
+            if !resolved.is_dir() {
+                return Err(anyhow!("{} is not a directory", display(cfg, &resolved)));
             }
-            if resolved.is_file() {
-                // Fall back to the file itself if it somehow has no parent, so
-                // a relative path stays computable either way.
-                let root = resolved
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| resolved.clone());
-                return Ok(WalkScope {
-                    root,
-                    only: Some(resolved),
-                });
-            }
-            Err(anyhow!("{} does not exist", display(cfg, &resolved)))
+            Ok(resolved)
         }
         None => cfg
             .filesystem
             .roots
             .first()
             .cloned()
-            .map(|root| WalkScope { root, only: None })
             .ok_or_else(|| anyhow!("no filesystem roots are configured")),
     }
 }
@@ -568,8 +455,7 @@ pub fn read_file_range(cfg: &Config, raw: &str, offset: u32, limit: u32) -> Resu
     require_enabled(cfg)?;
     let path = resolve(cfg, raw)?;
 
-    let bytes =
-        std::fs::read(&path).map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))?;
+    let bytes = std::fs::read(&path).map_err(|e| anyhow!("cannot read {}: {e}", display(cfg, &path)))?;
     if looks_binary(&bytes) {
         return Err(anyhow!(
             "{} looks like a binary file, not text",
@@ -591,38 +477,15 @@ pub fn read_file_range(cfg: &Config, raw: &str, offset: u32, limit: u32) -> Resu
         ));
     }
 
-    // Two bounds, not one. `limit` counts lines, but the real constraint on a
-    // tool result is bytes, and a file of long lines blows the byte budget long
-    // before it reaches the line limit. Bounding only by lines meant this
-    // function believed it had shown everything, emitted no footer, and left the
-    // caller to cut the text blind — losing the footer with it. So stop at
-    // whichever bound comes first and report honestly either way.
-    // Leave headroom under the tool-output cap so the footer, and the caller's
-    // own framing, still fit without triggering a spill.
-    let byte_budget = cfg.max_tool_output_bytes.saturating_sub(2_048).max(4_096);
-
     let mut out = String::new();
-    let mut shown_end = start - 1;
-    let mut stopped_early = false;
     for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
-        let rendered = format!("{:>6}\t{}\n", i + 1, clip(line));
-        if !out.is_empty() && out.len() + rendered.len() > byte_budget {
-            stopped_early = true;
-            break;
-        }
-        out.push_str(&rendered);
-        shown_end = i + 1;
+        out.push_str(&format!("{:>6}\t{}\n", i + 1, clip(line)));
     }
 
-    let shown_end = shown_end.max(start - 1);
+    let shown_end = (start + limit - 1).min(total);
     if shown_end < total {
-        let reason = if stopped_early {
-            " (stopped at the output size limit)"
-        } else {
-            ""
-        };
         out.push_str(&format!(
-            "\n[lines {start}-{shown_end} of {total}{reason}; read on with offset {}]\n",
+            "\n[lines {start}-{shown_end} of {total}; read on with offset {}]\n",
             shown_end + 1
         ));
     } else if start > 1 {
@@ -651,14 +514,10 @@ pub fn edit_file(
         return Err(anyhow!("{name} is protected and cannot be written"));
     }
     if old_text.is_empty() {
-        return Err(anyhow!(
-            "old_text is empty; use write_path to create a file"
-        ));
+        return Err(anyhow!("old_text is empty; use write_path to create a file"));
     }
     if old_text == new_text {
-        return Err(anyhow!(
-            "old_text and new_text are identical, so there is nothing to change"
-        ));
+        return Err(anyhow!("old_text and new_text are identical, so there is nothing to change"));
     }
 
     let text = std::fs::read_to_string(&path)
@@ -745,19 +604,15 @@ pub fn search_files(
         .build()
         .map_err(|e| anyhow!("bad pattern `{pattern}`: {e}"))?;
     let glob_re = glob.map(glob_to_regex).transpose()?;
-    let cap = if max_results == 0 {
-        100
-    } else {
-        max_results as usize
-    };
+    let cap = if max_results == 0 { 100 } else { max_results as usize };
 
     let mut lines: Vec<String> = Vec::new();
     let mut files_with_matches = 0usize;
     let mut total_matches = 0usize;
     let mut hit_cap = false;
 
-    let complete = root.walk(|file| {
-        if let (Some(g), Some(rel)) = (&glob_re, path_relative(&root.root, file)) {
+    let complete = walk(&root, |file| {
+        if let (Some(g), Some(rel)) = (&glob_re, path_relative(&root, file)) {
             if !glob_matches(g, glob_target(glob.unwrap_or(""), &rel)) {
                 return true;
             }
@@ -815,7 +670,7 @@ pub fn search_files(
     if lines.is_empty() {
         return Ok(format!(
             "no matches for /{pattern}/ under {}{}",
-            display(cfg, root.target()),
+            display(cfg, &root),
             glob.map(|g| format!(" matching {g}")).unwrap_or_default()
         ));
     }
@@ -855,15 +710,11 @@ pub fn find_files(
     require_enabled(cfg)?;
     let root = walk_root(cfg, path)?;
     let re = glob_to_regex(glob)?;
-    let cap = if max_results == 0 {
-        200
-    } else {
-        max_results as usize
-    };
+    let cap = if max_results == 0 { 200 } else { max_results as usize };
 
     let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
-    let complete = root.walk(|file| {
-        let Some(rel) = path_relative(&root.root, file) else {
+    let complete = walk(&root, |file| {
+        let Some(rel) = path_relative(&root, file) else {
             return true;
         };
         if !glob_matches(&re, glob_target(glob, &rel)) {
@@ -879,7 +730,7 @@ pub fn find_files(
     if found.is_empty() {
         return Ok(format!(
             "nothing matching {glob} under {}",
-            display(cfg, root.target())
+            display(cfg, &root)
         ));
     }
 
@@ -984,51 +835,6 @@ mod tests {
         assert!(!deep.contains("src/lib.rs"), "{deep}");
     }
 
-    /// Passing a file as `path` is what callers actually write, so it has to
-    /// work. It used to be refused with "is not a directory" — an error that
-    /// named the problem but not the remedy, so a caller would rephrase the
-    /// same mistake instead of correcting it.
-    #[test]
-    fn a_file_is_a_legal_search_scope() {
-        let (cfg, _d) = searchable();
-
-        let one = search_files(&cfg, "parse", Some("src/lib.rs"), None, "content", 0).unwrap();
-        assert!(one.contains("src/lib.rs:1:"), "{one}");
-        assert!(one.contains("src/lib.rs:3:"), "{one}");
-        // Confinement is the point: a sibling that matches must not appear.
-        assert!(!one.contains("deep/mod.rs"), "{one}");
-
-        // And a glob still has a name to match against, not an empty string.
-        let globbed = search_files(&cfg, "parse", Some("src/lib.rs"), Some("*.rs"), "files", 0);
-        assert!(globbed.unwrap().contains("src/lib.rs"), "glob should match");
-
-        let missed = search_files(&cfg, "parse", Some("README.md"), Some("*.rs"), "files", 0);
-        assert!(
-            missed.unwrap().starts_with("no matches"),
-            "glob should filter"
-        );
-    }
-
-    #[test]
-    fn find_can_be_scoped_to_one_file() {
-        let (cfg, _d) = searchable();
-        let out = find_files(&cfg, "*.rs", Some("src/lib.rs"), 0).unwrap();
-        assert!(out.contains("src/lib.rs"), "{out}");
-        assert!(!out.contains("deep/mod.rs"), "{out}");
-    }
-
-    /// A path that is neither file nor directory is still an error — but one
-    /// that says what is actually wrong.
-    #[test]
-    fn a_path_that_does_not_exist_says_that_much() {
-        let (cfg, _d) = searchable();
-        let err = search_files(&cfg, "parse", Some("src/nope.rs"), None, "content", 0)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("does not exist"), "{err}");
-        assert!(!err.contains("not a directory"), "{err}");
-    }
-
     #[test]
     fn search_says_when_it_stopped_early() {
         let (cfg, _d) = searchable();
@@ -1114,10 +920,7 @@ mod tests {
     fn editing_a_snippet_that_is_not_there_explains_why() {
         let (cfg, _d) = fixture();
         let err = edit_file(&cfg, "src/main.rs", "fn nope()", "fn yes()", false).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("Read the file first"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("Read the file first"), "{err:#}");
     }
 
     #[test]
@@ -1160,89 +963,11 @@ mod tests {
         }
     }
 
-    /// The shared workspace has to be reachable by the name the agent knows it
-    /// by. A guest sees the preopen as `/workspace`; on this machine it is some
-    /// other absolute path entirely, and taking the guest spelling literally
-    /// used to produce "outside the allowed roots" for the one directory every
-    /// agent is meant to share.
-    #[test]
-    fn the_workspace_is_reachable_by_its_guest_name() {
-        let (mut cfg, _d) = fixture();
-        let ws = cfg.filesystem.roots[0].join("shared-ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("note.md"), "shared").unwrap();
-        cfg.wasi.dirs = vec![ws.clone()];
-        cfg.filesystem.roots.push(ws.clone());
-
-        assert_eq!(resolve(&cfg, "/shared-ws").unwrap(), ws);
-        assert_eq!(
-            resolve(&cfg, "/shared-ws/note.md").unwrap(),
-            ws.join("note.md")
-        );
-        assert_eq!(read_file(&cfg, "/shared-ws/note.md").unwrap(), "shared");
-        assert!(
-            list_dir(&cfg, "/shared-ws")
-                .unwrap()
-                .iter()
-                .any(|e| e.name == "note.md")
-        );
-    }
-
-    /// Whatever a listing or a search result calls a file, feeding that name
-    /// straight back to another call has to reach the same file. Making the
-    /// workspace a root put that at risk: relative names resolve against the
-    /// *first* root, so a workspace file rendered as a bare `note.md` would be
-    /// read again from the project root.
-    #[test]
-    fn a_workspace_path_round_trips_through_display() {
-        let (mut cfg, _d) = fixture();
-        let project = cfg.filesystem.roots[0].clone();
-        let ws = project.join("shared-ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("note.md"), "in the workspace").unwrap();
-        // Same file name in the project root: a bare `note.md` would find this
-        // one instead, which is the failure worth catching.
-        std::fs::write(project.join("note.md"), "in the project").unwrap();
-        cfg.wasi.dirs = vec![ws.clone()];
-        cfg.filesystem.roots.push(ws.clone());
-
-        let shown = display(&cfg, &ws.join("note.md"));
-        assert_eq!(shown, "/shared-ws/note.md");
-        assert_eq!(read_file(&cfg, &shown).unwrap(), "in the workspace");
-
-        // And the listing agrees with itself.
-        let entry = list_dir(&cfg, "/shared-ws")
-            .unwrap()
-            .into_iter()
-            .find(|e| e.name == "note.md")
-            .expect("note.md should be listed");
-        assert_eq!(read_file(&cfg, &entry.path).unwrap(), "in the workspace");
-    }
-
-    /// Rewriting the prefix is a spelling fix, not a grant: `..` out of the
-    /// workspace still has to land inside a root to be allowed.
-    #[test]
-    fn the_workspace_alias_still_cannot_escape() {
-        let (mut cfg, _d) = fixture();
-        let ws = cfg.filesystem.roots[0].join("shared-ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        cfg.wasi.dirs = vec![ws];
-
-        let err = resolve(&cfg, "/shared-ws/../../../../etc/passwd").unwrap_err();
-        assert!(
-            format!("{err:#}").contains("outside the allowed roots"),
-            "{err:#}"
-        );
-    }
-
     #[test]
     fn traversal_that_stays_inside_is_allowed() {
         let (cfg, _d) = fixture();
         // Normalises to src/main.rs, which is within the root.
-        assert_eq!(
-            read_file(&cfg, "src/../src/main.rs").unwrap(),
-            "fn main() {}"
-        );
+        assert_eq!(read_file(&cfg, "src/../src/main.rs").unwrap(), "fn main() {}");
     }
 
     #[test]
@@ -1309,60 +1034,6 @@ mod tests {
         assert!(format!("{err:#}").contains("deleting is off"), "{err:#}");
         // Reading and writing still work.
         assert!(read_file(&cfg, "src/main.rs").is_ok());
-    }
-
-    /// The proven regression: a file of long lines exceeds the byte budget well
-    /// before the 2000-line default, and used to come back with no footer at all
-    /// — so the caller cut it blind and the model was left with no way to read on.
-    #[test]
-    fn a_read_bounded_by_bytes_still_says_how_to_continue() {
-        let (cfg, _d) = fixture();
-        let wide = "a".repeat(290);
-        let body: String = std::iter::repeat(wide).take(400).collect::<Vec<_>>().join("\n");
-        write_file(&cfg, "wide.txt", &body).expect("write");
-
-        let out = read_file_range(&cfg, "wide.txt", 0, 0).expect("reads");
-        assert!(
-            out.len() <= cfg.max_tool_output_bytes,
-            "must fit the tool-output budget, got {}",
-            out.len()
-        );
-        assert!(
-            out.contains("read on with offset"),
-            "a partial read must say how to continue: {}",
-            &out[out.len().saturating_sub(200)..]
-        );
-        assert!(
-            out.contains("stopped at the output size limit"),
-            "and why it stopped"
-        );
-    }
-
-    /// Reading on from the offset the footer gave must actually advance.
-    #[test]
-    fn the_offered_offset_reads_the_next_window() {
-        let (cfg, _d) = fixture();
-        let body: String = (1..=400)
-            .map(|i| format!("line{i} {}", "b".repeat(280)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        write_file(&cfg, "wide.txt", &body).expect("write");
-
-        let first = read_file_range(&cfg, "wide.txt", 0, 0).expect("reads");
-        let marker = "read on with offset ";
-        let at = first.find(marker).expect("footer") + marker.len();
-        let next: u32 = first[at..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .expect("a number");
-
-        let second = read_file_range(&cfg, "wide.txt", next, 0).expect("reads on");
-        assert!(
-            second.contains(&format!("line{next} ")),
-            "reading on starts at the line the footer promised"
-        );
     }
 
     #[test]

@@ -5,9 +5,8 @@ when_to_use = "Use for every reply. Applies hardest to short factual questions, 
 universal = true
 tags = ["style", "brevity", "communication"]
 children = "none"
-version = 2
+version = 1
 ---
-# Concise replies
 
 Lead with the answer. Do not restate the question, do not announce what you are
 about to do, and do not close with an offer of further help unless there is a

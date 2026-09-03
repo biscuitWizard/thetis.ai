@@ -1,12 +1,12 @@
 ---
 name = "Web UI design"
 brief = "Design and extend the web chat UI: the three-zone shell, the context rail, the design tokens, and the rules that keep new surfaces from becoming modals."
-when_to_use = "Use when changing anything the browser shows — a panel, inspector, tab, button, chip, meter or transcript element under gateways/gateway-web/src/ui — picking a colour or size, or deciding where a new feature belongs. Use it also when a surface feels sloppy, buried or cramped, or a UI change needs deploying and verifying. Not for the wire protocol's semantics, the agent loop, or tool authoring."
+when_to_use = "Use when changing anything the browser shows — adding or restyling a panel, inspector, tab, button, chip, meter or transcript element under gateways/gateway-web/src/ui, picking a colour or a size, or deciding where on screen a new feature belongs. Use it also when a surface feels sloppy, buried or cramped and you need the house rules for fixing it, and when a UI change has to be deployed and verified. Not for the wire protocol's semantics, the agent loop, or tool authoring — though it does say how to add the host-side frame a new panel needs."
 universal = false
-tags = ["ui", "web ui", "frontend", "css", "design", "design tokens", "panel", "rail", "inspector", "chat interface", "gateway-web", "layout", "restyle", "sloppy ui", "host-side frame", "deploy and verify", "tool-group:selfmod"]
+tags = ["ui", "web ui", "frontend", "css", "design", "design tokens", "panel", "rail", "inspector", "chat interface", "gateway-web", "layout", "restyle", "sloppy ui"]
 children = "auto"
 related = ["thetis-internals", "careful-surgery"]
-version = 3
+version = 1
 ---
 
 # Web UI design
@@ -14,13 +14,6 @@ version = 3
 The design language of the chat surface, and the rules that keep it coherent
 while it grows. Exact token values and the component catalogue are in
 `references/tokens.md` — fetch that when writing actual CSS or markup.
-
-Two related skills, fetched only when their narrower question comes up:
-
-- [file-mentions](skill:web-ui-design/file-mentions) — how a file or path
-  typed or dropped into the composer becomes a chip and reaches the agent.
-- [verifying-on-a-branch](skill:web-ui-design/verifying-on-a-branch) — running
-  a branch's own gateway on a spare port to see a UI change before it merges.
 
 ## The shape of the screen
 
@@ -30,13 +23,8 @@ the surface got sloppy the last time.
 | Zone | Width | Job | Never |
 |---|---|---|---|
 | Sidebar | `--sidebar-w` 272px | Navigate conversations: search, recency groups, archived | Hold a feature. The workspace explorer lived here once and was unfindable |
-| Main | Tab strip + stage; the chat pane keeps `--measure` 48rem, centred | The stage: the conversation, plus a tab per sub-agent and per open file | Let another tab displace the conversation's own — it is tab 0 and never closes |
+| Main | `--measure` 48rem, centred | The conversation: transcript, composer | Get replaced by another view |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
-
-Inside Main, each turn carries an avatar in a gutter outside the text column —
-the agent's on the left, the user's on the right, with each byline aligned to its
-own side. The gutters are side padding on the scroll container, so every centred
-child moves together and the text keeps its measure. See `references/tokens.md`.
 
 **The one structural rule: an inspector is a rail tab, not a modal.** The rail
 docks — the chat reflows beside it and stays readable and typable with anything
@@ -48,73 +36,18 @@ The tabs are Branch, Files, Context, Skills, Tools, Models. Branch is the
 resting tab and opens itself once a conversation has a commit graph, so version
 state is ever-present rather than behind a click.
 
-### The centre stage is tabbed — reversed by operator decision
+### Two directions that were tried and rejected
 
-This skill used to forbid tabs over the centre stage, on the grounds that making
-the editor a peer of the conversation turns the product into an IDE. **The
-operator overruled that, and the tabs are built.** What actually made the
-original objection wrong was scale: a turn now spawns half a dozen sub-agents,
-and rendering every child inline in one scroll made the conversation unreadable
-long before the editor was the problem. Do not revert this; the reasoning below
-is what keeps it from becoming an IDE.
+Do not "improve" the surface back into either of these.
 
-The stage lives in `views/stage.js` and owns the strip and the panes.
-
-- **Tab 0 is the conversation, is not closable, and carries the title.**
-  Clicking it while it is already active is the rename affordance the old
-  `.chat-head` carried. The conversation is the product; a tab is a place to
-  glance from it.
-- **The composer belongs to the chat pane, not the stage.** A sub-agent tab has
-  no composer — you do not talk to a child. A file tab shows Save/Revert in that
-  slot. This is what stops the editor reading as the main event.
-- **Every pane stays in the DOM; exactly one is visible, via the `hidden`
-  attribute** (rule 5). Two children streaming at once must both keep
-  accumulating while you watch one, and a half-typed file draft must survive a
-  tab switch — that draft is the one thing on the surface the host cannot give
-  back.
-- **A sub-agent renders in two homes at once**: its inline `details.agent` block
-  in the transcript *and* its own pane. `inAgent()` in `transcript.js` runs each
-  renderer once per home with per-home cursors (`live`, `thinking`, `open`,
-  `compactNode`, `openAsks`). One shared cursor across two homes puts a
-  streaming delta in whichever home drew last.
-- **Sub-agent tabs are per-conversation; file tabs are global.** The workspace is
-  shared by every conversation, so its tabs follow you across a switch. Children
-  do not, and are closed by `store.agents` going empty on transcript reset.
-- **A tab outlives what it shows.** A finished child keeps its tab, with a state
-  dot and its cost; that is the point of it.
-- **Give tabs a width floor, not `min-width: 0`.** With no floor, twelve tabs
-  shrink until every label is *nought pixels* wide and the strip is a row of
-  identical close buttons — measured in a real browser, not imagined. A floor
-  makes them overflow, which the strip's `overflow-x: auto` turns into a scroll.
-  Scroll the active tab into view on every redraw (`block: "nearest"`), or
-  activating a tab past the right-hand edge looks like a no-op.
-
-The rail is unaffected and still owns every inspector. Two tab systems coexist
-deliberately: the **stage** holds things you *work in* (a conversation, a child's
-stream, a file), the **rail** holds things you *consult about* the conversation.
-A new surface that answers "what is the state of this?" is a rail tab.
-
-### One direction that was tried and rejected
-
-Do not "improve" the surface into this.
-
-- **A command palette instead of the rail.** A palette is an accelerator for
-  people who already know the surface; it is not information architecture. It
-  would leave every panel still hidden. Worth adding *on top of* the rail one
-  day, never in place of it.
-
-### Ask which box, before building
-
-A layout request usually names a *neighbour* ("next to the name", "beside the
-chat") and not a *box*, and those underdetermine the arrangement. Turn avatars
-were built three times: flanking portrait columns, then inline in the byline,
-then — correctly — in a gutter outside the text column. Each version satisfied a
-plain reading of the words. What settled it was a pair of before/after
-screenshots.
-
-So when a request could mean two arrangements, spend the cheap move first: say
-which one you are about to build, or ask for a sketch. A wrong layout costs a
-full verification cycle, and the user has to look at it to know it is wrong.
+1. **Tabs over the centre stage** (chat and files as peers, the editor filling
+   the main zone). This makes the editor a peer of the conversation, and one
+   keystroke turns the product into an IDE. The editor matters, but it is
+   something you glance at while conversing. Files widens the *rail* instead.
+2. **A command palette instead of the rail.** A palette is an accelerator for
+   people who already know the surface; it is not information architecture. It
+   would leave every panel still hidden. Worth adding *on top of* the rail one
+   day, never in place of it.
 
 ## Aesthetic
 
@@ -138,12 +71,7 @@ These are not preferences. Breaking one has bitten this codebase.
    and means it. Use a token; add one to `theme.css` if none fits. Stale
    fallbacks like `var(--ok, #9ece6a)` are the same bug wearing a hat, and a
    typo'd token name (`var(--sans)` when it is `--font`) fails silently — the
-   branch graph's labels inherited the wrong family for weeks. Spacing is the
-   easiest to get wrong, because the scale is *numbered*: `--gap-1` … `--gap-6`,
-   and there is no `--gap-xs`. An invented name yields no gap at all rather than
-   a wrong one, so the build is green and the row just looks tight. Read the
-   value back — `getComputedStyle(el).gap` or `.marginLeft` — rather than
-   trusting the name you wrote.
+   branch graph's labels inherited the wrong family for weeks.
 2. **No `confirm()`, `prompt()` or `alert()`.** Use `popover(anchor, {...})` for
    anything destructive or needing a name, and `toast()` for outcomes. Native
    dialogs cannot say what they are about to destroy, and they cannot be
@@ -154,15 +82,9 @@ These are not preferences. Breaking one has bitten this codebase.
 4. **Dependency-free, no build step.** Plain ES modules, hand-rolled SVG icons.
    A new file under `ui/` must be registered in `gateways/gateway-web/src/assets.rs`
    or it 404s at runtime with the module graph half-loaded.
-5. **Hide with the `hidden` attribute — via `setHidden`, not `.hidden =`.**
-   `app.css` forces `[hidden] { display: none !important; }` precisely because
-   component rules that set their own `display` silently defeat the UA
-   stylesheet. But `hidden` is an IDL attribute of `HTMLElement`, and
-   `SVGElement` does not inherit it: `svg.hidden = true` sets an ordinary JS
-   property and the element stays on screen, with no error. Every avatar in the
-   UI is an `<img>` paired with a fallback `<svg>` mark, so this showed up as
-   both being visible at once. `setHidden(node, bool)` in `lib/dom.js` goes
-   through the attribute and works on either.
+5. **Hide with the `hidden` attribute.** `app.css` forces
+   `[hidden] { display: none !important; }` precisely because component rules
+   that set their own `display` silently defeat the UA stylesheet.
 6. **Two steps for anything destructive, and name the object.** "Reset the
    branch to 7bf7a1a? — history is kept; this adds a new commit restoring that
    state" beats "Are you sure?". A destructive verb never sits on a bare 5px
@@ -233,24 +155,6 @@ Reach for an existing class before inventing one. Full markup in
 | Outcome message | `toast(message, {tone, action})` |
 | Confirm / rename in place | `popover(anchor, {...})` |
 
-## Adding a stage tab kind
-
-Only for a *third* kind of thing to work in — not for an inspector, which is a
-rail tab. In `views/stage.js`:
-
-1. Give the kind an id prefix (`chat`, `agent:<id>`, `file:<path>`) and a
-   `kind` string; the strip styles itself off `.stage-tab.is-<kind>`.
-2. Build the pane once and keep it: furniture (head, body, foot) built in a
-   `build*` function, contents refreshed separately. Rebuilding a pane on every
-   update destroys a `<textarea>`'s caret, selection and scroll — the file
-   editor's node identity is asserted across a save for exactly this reason.
-3. Decide the lifetime and say so in a comment: does the tab survive a
-   conversation switch (file: yes) or belong to one (agent: no)?
-4. Anything the host must fetch needs a filter on the reply. `workspace-file`
-   carries no requester identity, so the rail and the stage each keep a set of
-   paths they asked for and ignore the rest. A failed read replies only with
-   `workspace-result` — handle that, or the pane says "reading…" for ever.
-
 ## Adding a rail tab
 
 1. Write the view in `ui/views/<name>.js`. Export a draw function that calls
@@ -300,8 +204,8 @@ restart, then check. This has wasted a debugging session more than once.
 A conversation on its own branch has *not* committed to trunk, so its new
 `ui/` files 404 on the live port however green the build is. To see a change
 before merging — or when the playwright MCP tools are unavailable — fetch
-[verifying-on-a-branch](skill:web-ui-design/verifying-on-a-branch): it runs
-the branch's own gateway on a spare port and drives headless Chrome over CDP.
+`web-ui-design/verifying-on-a-branch`: it runs the branch's own gateway on a
+spare port and drives headless Chrome over CDP.
 
 Verify in the real browser through the playwright MCP tools, not by reasoning
 about the diff:
@@ -320,11 +224,6 @@ about the diff:
 | A UI edit does nothing after restart | Guest built from committed trunk | Commit, then restart |
 | Module 404s, page half-dead | New `ui/` file not in `assets.rs` | Register it |
 | An element will not hide | A component rule sets `display` | Use the `hidden` attribute |
-| An `<svg>` will not hide, no error | `.hidden = true` on an SVGElement sets a dead JS property | `setHidden(node, true)` from `lib/dom.js` |
-| A flex row's children spill past their column | A flex item will not shrink below its content | `min-width: 0` on the one that should give way |
-| Something needs to sit beside the centred column | Adding a sibling column reflows everything | Pad the scroll container and position into the padding; every `margin: 0 auto` child follows |
-| An alignment assertion passes both ways at once | Measuring a full-width flex container, not its content | Measure a `Range` over the text node |
-| An absolutely-positioned element spans its whole row | `left` set without clearing the inherited `right` | `right: auto` alongside the new `left` |
 | Colour looks off in one place only | Literal hex or a typo'd token | Token from `theme.css` |
 | A panel covers the chat | Built as a modal instead of a rail tab | `rail.open` |
 | Handler throws on the second call | Two paths both tearing down (Enter *and* blur) | Make teardown idempotent |
@@ -333,43 +232,3 @@ about the diff:
 | A panel sits stale while the agent works | Nothing invalidates it | Add the tab to `INVALIDATED_BY` |
 | Totals read zero during a long turn | Accounting hangs off `turn-finished` | Accumulate each `assistant` frame's usage |
 | A sidebar row keeps an old title | The tab was not subscribed to that session | Re-ask for the list on open |
-| Every tab label is 0px wide, strip is a row of close buttons | `.stage-tab { min-width: 0 }` lets a dozen tabs shrink to nothing | A width floor (`min-width: 7.5rem`), so they overflow and the strip scrolls |
-| Activating a tab appears to do nothing | The tab is scrolled off the strip's right edge | `scrollIntoView({block:"nearest"})` on every `drawStrip` |
-| A streaming delta lands in the wrong copy of a sub-agent | Two homes sharing one `live`/`open` cursor | Per-home cursors in `inAgent()` |
-| An editor loses its caret on save | The pane was rebuilt instead of refreshed | Build furniture once; assert node identity across a save |
-| A file pane says "reading…" for ever | A failed read replies only with `workspace-result` | Handle `op === "read"` failure and clear the wanted set |
-| Opening a conversation freezes the tab for seconds | Every off-screen pane is built up front — with sub-agents the transcript is rendered twice | Queue events per home, drain on first show (see below) |
-| A drained pane glides through thousands of pixels of history | The scroller inherits `scroll-behavior: smooth` | `scrollTo({top, behavior:"instant"})`, guarded — linkedom has no `scrollTo` |
-
-## Keeping an off-screen pane cheap
-
-A pane that stays in the DOM to preserve its state must not also *build* while
-off screen. Sub-agent panes broke this: a conversation with four children
-rendered every child's history twice — once inline, once into a hidden tab — and
-opening it blocked the main thread for **5346ms** across 28,623 nodes, 87% of the
-events belonging to a child.
-
-The fix is one flag per home, not a new data structure:
-
-1. Each home carries `awake` and a `queue`. While asleep, `inAgent` pushes the
-   event instead of rendering it.
-2. `wake(spot)` is idempotent: flip `awake`, drain the queue through the same
-   renderer, then scroll to the bottom once.
-3. Wake on the real reveal events — `stage.onAgentPaneShown(id, …)` for a tab,
-   the `<details>` `toggle` for the inline block. `details.open = true` fires
-   `toggle` *asynchronously*, so a programmatic reveal must call `wake`
-   synchronously or the caller sees an empty block.
-4. Set a `draining` flag during the drain and skip the scroll-position read while
-   it is set. Asking for `scrollHeight` between rows flushes layout hundreds of
-   times, and the answer cannot change while nothing is on screen.
-5. Keep every store side effect — the ledger, `busy`, `publishAgents()` — in
-   `dispatch`, once per event, never per home. Otherwise waking a pane
-   double-counts spend.
-6. During `replay`, spawn homes asleep (a `bulk` flag) and wake only what is
-   actually open when it finishes.
-
-Result on the same conversation: 5346ms → **388ms**, 28,623 → 2,612 nodes, and a
-woken pane builds byte-identical content (verify by comparing node counts against
-the eager numbers). Assert the *emptiness* of an unfocused pane, not just the
-content of a focused one — that assertion is what fails if someone reverts the
-laziness.

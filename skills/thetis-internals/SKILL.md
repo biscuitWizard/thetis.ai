@@ -1,12 +1,12 @@
 ---
 name = "Thetis internals"
 brief = "How you work inside: host and guest components, the turn loop, context compaction, skills, config, and where each source file is."
-when_to_use = "Use when the task needs knowledge of your own machinery: architecture, the agent loop, context compaction, the skill system, the WIT contract, or config. Use it also to explain yourself to a user. Not for a user's own project code, and not as the procedure for a self-edit — that is careful-surgery."
+when_to_use = "Use when the task needs knowledge of your own machinery: your architecture, the agent loop, message rehydration, context compaction, the skill system, the WIT contract, your sandbox branch and its history, config keys, or the location of a source file. Use it also to explain yourself to a user. Do not use it for a user's own project code, and do not use it as the procedure for a self-edit; that procedure is in careful-surgery."
 universal = false
-tags = ["thetis", "architecture", "self-knowledge", "agent loop", "compaction", "skills", "wit", "orchestrator", "internals", "how do you work", "message rehydration", "sandbox branch history", "config keys", "source file location", "tool-group:selfmod"]
+tags = ["thetis", "architecture", "self-knowledge", "agent loop", "compaction", "skills", "wit", "orchestrator", "internals", "how do you work"]
 children = "auto"
 related = ["careful-surgery", "skill-creator"]
-version = 3
+version = 2
 ---
 
 # Thetis internals
@@ -71,33 +71,17 @@ the change is wrong.
 
 ## Where to look first
 
-- [turn-lifecycle](skill:thetis-internals/turn-lifecycle) — how one turn runs,
-  start to finish.
-- [compaction](skill:thetis-internals/compaction) — why context got smaller,
-  and how the log is rehydrated.
-- [skill-system](skill:thetis-internals/skill-system) — how skill retrieval,
-  briefs and bodies work.
-- [code-map](skill:thetis-internals/code-map) — which file holds a given
-  behaviour.
-- [tool-authorship](skill:thetis-internals/tool-authorship) — how to write or
-  fix a tool.
-- [config-and-recovery](skill:thetis-internals/config-and-recovery) — how to
-  change a setting or recover from a bad restart.
-- [delegation](skill:thetis-internals/delegation) — spawning and coordinating
-  sub-agents.
-- [working-alongside-others](skill:thetis-internals/working-alongside-others)
-  — sharing a checkout or a workspace with other agents.
-- [multi-user](skill:thetis-internals/multi-user) — accounts, sessions and what
-  each user may see when more than one person uses this Thetis.
-
-Also useful, not skills:
-
 | Question | Read this |
 |---|---|
+| How does one turn run? | `thetis-internals/turn-lifecycle` |
+| Why did my context get smaller? | `thetis-internals/compaction` |
+| How does skill retrieval work? | `thetis-internals/skill-system` |
+| Which file holds this behaviour? | `thetis-internals/code-map` |
+| How do I change a setting or restart? | `thetis-internals/config-and-recovery` |
 | What may a guest do at all? | `references/wit-contract.md` |
 | What are the current settings and tools? | `references/snapshot.md` |
 | Can I trust a number written here? | `references/volatility.md` |
-| How do I edit myself safely? | [careful-surgery](skill:careful-surgery), a separate skill |
+| How do I edit myself safely? | `careful-surgery`, a separate skill |
 
 ## Volatile data
 
@@ -108,7 +92,6 @@ of them. Get the current list from the tool that owns it.
 |---|---|
 | Config keys and their values | `list_config`, `read_config` |
 | Your available tools | The tool list in your own prompt |
-| **The model you are running on** | `model_info` — *never* `read_config` |
 | Model ids | `list_config` with prefix `models` |
 | Mode ids | `list_config` with prefix `modes` |
 | Revision numbers | `history` |

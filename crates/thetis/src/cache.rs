@@ -21,7 +21,7 @@
 //! a single breakpoint at the end would sail straight past the previous entry
 //! and re-read the entire conversation at full price.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::config::{CacheSettings, CacheStrategy};
 
@@ -207,10 +207,7 @@ mod tests {
 
         assert!(n >= 2);
         let positions = marked(&b);
-        assert!(
-            positions.contains(&0),
-            "the system prompt anchors the prefix"
-        );
+        assert!(positions.contains(&0), "the system prompt anchors the prefix");
         assert!(positions.contains(&3), "the newest message writes the tail");
     }
 

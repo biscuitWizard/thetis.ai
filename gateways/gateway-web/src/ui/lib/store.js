@@ -14,14 +14,6 @@ export const store = {
   /** Models pushed out of the picker; the inspector still lists them so one
    *  can be brought back. */
   modelsHidden: [],
-  modelsRestricted: false,
-  /** The `user` frame: who this socket is for and what their role withholds.
-   *  Null until the host says, which is the first thing it does. */
-  user: null,
-  /** Whether the sidebar is showing everyone's conversations. Only an
-   *  account whose role grants `see_all_sessions` can turn this on; for
-   *  anyone else the host ignores it. */
-  viewAll: false,
   modes: [],
   busy: false,
   attachments: [],
@@ -42,22 +34,6 @@ export const store = {
   creating: false,
   skills: [],
   tools: [],
-  /** Authoritative todo frame for the current conversation. */
-  todos: null,
-
-  /* Sub-agents of the conversation on screen, in spawn order.
-   *
-   * Shape: {id, label, state, cost}, where state is "running" | "done" |
-   * whatever a failed turn stopped by. Published by the transcript, because the
-   * transcript is what learns of a child at all: children are deliberately
-   * absent from `list_sessions` — as top-level rows they would look like
-   * conversations you could talk into, and opening one would give a chat with
-   * no composer — so the only signal is their tagged frames.
-   *
-   * The consequence, worth knowing: this only ever describes the *current*
-   * conversation. A child running in a conversation you are not watching is not
-   * known to this client at all. */
-  agents: [],
 
   /** The current conversation's branch-status frame, or null (panel hidden). */
   branch: null,
@@ -144,13 +120,3 @@ export const store = {
     return known?.label || this.model;
   },
 };
-
-/** True when the signed-in user's role withholds a host capability family
- *  (`terminal`, `branch_write`, `workspace_write`, …). The host refuses the
- *  frame regardless; this is what lets a view leave the control out rather
- *  than offer a button that only ever answers with an error. Unknown until
- *  the `user` frame arrives, and unknown reads as allowed: the frame comes
- *  first on every socket, so nothing is drawn before it in practice. */
-export function denied(cap) {
-  return Boolean(store.user?.denied?.includes(cap));
-}

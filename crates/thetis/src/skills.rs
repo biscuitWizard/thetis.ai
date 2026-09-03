@@ -35,7 +35,7 @@
 //! Files are read on demand rather than cached, so editing a skill takes effect
 //! on the next turn without a restart.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -66,12 +66,6 @@ pub struct Skill {
     pub children: ChildSpec,
     /// Cross-references, not hierarchy.
     pub related: Vec<String>,
-    /// Lifecycle: empty or `"active"` for a live skill, `"retired"` for one kept
-    /// only so its id still resolves. A retired skill is still fetchable — the
-    /// point is that anything linking to it gets told.
-    pub status: String,
-    /// The skill that replaced this one, when `status` is `"retired"`.
-    pub superseded_by: String,
     pub version: u32,
 
     pub body: String,
@@ -324,8 +318,6 @@ fn load(path: &Path, parent: &str, depth: usize) -> Result<Skill> {
         tags: fm.tags,
         children: fm.children,
         related: fm.related,
-        status: fm.status,
-        superseded_by: fm.superseded_by,
         version: fm.version,
         body,
         resources,
@@ -371,8 +363,6 @@ struct Frontmatter {
     tags: Vec<String>,
     children: ChildSpec,
     related: Vec<String>,
-    status: String,
-    superseded_by: String,
     version: u32,
 }
 
@@ -388,8 +378,6 @@ impl Default for Frontmatter {
             // which is what a directory layout already implies.
             children: ChildSpec::Auto,
             related: Vec::new(),
-            status: String::new(),
-            superseded_by: String::new(),
             version: 1,
         }
     }
@@ -451,7 +439,7 @@ fn parse_frontmatter(source: &str) -> Result<(Frontmatter, String)> {
             Some(other) => {
                 return Err(anyhow!(
                     "children: expected \"auto\", \"none\" or a list, got \"{other}\""
-                ));
+                ))
             }
             None if v.is_array() => ChildSpec::Explicit(strings("children")),
             None => return Err(anyhow!("children: expected a string or a list")),
@@ -470,8 +458,6 @@ fn parse_frontmatter(source: &str) -> Result<(Frontmatter, String)> {
             tags: strings("tags"),
             children,
             related: strings("related"),
-            status: string("status").to_ascii_lowercase(),
-            superseded_by: string("superseded_by"),
             version: table
                 .get("version")
                 .and_then(|v| v.as_integer())
@@ -626,27 +612,9 @@ pub fn lint(tree: &SkillTree, id: &str) -> Vec<Diagnostic> {
     if skill.depth + 1 >= MAX_DEPTH && !tree.children(id).is_empty() {
         push(
             Severity::Warning,
-            format!(
-                "at depth {}, children below this are not loaded",
-                skill.depth
-            ),
+            format!("at depth {}, children below this are not loaded", skill.depth),
         );
     }
-
-    if !skill.status.is_empty() && !["active", "retired"].contains(&skill.status.as_str()) {
-        push(
-            Severity::Error,
-            format!(
-                "status is `{}`; expected \"active\" or \"retired\"",
-                skill.status
-            ),
-        );
-    }
-
-    drop(push);
-    // Card checks above, body and link checks below. Kept in a separate module
-    // because they are the half that needs the whole tree to resolve references.
-    out.extend(crate::skill_lint::body_diagnostics(tree, skill));
 
     out
 }
@@ -692,20 +660,6 @@ pub fn l0_block(skills: &[&Skill]) -> String {
 pub fn l1_card(skill: &Skill, children: &[&Skill]) -> String {
     let mut card = format!("### `{}` — {}\n{}\n", skill.id, skill.name, skill.brief);
 
-    // A retired skill still ranks — it describes a system that existed, and a
-    // reader who arrives from old code needs it. Say so on the card, though, so
-    // the body is read as history rather than as instruction.
-    if skill.status == "retired" {
-        card.push_str("\n**Retired.**");
-        if skill.superseded_by.is_empty() {
-            card.push_str(" Describes a system no longer in use.\n");
-        } else {
-            card.push_str(&format!(
-                " Superseded by `{}`; prefer that unless you need the history.\n",
-                skill.superseded_by
-            ));
-        }
-    }
     if !skill.when_to_use.is_empty() {
         card.push_str(&format!("\n**When to use:** {}\n", skill.when_to_use));
     }
@@ -717,21 +671,6 @@ pub fn l1_card(skill: &Skill, children: &[&Skill]) -> String {
         for c in children {
             card.push_str(&format!("- `{}` — {}\n", c.id, c.brief));
         }
-    }
-    // `related` is a machine-readable sibling pointer. It was parsed and
-    // lint-checked long before anything rendered it, which is why bodies grew
-    // hand-written "See also" prose instead. Render it, and the prose is
-    // redundant.
-    if !skill.related.is_empty() {
-        card.push_str(&format!(
-            "**Related:** {}\n",
-            skill
-                .related
-                .iter()
-                .map(|r| format!("`{r}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
     }
     if !skill.resources.is_empty() {
         card.push_str(&format!(
@@ -977,22 +916,18 @@ The body.
             &format!("---\nname = \"N\"\nbrief = \"{brief}\"\n---\nBody."),
         )]);
         let diags = lint(&tree, "s");
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.severity == Severity::Error && d.message.contains("over the 200 limit"))
-        );
+        assert!(diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("over the 200 limit")));
     }
 
     #[test]
     fn lint_reports_a_missing_brief_as_an_error() {
         let (_d, tree) = tree_from(&[("s.md", "---\nname = \"N\"\n---\nBody.")]);
         let diags = lint(&tree, "s");
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.severity == Severity::Error && d.message.contains("brief is empty"))
-        );
+        assert!(diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("brief is empty")));
     }
 
     #[test]
@@ -1001,21 +936,17 @@ The body.
             "s.md",
             "---\nname = \"N\"\nbrief = \"b\"\nrelated = [\"ghost\"]\n---\nBody.",
         )]);
-        assert!(
-            lint(&tree, "s")
-                .iter()
-                .any(|d| d.message.contains("`ghost` does not exist"))
-        );
+        assert!(lint(&tree, "s")
+            .iter()
+            .any(|d| d.message.contains("`ghost` does not exist")));
     }
 
     #[test]
     fn lint_reports_an_empty_leaf() {
         let (_d, tree) = tree_from(&[("s.md", "---\nname = \"N\"\nbrief = \"b\"\n---\n")]);
-        assert!(
-            lint(&tree, "s")
-                .iter()
-                .any(|d| d.message.contains("nothing to disclose"))
-        );
+        assert!(lint(&tree, "s")
+            .iter()
+            .any(|d| d.message.contains("nothing to disclose")));
     }
 
     #[test]
@@ -1034,11 +965,9 @@ The body.
             .collect();
         let (_d, tree) = tree_from(&refs);
 
-        assert!(
-            lint_all(&tree)
-                .iter()
-                .any(|d| d.id.is_empty() && d.message.contains("over the hard limit"))
-        );
+        assert!(lint_all(&tree)
+            .iter()
+            .any(|d| d.id.is_empty() && d.message.contains("over the hard limit")));
     }
 
     #[test]
@@ -1068,10 +997,7 @@ The body.
                 "---\nname = \"P\"\nbrief = \"Parent.\"\nwhen_to_use = \"When routing.\"\ntags = [\"meta\"]\n---\nx",
             ),
             ("p/references/notes.md", "notes"),
-            (
-                "p/kid/SKILL.md",
-                "---\nname = \"K\"\nbrief = \"Child.\"\n---\nx",
-            ),
+            ("p/kid/SKILL.md", "---\nname = \"K\"\nbrief = \"Child.\"\n---\nx"),
         ]);
 
         let card = l1_card(tree.get("p").unwrap(), &tree.children("p"));

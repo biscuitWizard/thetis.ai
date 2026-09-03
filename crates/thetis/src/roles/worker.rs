@@ -7,12 +7,11 @@
 //! gateway on the other end of fd 3.
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::os::fd::FromRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
-use crate::aspect::Aspect;
 use crate::config::Config;
 use crate::gateway;
 use crate::grip::Grip;
@@ -20,6 +19,7 @@ use crate::ipc::{self, Handler, Peer};
 use crate::pipeline;
 use crate::revisions::Origin;
 use crate::runtime::Runtime;
+use crate::aspect::Aspect;
 use crate::workers::WORKER_SOCKET_FD;
 use crate::{watchdog, watcher};
 
@@ -39,7 +39,11 @@ impl Handler for WorkerHandler {
             if method == "hello" {
                 return Ok(ipc::hello_response());
             }
-            let grip = self.grip.get().context("worker is still starting")?.clone();
+            let grip = self
+                .grip
+                .get()
+                .context("worker is still starting")?
+                .clone();
 
             let session = || -> Result<String> {
                 params
@@ -64,14 +68,16 @@ impl Handler for WorkerHandler {
                     Ok(Value::Null)
                 }
                 "cancel" => {
-                    let stopped = grip.cancel(&session()?).await;
-                    Ok(serde_json::json!({ "stopped": stopped }))
+                    grip.cancel(&session()?).await;
+                    Ok(Value::Null)
                 }
                 "resume" => {
                     grip.resume(&session()?).await;
                     Ok(Value::Null)
                 }
-                "agent_tools" => Ok(serde_json::to_value(grip.agent_tools(&session()?).await)?),
+                "agent_tools" => Ok(serde_json::to_value(
+                    grip.agent_tools(&session()?).await,
+                )?),
                 // Branch operations relayed from the gateway: the same code
                 // paths the agent's own branch tools use, so user- and
                 // agent-initiated operations behave identically.
@@ -113,12 +119,14 @@ impl Handler for WorkerHandler {
                 // exactly like agent-initiated ones.
                 "branch.record_op" => {
                     let op: crate::bindings::types::BranchOp =
-                        serde_json::from_value(params.clone()).context("unreadable branch op")?;
-                    grip.append_event(
-                        &session()?,
-                        crate::bindings::types::SessionEvent::BranchOp(op),
-                    )
-                    .await?;
+                        serde_json::from_value(params.clone())
+                            .context("unreadable branch op")?;
+                    grip
+                        .append_event(
+                            &session()?,
+                            crate::bindings::types::SessionEvent::BranchOp(op),
+                        )
+                        .await?;
                     Ok(Value::Null)
                 }
                 "branch.commit_dirty" => {
@@ -141,41 +149,6 @@ impl Handler for WorkerHandler {
                     "busy": grip.is_busy(),
                     "rss_kb": crate::system_api::self_rss_kb(),
                 })),
-                // Every shell this worker holds, with its transcript, for a
-                // browser tab that has just opened the terminal drawer.
-                "terminals.list" => Ok(serde_json::json!({
-                    "terminals": grip.terminals.views().await,
-                })),
-                // Closing a shell from the drawer. The agent may be holding
-                // this session, so the kill goes through the same `close` the
-                // agent's own tool uses — process group and all — and the
-                // resulting `closed` feed event is what updates every watching
-                // tab, including the one that asked.
-                "terminals.close" => {
-                    let id = params
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if id.is_empty() {
-                        anyhow::bail!("terminals.close needs an id");
-                    }
-                    match grip.terminals.close(&id).await {
-                        Ok(note) => Ok(serde_json::json!({
-                            "ok": true,
-                            "id": id,
-                            "note": note,
-                        })),
-                        // A shell that has already gone is the outcome the
-                        // caller wanted, so this is reported as success rather
-                        // than as an error the drawer would have to explain.
-                        Err(e) => Ok(serde_json::json!({
-                            "ok": true,
-                            "id": id,
-                            "note": format!("{e:#}"),
-                        })),
-                    }
-                }
                 "live_revisions" => {
                     let map: std::collections::BTreeMap<String, u64> = grip
                         .loader
@@ -197,10 +170,6 @@ impl Handler for WorkerHandler {
                     if if_idle && grip.is_busy() {
                         return Ok(serde_json::json!({ "busy": true }));
                     }
-                    // Said out loud, because `exit` is otherwise indistinguishable
-                    // from being killed: a worker that vanishes silently gives
-                    // whoever is debugging it nothing to go on.
-                    tracing::info!(if_idle, "shutting down on request");
                     let grip = grip.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -223,7 +192,10 @@ impl Handler for WorkerHandler {
     }
 }
 
-pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) -> Result<()> {
+pub async fn run(
+    session: Option<String>,
+    worktree: Option<std::path::PathBuf>,
+) -> Result<()> {
     // The checkout this worker runs against. In the single-worker phase it is
     // the project root; per-conversation worktrees arrive with branching.
     if let Some(worktree) = worktree {
@@ -240,8 +212,7 @@ pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) 
     // the conversation would be unreachable until the gateway itself restarts.
     unsafe {
         if libc::fcntl(WORKER_SOCKET_FD, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("marking the gateway socket close-on-exec");
+            return Err(std::io::Error::last_os_error()).context("marking the gateway socket close-on-exec");
         }
     }
     stream
@@ -251,7 +222,6 @@ pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) 
 
     let handler = Arc::new(WorkerHandler::default());
     crate::offload::spawn_stall_detector();
-    spawn_orphan_watch();
     let (peer, connection) = Peer::spawn(stream, handler.clone());
     let connection = tokio::spawn(connection);
     ipc::handshake(&peer, "worker").await?;
@@ -266,44 +236,16 @@ pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) 
     let runtime = Runtime::new(cfg.clone())?;
     let grip = Grip::worker(cfg.clone(), runtime, peer.clone())?;
 
-    // Before a single aspect is built: does this checkout's WIT agree with the
-    // kernel that has to load what it produces? A branch that has not merged a
-    // trunk WIT change builds guests wasmtime will refuse, and no later gate
-    // can recover from it — the smoke test rejects the artifact and the green
-    // fallback searches the same stale branch. Settling it here, by merging
-    // trunk, is what keeps that from becoming an unloadable worker.
-    let contract = pipeline::reconcile_wit_contract(&grip).await;
-    contract.report();
-
     // Bring every aspect up. An aspect that will not start leaves the rest
     // running; the gateway's /admin stays available for a manual rollback.
     for aspect in pipeline::discover_aspects(&grip.cfg) {
         if let Err(e) = bring_up(&grip, &aspect).await {
-            match contract.is_sound() {
-                true => tracing::error!(%aspect, error = %e, "aspect failed to start"),
-                // Not a fault in this aspect's source: nothing built in this
-                // checkout can load until the contract is settled.
-                false => tracing::error!(
-                    %aspect, error = %e,
-                    "aspect failed to start, and this checkout's WIT contract does not match \
-                     the kernel — that is the cause, not this aspect's source"
-                ),
-            }
+            tracing::error!(%aspect, error = %e, "aspect failed to start");
         }
     }
 
-    // A stalled provider is otherwise completely silent. See
-    // `spawn_retry_notices`.
-    spawn_retry_notices(grip.clone());
-
     // This worker renders its own sessions' events and ships the frames up.
     spawn_render_loop(grip.clone(), peer.clone());
-    // Shell activity goes up the same socket, so the browser can draw a live
-    // terminal. The session it belongs to is not sent: the gateway end of this
-    // socket already knows which conversation this worker serves, and having
-    // one side of a per-conversation link restate that invites the two to
-    // disagree.
-    spawn_terminal_feed(grip.clone(), peer.clone());
 
     // The agent creates tools here. Make sure it exists before the watcher
     // starts, or newly scaffolded tools would not be watched until a restart.
@@ -338,115 +280,6 @@ pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) 
     Ok(())
 }
 
-/// Writes the LLM client's retry notices into the conversation they belong to.
-///
-/// Without this a provider that accepts a request and never answers is
-/// invisible: the read timeout is a silence, the retry is a silence, and the
-/// default four attempts at 180s each is twelve minutes in which a turn is
-/// indistinguishable from a hung one. The only thing that ever reached the
-/// person watching was the transport error at the very end.
-///
-/// An incident rather than a system note, because that is what the browser
-/// already renders as something gone wrong, and because it leaves the retries
-/// in the log afterwards — "this turn spent eleven of its twelve minutes
-/// waiting on a provider" is not reconstructible from anything else.
-fn spawn_retry_notices(grip: Arc<Grip>) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    grip.llm.on_retry(tx);
-    tokio::spawn(async move {
-        while let Some(notice) = rx.recv().await {
-            if notice.session.is_empty() {
-                continue;
-            }
-            // The budget, not just this attempt. Four attempts at a 180s read
-            // timeout is twelve minutes before the turn fails, and knowing
-            // that at the first notice rather than the last is the difference
-            // between waiting and wondering.
-            let left = notice.attempts.saturating_sub(notice.attempt);
-            let text = format!(
-                "Attempt {} of {} got no answer from the model provider after {}s ({}). \
-                 Retrying — {} left, so up to about {} more minute(s) before this turn gives up.",
-                notice.attempt,
-                notice.attempts,
-                notice.elapsed.as_secs(),
-                notice.error,
-                left,
-                (u64::from(left) * notice.elapsed.as_secs()).div_ceil(60).max(1),
-            );
-            if let Err(e) = grip
-                .persist
-                .append_event(
-                    &notice.session,
-                    crate::bindings::types::SessionEvent::Incident(text),
-                )
-                .await
-            {
-                tracing::debug!(error = %e, "a retry notice was not recorded");
-            }
-        }
-    });
-}
-
-/// Exits if the gateway goes away.
-///
-/// A worker exists to serve one conversation on behalf of one gateway; with
-/// that gateway gone there is nowhere to persist anything, and a worker left
-/// behind would hold a worktree and its shells indefinitely. The kernel can
-/// signal this for us — `PR_SET_PDEATHSIG` — but only on the death of the
-/// *thread* that forked, which for a tokio parent is an arbitrary thread that
-/// may retire while the process is perfectly healthy. That killed
-/// conversations mid-turn. Watching `getppid` instead asks the question we
-/// actually mean, and a reparented process is unambiguous: init adopted us
-/// because the gateway is gone.
-fn spawn_orphan_watch() {
-    let parent = unsafe { libc::getppid() };
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let now = unsafe { libc::getppid() };
-            if now != parent {
-                tracing::warn!(
-                    was = parent,
-                    now,
-                    "the gateway is gone; exiting rather than squatting on this worktree"
-                );
-                std::process::exit(0);
-            }
-        }
-    });
-}
-
-/// Stamps parentage onto an already-rendered frame.
-///
-/// Done here rather than in the gateway guest deliberately. The guest renders
-/// one `session-event` at a time and has no way to ask whose child a session is
-/// — the contract does not tell it, and widening `outbound-event` to carry
-/// parentage would change a record every guest is matched against at
-/// instantiation. Adding two fields to the JSON afterwards is additive on the
-/// wire, so an older UI ignores them and a newer one nests.
-///
-/// `agent` is the routing key the frame *came* from, so the UI can group
-/// several children's interleaved frames correctly even though they all arrive
-/// addressed to the parent.
-fn tag_frame(frame: String, tag: &crate::delegation::ChildTag) -> String {
-    let Ok(mut value) = serde_json::from_str::<Value>(&frame) else {
-        return frame;
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return frame;
-    };
-    obj.insert("agent".into(), json!(tag.child_id));
-    obj.insert("agent_label".into(), json!(tag.label));
-    obj.insert("agent_parent".into(), json!(tag.parent_id));
-    // The outer worker notification is routed to the root conversation, and the
-    // browser also filters on the frame's own `session`. Keep those two routing
-    // keys aligned: leaving the child's id here made every live child frame get
-    // delivered and then discarded by the UI, while refresh appeared to repair
-    // it because history already renders child events with the root id.
-    obj.insert("session".into(), json!(tag.root_id));
-    serde_json::to_string(&value).unwrap_or(frame)
-}
-
 fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
     tokio::spawn(async move {
         let mut events = grip.events_tx.subscribe();
@@ -460,20 +293,8 @@ fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
                         peer.notify("event", raw).await;
                     }
                     let session_id = event.session_id.clone();
-                    // A sub-agent's events are rendered exactly like anyone
-                    // else's — it is a session and the gateway guest need not
-                    // know it is a child — and then re-addressed to the
-                    // conversation the user is actually watching, carrying the
-                    // parentage the UI nests them under. Delivering them to the
-                    // child's own id instead would put every sub-agent's work
-                    // somewhere nobody has open.
-                    let tag = crate::delegation::frame_tag(&grip, &session_id).await;
                     if let Some(frame) = renderer.render(event).await {
-                        let (route, frame) = match &tag {
-                            Some(tag) => (tag.root_id.clone(), tag_frame(frame, tag)),
-                            None => (session_id, frame),
-                        };
-                        peer.notify("frame", json!({ "session": route, "frame": frame }))
+                        peer.notify("frame", json!({ "session": session_id, "frame": frame }))
                             .await;
                     }
                 }
@@ -484,67 +305,6 @@ fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
             }
         }
     });
-}
-
-/// Mirrors shell activity up to the gateway.
-///
-/// Coalesced, not per line: a `cargo build` writes hundreds of lines a second,
-/// and one IPC note each would swamp the socket the same build's tool calls are
-/// travelling on. Output for one shell is gathered for a few tens of
-/// milliseconds and sent as one note; structural events (opened, command, exit,
-/// closed) go straight through, because their ordering against the output is
-/// what makes the transcript readable.
-fn spawn_terminal_feed(grip: Arc<Grip>, peer: Arc<Peer>) {
-    const FLUSH_MS: u64 = 60;
-    tokio::spawn(async move {
-        let mut feed = grip.terminals.subscribe();
-        // id -> pending output, in arrival order.
-        let mut pending: Vec<(String, String)> = Vec::new();
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(FLUSH_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                event = feed.recv() => match event {
-                    Ok(item) if item.kind == "output" => {
-                        match pending.iter_mut().find(|(id, _)| *id == item.id) {
-                            Some((_, text)) => text.push_str(&item.text),
-                            None => pending.push((item.id, item.text)),
-                        }
-                    }
-                    Ok(item) => {
-                        // Flush first, or a command's output would arrive after
-                        // the "exit" that ended it.
-                        flush(&peer, &mut pending).await;
-                        peer.notify("terminal", json!({
-                            "id": item.id,
-                            "kind": item.kind,
-                            "text": item.text,
-                            "cwd": item.cwd,
-                            "shell": item.shell,
-                            "remote": item.remote,
-                        }))
-                        .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                        tracing::debug!(missed, "terminal feed fell behind");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                },
-                _ = ticker.tick() => flush(&peer, &mut pending).await,
-            }
-        }
-    });
-}
-
-async fn flush(peer: &Arc<Peer>, pending: &mut Vec<(String, String)>) {
-    for (id, text) in pending.drain(..) {
-        peer.notify(
-            "terminal",
-            json!({ "id": id, "kind": "output", "text": text }),
-        )
-        .await;
-    }
 }
 
 async fn bring_up(grip: &Arc<Grip>, aspect: &Aspect) -> Result<()> {
@@ -614,29 +374,4 @@ async fn bring_up(grip: &Arc<Grip>, aspect: &Aspect) -> Result<()> {
         "loaded"
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn child_frame_is_addressed_to_the_root_conversation() {
-        let tag = crate::delegation::ChildTag {
-            child_id: "child".into(),
-            parent_id: "parent".into(),
-            root_id: "root".into(),
-            label: "research".into(),
-        };
-        let tagged = tag_frame(
-            serde_json::json!({"type": "event", "session": "child", "kind": "turn-started"})
-                .to_string(),
-            &tag,
-        );
-        let value: Value = serde_json::from_str(&tagged).unwrap();
-        assert_eq!(value["session"], "root");
-        assert_eq!(value["agent"], "child");
-        assert_eq!(value["agent_parent"], "parent");
-        assert_eq!(value["agent_label"], "research");
-    }
 }

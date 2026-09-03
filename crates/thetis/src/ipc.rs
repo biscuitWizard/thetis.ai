@@ -13,20 +13,20 @@
 //! spend). Unknown fields are ignored everywhere, because a branch worker may
 //! be running a *modified* kernel that has learned new tricks.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, oneshot};
+use tokio::net::UnixStream;
+use tokio::sync::{oneshot, Mutex};
 
 /// Bumped when the protocol changes shape incompatibly. The handshake rejects
 /// a mismatch, and the supervisor falls back to the trunk kernel — a branch
@@ -138,7 +138,12 @@ impl Peer {
     /// A method whose own work is slower than the default budget must say so
     /// here rather than being abandoned mid-flight — an abandoned call does
     /// not cancel anything, it just stops anyone hearing the answer.
-    pub async fn call_within(&self, method: &str, params: Value, limit: Duration) -> Result<Value> {
+    pub async fn call_within(
+        &self,
+        method: &str,
+        params: Value,
+        limit: Duration,
+    ) -> Result<Value> {
         if self.closed.load(Ordering::SeqCst) {
             bail!("ipc peer is gone (calling {method})");
         }
@@ -196,7 +201,8 @@ impl Peer {
         params: Value,
     ) -> Result<T> {
         let value = self.call(method, params).await?;
-        serde_json::from_value(value).with_context(|| format!("decoding the response to {method}"))
+        serde_json::from_value(value)
+            .with_context(|| format!("decoding the response to {method}"))
     }
 
     /// Sends a one-way note. Failures are logged, not returned: notes carry
@@ -430,7 +436,10 @@ mod tests {
     #[tokio::test]
     async fn round_trip_and_errors() {
         let (a, _b) = pair();
-        let out = a.call("echo", serde_json::json!({"x": 1})).await.unwrap();
+        let out = a
+            .call("echo", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
         assert_eq!(out, serde_json::json!({"x": 1}));
 
         let err = a.call("boom", Value::Null).await.unwrap_err();
@@ -515,9 +524,7 @@ mod tests {
         tokio::spawn(done_x);
         tokio::spawn(done_y);
 
-        peer_y
-            .notify("frame", serde_json::json!({"s": "abc"}))
-            .await;
+        peer_y.notify("frame", serde_json::json!({"s": "abc"})).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(collector.0.lock().unwrap().as_slice(), ["frame"]);
     }
@@ -531,7 +538,10 @@ mod tests {
         // Write garbage directly, then a real request still succeeds.
         let (_read, mut write) = y.into_split();
         write.write_all(b"not json at all\n\n").await.unwrap();
-        write.write_all(b"{\"weird\": \"shape\"}\n").await.unwrap();
+        write
+            .write_all(b"{\"weird\": \"shape\"}\n")
+            .await
+            .unwrap();
         write.flush().await.unwrap();
 
         // peer_x should still be alive; prove it by asking it to handle a

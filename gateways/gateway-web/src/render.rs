@@ -1,11 +1,5 @@
 //! Session events to wire frames.
 //!
-//! Sub-agent frames pass through here unchanged: a child's events render
-//! exactly as a parent's do, and the `agent` / `agent_label` / `agent_parent`
-//! tags that tell the transcript whose they are are added outside this module —
-//! natively in the worker for a live frame, and in `handlers::history` for a
-//! replay. Neither of those has anything this renderer needs to know about.
-//!
 //! Written out explicitly rather than derived from the WIT variant, so the
 //! protocol the browser sees stays readable and can evolve independently of the
 //! event schema. Each arm produces the `kind` the transcript view switches on.
@@ -46,8 +40,6 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
 
         SessionEvent::StreamDelta(chunk) => json!({ "kind": "delta", "text": chunk }),
 
-        SessionEvent::ReasoningDelta(chunk) => json!({ "kind": "reasoning", "text": chunk }),
-
         SessionEvent::ToolInvocation(call) => json!({
             "kind": "tool-call",
             "id": call.id,
@@ -55,8 +47,6 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "arguments": call.arguments_json,
         }),
 
-        // `name` on both arms is what lets the transcript special-case a tool
-        // whose call renders as a form rather than a row.
         SessionEvent::ToolResult(out) => json!({
             "kind": "tool-result",
             "id": out.call_id,
@@ -109,21 +99,6 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "replaced": c.messages_replaced,
             "tokens_before": c.tokens_before,
             "summary": c.summary,
-        }),
-
-        // Transient, like a token delta: the transcript draws one progress card
-        // and updates it in place rather than appending a row per frame. The
-        // `compacted` event above is what finally replaces it.
-        SessionEvent::CompactionProgress(p) => json!({
-            "kind": "compacting",
-            "phase": p.phase,
-            "span": p.span,
-            "spans": p.spans,
-            "messages": p.messages,
-            "tokens_before": p.tokens_before,
-            "tokens_target": p.tokens_target,
-            "model": p.model,
-            "detail": p.detail,
         }),
     };
 

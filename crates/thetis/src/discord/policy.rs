@@ -24,7 +24,12 @@ pub enum Decision {
 /// The order matters. Authorization is checked before the mention rules, so an
 /// unauthorized user cannot learn anything about the bot's configuration by
 /// probing which channels it answers in.
-pub fn decide(cfg: &DiscordSettings, bot_id: &str, paired: &[String], msg: &Incoming) -> Decision {
+pub fn decide(
+    cfg: &DiscordSettings,
+    bot_id: &str,
+    paired: &[String],
+    msg: &Incoming,
+) -> Decision {
     // Never answer another bot, or ourselves. Two bots that answer each other
     // will do so until someone intervenes.
     if msg.author_is_bot {
@@ -249,7 +254,10 @@ mod tests {
         cfg.allow_all_users = true;
         let mut m = msg("other", None, "hello");
         m.author_is_bot = true;
-        assert!(matches!(decide(&cfg, "bot", &[], &m), Decision::Ignore(_)));
+        assert!(matches!(
+            decide(&cfg, "bot", &[], &m),
+            Decision::Ignore(_)
+        ));
     }
 
     #[test]
@@ -336,7 +344,8 @@ mod tests {
         let mut m = msg("alice", Some("g"), "hi");
         m.channel_id = "chan".into();
         let from_message = session_key(&cfg, &m);
-        let from_interaction = session_key_for(&cfg, false, false, "chan", "alice");
+        let from_interaction =
+            session_key_for(&cfg, false, false, "chan", "alice");
         assert_eq!(from_message, from_interaction);
     }
 

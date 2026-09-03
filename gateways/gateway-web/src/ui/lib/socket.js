@@ -1,4 +1,4 @@
-/* The websocket, with reconnect and expired-login recovery.
+/* The websocket, with reconnect.
  *
  * Frames are handed to whoever registers for their `type`, so adding a message
  * kind means registering a handler rather than editing a switch.
@@ -11,8 +11,6 @@ export class Connection {
     this.onStatus = onStatus;
     this.retryDelay = 400;
     this.openHooks = [];
-    this.failures = 0;
-    this.everOpened = false;
   }
 
   on(type, handler) {
@@ -31,25 +29,12 @@ export class Connection {
 
     this.socket.onopen = () => {
       this.retryDelay = 400;
-      this.failures = 0;
-      this.everOpened = true;
       this.onStatus("online", "connected");
       this.openHooks.forEach((hook) => hook());
     };
 
     this.socket.onclose = () => {
       this.onStatus("offline", "reconnecting…");
-      this.failures += 1;
-      if (this.failures >= 3) {
-        fetch("/api/me", { credentials: "same-origin" })
-          .then((response) => {
-            if (response.status === 401) {
-              const next = encodeURIComponent(location.pathname + location.search);
-              location.assign(`/login?next=${next}`);
-            }
-          })
-          .catch(() => {});
-      }
       setTimeout(() => this.connect(), this.retryDelay);
       // Back off, but stay responsive enough that a restart feels instant.
       this.retryDelay = Math.min(this.retryDelay * 2, 8000);

@@ -17,12 +17,10 @@
 //! to switch modes.
 
 pub mod api;
-pub mod ask;
 pub mod commands;
 pub mod policy;
-pub mod split;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,17 +29,12 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::bindings::types::SessionEvent;
 use crate::grip::Grip;
 
-use api::{Component, Event, Incoming, Interaction, Rest, Shard};
+use api::{Event, Incoming, Interaction, Rest, Shard};
 use policy::Decision;
 
 /// KV scope and key holding the paired user ids.
 const PAIR_SCOPE: &str = "global";
 const PAIR_KEY: &str = "discord.paired_users";
-
-/// The tool whose call is posted as controls rather than as a progress note.
-/// Named here rather than in `ask` so the rendering module stays independent of
-/// which tool happens to drive it.
-const ASK_TOOL: &str = "ask_user";
 
 /// Starts the connector, unless it is switched off or misconfigured.
 ///
@@ -79,7 +72,9 @@ pub fn spawn(grip: Arc<Grip>) -> Result<()> {
     }
 
     if cfg.allow_all_users {
-        tracing::warn!("DISCORD_ALLOW_ALL_USERS is on: anyone who can see the bot may talk to it");
+        tracing::warn!(
+            "DISCORD_ALLOW_ALL_USERS is on: anyone who can see the bot may talk to it"
+        );
     } else if cfg.allowed_users.is_empty() {
         tracing::warn!(
             "no Discord users are allowed yet; add ids to discord.allowed_users, \
@@ -106,9 +101,6 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
     // Commands only need registering once per process: a reconnect does not
     // clear them, and Discord rate-limits the endpoint globally.
     let mut commands_registered = false;
-    // Likewise the rename: Discord allows roughly two username changes an hour,
-    // so a reconnect loop must not spend that budget on every READY.
-    let mut rename_attempted = false;
 
     loop {
         match Shard::connect(&token, resume.clone()).await {
@@ -118,7 +110,6 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                         Ok(Event::Ready {
                             bot_id: id,
                             application_id,
-                            bot_name,
                         }) => {
                             // Reset the backoff *here*, not on `connect`.
                             // `Shard::connect` returns as soon as the socket is
@@ -132,36 +123,6 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                             }
                             tracing::info!(bot = %bot_id, "connected to Discord");
 
-                            // Show up under the configured agent name. Skipped
-                            // when it already matches, because the rate limit
-                            // here is about two changes an hour and a restart
-                            // must not burn it re-setting the same name.
-                            let wanted = grip.cfg.agent_name.clone();
-                            if !rename_attempted && !wanted.is_empty() && bot_name != wanted {
-                                rename_attempted = true;
-                                match rest.set_username(&wanted).await {
-                                    Ok(now) => tracing::info!(
-                                        from = %bot_name,
-                                        to = %now,
-                                        "renamed the Discord bot to the configured agent name"
-                                    ),
-                                    // Never fatal: the bot answers perfectly
-                                    // well under its old name, and the two
-                                    // usual causes -- the hourly rate limit and
-                                    // a name already taken -- are not something
-                                    // retrying now would fix.
-                                    Err(e) => tracing::warn!(
-                                        error = %format!("{e:#}"),
-                                        wanted = %wanted,
-                                        current = %bot_name,
-                                        "could not rename the Discord bot; it keeps its \
-                                         current username. Discord allows about two \
-                                         username changes an hour and rejects a name \
-                                         already taken"
-                                    ),
-                                }
-                            }
-
                             // Without this the Discord client has nothing to
                             // match `/new` against, so it refuses to send it
                             // and the bot never hears about it at all.
@@ -170,16 +131,6 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                                     .register_commands(&application_id, commands::schema())
                                     .await
                                 {
-                                    // `count` is the number Discord stored in a
-                                    // usable state, not the number sent, so a
-                                    // registration that is accepted and then
-                                    // silently unusable reports zero rather
-                                    // than looking like a success.
-                                    Ok(0) => tracing::error!(
-                                        "Discord accepted the slash commands but stored \
-                                         none of them in a usable state; the picker will \
-                                         offer nothing and no interaction will arrive"
-                                    ),
                                     Ok(count) => {
                                         commands_registered = true;
                                         tracing::info!(
@@ -221,18 +172,6 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                                     tracing::warn!(
                                         error = %format!("{e:#}"),
                                         "failed to handle a Discord slash command"
-                                    );
-                                }
-                            });
-                        }
-                        Ok(Event::Interacted(component)) => {
-                            let h = grip.clone();
-                            let r = rest.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_component(h, r, component).await {
-                                    tracing::warn!(
-                                        error = %format!("{e:#}"),
-                                        "failed to handle a Discord component"
                                     );
                                 }
                             });
@@ -295,7 +234,8 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
 /// list of ids, and a schema of its own would be more machinery than the data
 /// deserves.
 async fn paired_users(grip: &Grip) -> Vec<String> {
-    grip.persist
+    grip
+        .persist
         .kv_get(PAIR_SCOPE, PAIR_KEY)
         .await
         .ok()
@@ -315,7 +255,8 @@ async fn add_paired_user(grip: &Grip, user_id: &str) -> Result<()> {
     if !users.iter().any(|u| u == user_id) {
         users.push(user_id.to_string());
     }
-    grip.persist
+    grip
+        .persist
         .kv_put(PAIR_SCOPE, PAIR_KEY, &users.join(","))
         .await
         .map_err(Into::into)
@@ -395,7 +336,12 @@ async fn redeem_code(grip: &Grip, code: &str, user_id: &str) -> bool {
 
 // --- message handling ------------------------------------------------------
 
-async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> Result<()> {
+async fn handle(
+    grip: Arc<Grip>,
+    rest: Rest,
+    bot_id: String,
+    msg: Incoming,
+) -> Result<()> {
     let cfg = grip.cfg.discord.clone();
     let paired = paired_users(&grip).await;
 
@@ -453,7 +399,7 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
         return Ok(());
     }
 
-    let session_id = session_for(&grip, &key, &msg.author_id).await?;
+    let session_id = session_for(&grip, &key).await?;
     let attributed = policy::attribute(&msg, &text, cfg.group_sessions_per_user);
 
     // Subscribe before submitting, or a fast first token could be missed.
@@ -461,8 +407,7 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
     grip.submit(&session_id, attributed, Vec::new()).await?;
     let _ = rest.typing(&msg.channel_id).await;
 
-    let author_id = msg.author_id.clone();
-    stream_reply(grip, rest, msg.channel_id, session_id, author_id, events).await
+    stream_reply(grip, rest, msg.channel_id, session_id, events).await
 }
 
 /// Runs a slash command that arrived as an interaction.
@@ -470,7 +415,11 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
 /// Authorization is repeated here rather than borrowed from the message path:
 /// an interaction never passes through `decide`, so leaving it out would make
 /// every command reachable by anyone who can see the bot.
-async fn handle_command(grip: Arc<Grip>, rest: Rest, interaction: Interaction) -> Result<()> {
+async fn handle_command(
+    grip: Arc<Grip>,
+    rest: Rest,
+    interaction: Interaction,
+) -> Result<()> {
     let cfg = grip.cfg.discord.clone();
     let paired = paired_users(&grip).await;
 
@@ -511,563 +460,13 @@ async fn handle_command(grip: Arc<Grip>, rest: Rest, interaction: Interaction) -
     )
     .await?
     .unwrap_or_else(|| {
-        format!(
-            "`/{}` is not a command I know. Try /help.",
-            interaction.name
-        )
+        format!("`/{}` is not a command I know. Try /help.", interaction.name)
     });
 
     // Discord shows "the application did not respond" after three seconds, and
     // every one of these commands is a database read or write, not a turn.
     rest.respond_to_interaction(&interaction.id, &interaction.token, &reply, true)
         .await
-}
-
-// --- asking the user -------------------------------------------------------
-
-/// Epoch milliseconds, for a form's age.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// A short id for one posted form.
-///
-/// Short on purpose: it travels inside a `custom_id`, which Discord caps at 100
-/// characters alongside the question index and the action. Uniqueness only has
-/// to hold among forms alive at once, and it is not a secret — the interaction
-/// is authorized by user id, not by guessing this.
-fn form_id() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    // Base36 of the low bits: eight characters, `[0-9a-z]`, no separators that
-    // could be mistaken for the id's own delimiter.
-    let mut id = String::new();
-    let mut v = n;
-    for _ in 0..8 {
-        let digit = (v % 36) as u32;
-        id.push(char::from_digit(digit, 36).unwrap_or('0'));
-        v /= 36;
-    }
-    id
-}
-
-/// A form's state, with the exact bytes it was read as.
-///
-/// The bytes are what make the next write a compare-and-set: every transition
-/// of a form has to be claimed, not merely performed. Two clicks arriving
-/// together — a double tap, or two clients on one account — otherwise both load
-/// the same state, both record an answer over the top of it, and if that was
-/// the last question both submit. One question, two answers.
-struct Loaded {
-    state: ask::State,
-    raw: String,
-}
-
-async fn load_form(grip: &Grip, state_id: &str) -> Option<Loaded> {
-    let raw = grip
-        .persist
-        .kv_get(ask::SCOPE, &ask::key(state_id))
-        .await
-        .ok()
-        .flatten()?;
-    let state = serde_json::from_str(&raw).ok()?;
-    Some(Loaded { state, raw })
-}
-
-/// Advances a form from the state it was read as to its successor, or reports
-/// that someone else got there first.
-///
-/// `finished` writes the empty value rather than the next state: the KV
-/// interface has no delete, and empty fails to deserialize, which `load_form`
-/// already reads as absent. Clearing through the same compare-and-set is the
-/// point — it is what makes "this click finished the form" a fact exactly one
-/// caller can observe, and therefore what stops two callers from both
-/// submitting the answers.
-async fn advance_form(
-    grip: &Grip,
-    state_id: &str,
-    from: &Loaded,
-    to: &ask::State,
-    finished: bool,
-) -> Result<bool> {
-    let next = if finished {
-        String::new()
-    } else {
-        serde_json::to_string(to)?
-    };
-    grip.persist
-        .kv_swap(ask::SCOPE, &ask::key(state_id), &from.raw, &next)
-        .await
-        .map_err(Into::into)
-}
-
-/// Saves a form's first state, failing if something is already there.
-async fn create_form(grip: &Grip, state_id: &str, state: &ask::State) -> Result<bool> {
-    let raw = serde_json::to_string(state)?;
-    grip.persist
-        .kv_swap(ask::SCOPE, &ask::key(state_id), "", &raw)
-        .await
-        .map_err(Into::into)
-}
-
-/// Drops a form's state unconditionally, for a form that was never usable —
-/// one whose message failed to post, or one that has expired.
-async fn clear_form(grip: &Grip, state_id: &str) {
-    let _ = grip
-        .persist
-        .kv_put(ask::SCOPE, &ask::key(state_id), "")
-        .await;
-}
-
-/// Overwrites a form's state without a compare-and-set.
-///
-/// Only for the window before the form is answerable: recording the message id
-/// on a form whose controls are already on screen would race with a click. It is
-/// safe there precisely because nobody can have loaded this state yet.
-async fn save_form_unconditionally(grip: &Grip, state_id: &str, state: &ask::State) -> Result<()> {
-    let raw = serde_json::to_string(state)?;
-    grip.persist
-        .kv_put(ask::SCOPE, &ask::key(state_id), &raw)
-        .await
-        .map_err(Into::into)
-}
-
-/// Takes away the controls of the form a session currently has outstanding, if
-/// any, so only one form is ever answerable per conversation.
-///
-/// The claim on the live pointer is a compare-and-set, so two turns posting at
-/// once cannot both decide they are retiring the same predecessor and race to
-/// edit it. Failing to edit the message is not fatal: the state is cleared
-/// either way, and a click on controls whose state is gone is already answered
-/// with "this question is no longer open".
-async fn retire_live_form(grip: &Grip, rest: &Rest, session_id: &str) {
-    let live = ask::live_key(session_id);
-    let Ok(Some(previous)) = grip.persist.kv_get(ask::SCOPE, &live).await else {
-        return;
-    };
-    if previous.is_empty() {
-        return;
-    }
-    // Claim the retirement. Losing means another poster is already doing it.
-    match grip.persist.kv_swap(ask::SCOPE, &live, &previous, "").await {
-        Ok(true) => {}
-        _ => return,
-    }
-
-    let form = load_form(grip, &previous).await;
-    clear_form(grip, &previous).await;
-
-    let Some(form) = form else { return };
-    let Some(message_id) = form.state.message_id.as_deref() else {
-        return;
-    };
-    tracing::info!(session = %session_id, form = %previous,
-        "retiring an unanswered ask_user form; a newer one supersedes it");
-    let text = format!(
-        "{}\n\n_Superseded by the questions below._",
-        ask::prompt_text(&form.state)
-    );
-    if let Err(e) = rest
-        .edit_with_components(
-            &form.state.channel_id,
-            message_id,
-            &text,
-            serde_json::json!([]),
-        )
-        .await
-    {
-        tracing::warn!(error = %format!("{e:#}"),
-            "could not take the controls off a superseded ask_user form");
-    }
-}
-
-/// What a reader of the event stream should do about an `ask_user` call.
-enum Posted {
-    /// This reader posted the form; it owns the questions from here.
-    Form,
-    /// Another reader already posted a form for this same call. Nothing to do,
-    /// and nothing to say: the questions are on screen once, which is right.
-    AlreadyPosted,
-    /// Nothing askable, or Discord refused the message. The caller falls back
-    /// to its ordinary "… ask_user" progress note rather than to silence.
-    Failed,
-}
-
-/// Posts the first question of an `ask_user` call, at most once per call.
-///
-/// The claim is taken *before* the form is built, and it is a compare-and-set on
-/// a key named by the call id, so concurrent readers of the same
-/// `tool-invocation` cannot both post. This is the atomicity that matters most:
-/// a duplicate form does not merely look wrong, it collects a second set of
-/// answers and submits them as a second user message, which is what forked the
-/// conversation.
-async fn post_form(
-    grip: &Grip,
-    rest: &Rest,
-    channel_id: &str,
-    session_id: &str,
-    user_id: &str,
-    call_id: &str,
-    arguments_json: &str,
-) -> Posted {
-    let Some(parsed) = ask::parse(arguments_json) else {
-        tracing::warn!("an ask_user call carried no answerable questions");
-        return Posted::Failed;
-    };
-
-    let state_id = form_id();
-    // Claim the call first. Losing here means another reader of this same event
-    // is posting the form, so this one must stay quiet — including about the
-    // failure, since from the user's side nothing failed.
-    let claim = ask::claim_key(session_id, call_id);
-    match grip
-        .persist
-        .kv_swap(ask::SCOPE, &claim, "", &state_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::info!(session = %session_id, call = %call_id,
-                "an ask_user form for this call is already posted; not posting a second");
-            return Posted::AlreadyPosted;
-        }
-        Err(e) => {
-            // Without a claim there is no way to know whether a second reader
-            // is about to post the same questions, and two live forms is the
-            // failure being prevented. The progress note is the safe fallback.
-            tracing::warn!(error = %format!("{e:#}"), session = %session_id,
-                "could not claim an ask_user call; not posting a form");
-            return Posted::Failed;
-        }
-    }
-
-    // At most one form per session may be answerable. A form left over from an
-    // earlier turn is retired *before* this one is posted, so the channel never
-    // holds two clickable forms feeding one conversation.
-    retire_live_form(grip, rest, session_id).await;
-
-    let mut state = ask::State::new(session_id, channel_id, user_id, parsed, now_ms());
-
-    // State before message: a form whose buttons arrive before their state can
-    // be answered, and the answer would find nothing. The reverse — state with
-    // no message — is merely a row that expires unread.
-    match create_form(grip, &state_id, &state).await {
-        Ok(true) => {}
-        // The form id collided with a live form — two forms within the same
-        // nanosecond tick. Refusing is right: overwriting would silently
-        // destroy the other form's answers.
-        Ok(false) => {
-            tracing::warn!(form = %state_id, "an ask_user form id collided; not posting");
-            return Posted::Failed;
-        }
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "could not persist an ask_user form");
-            return Posted::Failed;
-        }
-    }
-
-    match rest
-        .send_with_components(
-            channel_id,
-            &ask::prompt_text(&state),
-            ask::components(&state, &state_id),
-        )
-        .await
-    {
-        Ok(id) => {
-            tracing::info!(session = %session_id, form = %state_id, message = %id,
-                questions = state.ask.questions.len(), "posted an ask_user form");
-            // Record the message on the state, and mark this form as the
-            // session's live one, so a later form can find and retire it.
-            state.message_id = Some(id);
-            if let Err(e) = save_form_unconditionally(grip, &state_id, &state).await {
-                tracing::warn!(error = %format!("{e:#}"),
-                    "could not record an ask_user form's message id");
-            }
-            let _ = grip
-                .persist
-                .kv_put(ask::SCOPE, &ask::live_key(session_id), &state_id)
-                .await;
-            Posted::Form
-        }
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "could not post an ask_user form");
-            clear_form(grip, &state_id).await;
-            // The claim stays. A call whose message Discord refused is not
-            // retried by a second reader: it would be posting questions whose
-            // turn has already ended, and the fallback note has said as much.
-            Posted::Failed
-        }
-    }
-}
-
-/// Handles a press on one of the bot's own components.
-///
-/// Only `ask_user` forms use components, so anything else is left alone rather
-/// than acknowledged: acknowledging an interaction we do not understand would
-/// clear the "thinking" state on a control something else owns.
-async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> Result<()> {
-    let Some(route) = ask::parse_custom_id(&component.custom_id) else {
-        tracing::trace!(id = %component.custom_id, "a component that is not an ask_user form");
-        return Ok(());
-    };
-
-    let Some(loaded) = load_form(&grip, &route.state_id).await else {
-        // The form is gone: answered already, expired, or from a build before a
-        // restart. Say so rather than failing silently — the buttons are still
-        // on screen and pressing them has to mean something.
-        return retire(
-            &rest,
-            &component,
-            "This question is no longer open. Ask me again if you still want to answer.",
-        )
-        .await;
-    };
-
-    // Authorization is re-checked here, exactly as on the command path: a
-    // component interaction never passes through `decide`, so without this
-    // anyone who can see the message could answer in someone else's name.
-    let paired = paired_users(&grip).await;
-    if !grip.cfg.discord.authorized(&component.user_id, &paired) {
-        tracing::info!(user = %component.user_id,
-            "refused an ask_user interaction from an unauthorized Discord user");
-        return rest
-            .respond_to_interaction(
-                &component.id,
-                &component.token,
-                "I do not know you, so I will not take your answer.",
-                true,
-            )
-            .await;
-    }
-    // A form posted in a shared channel is addressed to the person whose turn
-    // produced it. A bystander answering would put words in their mouth, and the
-    // answer is submitted as *their* message.
-    if loaded.state.user_id != component.user_id {
-        return rest
-            .respond_to_interaction(
-                &component.id,
-                &component.token,
-                "These questions were asked of someone else, so they are not yours to answer.",
-                true,
-            )
-            .await;
-    }
-
-    if loaded.state.expired(now_ms()) {
-        clear_form(&grip, &route.state_id).await;
-        return retire(
-            &rest,
-            &component,
-            "These questions have expired — the turn that asked them is long finished.",
-        )
-        .await;
-    }
-
-    // A stale row: the message was edited on to the next question, but a client
-    // that had not caught up pressed the old one. Applying it would record an
-    // answer against the wrong question.
-    if route.index != loaded.state.index {
-        return rest
-            .respond_to_interaction(
-                &component.id,
-                &component.token,
-                "That was the previous question. Scroll to the latest message and answer there.",
-                true,
-            )
-            .await;
-    }
-
-    let Some(question) = loaded.state.current().cloned() else {
-        clear_form(&grip, &route.state_id).await;
-        return retire(&rest, &component, "Every question is already answered.").await;
-    };
-
-    // From here the click may record an answer, so work on a copy: `loaded.raw`
-    // has to keep the bytes the compare-and-set below is against.
-    let mut state = loaded.state.clone();
-
-    // Free text is the one branch that does not record an answer yet: Discord
-    // has no text input on a message, so it opens a modal and the answer arrives
-    // as a second interaction.
-    if route.action == ask::Action::Other {
-        return rest
-            .open_modal(
-                &component.id,
-                &component.token,
-                ask::modal(&state, &route.state_id),
-            )
-            .await;
-    }
-
-    let answer = match route.action {
-        ask::Action::Skip => ask::Answer {
-            skipped: true,
-            text: String::new(),
-        },
-        ask::Action::Typed => {
-            let typed = component.values.first().cloned().unwrap_or_default();
-            if typed.trim().is_empty() {
-                ask::Answer {
-                    skipped: true,
-                    text: String::new(),
-                }
-            } else {
-                ask::Answer {
-                    skipped: false,
-                    text: typed.trim().to_string(),
-                }
-            }
-        }
-        ask::Action::Choose => match route.option {
-            // A button press: the option is in the id, since a button sends no
-            // values of its own.
-            Some(index) => ask::answer_from_option(&question, index),
-            // A select menu. Choosing the free-text entry from the menu asks for
-            // the modal, exactly as the button does.
-            None => match ask::answer_from_values(&question, &component.values) {
-                Some(answer) => answer,
-                None => {
-                    return rest
-                        .open_modal(
-                            &component.id,
-                            &component.token,
-                            ask::modal(&state, &route.state_id),
-                        )
-                        .await;
-                }
-            },
-        },
-        ask::Action::Other => unreachable!("handled above"),
-    };
-
-    state.record(answer);
-    let finished = state.done();
-    let text = ask::prompt_text(&state);
-    let components = ask::components(&state, &route.state_id);
-
-    /* The answer is committed by compare-and-set against the bytes the state was
-     * read as, and *losing* means abandoning this click entirely. Two clicks
-     * arriving together would otherwise both read index N, both write index N+1,
-     * and — on the last question — both call `submit`, which is exactly the
-     * forked conversation: one set of questions answered twice.
-     *
-     * The stale-index check above does not cover this. It compares against a
-     * state read before the race, so both racers pass it; only a write that
-     * fails on the value it expected can tell the loser it lost. */
-    match advance_form(&grip, &route.state_id, &loaded, &state, finished).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::info!(form = %route.state_id, index = route.index,
-                "an ask_user answer lost the race for this question; dropping it");
-            // Ephemeral, and deliberately not an error: the other click is
-            // being applied and will edit the message, so the form on screen is
-            // about to be correct without this one doing anything.
-            return rest
-                .respond_to_interaction(
-                    &component.id,
-                    &component.token,
-                    "That question was just answered. The message above has the latest.",
-                    true,
-                )
-                .await;
-        }
-        Err(e) => {
-            // The answer is not stored, so it must not be acted on: proceeding
-            // would edit the message as though it had been recorded, and on the
-            // last question would submit answers no restart could recover.
-            tracing::warn!(error = %format!("{e:#}"), "could not persist an ask_user answer");
-            return rest
-                .respond_to_interaction(
-                    &component.id,
-                    &component.token,
-                    "I could not save that answer, so I have not taken it. Try again.",
-                    true,
-                )
-                .await;
-        }
-    }
-
-    /* A modal submission cannot be answered with an update to the message the
-     * modal came from — Discord attaches no message to it — so that path
-     * acknowledges the interaction and edits the message separately. A button or
-     * menu press updates in one request, which is both fewer round trips and
-     * atomic: the control cannot be pressed twice while the edit is in flight. */
-    if component.from_modal {
-        rest.ack_interaction(&component.id, &component.token)
-            .await?;
-        if let Some(message_id) = component.message_id.as_deref() {
-            if let Err(e) = rest
-                .edit_with_components(&component.channel_id, message_id, &text, components)
-                .await
-            {
-                tracing::warn!(error = %format!("{e:#}"),
-                    "could not update an ask_user form after a modal");
-            }
-        }
-    } else {
-        rest.update_interaction_message(&component.id, &component.token, &text, components)
-            .await?;
-    }
-
-    if !finished {
-        return Ok(());
-    }
-
-    // Every question is answered, so the answers become an ordinary user
-    // message — the same path the browser's form uses, and the same path typed
-    // text uses. That is what puts them in the event log as something the model
-    // simply reads.
-    // The form is finished, so the session has no outstanding one. Cleared
-    // before submitting: the next turn may ask again, and it must not find this
-    // form's pointer and try to retire a message that is already retired.
-    let _ = grip
-        .persist
-        .kv_swap(
-            ask::SCOPE,
-            &ask::live_key(&state.session_id),
-            &route.state_id,
-            "",
-        )
-        .await;
-
-    let answers = ask::compose(&state);
-    let events = grip.events_tx.subscribe();
-    grip.submit(&state.session_id, answers, Vec::new()).await?;
-    let _ = rest.typing(&state.channel_id).await;
-    stream_reply(
-        grip,
-        rest,
-        state.channel_id.clone(),
-        state.session_id.clone(),
-        state.user_id.clone(),
-        events,
-    )
-    .await
-}
-
-/// Answers an interaction whose form is gone, taking the dead controls away.
-///
-/// A modal submission has no message to update, so it gets an ephemeral note
-/// instead; either way the press is acknowledged inside Discord's three seconds.
-async fn retire(rest: &Rest, component: &Component, message: &str) -> Result<()> {
-    if component.from_modal {
-        return rest
-            .respond_to_interaction(&component.id, &component.token, message, true)
-            .await;
-    }
-    rest.update_interaction_message(
-        &component.id,
-        &component.token,
-        message,
-        serde_json::json!([]),
-    )
-    .await
 }
 
 /// Finds or creates the Thetis session backing a Discord conversation.
@@ -1083,7 +482,7 @@ async fn retire(rest: &Rest, component: &Component, message: &str) -> Result<()>
 /// meant to be at rest. Discord gets a fresh conversation instead, exactly as
 /// if the channel had never spoken. Archiving is therefore equivalent to `/new`
 /// for every surface at once, and the archived transcript stays readable.
-async fn session_for(grip: &Grip, key: &str, discord_user_id: &str) -> Result<String> {
+async fn session_for(grip: &Grip, key: &str) -> Result<String> {
     let kv_key = format!("discord.session.{key}");
     if let Some(existing) = grip.persist.kv_get(PAIR_SCOPE, &kv_key).await? {
         // `get_session` returns archived sessions too — archiving only sets a
@@ -1102,15 +501,9 @@ async fn session_for(grip: &Grip, key: &str, discord_user_id: &str) -> Result<St
     }
 
     let title = format!("Discord {key}");
-    let synthetic_owner = format!("discord:{key}");
-    let owner = grip
-        .cfg
-        .auth
-        .owner_for_discord(discord_user_id, &synthetic_owner);
     let meta = grip
         .persist
-        .create_session(Some(title), &grip.cfg.discord.mode, &owner)
-        .await?;
+        .create_session(Some(title), &grip.cfg.discord.mode).await?;
     grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
     tracing::info!(session = %meta.id, %key, mode = %grip.cfg.discord.mode,
         "created a Discord session");
@@ -1126,65 +519,21 @@ async fn stream_reply(
     rest: Rest,
     channel_id: String,
     session_id: String,
-    // Who this turn is for. Needed so an `ask_user` form is addressed to the
-    // person who spoke, rather than answerable by anyone in the channel.
-    user_id: String,
     mut events: tokio::sync::broadcast::Receiver<crate::bindings::types::OutboundEvent>,
 ) -> Result<()> {
     let interval = grip.cfg.discord.stream_edit_interval;
-    /* What a multi-step turn shows is two pieces, not one.
-     *
-     * `settled` is the text of assistant steps that have finished; `buffer` is
-     * the current step's deltas as they arrive. They are separate because the
-     * two events disagree about what they mean: `StreamDelta` *appends* a
-     * fragment, while `AssistantMessage` carries a step's *whole* final text.
-     * Held in one string, the second event overwrites everything the first one
-     * built, so in a turn that narrates, calls a tool, then narrates again, the
-     * first narration silently vanishes from the channel. */
-    let mut settled = String::new();
     let mut buffer = String::new();
-    // A reply may span several messages: see `Reply` and `split`.
-    let mut reply = Reply::default();
+    let mut message_id: Option<String> = None;
     let mut last_edit = std::time::Instant::now();
     let mut last_sent = String::new();
-    // Set once a question form has been posted, so the turn's ending does not
-    // write a second message over the top of it.
-    let mut asked = false;
-    /* The tool the turn is working in, shown as a trailing line while it runs.
-     *
-     * Held separately from `settled` and `buffer` because it is the one part of
-     * the message that is *retracted*: it is replaced by the next tool's note
-     * and disappears entirely when the turn produces text again or ends. Mixing
-     * it into either of the other two would make a transient progress note
-     * indistinguishable from something the model actually said. */
-    let mut activity: Option<String> = None;
-
-    /* Typing runs on its own clock, not on a `select!` arm.
-     *
-     * Discord clears the indicator after about ten seconds, so it has to be
-     * re-sent while a turn works. A `sleep` inside `select!` cannot do that: the
-     * future is rebuilt every iteration, so every event resets it, and during a
-     * turn events arrive far more often than every eight seconds. The timer
-     * therefore never elapsed once a turn was actually producing anything —
-     * exactly when the indicator is wanted — and only fired in the idle gaps.
-     *
-     * An interval owned outside the loop ticks on wall-clock time regardless of
-     * how busy the stream is. */
-    let mut typing_tick = tokio::time::interval(Duration::from_secs(8));
-    typing_tick.tick().await; // the first tick resolves immediately
 
     loop {
         let event = tokio::select! {
             received = events.recv() => received,
-            _ = typing_tick.tick() => {
-                // Shown while the turn is working but has nothing on screen
-                // yet, and kept up once a step has settled and the model has
-                // gone quiet into a tool: that is the honest signal that more
-                // is still coming.
-                if compose(&settled, &buffer, activity.as_deref())
-                    .trim()
-                    .is_empty()
-                {
+            // Refresh the typing indicator, which Discord clears after about
+            // ten seconds, while a long turn is still working.
+            _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                if buffer.is_empty() {
                     let _ = rest.typing(&channel_id).await;
                 }
                 continue;
@@ -1206,150 +555,42 @@ async fn stream_reply(
 
         match event.event {
             SessionEvent::StreamDelta(chunk) => {
-                // Text is arriving again, so the tool note has served its
-                // purpose and comes off.
-                activity = None;
                 buffer.push_str(&chunk);
-                let shown = compose(&settled, &buffer, activity.as_deref());
-                if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut reply, &shown).await;
-                    last_sent = shown;
+                if last_edit.elapsed() >= interval && buffer.trim() != last_sent.trim() {
+                    flush(&rest, &channel_id, &mut message_id, &buffer).await;
+                    last_sent = buffer.clone();
                     last_edit = std::time::Instant::now();
                 }
             }
             SessionEvent::AssistantMessage(m) => {
                 // The final text is authoritative: streamed deltas can be
                 // missing a tail, and a tool-only turn has no deltas at all.
-                activity = None;
                 if !m.content.trim().is_empty() {
                     buffer = m.content.clone();
                 }
-                // This step is over, so its text moves into the settled part
-                // and the delta buffer reopens empty for the next one.
-                settled = visible(&settled, &buffer);
-                buffer.clear();
-                /* And it is written out now, not left for `TurnFinished`.
-                 * Deltas only flush on the interval, so when a step's text
-                 * stops arriving — which is exactly what happens the moment the
-                 * model turns to a tool call — whatever came in since the last
-                 * tick is still sitting unsent. A turn that then spends ten
-                 * minutes in tools leaves a half-finished sentence on screen
-                 * for all of it, which is what "streaming broke" looks like.
-                 * The text is final here, so there is nothing to wait for; the
-                 * interval still bounds the streaming case, so this costs at
-                 * most one extra edit per assistant step. */
-                let shown = compose(&settled, &buffer, activity.as_deref());
-                if shown.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut reply, &shown).await;
-                    last_sent = shown;
-                    last_edit = std::time::Instant::now();
-                }
             }
-            SessionEvent::ToolInvocation(call) if call.name == ASK_TOOL => {
-                /* The questions get their own message with real controls, rather
-                 * than the "… ask_user" progress note. The turn is ending here —
-                 * the agent's loop ends it as soon as this call succeeds — so
-                 * anything said before the questions is flushed first, or it
-                 * would be overwritten by the turn-finished text and lost. */
-                // The questions replace any progress note entirely.
-                activity = None;
-                let said = compose(&settled, &buffer, activity.as_deref());
-                if !said.trim().is_empty() {
-                    flush(&rest, &channel_id, &mut reply, &said).await;
-                    last_sent = said.clone();
-                }
-                // The call id is what makes posting idempotent. A provider that
-                // omitted one leaves the arguments as the next best stable
-                // handle: two readers of the same event agree on it, which is
-                // all the claim needs.
-                let call_id = if call.id.trim().is_empty() {
-                    ask::digest(&call.arguments_json)
-                } else {
-                    call.id.clone()
-                };
-                match post_form(
-                    &grip,
-                    &rest,
-                    &channel_id,
-                    &session_id,
-                    &user_id,
-                    &call_id,
-                    &call.arguments_json,
-                )
-                .await
-                {
-                    // The form carries the conversation now. Leaving the buffer
-                    // in place would make `TurnFinished` post "I finished
-                    // without saying anything" underneath the questions.
-                    Posted::Form => asked = true,
-                    // Another follower of this session posted the form. Treated
-                    // exactly like posting it: the questions are on screen, and
-                    // writing anything more would sit under them.
-                    Posted::AlreadyPosted => asked = true,
-                    Posted::Failed => {
-                        if said.trim().is_empty() {
-                            // Nothing askable and nothing said: fall back to the
-                            // note, so a malformed call is not silence.
-                            let note = format!("_… {}_", call.name);
-                            flush(&rest, &channel_id, &mut reply, &note).await;
-                            last_edit = std::time::Instant::now();
-                        }
+            SessionEvent::ToolInvocation(call) => {
+                // Only shown while nothing has been said yet, so a long
+                // research turn does not look stalled.
+                if buffer.trim().is_empty() {
+                    let note = format!("_… {}_", call.name);
+                    if last_edit.elapsed() >= interval {
+                        flush(&rest, &channel_id, &mut message_id, &note).await;
+                        last_edit = std::time::Instant::now();
                     }
                 }
             }
-            SessionEvent::ToolInvocation(call) => {
-                /* The note is a *trailing line*, not a replacement.
-                 *
-                 * It used to be shown only while nothing had been said yet, on
-                 * the reasoning that overwriting text would take back something
-                 * already said. True, but the conclusion was too strong: it
-                 * meant that after the first sentence, every tool call was
-                 * invisible. A turn that says one line and then works for
-                 * eighteen minutes left that line frozen on screen with no sign
-                 * of life — which is what "streaming broke" actually looked
-                 * like. Keeping the note appended says what is happening
-                 * without retracting a word. */
-                activity = Some(call.name.clone());
-                let shown = compose(&settled, &buffer, activity.as_deref());
-                if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut reply, &shown).await;
-                    last_sent = shown;
-                    last_edit = std::time::Instant::now();
-                }
-            }
             SessionEvent::Incident(detail) => {
-                // Onto the settled text: an incident is not part of any step's
-                // streamed output, so the next `AssistantMessage` must not
-                // replace it.
-                settled = format!(
-                    "{}\n\n**Something went wrong:** {detail}",
-                    visible(&settled, &buffer)
-                );
-                buffer.clear();
-                activity = None;
-                let shown = compose(&settled, &buffer, activity.as_deref());
-                flush(&rest, &channel_id, &mut reply, &shown).await;
-                last_sent = shown;
-                last_edit = std::time::Instant::now();
+                buffer.push_str(&format!("\n\n**Something went wrong:** {detail}"));
             }
             SessionEvent::TurnFinished(stats) => {
-                // A turn that ended by asking has already said its piece, in a
-                // message with controls on it. Anything more would sit under the
-                // questions contradicting them.
-                if asked {
-                    break;
-                }
-                // The tool note is retracted here whatever was running: the turn
-                // is over, so nothing is.
-                activity = None;
-                let mut final_text = compose(&settled, &buffer, activity.as_deref());
-                if final_text.trim().is_empty() {
-                    final_text = format!(
+                if buffer.trim().is_empty() {
+                    buffer = format!(
                         "I finished without saying anything (stopped by {}).",
                         stats.stopped_by
                     );
                 }
-                flush(&rest, &channel_id, &mut reply, &final_text).await;
+                flush(&rest, &channel_id, &mut message_id, &buffer).await;
                 break;
             }
             _ => {}
@@ -1359,99 +600,28 @@ async fn stream_reply(
     Ok(())
 }
 
-/// What the channel should currently show: the steps that have finished, plus
-/// whatever the step in flight has streamed so far.
-///
-/// Kept as one function so every arm of the loop agrees on the answer. Either
-/// part may be empty — a tool-only turn never streams, and the first step has
-/// nothing settled before it — so the blank line only appears between two
-/// pieces that both exist.
-fn visible(settled: &str, buffer: &str) -> String {
-    match (settled.trim().is_empty(), buffer.trim().is_empty()) {
-        (true, _) => buffer.to_string(),
-        (false, true) => settled.to_string(),
-        (false, false) => format!("{settled}\n\n{buffer}"),
-    }
-}
-
-/// What the message should say right now: the text, plus the running tool.
-///
-/// The note goes last so the reading order is what was said, then what is
-/// happening. It is dropped once there is nothing running, which is what makes
-/// the finished message clean rather than ending on a stale "… web_search".
-fn compose(settled: &str, buffer: &str, activity: Option<&str>) -> String {
-    let text = visible(settled, buffer);
-    match activity {
-        Some(tool) if text.trim().is_empty() => format!("_… {tool}_"),
-        Some(tool) => format!("{text}\n\n_… {tool}_"),
-        None => text,
-    }
-}
-
-/// The messages a reply currently occupies in the channel.
-///
-/// A reply is not one message. Discord caps a body at 2000 characters, and the
-/// connector used to meet that by keeping the tail and stamping
-/// `… (truncated)` on the front — so the opening of every long answer was
-/// thrown away, which is where the reasoning is. A long reply is now laid out
-/// across as many messages as it needs.
-///
-/// The ids are held in order, so page N is always `ids[N]`, and pagination is
-/// prefix-stable, so a page that has not changed is never re-sent.
-#[derive(Default)]
-struct Reply {
-    ids: Vec<String>,
-    /// The body each message currently holds, so an unchanged page can be
-    /// recognised without asking Discord what it says.
-    bodies: Vec<String>,
-}
-
-/// Brings the channel in line with `content`, sending, editing and deleting
-/// messages as the layout requires.
-async fn flush(rest: &Rest, channel_id: &str, reply: &mut Reply, content: &str) {
-    let want = split::paginate(content, split::LIMIT);
-    if want.is_empty() {
+/// Sends the reply, or edits it if one is already posted.
+async fn flush(
+    rest: &Rest,
+    channel_id: &str,
+    message_id: &mut Option<String>,
+    content: &str,
+) {
+    if content.trim().is_empty() {
         return;
     }
-    for op in split::plan(&reply.bodies, &want) {
-        match op {
-            split::Op::Edit { page } => {
-                let id = reply.ids[page].clone();
-                match rest.edit_message(channel_id, &id, &want[page]).await {
-                    Ok(()) => reply.bodies[page] = want[page].clone(),
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "could not edit a Discord reply")
-                    }
-                }
-            }
-            split::Op::Send { page } => {
-                match rest.send_message(channel_id, &want[page]).await {
-                    Ok(id) => {
-                        reply.ids.push(id);
-                        reply.bodies.push(want[page].clone());
-                    }
-                    Err(e) => {
-                        // Stop rather than carrying on: posting page N+1 after
-                        // page N failed would show the answer out of order,
-                        // with a hole in it and no sign that anything is
-                        // missing. A later flush retries from here.
-                        tracing::warn!(error = %format!("{e:#}"), "could not send a Discord reply");
-                        return;
-                    }
-                }
-            }
-            split::Op::Delete { page } => {
-                let id = reply.ids[page].clone();
-                if let Err(e) = rest.delete_message(channel_id, &id).await {
-                    // Leave the record alone on failure: the message is still
-                    // there, so forgetting it would orphan it on screen.
-                    tracing::warn!(error = %format!("{e:#}"), "could not delete a Discord page");
-                    continue;
-                }
-                reply.ids.remove(page);
-                reply.bodies.remove(page);
+    match message_id {
+        Some(id) => {
+            if let Err(e) = rest.edit_message(channel_id, id, content).await {
+                tracing::warn!(error = %format!("{e:#}"), "could not edit a Discord reply");
             }
         }
+        None => match rest.send_message(channel_id, content).await {
+            Ok(id) => *message_id = Some(id),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not send a Discord reply")
+            }
+        },
     }
 }
 
@@ -1485,112 +655,7 @@ async fn typed_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose, visible};
     use crate::config::Config;
-
-    /* The regression these pin: a turn that says one sentence and then works in
-     * tools for eighteen minutes. The progress note used to be shown only while
-     * nothing had been said, so after the first sentence every tool call was
-     * invisible and the message sat frozen — no edits, no typing indicator, no
-     * error. Observed live: one Discord message, 146 characters, three
-     * sentences, a single edit across eighteen minutes. */
-
-    /// The note must appear *alongside* text, not instead of it. This is the
-    /// whole fix: activity is visible even once the model has spoken.
-    #[test]
-    fn a_running_tool_is_shown_without_retracting_what_was_said() {
-        let shown = compose("Let me verify a few things.", "", Some("web_search"));
-        assert!(
-            shown.starts_with("Let me verify a few things."),
-            "nothing already said may be taken back: {shown:?}"
-        );
-        assert!(
-            shown.ends_with("_… web_search_"),
-            "the running tool must be on screen: {shown:?}"
-        );
-    }
-
-    /// With nothing said yet the note stands alone, and must not be padded with
-    /// leading blank lines.
-    #[test]
-    fn the_note_stands_alone_before_anything_is_said() {
-        assert_eq!(compose("", "", Some("read_path")), "_… read_path_");
-    }
-
-    /// The note is the one retractable part of the message: when the turn ends
-    /// or speaks again it goes away, so a finished reply never ends on a stale
-    /// "… some_tool".
-    #[test]
-    fn the_note_disappears_when_nothing_is_running() {
-        assert_eq!(compose("All done.", "", None), "All done.");
-        // And a later tool replaces the earlier note rather than stacking.
-        let first = compose("Working.", "", Some("search_files"));
-        let second = compose("Working.", "", Some("read_path"));
-        assert!(
-            !second.contains("search_files"),
-            "stale note left behind: {second:?}"
-        );
-        assert_ne!(first, second);
-    }
-
-    /// The edit must be skipped when the composed text is unchanged, or a turn
-    /// calling the same tool repeatedly would burn Discord's edit rate limit on
-    /// identical requests.
-    #[test]
-    fn an_unchanged_message_is_not_re_sent() {
-        let a = compose("Thinking.", "", Some("read_path"));
-        let b = compose("Thinking.", "", Some("read_path"));
-        assert_eq!(a.trim(), b.trim(), "identical state must compare equal");
-    }
-
-    /// The bug this pins: `StreamDelta` appends a fragment but
-    /// `AssistantMessage` carries a step's whole final text. Held in one
-    /// string, the second overwrites the first, and a turn that narrates,
-    /// calls a tool, then narrates again loses its opening paragraph from the
-    /// channel entirely.
-    #[test]
-    fn a_finished_step_survives_the_next_ones_text() {
-        // Step one narrated and settled; step two is now streaming.
-        let settled = "First I will read the issue.";
-        let buffer = "Now here is what I found";
-        let shown = visible(settled, buffer);
-        assert!(
-            shown.starts_with(settled),
-            "the earlier step must still be on screen: {shown:?}"
-        );
-        assert!(
-            shown.ends_with(buffer),
-            "the live step must be too: {shown:?}"
-        );
-    }
-
-    /// Either side can be empty — a tool-only turn never streams, and the
-    /// first step has nothing before it — and neither case may leave stray
-    /// blank lines in the message.
-    #[test]
-    fn nothing_is_padded_when_only_one_side_has_text() {
-        assert_eq!(visible("", "just streaming"), "just streaming");
-        assert_eq!(visible("just settled", ""), "just settled");
-        assert_eq!(visible("", ""), "");
-        assert_eq!(visible("a", "b"), "a\n\nb");
-    }
-
-    /// A step's text is flushed when the step ends, so the channel is never
-    /// left holding a half-finished sentence while the turn spends minutes in
-    /// tools. The condition the loop uses is this inequality.
-    #[test]
-    fn the_end_of_a_step_has_something_new_to_send() {
-        // What was last sent mid-stream, before the tail delta arrived.
-        let last_sent = "I'll pull the issue and cross-check against the";
-        let settled = "I'll pull the issue and cross-check against the crate map.";
-        assert_ne!(
-            settled.trim(),
-            last_sent.trim(),
-            "the settled step differs from what is on screen, so it must be flushed"
-        );
-        // And once flushed, an identical repeat is not re-sent.
-        assert_eq!(settled.trim(), settled.trim());
-    }
 
     /// The connector's whole tool restriction is the mode it stamps, so a mode
     /// that is missing or not read-only must stop it from starting. The agent

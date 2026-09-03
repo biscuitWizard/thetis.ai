@@ -4,9 +4,8 @@
 //! own git worktree. Workers are children of the gateway, not systemd units:
 //! the control socket is inherited at spawn, a replacement can be a
 //! *different* binary (a branch that rebuilt its own kernel), and
-//! and a worker that finds itself orphaned exits on its own, so a dying
-//! gateway still takes its workers with it — no orphan can squat on a
-//! worktree or wedge a terminal.
+//! `PR_SET_PDEATHSIG` guarantees a dying gateway takes its workers with it —
+//! no orphan can ever squat on a worktree or wedge a terminal.
 //!
 //! Materialization is lazy: a conversation gets its branch, worktree, and
 //! worker at its first message. A worker that dies is respawned by the next
@@ -15,8 +14,8 @@
 //! reaped after a quiet period — their branch state is all on disk and in the
 //! gateway's database, so nothing is lost by stopping one.
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::os::fd::IntoRawFd;
 use std::sync::Arc;
@@ -67,18 +66,6 @@ struct WorkerEntry {
     /// inside MIN_UPTIME counted as two fast deaths and threw away a perfectly
     /// good branch kernel with "it kept crashing at startup".
     stopping: std::sync::atomic::AtomicBool,
-    /// Turns this worker says it is running, and when it last said so.
-    ///
-    /// Reported by the worker rather than inferred here: the gateway's own
-    /// turn counter is necessarily zero, because turns run over there. Without
-    /// this `/admin/waits` answered "nothing is running" for a conversation
-    /// that was twelve minutes into a stalled turn — the one question that
-    /// page exists to answer.
-    turns: std::sync::atomic::AtomicUsize,
-    turns_since: std::sync::Mutex<Instant>,
-    /// Highest report stamp seen, so a note that overtook a newer one on its
-    /// way here is dropped rather than applied. See `Grip::turn_report_seq`.
-    turns_seq: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -129,7 +116,6 @@ impl WorkerRouter {
                 .into_iter()
                 .map(|(id, method, age)| json!({ "id": id, "method": method, "age_s": age }))
                 .collect();
-            let turns = entry.turns.load(std::sync::atomic::Ordering::SeqCst);
             rows.push(json!({
                 "session": session,
                 "ready": *entry.ready.borrow(),
@@ -140,19 +126,6 @@ impl WorkerRouter {
                     .lock()
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or_default(),
-                "turns_running": turns,
-                // How long the count has stood. A turn that has been running
-                // for one figure while the socket has been idle for the same
-                // one is the shape of a stall, and neither number says it
-                // alone.
-                "turn_age_s": match turns {
-                    0 => None,
-                    _ => entry
-                        .turns_since
-                        .lock()
-                        .map(|t| t.elapsed().as_secs())
-                        .ok(),
-                },
                 "pending": pending,
             }));
         }
@@ -236,34 +209,11 @@ pub async fn call_session(
     method: &str,
     params: Value,
 ) -> Result<Value> {
-    let route = routing_key(grip, session_id);
-    let entry = ensure_worker(grip, router, &route).await?;
+    let entry = ensure_worker(grip, router, session_id).await?;
     if let Ok(mut stamp) = entry.last_activity.lock() {
         *stamp = Instant::now();
     }
-    entry
-        .peer
-        .call_within(method, params, method_budget(method))
-        .await
-}
-
-/// Which worker serves a session: itself, or its parent conversation's.
-///
-/// A sub-agent has its own session and its own event log, but no branch and no
-/// checkout of its own. It runs inside the worker of the conversation that
-/// spawned it, so parent and child see the same working tree — which is the
-/// whole reason delegation is useful for code work. Spawning a worker and a git
-/// worktree per child would also make a three-way fan-out cost three worktrees
-/// and three process startups.
-///
-/// Resolved from the registry, which only the gateway can read; a worker asking
-/// this of itself gets the id back unchanged, which is correct, because a
-/// worker only ever runs sessions already routed to it.
-fn routing_key(grip: &Arc<Grip>, session_id: &str) -> String {
-    match grip.local_store() {
-        Some(store) => crate::subagents::Subagents::new(store).root_of(session_id),
-        None => session_id.to_string(),
-    }
+    entry.peer.call_within(method, params, method_budget(method)).await
 }
 
 /// How long this method is allowed to take.
@@ -343,9 +293,7 @@ async fn materialize(
 
     // The chosen starting revision, if the user picked one before the first
     // message pinned the branch.
-    let base = store
-        .kv_get(session_id, PENDING_BASE_KEY)?
-        .filter(|b| !b.is_empty());
+    let base = store.kv_get(session_id, PENDING_BASE_KEY)?.filter(|b| !b.is_empty());
     let row = branches.ensure(session_id, base.as_deref()).await?;
     let _ = store.kv_put(session_id, PENDING_BASE_KEY, "");
 
@@ -389,9 +337,6 @@ async fn materialize(
         ready: ready_rx,
         last_activity: std::sync::Mutex::new(Instant::now()),
         stopping: std::sync::atomic::AtomicBool::new(false),
-        turns: std::sync::atomic::AtomicUsize::new(0),
-        turns_since: std::sync::Mutex::new(Instant::now()),
-        turns_seq: std::sync::atomic::AtomicU64::new(0),
     });
     router
         .workers
@@ -459,29 +404,7 @@ async fn supervise(
     // Whichever arm won, callers still parked on this peer must be woken now
     // rather than at CALL_TIMEOUT, and no new call may be admitted.
     peer.force_close();
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .ok()
-        .and_then(Result::ok);
-    // How it died, not merely that it did. A worker that ends silently is
-    // indistinguishable from one that was killed, and telling those apart is
-    // the whole difference between a bug in the turn and something outside
-    // reaching in.
-    match status {
-        Some(status) => {
-            use std::os::unix::process::ExitStatusExt;
-            tracing::info!(
-                session = %session_id,
-                code = ?status.code(),
-                signal = ?status.signal(),
-                "worker process ended"
-            );
-        }
-        None => tracing::warn!(
-            session = %session_id,
-            "worker process did not exit within 5s of its socket closing"
-        ),
-    }
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     let _ = child.start_kill();
     let _ = child.wait().await;
     let requested = router
@@ -542,7 +465,7 @@ async fn supervise(
                     ),
                 )
                 .await;
-            reconcile_session(&grip, &session_id).await;
+            reconcile_and_resume(&grip).await;
             return;
         }
 
@@ -565,9 +488,9 @@ async fn supervise(
     }
 
     tracing::info!(session = %session_id, "worker exited");
-    // Repair whatever *this* death interrupted; resuming re-materializes the
-    // worker on demand. Deliberately scoped: see `reconcile_session`.
-    reconcile_session(&grip, &session_id).await;
+    // Repair whatever the death interrupted; resuming re-materializes the
+    // worker on demand.
+    reconcile_and_resume(&grip).await;
 }
 
 /// Points a branch back at the trunk kernel. True when it was on its own.
@@ -665,7 +588,6 @@ impl ipc::Handler for GatewayHandler {
                     .context("gateway has no local store")?;
                 return crate::persist::serve_store_call(
                     store,
-                    Some(&self.grip.cfg),
                     &method,
                     params,
                     &self.session_id,
@@ -694,45 +616,6 @@ impl ipc::Handler for GatewayHandler {
         }
 
         match name.as_str() {
-            // How many turns the worker has in flight. See `WorkerEntry::turns`.
-            "turns" => {
-                let running = params
-                    .get("running")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default() as usize;
-                let seq = params
-                    .get("seq")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default();
-                if let Role::Gateway(router) = &grip.role {
-                    let router = router.clone();
-                    let session = self.session_id.clone();
-                    tokio::spawn(async move {
-                        let Some(entry) = router.entry(&session).await else {
-                            return;
-                        };
-                        // Stale report: a newer one is already applied.
-                        if entry
-                            .turns_seq
-                            .fetch_max(seq, std::sync::atomic::Ordering::SeqCst)
-                            >= seq
-                        {
-                            return;
-                        }
-                        let was = entry
-                            .turns
-                            .swap(running, std::sync::atomic::Ordering::SeqCst);
-                        // Only restart the clock when the count actually
-                        // changes, so `turn_age_s` measures the turn rather
-                        // than the last report about it.
-                        if was != running {
-                            if let Ok(mut since) = entry.turns_since.lock() {
-                                *since = Instant::now();
-                            }
-                        }
-                    });
-                }
-            }
             // A frame the worker rendered for one of its session's events.
             "frame" => {
                 let session = params
@@ -752,24 +635,6 @@ impl ipc::Handler for GatewayHandler {
                     });
                 }
             }
-            // Shell activity in this worker's sandbox, broadcast as an ordinary
-            // frame so the browser's terminal drawer draws it live. Tagged with
-            // the session here rather than by the worker: the socket already
-            // identifies the conversation, and asking the far end to restate it
-            // would let the two disagree.
-            "terminal" => {
-                let mut frame = params;
-                if let Some(obj) = frame.as_object_mut() {
-                    obj.insert("type".into(), Value::String("terminal".into()));
-                    obj.insert("session".into(), Value::String(self.session_id.clone()));
-                }
-                if let Ok(text) = serde_json::to_string(&frame) {
-                    let _ = grip.frames_tx.send(RenderedFrame {
-                        session_id: self.session_id.clone(),
-                        frame: text,
-                    });
-                }
-            }
             // The worker's raw event stream, mirrored so connectors on this
             // side (Discord) can follow conversations exactly as before the
             // split. Browsers are fed by the rendered `frame` notes instead.
@@ -786,7 +651,6 @@ impl ipc::Handler for GatewayHandler {
             // The worker's aspects are up and it is accepting turns.
             "ready" => {
                 let _ = self.ready.send(true);
-                let session_id = self.session_id.clone();
                 tokio::spawn(async move {
                     // A fresh deployment serves the fallback page until some
                     // worker's first build lands in the cache; a branch at
@@ -795,7 +659,7 @@ impl ipc::Handler for GatewayHandler {
                     if grip.loader.get(&ui).is_none() {
                         crate::roles::gateway::load_ui_gateway(&grip).await;
                     }
-                    reconcile_session(&grip, &session_id).await;
+                    reconcile_and_resume(&grip).await;
                 });
             }
             // The worker wants itself restarted — after a kernel rebuild in
@@ -822,7 +686,9 @@ impl ipc::Handler for GatewayHandler {
                     // session" would then kill an innocent replacement
                     // mid-turn.
                     let asked_by = match &grip.role {
-                        crate::grip::Role::Gateway(router) => router.live_peer(&session).await,
+                        crate::grip::Role::Gateway(router) => {
+                            router.live_peer(&session).await
+                        }
                         _ => None,
                     };
                     if let Some(kernel) = kernel {
@@ -879,27 +745,14 @@ impl ipc::Handler for GatewayHandler {
 /// turns, resuming materializes workers, and a worker's supervision calls
 /// back here when it dies. The box gives the compiler a concrete type to
 /// close the loop on.
-pub fn reconcile_and_resume(grip: &Arc<Grip>) -> futures_util::future::BoxFuture<'static, ()> {
-    let grip = grip.clone();
-    Box::pin(async move { reconcile_and_resume_inner(grip, None).await })
-}
-
-/// Reconciles one conversation, for the common case: its own worker died.
-///
-/// A worker's death says nothing about anyone else, and the fleet-wide sweep
-/// used to drag in every session that merely had no worker at that instant —
-/// including agents part-way through a restart they asked for. With several
-/// self-modifying conversations running that fed back on itself.
-pub fn reconcile_session(
+pub fn reconcile_and_resume(
     grip: &Arc<Grip>,
-    session_id: &str,
 ) -> futures_util::future::BoxFuture<'static, ()> {
     let grip = grip.clone();
-    let session_id = session_id.to_string();
-    Box::pin(async move { reconcile_and_resume_inner(grip, Some(session_id)).await })
+    Box::pin(async move { reconcile_and_resume_inner(grip).await })
 }
 
-async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
+async fn reconcile_and_resume_inner(grip: Arc<Grip>) {
     // One at a time: readiness and death fire this from several places, and
     // two scans racing each other once synthesized duplicate tool results.
     static RECONCILING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -915,10 +768,9 @@ async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
         Role::Worker(_) => Vec::new(),
     };
     let interrupted = match store.reconcile_interrupted_turns(
-        "This turn was interrupted and has been picked back up. Carry on from where \
-         you left off; anything you were part-way through may need doing again.",
+        "This turn was interrupted when Thetis restarted. Carry on from where you \
+         left off; anything you were part-way through may need doing again.",
         &live,
-        only.as_deref(),
     ) {
         Ok(found) => found,
         Err(e) => {
@@ -954,9 +806,7 @@ async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
     let mut in_flight = 0usize;
     loop {
         while in_flight < RESUME_CONCURRENCY {
-            let Some(session_id) = queue.next() else {
-                break;
-            };
+            let Some(session_id) = queue.next() else { break };
             let grip = grip.clone();
             resumes.spawn(async move {
                 tracing::info!(session = %session_id, "resuming");
@@ -986,10 +836,7 @@ async fn reconcile_and_resume_inner(grip: Arc<Grip>, only: Option<String>) {
 
 /// The cached kernel this branch runs, when it has adopted one and the cache
 /// still holds it. `None` means the trunk binary — this very executable.
-fn branch_kernel_path(
-    grip: &Arc<Grip>,
-    row: &crate::branches::BranchRow,
-) -> Option<std::path::PathBuf> {
+fn branch_kernel_path(grip: &Arc<Grip>, row: &crate::branches::BranchRow) -> Option<std::path::PathBuf> {
     if row.kernel_commit.is_empty() {
         return None;
     }
@@ -1005,7 +852,11 @@ fn branch_kernel_path(
 
 /// Probes a branch-built kernel and, if it answers, files it in the kernel
 /// cache and points the branch at it. The next spawn of this worker runs it.
-async fn adopt_branch_kernel(grip: &Arc<Grip>, session_id: &str, kernel: &str) -> Result<()> {
+async fn adopt_branch_kernel(
+    grip: &Arc<Grip>,
+    session_id: &str,
+    kernel: &str,
+) -> Result<()> {
     let kernel = std::path::Path::new(kernel);
     if !kernel.is_file() {
         bail!("{} does not exist", kernel.display());
@@ -1048,7 +899,8 @@ async fn adopt_branch_kernel(grip: &Arc<Grip>, session_id: &str, kernel: &str) -
         .with_context(|| format!("staging the kernel at {}", staging.display()))?;
     if let Err(e) = std::fs::rename(&staging, &cached) {
         let _ = std::fs::remove_file(&staging);
-        return Err(e).with_context(|| format!("caching the kernel at {}", cached.display()));
+        return Err(e)
+            .with_context(|| format!("caching the kernel at {}", cached.display()));
     }
 
     row.kernel_commit = commit.clone();
@@ -1093,24 +945,9 @@ fn spawn_worker_process(
         // retarget it by editing its own copy of thetis.toml.
         .env("THETIS_DATA_DIR", &cfg.paths.data)
         .env("THETIS_ARTIFACTS_DIR", &cfg.paths.artifacts)
-        // Deliberately NOT pinning THETIS_TARGET_DIR. A cargo target directory
-        // is not shared state: it is keyed by nothing but its own path, so two
-        // checkouts building the same aspect into one target dir write the same
-        // output file and each can be handed the other's component. That is a
-        // correctness bug, and the workaround for it (dirtying a source file
-        // before every build, so cargo always re-links) fed the file watcher a
-        // real-looking modify event and made every build trigger the next one.
-        // Letting each worktree resolve `target-wasm` against its own root cuts
-        // both problems off at the root. Cross-branch reuse is not lost: it
-        // lives in the content-addressed artifact cache, which IS shared, and
-        // which serves an identical tree with no toolchain at all.
+        .env("THETIS_TARGET_DIR", &cfg.build.target_dir)
         .env("THETIS_LOCAL_CONFIG", cfg.local_overlay())
         .env("THETIS_TRUNK", trunk)
-        // The browser sidecar's token is deliberately NOT pinned here. A worker
-        // is spawned by whichever gateway is running, normally trunk's binary,
-        // so a branch adding an `.env()` call here would not affect its own
-        // workers at all. It travels through a file in the shared data
-        // directory instead. See `browser::token`.
         // A worker must never mistake itself for a supervised service: its
         // restart path is the gateway, not systemd.
         .env_remove("INVOCATION_ID")
@@ -1119,23 +956,14 @@ fn spawn_worker_process(
         cmd.env("THETIS_WORKSPACE_DIR", workspace);
     }
 
-    // After fork, before exec: pin the socket to the agreed fd. Only
-    // async-signal-safe calls are allowed here.
-    //
-    // Deliberately *not* `PR_SET_PDEATHSIG`. The kernel delivers that when the
-    // thread that forked dies, not when the parent process does — and a tokio
-    // worker thread is not a stable thing to hang a process's life on. Threads
-    // move between the core and blocking pools (`offload::blocking` uses
-    // `block_in_place`, which does exactly that) and retired blocking threads
-    // exit, at which point every worker forked from one is SIGKILLed while the
-    // gateway is perfectly healthy. That is what was killing conversations
-    // mid-turn: `signal=9`, no shutdown request, nothing in the log. The
-    // guarantee it was there for — no orphan squatting on a worktree — is kept
-    // by the worker watching its own parent instead, which is a property of
-    // the process and cannot be undone by a thread going away.
+    // After fork, before exec: pin the socket to the agreed fd and arrange to
+    // die with the gateway. Only async-signal-safe calls are allowed here.
     unsafe {
         cmd.pre_exec(move || {
             if libc::dup2(theirs_fd, WORKER_SOCKET_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

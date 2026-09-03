@@ -12,7 +12,7 @@
 //! Entries are write-once: a key names exactly one build output, so nothing
 //! is ever overwritten, and concurrent writers of the same key are benign.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,7 +134,11 @@ impl BuildCache {
 
     /// Absolute path of a cached artifact, verified to exist and match its
     /// recorded hash — a half-written or corrupted entry must never load.
-    pub fn artifact_path(&self, meta: &BuildMeta, artifact_name: &str) -> Result<PathBuf> {
+    pub fn artifact_path(
+        &self,
+        meta: &BuildMeta,
+        artifact_name: &str,
+    ) -> Result<PathBuf> {
         let path = self.entry_dir(&meta.aspect, &meta.key).join(artifact_name);
         if !path.is_file() {
             bail!("cache entry {} has no artifact {artifact_name}", meta.key);
@@ -232,11 +236,7 @@ mod tests {
         fs::write(&wasm, b"first").unwrap();
         let sha = hash_file(&wasm).unwrap();
         cache
-            .store(
-                &wasm,
-                "component.wasm",
-                &meta("agent", "k", &sha, SmokeVerdict::Pass),
-            )
+            .store(&wasm, "component.wasm", &meta("agent", "k", &sha, SmokeVerdict::Pass))
             .unwrap();
 
         // A second store of the same key keeps the original.
@@ -294,59 +294,6 @@ mod tests {
         assert_eq!(listed[0].key, "new");
         assert_eq!(listed[1].key, "old");
         assert!(cache.list("tool/none").unwrap().is_empty());
-    }
-
-    /// The merge gate in `merge.rs` does not look an entry up by cache key; it
-    /// scans `list()` for one whose `aspect_tree` and `wit_tree` equal the
-    /// branch's trees, with `smoke == Pass`. So an entry that records a green
-    /// verdict but leaves the trees empty is invisible to the gate, and the
-    /// branch reads as never built.
-    ///
-    /// This is the shape of a real deadlock: the "identical to what is serving"
-    /// exit in `pipeline.rs` used to commit its source without caching
-    /// anything, and rebuilding could not clear it because the rebuild was
-    /// byte-identical too and took the same exit. Both green exits now go
-    /// through `cache_green`.
-    #[test]
-    fn the_merge_gate_only_sees_entries_that_record_their_trees() {
-        let tmp = TempDir::new().unwrap();
-        let cache = BuildCache::new(tmp.path().join("cache"));
-        let wasm = tmp.path().join("e.wasm");
-        fs::write(&wasm, b"identical bytes").unwrap();
-        let sha = hash_file(&wasm).unwrap();
-
-        // The gate's predicate, verbatim in shape.
-        let gate_sees_green = |cache: &BuildCache, aspect_tree: &str, wit_tree: &str| {
-            cache.list("agent").unwrap().iter().any(|m| {
-                m.aspect_tree == aspect_tree
-                    && m.wit_tree == wit_tree
-                    && m.smoke == SmokeVerdict::Pass
-            })
-        };
-
-        // A pass recorded without trees: the old no-op path's effect.
-        let untreed = meta("agent", "k-untreed", &sha, SmokeVerdict::Pass);
-        assert_eq!(untreed.aspect_tree, "");
-        cache.store(&wasm, "component.wasm", &untreed).unwrap();
-        assert!(
-            !gate_sees_green(&cache, "tree-abc", "wit-xyz"),
-            "a green with no recorded trees must not satisfy the gate"
-        );
-
-        // What cache_green now writes for the same artifact.
-        let mut treed = meta("agent", "k-treed", &sha, SmokeVerdict::Pass);
-        treed.aspect_tree = "tree-abc".to_string();
-        treed.wit_tree = "wit-xyz".to_string();
-        cache.store(&wasm, "component.wasm", &treed).unwrap();
-        assert!(
-            gate_sees_green(&cache, "tree-abc", "wit-xyz"),
-            "a green recording the branch's trees must satisfy the gate"
-        );
-
-        // Trees are matched, not merely present: another commit's tree is no
-        // evidence for this one.
-        assert!(!gate_sees_green(&cache, "tree-other", "wit-xyz"));
-        assert!(!gate_sees_green(&cache, "tree-abc", "wit-other"));
     }
 
     #[test]

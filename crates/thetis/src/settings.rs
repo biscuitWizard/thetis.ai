@@ -15,7 +15,7 @@
 //! Nothing is applied live: the process reads its configuration once at
 //! startup. `set` says so, and the agent has a restart tool to finish the job.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use crate::config::Config;
@@ -117,7 +117,11 @@ fn walk(item: &Item, path: &str, out: &mut Vec<Setting>) {
         }
         Item::Value(TomlValue::InlineTable(table)) => {
             for (key, value) in table.iter() {
-                walk(&Item::Value(value.clone()), &join(path, key), out);
+                walk(
+                    &Item::Value(value.clone()),
+                    &join(path, key),
+                    out,
+                );
             }
         }
         Item::ArrayOfTables(array) => {
@@ -142,11 +146,7 @@ fn setting(key: &str, value: String, scalar: bool) -> Setting {
     let editable = scalar && locked_reason(key).is_none();
     Setting {
         value: if is_secret(key) {
-            if value.trim().is_empty() {
-                String::new()
-            } else {
-                "***".to_string()
-            }
+            if value.trim().is_empty() { String::new() } else { "***".to_string() }
         } else {
             value
         },
@@ -165,7 +165,11 @@ fn render(value: &TomlValue) -> String {
         TomlValue::Float(f) => f.value().to_string(),
         TomlValue::Boolean(b) => b.value().to_string(),
         TomlValue::Datetime(d) => d.value().to_string(),
-        TomlValue::Array(a) => a.iter().map(render).collect::<Vec<_>>().join(", "),
+        TomlValue::Array(a) => a
+            .iter()
+            .map(render)
+            .collect::<Vec<_>>()
+            .join(", "),
         TomlValue::InlineTable(_) => "{...}".to_string(),
     }
 }
@@ -214,9 +218,8 @@ pub fn set(cfg: &Config, key: &str, value: &str) -> Result<String> {
 
     // The whole point of the guard: a config Thetis cannot load leaves it
     // unable to start, and nothing in-band can fix that.
-    Config::validate(&candidate, &cfg.root).with_context(|| {
-        format!("setting {key} to {value:?} would make the configuration invalid")
-    })?;
+    Config::validate(&candidate, &cfg.root)
+        .with_context(|| format!("setting {key} to {value:?} would make the configuration invalid"))?;
 
     std::fs::write(&cfg.config_path, &candidate)
         .with_context(|| format!("writing {}", cfg.config_path.display()))?;
@@ -233,11 +236,7 @@ pub fn set(cfg: &Config, key: &str, value: &str) -> Result<String> {
     Ok(format!(
         "{key}: {} -> {} (written to {}). Configuration is read at startup, so \
          restart Thetis for this to take effect.",
-        if previous.is_empty() {
-            "unset".to_string()
-        } else {
-            shown(&previous)
-        },
+        if previous.is_empty() { "unset".to_string() } else { shown(&previous) },
         shown(value),
         cfg.config_path
             .file_name()
@@ -371,11 +370,7 @@ data = "data"
     #[test]
     fn lists_settings_as_dotted_paths() {
         let (cfg, _d) = fixture();
-        let keys: Vec<String> = list(&cfg, None)
-            .unwrap()
-            .into_iter()
-            .map(|s| s.key)
-            .collect();
+        let keys: Vec<String> = list(&cfg, None).unwrap().into_iter().map(|s| s.key).collect();
 
         assert!(keys.contains(&"server.bind".to_string()));
         assert!(keys.contains(&"agent.max_iterations".to_string()));
@@ -445,9 +440,7 @@ data = "data"
 
         assert_eq!(token.value, "***");
         assert!(
-            !settings
-                .iter()
-                .any(|s| s.value.contains("ntn_super_secret")),
+            !settings.iter().any(|s| s.value.contains("ntn_super_secret")),
             "the token leaked: {settings:?}"
         );
         assert_eq!(
@@ -467,11 +460,9 @@ data = "data"
 
         // Neither the old nor the new value appears in what is reported back.
         assert!(!report.contains("sk-or-v1"), "{report}");
-        assert!(
-            std::fs::read_to_string(&cfg.config_path)
-                .unwrap()
-                .contains("sk-or-v1-brand-new")
-        );
+        assert!(std::fs::read_to_string(&cfg.config_path)
+            .unwrap()
+            .contains("sk-or-v1-brand-new"));
     }
 
     #[test]

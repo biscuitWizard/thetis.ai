@@ -3,7 +3,7 @@ name = "The turn lifecycle"
 brief = "What happens in one agent turn: rehydration from the event log, prompt assembly, streaming, tool dispatch, nudges, and resume after a restart."
 when_to_use = "Use when you must understand or change how a turn runs: the order of the steps in handle-turn, how messages are rebuilt from the log, what stops a turn, how a nudge or a cancel arrives mid-turn, how usage and cost are counted, or why a turn continues after a restart. Not for compaction internals, which have their own child skill."
 universal = false
-tags = ["turn", "loop", "rehydrate", "event log", "nudge", "cancel", "streaming", "tool dispatch", "resume", "session", "tool-group:selfmod"]
+tags = ["turn", "loop", "rehydrate", "event log", "nudge", "cancel", "streaming", "tool dispatch", "resume", "session"]
 version = 1
 ---
 
@@ -21,38 +21,22 @@ export is `handle-turn(session-id)`.
 3. **`retrieve_skills_once`** — If the session has no pinned skills, rank the
    corpus against the first user message and pin the result. Then rehydrate
    again, because the system prompt is now different.
-4. **`route_tools_once`** — Decide and pin this conversation's tool groups.
-   Strictly after skill retrieval, whose `tool-group:` tags feed it.
+4. **`maybe_compact`** — See the `compaction` child skill.
 5. **The loop**, for each iteration:
-   a. `flush_pending`, then **`maybe_compact`**, then drain the inbox for a
-      cancel — all before the counter moves. Compaction is checked *every*
-      iteration, not once per turn, because a turn's context grows as its tool
-      results pile up. See the `compaction` child skill.
-   b. `stream_completion` — Send `model`, `messages` and `tools`. Read chunks
+   a. `stream_completion` — Send `model`, `messages` and `tools`. Read chunks
       until `Finished`. Each `Delta` chunk goes to the browser immediately with
-      `emit_output`, and also into the reply text. A `Reasoning` chunk goes to
-      the browser with `emit_reasoning` and **not** into the reply text: a
-      reasoning model's thinking is not its answer, must not be persisted, and
-      must not be replayed to the model next iteration.
-   c. Append an `AssistantMessage` event **before** you act on it. The log must
+      `emit_output`, and also into the reply text.
+   b. Append an `AssistantMessage` event **before** you act on it. The log must
       be true even if a tool traps.
-   d. `record_usage` — Add the prompt tokens, completion tokens and cost, and
-      record `billed_to`, the message-list length the provider just priced.
-      Compaction estimates everything past it.
-   e. If there are no tool calls, drain the inbox. `None` stops the turn.
+   c. `record_usage` — Add the prompt tokens, completion tokens and cost.
+   d. If there are no tool calls, drain the inbox. `None` stops the turn.
       `Nudged` continues it. `Cancelled` stops it.
-   f. If there are tool calls, dispatch each one, then drain the inbox for a
+   e. If there are tool calls, dispatch each one, then drain the inbox for a
       cancel.
 6. Return `TurnStats`: iterations, tokens, cost, the tools used, and
    `stopped_by`.
 
-`stopped_by` is one of `stop`, `asked`, `max-iterations`, `cancelled`, or
-`llm-error`.
-
-`asked` means the turn ended because `ask_user` succeeded: the loop stops itself
-so the model cannot talk past its own questions. It is a normal ending, so a
-surface reporting turns should treat it like `stop` and not badge it as a fault.
-See the `asking-the-user` skill.
+`stopped_by` is one of `stop`, `max-iterations`, `cancelled`, or `llm-error`.
 
 Note: `max_iterations` in the `Turn` struct is set to `u32::MAX`, so the
 iteration ceiling in the config is not applied by the current loop code. Verify

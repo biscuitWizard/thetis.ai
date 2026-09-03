@@ -99,33 +99,6 @@ interface types {
     tokens-before: u32,
   }
 
-  /// How far a compaction has got, streamed to clients while it runs.
-  ///
-  /// Compaction happens before the first completion of a turn and can take tens
-  /// of seconds: several calls to the summary model, one per span. Without this
-  /// the surface shows a turn that has started and then says nothing at all,
-  /// which reads as a hang. Transient, like `stream-delta`: the log already
-  /// records the outcome as `context-compacted`, and progress is only
-  /// interesting while it is happening.
-  record compaction-progress {
-    /// "planning" | "summarizing" | "finished" | "failed" | "cancelled"
-    phase: string,
-    /// 1-based span being summarized now; 0 when not summarizing.
-    span: u32,
-    /// Spans this compaction will summarize; 0 until planning is done.
-    spans: u32,
-    /// Messages the plan replaces, so far.
-    messages: u32,
-    /// The provider's count of the context that triggered this.
-    tokens-before: u32,
-    /// What the policy is aiming to get down to.
-    tokens-target: u32,
-    /// The model doing the summarizing.
-    model: string,
-    /// A short human-readable line for the surface to show.
-    detail: string,
-  }
-
   // A branch operation on this conversation's sandbox: trunk updates,
   // merges, resets, conflict handoffs. In the log so the transcript shows
   // version history inline and every tab sees it the same way.
@@ -151,13 +124,8 @@ interface types {
     turn-started,
     turn-finished(turn-stats),
     stream-delta(string),
-    // Transient, like `stream-delta`: a fragment of the model's thinking,
-    // rendered as it arrives and never persisted.
-    reasoning-delta(string),
     context-compacted(compaction),
     branch-op(branch-op),
-    // Transient, like `stream-delta`: never persisted, only rendered.
-    compaction-progress(compaction-progress),
   }
 
   record event-record {
@@ -219,15 +187,6 @@ interface types {
     universal: bool,
     /// Fetchable sibling files, e.g. "references/format.md".
     resources: list<string>,
-    /// Ids of neighbouring skills, from frontmatter `related`. A reference that
-    /// belongs to the whole skill rather than to one sentence of its body.
-    related: list<string>,
-    /// "active" or "retired". Empty means active and unstated. A retired skill
-    /// still ranks — it describes a system that existed, and a reader arriving
-    /// from old code needs it — so say so on the card rather than hiding it.
-    status: string,
-    /// For a retired skill, the id that replaced it. Empty otherwise.
-    superseded-by: string,
     /// Retrieval score, 0 when this card did not come from ranking.
     score: f64,
     /// Why this card is here: "dense", "lexical", "parent-of-match",
@@ -312,13 +271,6 @@ interface types {
 
   variant stream-chunk {
     delta(string),
-    // A fragment of the model's thinking, not of its answer. Reasoning models
-    // served over an OpenAI-compatible endpoint send this as
-    // `delta.reasoning_content`, and it can be the bulk of a response. Kept
-    // apart from `delta` so it is never spliced into the assistant message:
-    // the answer is what gets persisted and replayed to the model, the
-    // reasoning is only shown as it arrives.
-    reasoning(string),
     tool-calls(list<tool-call>),
     finished(finish-info),
   }
@@ -346,62 +298,15 @@ interface types {
     output: string,
     timed-out: bool,
     truncated: bool,
-    /// The command's exit status, when the shell reported one. A field rather
-    /// than text in `output`, so success and failure can be told apart without
-    /// parsing prose.
-    exit-code: option<s32>,
-    /// The ssh host this ran on, empty for a local session. Never let a remote
-    /// result be mistaken for a local one.
-    host: string,
-  }
-
-  record env-var {
-    key: string,
-    value: string,
-  }
-
-  record terminal-open {
-    /// Local working directory, confined to the filesystem roots. Ignored for
-    /// a remote session, which starts where its host says.
-    cwd: option<string>,
-    /// A label of the caller's choosing, for listings.
-    name: option<string>,
-    env: list<env-var>,
-    /// The name of a registered ssh host. Absent opens a local shell.
-    host: option<string>,
   }
 
   record terminal-info {
     id: string,
-    name: string,
     cwd: string,
     shell: string,
-    /// The ssh host, empty for a local session.
-    remote: string,
     alive: bool,
     /// Commands run in this session so far.
     commands: u32,
-    /// The background command still running, empty when the session is idle.
-    busy: string,
-  }
-
-  /// Where a remote session connects. Stored outside the committed config so it
-  /// cannot be published by accident, and never carries a key's contents —
-  /// only the path to one.
-  record ssh-host-info {
-    name: string,
-    host: string,
-    /// 0 leaves the choice to ssh, which respects ~/.ssh/config.
-    port: u32,
-    user: string,
-    identity-file: string,
-    /// Complete ssh arguments, e.g. `-oStrictHostKeyChecking=accept-new`.
-    options: list<string>,
-    remote-cwd: string,
-    /// Allocate a remote terminal. Needed to interrupt a remote command, at
-    /// the cost of echoed commands and prompts in the output.
-    pty: bool,
-    description: string,
   }
 
   // --- execution ------------------------------------------------------------
@@ -502,20 +407,12 @@ interface sys {
 
 interface session {
   use types.{attachment, event-record, session-event, session-meta, inbox-item,
-             tool-manifest, compaction-progress};
+             tool-manifest};
 
   events: func(session-id: string, from-seq: u64) -> list<event-record>;
   append: func(session-id: string, event: session-event) -> u64;
   // Streams a token fragment to connected clients without persisting it.
   emit-output: func(session-id: string, chunk: string);
-  // Streams a reasoning fragment. Separate from `emit-output` because
-  // reasoning must not land in the assistant message: the surface renders it
-  // as its own element, and it is never persisted.
-  emit-reasoning: func(session-id: string, chunk: string);
-  // Streams compaction progress to connected clients without persisting it.
-  // Separate from `emit-output` because it is structured: the surface draws a
-  // progress element from it rather than appending text.
-  emit-compaction-progress: func(session-id: string, progress: compaction-progress);
   // Drains mid-turn user input (nudges / cancel) so a running turn can steer.
   poll-inbox: func(session-id: string) -> list<inbox-item>;
 
@@ -593,284 +490,6 @@ interface skills {
 
   /// Lints one skill, or the whole tree when `id` is empty.
   lint: func(id: string) -> list<skill-diagnostic>;
-}
-
-// Delegation: an agent spawning agents.
-//
-// A sub-agent is a child session with its own event log, context window and
-// turn loop, sharing the parent's worker process, branch and checkout. The
-// isolation that matters is of *context*: a child explores a subproblem and
-// hands back one answer, so the parent pays for the conclusion rather than for
-// every step that produced it.
-//
-// Two rules are structural rather than stylistic, and both are enforced by the
-// host in two places — by withholding the capability, and again at the call:
-//
-//   1. A sub-agent cannot spawn sub-agents. One level keeps fan-out bounded,
-//      accounting attributable and the transcript readable.
-//   2. A child never asks a question. Its only correspondent is a parent that
-//      is itself mid-turn, so a question would wait forever.
-//
-// Agent-only. A gateway shows sub-agents from the frames it already receives.
-interface delegation {
-  use types.{event-record};
-
-  record agent-profile-info {
-    id: string,
-    label: string,
-    description: string,
-    // Empty means the grip default.
-    model: string,
-    mode: string,
-  }
-
-  record delegation-limits {
-    // Ceiling on *live* children at once, not on children ever spawned.
-    max-children: u32,
-    // Longest a single wait may block, whatever the caller asks for.
-    max-wait-secs: u64,
-    // A child's answer is clamped to this before it reaches the parent.
-    max-result-bytes: u32,
-  }
-
-  record spawn-request {
-    // Short human name, shown in the parent's transcript and in the UI.
-    label: string,
-    // The brief. The child sees this and nothing else about why it exists, so
-    // it must carry the objective, the output format and the boundaries.
-    task: string,
-    // Profile id from configuration, or empty for a plain child.
-    profile: string,
-    // Overrides the profile's model. Empty to inherit.
-    model: string,
-    // Overrides the profile's mode. Empty to inherit.
-    mode: string,
-  }
-
-  record subagent-info {
-    id: string,
-    label: string,
-    task: string,
-    profile: string,
-    model: string,
-    mode: string,
-    // running | done | failed | cancelled
-    state: string,
-    // The child's final answer, once it has one. Clamped.
-    // Named `answer` rather than `result` because `result` is a WIT keyword.
-    answer: string,
-    // Why it failed, when it did.
-    detail: string,
-    cost-usd: f64,
-    created-ms: u64,
-    // 0 while still running.
-    finished-ms: u64,
-    // Live progress, filled in only while the child is running: how many
-    // events its log holds, and when it last appended one. Both are 0 once it
-    // has settled, and 0 is also what a caller sees if the read failed.
-    //
-    // They exist because the registry says nothing at all about a child until
-    // it finishes, so "working hard" and "wedged" rendered identically — and a
-    // parent with no way to tell them apart eventually cancels both.
-    events: u64,
-    activity-ms: u64,
-  }
-
-  record wait-result {
-    // Why the wait ended: a predicate description, or "timeout".
-    reason: string,
-    timed-out: bool,
-    // Every child of the caller, as it stands now — not only what matched.
-    children: list<subagent-info>,
-  }
-
-  /// Whether this session may delegate at all. False for a sub-agent, and
-  /// false when delegation is switched off in configuration.
-  available: func() -> bool;
-
-  /// The configured agent profiles a spawn may name.
-  profiles: func() -> list<agent-profile-info>;
-
-  limits: func() -> delegation-limits;
-
-  /// Creates a child session, briefs it, and starts its turn.
-  ///
-  /// Returns when the turn has been *started*, never when it finishes, so a
-  /// parent can fan out. Blocking delegation is spawn followed by `wait` on
-  /// that one child.
-  spawn: func(req: spawn-request) -> result<subagent-info, string>;
-
-  /// Every sub-agent this session has spawned, running or finished.
-  children: func() -> list<subagent-info>;
- 
-  /// Blocks the caller's turn until a predicate holds or the deadline passes.
-  ///
-  /// `until` is one of:
-  ///   time | duration     - sleep out the whole timeout
-  ///   all | all-children  - every named child has finished
-  ///   any | any-child     - one named child has finished
-  ///   first-failure       - a named child failed or was cancelled
-  ///
-  /// `children` names which to watch; empty means all of them. A wait always
-  /// has a deadline, capped by `max-wait-secs`: a wait that could run forever
-  /// is indistinguishable from a hung turn.
-  wait: func(until: string, children: list<string>, timeout-secs: u64)
-      -> result<wait-result, string>;
-
-  /// Stops one of this session's children.
-  cancel-child: func(child-id: string) -> result<subagent-info, string>;
-
-  /// A child's own event log, for when the final answer is not enough —
-  /// diagnosing a failure, usually. Scoped to this session's children.
-  child-transcript: func(child-id: string, from-seq: u64)
-      -> result<list<event-record>, string>;
-}
-
-// Reading and searching conversation logs, across the whole database.
-//
-// Every other route into the event log is scoped to one conversation:
-// `session.events` is pinned by the host to the session the call is for, and
-// `delegation.child-transcript` admits only the caller's own children. Those
-// scopes stop a worker writing into, forging events for, or draining the budget
-// of a conversation that is not its own.
-//
-// This interface is deliberately outside them, because what it offers is
-// recall — "have I solved this before", "what did that sub-agent actually
-// find", "which conversation was it where this build broke" — and none of those
-// can be answered from one log. Three properties make the wider read something
-// the host is willing to grant:
-//
-//   1. It is read-only. There is no append, no rename, no settle. A caller
-//      gains the ability to see another conversation and nothing else.
-//   2. It is bounded. Every function caps what it returns and reports when the
-//      answer is partial, so a scan cannot quietly exhaust a context window.
-//   3. Text is clipped host-side, so a log full of large tool results cannot
-//      turn one call into a multi-megabyte response.
-//
-// Agent-only. The chat surface already has the log through its own frames.
-interface transcripts {
-  /// One conversation as a catalogue entry.
-  ///
-  /// The sub-agent fields are empty strings for a top-level conversation rather
-  /// than being optional: a flat record is cheaper to read on both sides, and
-  /// "no label" and "empty label" mean the same thing here.
-  record conversation-summary {
-    id: string,
-    title: string,
-    mode: string,
-    /// Model override; empty means the grip default.
-    model: string,
-    preview: string,
-    created-ms: u64,
-    updated-ms: u64,
-    event-count: u64,
-    archived: bool,
-    /// True when this is a sub-agent's session rather than one a person began.
-    is-subagent: bool,
-    /// The session that spawned it; empty for a top-level conversation.
-    parent-id: string,
-    /// The top-level conversation it belongs to.
-    root-id: string,
-    /// The sub-agent's short label.
-    label: string,
-    /// running | done | failed | cancelled, for a sub-agent.
-    state: string,
-    /// The brief a sub-agent was given.
-    task: string,
-  }
-
-  /// One line of a transcript, projected from an event and already clipped.
-  record transcript-entry {
-    seq: u64,
-    ts-ms: u64,
-    /// user | assistant | tool-call | tool-result | tool-failed | nudge | note
-    /// | incident | modification | branch-op | turn-finished | compacted.
-    kind: string,
-    text: string,
-    /// Characters cut from `text`; 0 when it is whole. So a caller can say
-    /// "there was more" rather than quoting a sentence that stops mid-word as
-    /// though it were the whole record.
-    elided: u64,
-  }
-
-  record transcript-hit {
-    session-id: string,
-    title: string,
-    is-subagent: bool,
-    /// The sub-agent's label, so a hit in a child is attributable without a
-    /// second lookup.
-    label: string,
-    seq: u64,
-    ts-ms: u64,
-    kind: string,
-    /// The matching line, clipped.
-    text: string,
-  }
-
-  /// What a search found, and how sure it is that this is all of it.
-  record search-report {
-    hits: list<transcript-hit>,
-    /// Conversations with at least one match.
-    matched-conversations: u64,
-    /// Matches found, including any past the hit cap.
-    total-matches: u64,
-    /// Conversations actually opened.
-    scanned-conversations: u64,
-    /// True when the hit cap stopped the scan.
-    capped: bool,
-    /// True when a bound was reached before every conversation was read. The
-    /// scan is newest-first, so an incomplete answer is missing the oldest.
-    incomplete: bool,
-  }
-
-  record search-query {
-    /// Rust regex syntax. Prefix `(?i)` to ignore case.
-    pattern: string,
-    /// One conversation, or empty for every one.
-    session-id: string,
-    include-archived: bool,
-    include-subagents: bool,
-    /// Whether *successful* tool output is searched. Off is the useful default:
-    /// tool output is most of the bytes in a transcript and most of the noise,
-    /// and a pattern matching a file's contents matches it in every
-    /// conversation that ever read that file.
-    ///
-    /// Failed tool results are searched either way. They are short, and they
-    /// are what someone grepping for an error is looking for.
-    include-tool-output: bool,
-    /// 0 for the host default; clamped to the host's ceiling.
-    max-results: u64,
-    /// Characters per hit. 0 for the host default.
-    max-chars: u64,
-  }
-
-  /// Conversations, most recently active first.
-  ///
-  /// Sub-agents are excluded unless asked for: a busy database holds many more
-  /// child sessions than conversations, and mixing them buries the latter.
-  /// `limit` of 0 means all of them.
-  conversations: func(include-archived: bool, include-subagents: bool, limit: u64)
-      -> result<list<conversation-summary>, string>;
-
-  /// One conversation's own summary, sub-agent or not.
-  conversation: func(session-id: string) -> result<conversation-summary, string>;
-
-  /// The sub-agents under a conversation, whatever their depth.
-  ///
-  /// Unlike `delegation.children` this answers for any conversation, not only
-  /// the caller's, and reports a whole tree rather than one generation.
-  subagents: func(root-id: string) -> result<list<conversation-summary>, string>;
-
-  /// A window of one conversation's transcript, oldest first.
-  ///
-  /// `from-seq` is exclusive, matching `session.events`, so paging is
-  /// `from-seq = last seq seen`. `limit` and `max-chars` of 0 take the host
-  /// defaults; both are clamped to host ceilings.
-  read: func(session-id: string, from-seq: u64, limit: u64, max-chars: u64)
-      -> result<list<transcript-entry>, string>;
-
-  /// Searches transcripts for a regular expression, newest conversation first.
-  search: func(query: search-query) -> result<search-report, string>;
 }
 
 // The read-only view of the same corpus, for the chat surface.
@@ -972,38 +591,14 @@ interface hostfs {
 // A session keeps its working directory and shell state between commands,
 // which is what separates it from a one-shot exec.
 interface terminal {
-  use types.{terminal-output, terminal-info, terminal-open, ssh-host-info};
+  use types.{terminal-output, terminal-info};
 
   available: func() -> bool;
-  open: func(spec: terminal-open) -> result<string, string>;
-  // `background` returns as soon as the command is started; the session
-  // remembers it and `read` reports when it finished.
-  run: func(
-    id: string,
-    command: string,
-    timeout-ms: u32,
-    background: bool,
-  ) -> result<terminal-output, string>;
+  open: func(cwd: option<string>) -> result<string, string>;
+  run: func(id: string, command: string, timeout-ms: u32) -> result<terminal-output, string>;
   read: func(id: string) -> result<string, string>;
-  // Signals what the session is running, sparing the shell. Local sessions get
-  // a real signal; a remote one needs a pty, where the control byte is the
-  // signal.
-  signal: func(id: string, signal: string) -> result<string, string>;
-  // Raw input, with no marker and no wait: the way to answer a prompt or drive
-  // a REPL, which `run` cannot do because such a command never completes.
-  send: func(id: string, text: string, submit: bool) -> result<string, string>;
   close: func(id: string) -> result<string, string>;
   sessions: func() -> list<terminal-info>;
-
-  // The named-host registry, kept in a gitignored file that the config loader
-  // never reads — so it cannot be published by accident, and a bad entry
-  // cannot stop Thetis from starting.
-  ssh-available: func() -> bool;
-  ssh-hosts: func() -> result<list<ssh-host-info>, string>;
-  // `merge` keeps fields the caller left empty, for editing one at a time.
-  ssh-host-set: func(host: ssh-host-info, merge: bool) -> result<string, string>;
-  ssh-host-remove: func(name: string) -> result<string, string>;
-  ssh-host-rename: func(old-name: string, new-name: string) -> result<string, string>;
 }
 
 // Control over the orchestrator process itself.
@@ -1120,16 +715,6 @@ world agent {
   import terminal;
   import control;
   import configuration;
-  // Spawning agents. Only this world imports it: a sub-agent is itself an
-  // agent, so the one-level rule cannot be expressed by who gets the import
-  // and is enforced by the host instead — `available` answers false for a
-  // child, and `spawn` refuses one outright.
-  import delegation;
-  // Reading and searching conversation logs. Agent-only: the chat surface
-  // already receives the log through its own frames. Unlike every other route
-  // into the log this one is not scoped to the calling session, which is what
-  // makes recall across conversations possible — and why it is read-only.
-  import transcripts;
 
   // Runs one full agentic turn for a session. The agent is stateless across
   // turns: it rehydrates from the session log every time.
@@ -1167,27 +752,6 @@ world gateway {
   export on-client-message: func(client-id: string, frame-json: string) -> list<gateway-action>;
   export render-event: func(event: outbound-event) -> option<string>;
   export describe: func() -> gateway-manifest;
-}
-
-// Staging ground for an interface the host can answer before any guest asks.
-//
-// The orchestrator generates its `Host` traits from a world, so an interface no
-// world imports has no Rust to implement. That makes a contract addition
-// circular: the host cannot be ready first, which is the one ordering rule that
-// keeps a WIT change from taking the agent and the gateway down together.
-//
-// This world breaks the circle. It is compiled only by the host, so an
-// interface listed here becomes implementable and gets registered in the
-// agent's linker without any guest world mentioning it yet. Once the host is
-// live, the real world imports it and finds it already answered.
-//
-// Nothing exports from here and no guest builds it. Entries are temporary: an
-// interface graduates to the world that needs it.
-world host-staging {
-  // Empty. `delegation` and `transcripts` both graduated to `world agent` once
-  // the host was live. Leave the world here: the next contract addition needs
-  // the same staging step, and rediscovering why is more expensive than
-  // keeping four lines.
 }
 
 world tool {

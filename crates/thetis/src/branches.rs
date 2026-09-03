@@ -214,7 +214,10 @@ mod tests {
         std::fs::write(root.dir().join("file.txt"), "newer\n").unwrap();
         root.add_all_and_commit("newer").await.unwrap();
 
-        let row = branches.ensure("11112222-x", Some(&old)).await.unwrap();
+        let row = branches
+            .ensure("11112222-x", Some(&old))
+            .await
+            .unwrap();
         assert_eq!(row.base_commit, old);
         assert_eq!(
             std::fs::read_to_string(row.worktree.join("file.txt")).unwrap(),

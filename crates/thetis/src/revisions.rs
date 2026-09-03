@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::aspect::Aspect;
 use crate::config::Config;
 use crate::persist::Persist;
+use crate::aspect::Aspect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {

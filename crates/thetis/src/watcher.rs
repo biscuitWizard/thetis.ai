@@ -8,16 +8,17 @@
 use anyhow::{Context, Result};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::aspect::Aspect;
+
 use crate::config::Config;
 use crate::grip::Grip;
 use crate::pipeline;
 use crate::revisions::Origin;
+use crate::aspect::Aspect;
 
 pub type WatchHandle = Debouncer<notify::RecommendedWatcher, RecommendedCache>;
 
@@ -36,15 +37,6 @@ pub fn spawn(grip: Arc<Grip>) -> Result<WatchHandle> {
                 continue;
             }
             for path in &event.paths {
-                // Classifying the event is not enough on its own. A write that
-                // changes no bytes still arrives here as Modify(Data), so the
-                // only reliable question is whether the content differs from
-                // what we last saw. This is what stops a build — or anything
-                // else that rewrites a file with identical bytes — from
-                // triggering the rebuild that triggers it again.
-                if !content_changed(path) {
-                    continue;
-                }
                 aspects.extend(aspects_for_path(&cfg, path));
             }
         }
@@ -102,7 +94,8 @@ async fn rebuild(grip: &Arc<Grip>, aspect: &Aspect) {
     // The note says what is true of this build. It deliberately does not claim
     // the commit holds only this aspect: a checkpoint sweeps the whole worktree,
     // so the file that changed and the aspect that rebuilt need not match.
-    match pipeline::build_and_activate(grip, aspect, origin, "rebuilt after a change on disk").await
+    match pipeline::build_and_activate(grip, aspect, origin, "rebuilt after a change on disk")
+        .await
     {
         Ok(outcome) if outcome.success => {
             tracing::info!(
@@ -120,50 +113,6 @@ async fn rebuild(grip: &Arc<Grip>, aspect: &Aspect) {
             }
         }
         Err(e) => tracing::error!(%aspect, error = %e, "rebuild pipeline failed"),
-    }
-}
-
-/// Whether a path's bytes differ from the last time we looked.
-///
-/// Keyed by path, holding a hash rather than the content so a large tree costs
-/// little. A path seen for the first time counts as changed, which is right: a
-/// newly created file is a real edit. A path that cannot be read (deleted, or
-/// mid-rename) also counts as changed, so removals still rebuild.
-///
-/// This is deliberately a global rather than state threaded through `spawn`:
-/// the debouncer's callback is a plain `Fn` closure owned by the watcher
-/// thread, and one process watches one checkout.
-fn content_changed(path: &Path) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    static SEEN: OnceLock<Mutex<HashMap<std::path::PathBuf, u64>>> = OnceLock::new();
-
-    let Ok(bytes) = std::fs::read(path) else {
-        // Gone or unreadable: treat as a change and let the pipeline decide.
-        if let Some(map) = SEEN.get() {
-            if let Ok(mut map) = map.lock() {
-                map.remove(path);
-            }
-        }
-        return true;
-    };
-
-    // Not cryptographic: this only has to notice that bytes differ.
-    let digest = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        hasher.finish()
-    };
-
-    let map = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut map) = map.lock() else {
-        return true; // a poisoned lock must not silently stop rebuilds
-    };
-    match map.insert(path.to_path_buf(), digest) {
-        Some(previous) => previous != digest,
-        None => true,
     }
 }
 
@@ -235,11 +184,7 @@ fn source_roots(cfg: &Config) -> [(&Path, &String, fn(&str) -> Aspect); 2] {
     }
 
     [
-        (
-            cfg.paths.gateways.as_path(),
-            &cfg.paths.gateway_prefix,
-            gateway,
-        ),
+        (cfg.paths.gateways.as_path(), &cfg.paths.gateway_prefix, gateway),
         (cfg.paths.tools.as_path(), &cfg.paths.tool_prefix, tool),
     ]
 }
@@ -291,10 +236,7 @@ mod tests {
             vec![Aspect::Agent]
         );
         assert_eq!(
-            aspects_for_path(
-                &cfg,
-                Path::new("C:/proj/gateways/gateway-web/src/ui/app.js")
-            ),
+            aspects_for_path(&cfg, Path::new("C:/proj/gateways/gateway-web/src/ui/app.js")),
             vec![Aspect::gateway("web")]
         );
         assert_eq!(
@@ -305,14 +247,11 @@ mod tests {
 
     #[test]
     fn ignores_reads_so_a_build_cannot_retrigger_itself() {
-        use notify::event::{
-            AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, RemoveKind,
-        };
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, MetadataKind,
+                            RemoveKind};
 
         // What cargo generates just by reading the sources it compiles.
-        assert!(!is_source_change(&EventKind::Access(AccessKind::Open(
-            AccessMode::Any
-        ))));
+        assert!(!is_source_change(&EventKind::Access(AccessKind::Open(AccessMode::Any))));
         assert!(!is_source_change(&EventKind::Access(AccessKind::Read)));
         // A restore touches files; that is not an edit.
         assert!(!is_source_change(&EventKind::Modify(ModifyKind::Metadata(
@@ -320,49 +259,10 @@ mod tests {
         ))));
 
         // Real edits still rebuild.
-        assert!(is_source_change(&EventKind::Modify(ModifyKind::Data(
-            DataChange::Any
-        ))));
+        assert!(is_source_change(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
         assert!(is_source_change(&EventKind::Create(CreateKind::File)));
         assert!(is_source_change(&EventKind::Remove(RemoveKind::File)));
         assert!(is_source_change(&EventKind::Any));
-    }
-
-    #[test]
-    fn a_rewrite_with_identical_bytes_is_not_a_change() {
-        // The regression this guards: the builder used to dirty `src/lib.rs`
-        // before every build to force cargo to re-link. That emits an inotify
-        // MODIFY, which `is_source_change` correctly calls a source change —
-        // so the watcher rebuilt what had just been built, forever. Classifying
-        // the event cannot distinguish the two; only the content can.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let file = tmp.path().join("lib.rs");
-        std::fs::write(&file, b"fn main() {}").unwrap();
-
-        // First sighting of a path is a change: a new file is a real edit.
-        assert!(content_changed(&file), "a newly seen file must rebuild");
-
-        // Exactly what the touch hack did: open for write, bump mtime, no
-        // byte changed.
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&file)
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
-        assert!(
-            !content_changed(&file),
-            "a touch that changes no bytes must not trigger a rebuild"
-        );
-
-        // A real edit still gets through.
-        std::fs::write(&file, b"fn main() { todo!() }").unwrap();
-        assert!(content_changed(&file), "a real edit must rebuild");
-
-        // And settles again once seen.
-        assert!(!content_changed(&file));
-
-        // Deletion counts as a change, so a removed tool still deregisters.
-        std::fs::remove_file(&file).unwrap();
-        assert!(content_changed(&file), "a deleted file must rebuild");
     }
 
     #[test]

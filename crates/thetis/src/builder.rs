@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-use crate::aspect::Aspect;
 use crate::config::Config;
+use crate::aspect::Aspect;
 
 #[derive(Debug, Clone)]
 pub struct BuildOutcome {
@@ -107,21 +107,24 @@ impl Builder {
             ));
         }
 
-        // No source is touched here, and nothing may reintroduce that.
-        //
-        // This used to dirty `src/lib.rs` before every build to force a
-        // re-link, because every checkout compiled into one shared target
-        // directory and cargo only rewrites the output when *this* copy is
-        // dirty — so a "Fresh" build could hand back whichever checkout linked
-        // last. The fix for that is per-checkout target directories (a worker's
-        // `target_dir` now resolves against its own worktree), which removes
-        // the need entirely.
-        //
-        // The touch was also actively harmful: `open(write)` + `set_modified`
-        // emits an inotify MODIFY, indistinguishable from a real edit, so the
-        // file watcher rebuilt the aspect that had just been built, forever.
-        // Green trees escaped only via the pipeline's hash-identical
-        // short-circuit, and a failing tree spun cargo without limit.
+        // Force a re-link. Every checkout's copy of this crate writes the
+        // same output path in the shared target dir, and cargo only rewrites
+        // it when *this* copy is dirty — so a "Fresh" build here would hand
+        // back whichever checkout linked last, silently serving another
+        // branch's component as this one's. Dirtying one source file costs a
+        // few seconds of incremental rebuild and buys the guarantee that the
+        // artifact returned was built from the tree we were asked to build.
+        for entry in ["src/lib.rs", "src/main.rs"] {
+            let path = src.join(entry);
+            if path.is_file() {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                break;
+            }
+        }
+
         let mut cmd = tokio::process::Command::new(&cfg.build.command);
         cmd.current_dir(&src)
             .env("CARGO_TARGET_DIR", &cfg.build.target_dir)
@@ -198,43 +201,8 @@ impl Builder {
 /// `flock` blocks, so acquisition runs on the blocking pool; release is the
 /// kernel dropping the lock when the file closes, which makes a crashed
 /// holder impossible to deadlock on.
-pub struct FileLock {
-    /// Held for the lifetime of the lock: closing it is what releases the
-    /// flock, and truncating it on the way out is what stops the file naming
-    /// whoever held it last. Without that, `/admin/waits` reported a build in
-    /// progress for hours after the last one finished.
-    file: std::fs::File,
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // Truncate rather than delete: the next `acquire` opens this path and
-        // would race a deletion. An empty file is unambiguously "nobody".
-        use std::io::{Seek, Write};
-        let _ = self.file.set_len(0);
-        let _ = self.file.rewind();
-        let _ = self.file.flush();
-    }
-}
-
-/// Whether anyone holds the lock at `path` right now.
-///
-/// Asks the kernel rather than trusting the pid written in the file: a holder
-/// that was killed leaves the pid behind, and a diagnostic page that reports
-/// that as a live build sends whoever is reading it after a process that
-/// exited hours ago. Taking the lock to find out is safe — it is released
-/// before this returns, and a builder waiting on it polls every 250ms.
-pub fn lock_is_held(path: &std::path::Path) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) else {
-        // No file means no lock has ever been taken here.
-        return false;
-    };
-    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if taken {
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    }
-    !taken
+struct FileLock {
+    _file: std::fs::File,
 }
 
 impl FileLock {
@@ -246,7 +214,7 @@ impl FileLock {
     /// deadline at all, so a worker waiting here was unreachable for as long
     /// as the holder took, with its stop button dead and the gateway's
     /// readiness timer running.
-    pub async fn acquire(path: &std::path::Path, limit: Duration) -> Result<Option<Self>> {
+    async fn acquire(path: &std::path::Path, limit: Duration) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -263,10 +231,8 @@ impl FileLock {
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc == 0 {
                 // Who is holding it, for whoever has to diagnose a stall.
-                // Cleared again by `Drop`, so the name outlives the hold by
-                // nothing.
                 let _ = std::fs::write(path, format!("{}\n", std::process::id()));
-                return Ok(Some(Self { file }));
+                return Ok(Some(Self { _file: file }));
             }
             let err = std::io::Error::last_os_error();
             if !matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK)) {
@@ -341,50 +307,5 @@ mod tests {
         let out = trim_diagnostics(&raw);
         assert!(out.len() < 14_000, "was {}", out.len());
         assert!(out.contains("truncated"));
-    }
-
-    fn lock_path() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("thetis-lock-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("build.lock")
-    }
-
-    // The file names its holder so a stalled build can be traced to a pid.
-    // Left there after release it names a process that finished — or died —
-    // and `/admin/waits` reported that as a build in progress for hours.
-    #[tokio::test]
-    async fn releasing_the_lock_stops_it_naming_a_holder() {
-        let path = lock_path();
-        {
-            let held = FileLock::acquire(&path, Duration::from_secs(1))
-                .await
-                .unwrap()
-                .expect("a fresh lock is free");
-            let written = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(written.trim(), std::process::id().to_string());
-            assert!(lock_is_held(&path), "it is held while the guard lives");
-            drop(held);
-        }
-        assert!(
-            std::fs::read_to_string(&path).unwrap().trim().is_empty(),
-            "a released lock names nobody"
-        );
-        assert!(!lock_is_held(&path), "and nothing holds it");
-    }
-
-    // Probing must not take the lock away from whoever asks next.
-    #[tokio::test]
-    async fn probing_a_free_lock_leaves_it_free() {
-        let path = lock_path();
-        assert!(!lock_is_held(&path), "no file yet means nobody holds it");
-        let _ = std::fs::write(&path, "");
-        assert!(!lock_is_held(&path));
-        assert!(
-            FileLock::acquire(&path, Duration::from_secs(1))
-                .await
-                .unwrap()
-                .is_some(),
-            "the probe released what it took"
-        );
     }
 }

@@ -15,7 +15,7 @@
  */
 
 import { el } from "../lib/dom.js";
-import { store, denied } from "../lib/store.js";
+import { store } from "../lib/store.js";
 
 const ROW = 22; // px per commit row
 const LANE_BRANCH = 14;
@@ -46,11 +46,6 @@ export function mountBranch({ onMerge, onUpdate, onHistory, onResolve, onAbort, 
 
     const materialized = Boolean(branch?.materialized && graph.branch_name);
     const conflicted = branch?.state === "conflict";
-    // A role may look at the branch and not change it. The host refuses the
-    // mutating frames regardless; leaving the buttons out is so the tab does
-    // not offer what it will then refuse.
-    const canWrite = !denied("branch_write");
-    const withheld = () => el("div", { class: "branch-note" }, "Branch changes are withheld by your role.");
     const parts = [];
 
     // --- header -----------------------------------------------------------
@@ -83,19 +78,17 @@ export function mountBranch({ onMerge, onUpdate, onHistory, onResolve, onAbort, 
           el("div", { class: "branch-conflict-head" }, `Merge conflict — ${files.length} file${files.length === 1 ? "" : "s"}`),
           ...files.slice(0, 4).map((f) => el("div", { class: "branch-conflict-file", title: f }, f)),
           files.length > 4 ? el("div", { class: "branch-note" }, `…and ${files.length - 4} more`) : null,
-          canWrite
-            ? el(
-                "div",
-                { class: "branch-actions" },
-                el("button", { type: "button", class: "ghost-btn is-primary",
-                  onClick: (event) => onResolve(event.currentTarget),
-                  title: "Hand the conflict to this conversation; the agent resolves it and completes the merge" },
-                  "Resolve in conversation"),
-                el("button", { type: "button", class: "ghost-btn is-danger",
-                  onClick: (event) => onAbort(event.currentTarget),
-                  title: "Abandon the merge and restore the pre-merge state" }, "Abort")
-              )
-            : withheld()
+          el(
+            "div",
+            { class: "branch-actions" },
+            el("button", { type: "button", class: "ghost-btn is-primary",
+              onClick: (event) => onResolve(event.currentTarget),
+              title: "Hand the conflict to this conversation; the agent resolves it and completes the merge" },
+              "Resolve in conversation"),
+            el("button", { type: "button", class: "ghost-btn is-danger",
+              onClick: (event) => onAbort(event.currentTarget),
+              title: "Abandon the merge and restore the pre-merge state" }, "Abort")
+          )
         )
       );
     } else if (!materialized) {
@@ -103,12 +96,6 @@ export function mountBranch({ onMerge, onUpdate, onHistory, onResolve, onAbort, 
         el("div", { class: "branch-note" },
           "This conversation will fork from trunk at its first message — click a commit to start from there instead.")
       );
-    } else if (!canWrite) {
-      const actions = el("div", { class: "branch-actions" });
-      actions.append(
-        el("button", { type: "button", class: "ghost-btn", title: "The full history, with details", onClick: onHistory }, "History…")
-      );
-      parts.push(withheld(), actions);
     } else {
       const actions = el("div", { class: "branch-actions" });
       const mergeReady = branch.ahead > 0 && branch.behind === 0;

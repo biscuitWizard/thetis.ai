@@ -15,21 +15,4 @@ fn the_registration_payload_is_well_formed() {
     let names: Vec<&str> = commands.iter().map(|c| c["name"].as_str().unwrap()).collect();
     let unique: std::collections::BTreeSet<_> = names.iter().collect();
     assert_eq!(unique.len(), names.len(), "command names must be unique: {names:?}");
-
-    // Every command must name its contexts. Omitting them registers fine and
-    // then never appears in the picker, which is the failure this test exists
-    // to keep from coming back. See `discord::commands::schema`.
-    for command in commands {
-        let name = command["name"].as_str().unwrap();
-        assert_eq!(
-            command["contexts"],
-            serde_json::json!([0, 1]),
-            "/{name} must name GUILD and BOT_DM explicitly"
-        );
-        assert_eq!(
-            command["integration_types"],
-            serde_json::json!([0]),
-            "/{name} must be guild-install only"
-        );
-    }
 }

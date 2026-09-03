@@ -725,27 +725,7 @@ pub fn user_label(user: &Value, names: &BTreeMap<String, String>) -> String {
     }
 }
 
-/// How to narrow a body that does not fit: a window, or a search.
-///
-/// Without this a long page was simply unreadable past the first 18,000
-/// characters — the note said the text was cut and offered nothing to do about
-/// it. A Notion page has no line numbers a caller can trust, so the window is
-/// measured in characters, and the footer reports the offset to resume from.
-#[derive(Default, Clone, Copy)]
-pub struct BodyWindow<'a> {
-    /// First character to return, counting from 0.
-    pub offset: usize,
-    /// How many characters to return. Zero means the default budget.
-    pub limit: usize,
-    /// Return only the paragraphs containing this text, instead of a window.
-    pub find: Option<&'a str>,
-}
-
 pub fn markdown_body(response: &Value) -> String {
-    markdown_body_window(response, BodyWindow::default())
-}
-
-pub fn markdown_body_window(response: &Value, window: BodyWindow<'_>) -> String {
     let markdown = response
         .get("markdown")
         .and_then(Value::as_str)
@@ -753,11 +733,7 @@ pub fn markdown_body_window(response: &Value, window: BodyWindow<'_>) -> String 
     // Shorten before clipping, so the budget is spent on prose rather than on
     // AWS signatures.
     let markdown = shorten_signed_urls(markdown);
-
-    let mut out = match window.find {
-        Some(needle) => find_in_body(&markdown, needle),
-        None => window_of_body(&markdown, window.offset, window.limit),
-    };
+    let mut out = clip_note(&markdown, MAX_MARKDOWN_CHARS);
 
     if response.get("truncated").and_then(Value::as_bool) == Some(true) {
         out.push_str(
@@ -784,92 +760,6 @@ pub fn markdown_body_window(response: &Value, window: BodyWindow<'_>) -> String 
         ));
     }
     out
-}
-
-/// How much of a page to echo back after writing to it.
-///
-/// A write tool returns the page so the caller can see the edit landed. That is a
-/// confirmation, not a read: echoing a whole long page after appending one line
-/// spends thousands of tokens to answer a yes/no question. So the echo is small
-/// and names the tool that does reading properly.
-const PREVIEW_CHARS: usize = 4_000;
-
-/// The body of a page after a write, capped as a confirmation rather than a read.
-pub fn markdown_body_preview(response: &Value) -> String {
-    let markdown = response
-        .get("markdown")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let markdown = shorten_signed_urls(markdown);
-    let total = markdown.chars().count();
-
-    if total <= PREVIEW_CHARS {
-        return markdown;
-    }
-    let kept: String = markdown.chars().take(PREVIEW_CHARS).collect();
-    format!(
-        "{kept}\n\n[{PREVIEW_CHARS} of {total} characters shown — this is a confirmation of the \
-write, not the whole page. Read the rest with notion-page-get, which takes \
-content_offset/content_limit and find.]"
-    )
-}
-
-/// Returns a character window of a body, with a footer naming the next offset.
-///
-/// The footer goes last and always states the truth about what was returned,
-/// because that is the line the caller needs in order to continue.
-fn window_of_body(text: &str, offset: usize, limit: usize) -> String {
-    let total = text.chars().count();
-    let limit = if limit == 0 { MAX_MARKDOWN_CHARS } else { limit.min(MAX_MARKDOWN_CHARS) };
-
-    if offset >= total && total > 0 {
-        return format!("[offset {offset} is past the end; this page has {total} characters]");
-    }
-
-    let kept: String = text.chars().skip(offset).take(limit).collect();
-    let end = offset + kept.chars().count();
-
-    if offset == 0 && end >= total {
-        return kept;
-    }
-    let mut out = kept;
-    out.push_str(&format!(
-        "\n\n[characters {offset}-{end} of {total}. Read on with offset {end}, \
-or pass find to jump to the part you want.]"
-    ));
-    out
-}
-
-/// Returns the paragraphs of a body containing `needle`, with their offsets.
-///
-/// This is the cheaper question most callers actually have: they want the one
-/// section that mentions something, not the first N characters of the page.
-fn find_in_body(text: &str, needle: &str) -> String {
-    let folded = needle.to_lowercase();
-    let mut hits = Vec::new();
-    let mut at = 0usize;
-
-    for para in text.split("\n\n") {
-        let chars = para.chars().count();
-        if para.to_lowercase().contains(&folded) {
-            hits.push(format!("[at character {at}]\n{}", para.trim_end()));
-        }
-        // +2 for the blank line the split consumed.
-        at += chars + 2;
-    }
-
-    if hits.is_empty() {
-        let total = text.chars().count();
-        return format!(
-            "[no paragraph contains {needle:?} in {total} characters. \
-Omit find and read with offset/limit to page through the page instead.]"
-        );
-    }
-
-    let count = hits.len();
-    let joined = hits.join("\n\n");
-    let body = clip_note(&joined, MAX_MARKDOWN_CHARS);
-    format!("[{count} matching paragraph(s) for {needle:?}]\n\n{body}")
 }
 
 /// A footer stating how much of a list was seen and how to see the rest. An

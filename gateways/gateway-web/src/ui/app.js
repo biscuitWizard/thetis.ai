@@ -4,18 +4,17 @@
  * user does is submitted to the host and comes back as an event, so several
  * tabs on one conversation stay in step with no client-side reconciliation.
  *
- * The shell is three zones. The sidebar is navigation only; the middle is a
- * tabbed stage whose first tab is always the conversation, with a tab per
- * sub-agent and per open file after it; every inspector — Branch, Files,
- * Context, Skills, Tools, Models — is a tab in the persistent rail on the
- * right, which docks beside the stage instead of covering it.
+ * The shell is three zones. The sidebar is navigation only; the middle is the
+ * conversation; every inspector — Branch, Files, Context, Skills, Tools,
+ * Models — is a tab in the persistent rail on the right, which docks beside
+ * the chat instead of covering it.
  *
  * This file only wires pieces together. Behaviour lives in views/ and lib/.
  */
 
-import { $, clear, el, setHidden } from "./lib/dom.js";
+import { $, clear, el } from "./lib/dom.js";
 import { Connection } from "./lib/socket.js";
-import { store, denied } from "./lib/store.js";
+import { store } from "./lib/store.js";
 import { toast, popover } from "./lib/toast.js";
 import { mountBranch } from "./views/branch.js";
 import { mountComposer } from "./views/composer.js";
@@ -23,13 +22,9 @@ import { mountSessions } from "./views/sessions.js";
 import * as workspace from "./views/workspace.js";
 import * as panel from "./views/panel.js";
 import * as rail from "./views/rail.js";
-import * as todoView from "./views/todo.js";
-import * as stage from "./views/stage.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
 import * as transcript from "./views/transcript.js";
-import * as avatars from "./views/avatars.js";
-import { mountTerminals } from "./views/terminal.js";
 
 // --- status -----------------------------------------------------------------
 
@@ -57,28 +52,6 @@ store.watch("pending", (pending) => {
 
 // --- connection -------------------------------------------------------------
 
-// A configured avatar is an arbitrary URL, so it can 404, be blocked, or point
-// at something that is not an image. The brand is the first thing on screen and
-// must not degrade to a broken-image glyph: fall back to the built-in mark,
-// which is always in the markup for exactly this reason.
-//
-// Two bugs were in here, both of the silent kind. The ids were "#"-prefixed
-// but `$` is getElementById, so the lookup found nothing and the function
-// returned before registering anything. And the mark is an <svg>, which does
-// not inherit the `hidden` IDL attribute — `mark.hidden = false` would have set
-// a dead JS property, leaving the mark hidden even once it was needed. Hence
-// setHidden, which goes through the attribute.
-function wireAvatar() {
-  const img = $("brand-avatar");
-  const mark = $("brand-mark");
-  if (!img || !mark) return;
-  img.addEventListener("error", () => {
-    setHidden(img, true);
-    setHidden(mark, false);
-  });
-}
-wireAvatar();
-
 const connection = new Connection({
   onStatus: (state, text) => {
     // A dropped socket cannot be carrying a submission any more, and leaving
@@ -89,143 +62,23 @@ const connection = new Connection({
   },
 });
 
-// The turn avatars and the sidebar's avatar button. Mounted before the frame
-// handlers, which route `user-avatar` into it, and before the transcript, which
-// asks it for a tile per turn.
-// `id` is the open conversation on every frame on this socket, and the host
-// needs it to fan a change out to the other tabs watching this conversation —
-// so it is added here rather than made the view's business.
-avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame }));
-
 connection.onOpen(() => {
   connection.send({ type: "hello" });
-  // The "everyone's conversations" switch lives on the socket's principal,
-  // so a reconnect starts personal again; put it back before the sidebar
-  // draws a list that quietly lost half its rows.
-  if (store.viewAll) connection.send({ type: "list", all: true });
   if (store.current) connection.send({ type: "open", id: store.current });
-  // `hello` already replies with the stored avatar, but it is asked for
-  // explicitly too: another tab can have changed it while this socket was down,
-  // and a broadcast sent then reached nobody here.
-  avatars.request();
 });
-
-// Mounted before the frame handlers below, which refer to it. The drawer asks
-// for its own list rather than being told: a reconnect, a conversation switch
-// and a newly opened shell all funnel through the same request.
-const terminals = mountTerminals({
-  // The drawer asks for the list whenever a conversation opens. Not for a
-  // role that is denied terminals: the host would answer every open with an
-  // error toast, for a drawer they cannot use.
-  onRequest: (id) => {
-    if (!denied("terminal")) connection.send({ type: "terminals", id });
-  },
-  // `id` is the conversation everywhere on this socket, so the shell goes in
-  // its own field rather than overloading it.
-  onKill: (terminal) =>
-    connection.send({ type: "terminal-close", id: store.current, terminal }),
-});
-
-/* The centre stage's tab strip. Mounted before the transcript, which opens a
- * pane for every sub-agent on its first frame, and before the frame handlers,
- * which route `workspace-file` into the editor tabs. */
-const centre = stage.mountStage({
-  sendFrame: (frame) => connection.send(frame),
-  onRename: (title) => {
-    connection.send({ type: "rename", id: store.current, title });
-    store.set({ title });
-    setHeader();
-  },
-  onRevealInline: (id) => revealInlineAgent(id),
-});
-
-/* Shows a sub-agent's work in the conversation itself, rather than in its tab.
- *
- * Goes through the transcript instead of querying the DOM for the block: the
- * inline copy's rows are built lazily, and `revealAgent` materialises them
- * before anything measures where to scroll. Both callers — the sidebar row when
- * the tab has gone, and the "Show in conversation" button on a sub-agent tab —
- * need identical behaviour, so it lives here once. */
-function revealInlineAgent(id) {
-  centre.show("chat");
-  const block = transcript.revealAgent(id);
-  if (!block) {
-    toast("That sub-agent's output is no longer on screen.", { tone: "error" });
-    return;
-  }
-  block.scrollIntoView({ behavior: "smooth", block: "center" });
-  block.classList.add("is-flashed");
-  setTimeout(() => block.classList.remove("is-flashed"), 1200);
-}
-
-// A reconnect replays `open` for the same conversation, which `setSession`
-// short-circuits — so the drawer would keep whatever it had from before the
-// socket dropped, having missed every feed frame in between. Re-ask here.
-connection.onOpen(() => {
-  // Not for someone whose role withholds terminals: the host would answer
-  // every open with an error toast, for a drawer they cannot use.
-  if (store.current && !denied("terminal")) connection.send({ type: "terminals", id: store.current });
-});
-
-// The "everyone's conversations" switch. Host-enforced: the frame flips a
-// per-connection flag on the principal, and `list_sessions` reads it. The
-// button only appears for a role that grants `see_all_sessions`.
-$("see-all")?.addEventListener("click", () => {
-  const on = !store.viewAll;
-  if (!connection.send({ type: "list", all: on })) {
-    return toast("Not connected.", { tone: "error" });
-  }
-  applyViewAll(on);
-});
-
-function applyViewAll(on) {
-  store.set({ viewAll: on });
-  const button = $("see-all");
-  if (!button) return;
-  button.setAttribute("aria-pressed", on ? "true" : "false");
-  button.title = on ? "Showing everyone's conversations — click for just yours" : "Show everyone's conversations";
-}
 
 connection
-  /* Who this socket is for. The host sends it before anything else, so every
-   * view can ask `store.user` when it draws. Everything identity-shaped on
-   * screen follows from here: the footer, the admin link, the logout form,
-   * the see-all switch, and which rail tabs exist at all. */
-  .on("user", (frame) => {
-    store.set({ user: frame });
-    const name = $("user-name");
-    if (name) {
-      name.textContent = frame.local ? "" : frame.name || frame.id || "";
-      name.title = frame.local ? "" : `Signed in as ${frame.id}${frame.role ? ` (${frame.role})` : ""}`;
-    }
-    setHidden($("admin-link"), !frame.admin);
-    setHidden($("logout"), Boolean(frame.local));
-    setHidden($("see-all"), !frame.see_all);
-    applyViewAll(Boolean(frame.see_all && frame.viewing_all));
-    // A tab for something the role withholds is not offered. The host refuses
-    // the frames anyway; this is so the refusal is never the first thing seen.
-    rail.setTabHidden("workspace", frame.workspace === "none");
-    rail.setTabHidden("branch", false);
-    if (frame.read_only) {
-      document.body.classList.add("is-read-only");
-    } else {
-      document.body.classList.remove("is-read-only");
-    }
-  })
-
   .on("catalog", (frame) => {
     store.set({
       models: frame.models || [],
       modelsHidden: frame.models_hidden || [],
       modes: frame.modes || [],
-      modelsRestricted: Boolean(frame.restricted),
     });
     // The catalogue is the panel's whole content, so a change made in any tab
     // redraws it here. The picker follows through its own `models` watcher.
     if (rail.isOpen("models")) drawModels();
     setHeader();
   })
-
 
   .on("sessions", (frame) => {
     store.set({ sessions: frame.sessions || [] });
@@ -264,7 +117,6 @@ connection
       branchLog: [],
       baseRevision: "",
       branchView: "graph",
-      todos: null,
       hasMessages: events.some((e) => e.kind === "user"),
     });
     setHeader();
@@ -285,29 +137,12 @@ connection
     // The rail persists across conversations, so whatever tab is open follows
     // to the one now on screen.
     refreshOpenTab();
-    // The drawer belongs to the conversation, so it drops the previous one's
-    // emulators and asks for this one's shells.
-    terminals.setSession(frame.session);
-    // And whether this conversation has a plan. Asked on every open rather than
-    // only when a tab is showing, because the plan's tab existing *is* how the
-    // user finds out there is one.
-    connection.send({ type: "plan", id: frame.session });
-    connection.send({ type: "todo", id: frame.session });
   })
 
   .on("settings", (frame) => {
     if (frame.session !== store.current) return;
     store.set({ mode: frame.mode || "agent", model: frame.model || "" });
     setHeader();
-  })
-
-  // The plan document. Owned by the stage, which opens or closes its tab from
-  // this frame — so a conversation with a plan shows it on reload, and one
-  // without never carries the previous conversation's tab over.
-  .on("plan", stage.onPlan)
-  .on("todo", (frame) => {
-    if (frame.session !== store.current) return;
-    todoView.onFrame(frame);
   })
 
   .on("opened", (frame) => store.set({ current: frame.session }))
@@ -348,24 +183,11 @@ connection
     if (frame.kind === "branch-op" || frame.kind === "turn-finished" || frame.kind === "modification") {
       connection.send({ type: "branch-status", id: store.current });
     }
-    // A plan tool that ran means the document moved. Keyed off the tool's name
-    // rather than off `turn-finished` so the tab tracks a plan being built up
-    // step by step during a long turn, which is exactly when the user is
-    // watching it.
-    if (frame.kind === "tool-result" && PLAN_TOOLS.includes(frame.name)) {
-      connection.send({ type: "plan", id: store.current });
-    }
-    if (frame.kind === "tool-result" && TODO_TOOLS.includes(frame.name)) {
-      connection.send({ type: "todo", id: store.current });
-    }
     transcript.applyEvent(frame);
     invalidate(frame.kind);
   })
 
   .on("system-status", statusbar.onFrame)
-
-  // The user's stored picture, on `hello` and after any tab changes it.
-  .on("user-avatar", avatars.onFrame)
 
   .on("skills", (frame) => {
     if (frame.session !== store.current) return;
@@ -380,14 +202,7 @@ connection
 
   .on("tools", (frame) => {
     if (frame.session !== store.current) return;
-    store.set({
-      tools: frame.tools || [],
-      toolGroups: frame.groups || [],
-      toolGroupsActive: frame.active || [],
-      toolGroupReasons: frame.reasons || {},
-      toolGroupingOn: frame.grouping === true,
-      toolGroupsRouted: frame.routed === true,
-    });
+    store.set({ tools: frame.tools || [] });
     if (rail.isOpen("tools")) drawTools();
   })
 
@@ -415,52 +230,11 @@ connection
     if (rail.isOpen("branch") && store.branchView === "history") drawBranchHistory();
   })
 
-  /* Workspace frames feed two surfaces: the Files tab, and the composer's
-   * @-mention index. Both get every frame rather than one claiming it — the
-   * explorer ignores listings for a directory it is not showing, and the
-   * mention index is crawling directories the explorer knows nothing about, so
-   * routing by path would need a registry neither of them wants to keep. */
-  .on("workspace-list", (frame) => {
-    workspace.onList(frame);
-    composer.mentions.onList(frame);
-  })
-  // Fuzzy path search for the composer's `@` menu. Answered host-side from a
-  // cached walk: the shared workspace is far too large to index in a browser.
-  .on("workspace-find", (frame) => composer.mentions.onFind(frame))
-  // Read replies feed the rail's preview and any editor tab on the stage. The
-  // stage ignores a path it did not ask for, so a single click in Files cannot
-  // stamp over an open editor's draft.
-  .on("workspace-file", (frame) => {
-    workspace.onFile(frame);
-    stage.onFile(frame);
-  })
-  .on("workspace-result", (frame) => {
-    workspace.onResult(frame);
-    stage.onResult(frame);
-    composer.mentions.onResult(frame);
-  })
+  .on("workspace-list", workspace.onList)
+  .on("workspace-file", workspace.onFile)
+  .on("workspace-result", workspace.onResult)
 
   .on("debug-request", context.onFrame)
-
-  // The shells this conversation has open, in full: sent on opening a
-  // conversation and whenever one is created or reaped.
-  .on("terminals", terminals.onList)
-  // One piece of live shell activity — a command, a burst of output, an exit.
-  // Pushed by the worker as it happens rather than polled: watching a build
-  // scroll is the entire point of the drawer.
-  .on("terminal", terminals.onFeed)
-  // The outcome of the drawer's own kill button. The list is not rebuilt from
-  // this: the `closed` feed event that follows is what removes the row, so a
-  // shell killed from another tab disappears the same way. This only has to
-  // report a failure, since success is already visible.
-  .on("terminal-close", (frame) => {
-    if (frame.session && frame.session !== store.current) return;
-    if (!frame.ok) {
-      toast(frame.message || `Could not close ${frame.id || "that shell"}.`, { tone: "error" });
-    } else if (frame.note) {
-      toast(frame.note, { tone: "info" });
-    }
-  })
 
   .on("turn-cancel", (frame) => {
     if (frame.session && frame.session !== store.current) return;
@@ -500,12 +274,7 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan|todo)/.test(frame.message || "")) return;
-    // A refusal from Execute belongs on the plan tab, beside the button that
-    // caused it, rather than in a toast that outlives the view it refers to.
-    if (frame.replying_to === "plan-execute" && stage.onPlanError(frame.message || "That was refused.")) {
-      return;
-    }
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive)/.test(frame.message || "")) return;
     // An error naming the frame it answers is that frame's verdict. A `send`
     // that reached the host and then failed — a worker that will not start,
     // say — arrives exactly this way, and the composer is locked behind an
@@ -646,27 +415,12 @@ const INVALIDATED_BY = {
   context: ["assistant", "turn-finished"],
   tools: ["modification", "turn-finished"],
   skills: ["modification", "turn-finished"],
-  todo: ["tool-result", "turn-finished"],
 };
-
-/** Tools whose result means the plan document has changed. Kept in step with
- *  the `plan_*` family in `agents/agent-core/src/tools.rs`. */
-const PLAN_TOOLS = ["plan_write", "plan_edit", "plan_append"];
-const TODO_TOOLS = ["todo_write", "todo_add", "todo_update"];
-
-/** Event kinds after which the composer's @-mention index cannot be trusted. */
-const MENTION_STALED_BY = ["tool-result", "modification", "turn-finished"];
 
 const INVALIDATE_COALESCE_MS = 500;
 let invalidateTimer = null;
 
 function invalidate(kind) {
-  /* The @-mention index is a derived view too (rule 8), but it is not a rail
-   * tab and it must not be refreshed on a timer: it is only read when someone
-   * types `@`. So it is marked stale here and re-crawled on demand, whichever
-   * tab is open — otherwise the menu would offer files a turn ago deleted. */
-  if (MENTION_STALED_BY.includes(kind)) composer.mentions.invalidate();
-
   if (!INVALIDATED_BY[rail.activeTab()]?.includes(kind)) return;
   clearTimeout(invalidateTimer);
   invalidateTimer = setTimeout(() => {
@@ -685,9 +439,6 @@ function invalidate(kind) {
         break;
       case "skills":
         if (store.current) connection.send({ type: "skills", id: store.current });
-        break;
-      case "todo":
-        if (store.current) connection.send({ type: "todo", id: store.current });
         break;
     }
   }, INVALIDATE_COALESCE_MS);
@@ -810,167 +561,70 @@ function drawSkills() {
   });
 }
 
-/* Which tool groups the user has unfolded. Groups open collapsed — a dozen
- * domains of paragraph-length descriptions is not a scannable list — and this
- * set survives the redraws that `INVALIDATED_BY` triggers, so a group the user
- * opened does not snap shut when the agent builds a tool. */
-const openToolGroups = new Set();
+// The domains tools are grouped into, in the order the panel shows them, each
+// with a sentence saying what the group covers. A tool whose group is not in
+// this list (a connected MCP tool, say) still appears — after these, by name.
+const TOOL_GROUP_ORDER = [
+  "Files",
+  "Shell",
+  "Code & tools",
+  "Version control",
+  "Skills",
+  "Memory",
+  "Configuration",
+  "Web",
+  "Notion",
+  "Other",
+];
 
-/* Sends a new active set and waits for the reply.
- *
- * The host answers with the whole `tools` frame rather than an acknowledgement,
- * so the panel redraws from what the store now holds rather than from what this
- * hoped it wrote. That matters here because the agent repairs the pin on read —
- * always-on groups are forced back in — so an optimistic update could show a
- * state that will not survive the next turn.
- */
-function setToolGroups(ids) {
-  connection.send({ type: "tool-groups-set", id: store.current, groups: ids });
-}
+const TOOL_GROUP_NOTE = {
+  Files: "Reading and writing files — the shared workspace and the sandbox filesystem.",
+  Shell: "Running commands and interactive terminal sessions in the sandbox.",
+  "Code & tools": "Editing its own source and tools, managing dependencies, and restarting the orchestrator.",
+  "Version control": "The conversation's sandbox branch — status, history, updating from trunk and merging back.",
+  Skills: "Finding, reading, writing and linting skills.",
+  Memory: "Durable notes this conversation can set and recall later.",
+  Configuration: "Reading and changing settings.",
+  Web: "Searching the web and fetching page content.",
+  Notion: "Reading and writing a Notion workspace — pages, databases and comments.",
+  Other: "Tools outside the named domains, including anything a connected server provides.",
+};
 
 function drawTools() {
   const tools = store.tools || [];
-  const groups = store.toolGroups || [];
-  const active = new Set(store.toolGroupsActive || []);
-  const reasons = store.toolGroupReasons || {};
-  const grouping = store.toolGroupingOn === true;
-  const routed = store.toolGroupsRouted === true;
 
-  // Bucket by the group the agent's own table puts each tool in. Table order is
-  // the panel's order: it is already the order the tool block is serialised in,
-  // so the panel reads the way the prompt does.
+  // Bucket by the group the host tagged each tool with, then lay the buckets
+  // out in a fixed domain order so the surface reads the same every time; any
+  // unexpected group falls in after the known ones, alphabetically.
   const byGroup = new Map();
   for (const tool of tools) {
-    const id = tool.group || "extra";
-    if (!byGroup.has(id)) byGroup.set(id, []);
-    byGroup.get(id).push(tool);
+    const group = tool.group || "Other";
+    if (!byGroup.has(group)) byGroup.set(group, []);
+    byGroup.get(group).push(tool);
   }
-
-  // Groups the table declares but this mode has no tools for — every BigQuery
-  // tool in a read-only mode, say — are still listed, because "attached and
-  // empty" and "not attached" are different states and a panel that showed only
-  // populated groups could not tell them apart.
   const ordered = [
-    ...groups.map((g) => g.id),
-    ...[...byGroup.keys()].filter((id) => !groups.some((g) => g.id === id)).sort(),
+    ...TOOL_GROUP_ORDER.filter((g) => byGroup.has(g)),
+    ...[...byGroup.keys()].filter((g) => !TOOL_GROUP_ORDER.includes(g)).sort(),
   ];
 
-  const blocks = ordered.map((id) => {
-    const group = groups.find((g) => g.id === id) || { id, brief: "", always_on: false };
-    const items = byGroup.get(id) || [];
-    const attached = active.has(id);
-    const locked = group.always_on === true;
-
-    return panel.collapsibleSection(
-      {
-        title: group.id,
-        mono: true,
-        count: items.length,
-        note: group.brief,
-        open: openToolGroups.has(id),
-        onToggle: (open) => {
-          if (open) openToolGroups.add(id);
-          else openToolGroups.delete(id);
-        },
-        // No switches until the agent has published a table: without one there
-        // is no group vocabulary, so a press could only guess at ids.
-        aside: grouping && groups.length
-          ? panel.toolGroupAside(group, {
-              attached,
-              reason: reasons[id],
-              locked,
-              onToggle: (attach) => {
-                const next = attach
-                  ? [...active, id]
-                  : [...active].filter((a) => a !== id);
-                setToolGroups(next);
-              },
-            })
-          : undefined,
-      },
-      items.map(panel.toolItem)
-    );
-  });
-
-  // What the panel is actually claiming, said once at the top rather than left
-  // to be inferred from which cards are dimmed.
-  const attachedCount = ordered.filter((id) => active.has(id)).length;
-  const loaded = tools.filter((t) => t.attached !== false).length;
-  const parts = [`${tools.length} available in ${store.modeLabel()} mode`];
-  if (grouping) {
-    parts.push(`${loaded} in the prompt`);
-    parts.push(`${attachedCount}/${ordered.length} groups attached`);
-  } else {
-    parts.push(`${ordered.length} group${ordered.length === 1 ? "" : "s"}`);
+  const blocks = [];
+  for (const group of ordered) {
+    const items = byGroup.get(group);
+    blocks.push(panel.section({ title: group, count: items.length, note: TOOL_GROUP_NOTE[group] }));
+    blocks.push(...items.map(panel.toolItem));
   }
-
-  const head = [];
-  if (grouping && routed) {
-    head.push(
-      el(
-        "button",
-        {
-          type: "button",
-          class: "ghost-btn sm",
-          title:
-            "Discard this override and let the agent choose the groups again from its own evidence on the next turn.",
-          onClick: () => connection.send({ type: "tool-groups-reset", id: store.current }),
-        },
-        "Reset routing"
-      )
-    );
-  }
-
-  // One line when the role is doing any withholding, because a tool whose
-  // capability is denied is simply absent from the list and nothing else on
-  // this tab says why.
-  const withheld = store.user?.read_only || (store.user?.denied || []).length > 0;
-  const policyNote = withheld
-    ? el(
-        "p",
-        { class: "panel-note is-inline" },
-        store.user?.read_only
-          ? "Your role is read-only: tools that change things are withheld."
-          : "Some tools are withheld by your role."
-      )
-    : null;
 
   rail.open({
     id: "tools",
     title: "Tools",
-    subtitle: tools.length ? parts.join(" · ") : undefined,
-    head,
-    items: tools,
-    blocks: tools.length
-      ? [toolScopeNote(grouping, routed), policyNote, ...blocks].filter(Boolean)
+    subtitle: tools.length
+      ? `${tools.length} available in ${store.modeLabel()} mode · ${ordered.length} group${ordered.length === 1 ? "" : "s"}`
       : undefined,
+    items: tools,
+    blocks: tools.length ? blocks : undefined,
     empty: "No tools are available in this mode.",
     renderItem: panel.toolItem,
   });
-}
-
-/* One line saying whether scoping is doing anything, because every state below
- * it looks the same otherwise: with scoping off, every group reads as attached
- * and no switch appears, which is indistinguishable from a conversation that
- * happened to be routed everything. */
-function toolScopeNote(grouping, routed) {
-  if (!grouping) {
-    return el(
-      "p",
-      { class: "panel-note is-inline" },
-      "Scoping is off, so every tool below is in the prompt. Turn on ",
-      el("code", { class: "mono" }, "tool_groups.grouping_enabled"),
-      " to attach groups by task instead."
-    );
-  }
-  if (!routed) {
-    return el(
-      "p",
-      { class: "panel-note is-inline" },
-      "Nothing has been routed yet — until the first message every group is attached. Send a message, or attach groups by hand."
-    );
-  }
-  return null;
 }
 
 /* The models inspector: the only tab that writes.
@@ -986,7 +640,6 @@ function drawModels() {
   const models = store.models || [];
   const hidden = store.modelsHidden || [];
 
-  const restricted = Boolean(store.modelsRestricted);
   const handlers = {
     // Only offered when a conversation is open: the catalogue is global, but
     // choosing a model is a per-conversation setting.
@@ -996,22 +649,16 @@ function drawModels() {
           store.set({ model: model.id });
         }
       : null,
-    onEdit: restricted
-      ? null
-      : (model) => {
-          editing = model.id;
-          drawModels();
-        },
-    onRemove: restricted
-      ? null
-      : (model) => {
-          connection.send({ type: "model-remove", id: store.current, slug: model.id });
-        },
-    onRestore: restricted
-      ? null
-      : (model) => {
-          connection.send({ type: "model-restore", id: store.current, slug: model.id });
-        },
+    onEdit: (model) => {
+      editing = model.id;
+      drawModels();
+    },
+    onRemove: (model) => {
+      connection.send({ type: "model-remove", id: store.current, slug: model.id });
+    },
+    onRestore: (model) => {
+      connection.send({ type: "model-restore", id: store.current, slug: model.id });
+    },
   };
 
   const save = ({ slug, label, previous }) => {
@@ -1035,16 +682,6 @@ function drawModels() {
 
   const blocks = [];
 
-  if (restricted) {
-    blocks.push(
-      el(
-        "p",
-        { class: "panel-section-note" },
-        "Your role fixes the model catalogue. You may select an offered model, but cannot add or edit entries."
-      )
-    );
-  }
-
   blocks.push(
     panel.section({
       title: "In the picker",
@@ -1054,9 +691,7 @@ function drawModels() {
   );
   blocks.push(...models.map(row));
 
-  if (restricted) {
-    editing = null;
-  } else if (editing === "") {
+  if (editing === "") {
     blocks.push(
       panel.modelForm({
         onSave: save,
@@ -1123,14 +758,7 @@ function openSkills() {
 
 function openTools() {
   if (!store.current) return toast("Open a conversation first — the tool set depends on its mode.");
-  // Cleared together: a stale group set drawn against a fresh tool list would
-  // dim the wrong cards for as long as the round trip takes.
-  store.set({
-    tools: [],
-    toolGroups: [],
-    toolGroupsActive: [],
-    toolGroupReasons: {},
-  });
+  store.set({ tools: [] });
   rail.open({ id: "tools", title: "Tools", items: undefined, renderItem: () => null });
   connection.send({ type: "tools", id: store.current });
 }
@@ -1301,13 +929,10 @@ const branchGraph = mountBranch({
 
 rail.mountRail([
   { id: "branch", label: "Branch", hint: "Branch — this conversation's sandbox: graph, merge, history", icon: rail.ICONS.branch, activate: showBranchTab },
-  { id: "todo", label: "Todo", hint: "Todo — what this conversation is working through", icon: rail.ICONS.todo, activate: todoView.openTab },
   { id: "workspace", label: "Files", hint: "Files — the shared workspace every agent reads and writes", icon: rail.ICONS.files, wide: true, activate: () => workspaceView.open() },
   { id: "context", label: "Context", hint: "Context — the exact request the model receives", icon: rail.ICONS.context, wide: true, activate: () => context.openTab() },
   { id: "skills", label: "Skills", hint: "Skills — what reached this conversation's prompt, and why", icon: rail.ICONS.skills, activate: openSkills },
-  // Wide, like Files and Context: a tool's description is a paragraph of prose,
-  // and in the 380px panel a dozen of them wrapped every three or four words.
-  { id: "tools", label: "Tools", hint: "Tools — everything the agent can call here", icon: rail.ICONS.tools, wide: true, activate: openTools },
+  { id: "tools", label: "Tools", hint: "Tools — everything the agent can call here", icon: rail.ICONS.tools, activate: openTools },
   { id: "models", label: "Models", hint: "Models — the picker's catalogue: list, edit, add by slug", icon: rail.ICONS.models, activate: openModels },
 ]);
 
@@ -1316,10 +941,6 @@ function refreshOpenTab() {
   switch (rail.activeTab()) {
     case "branch":
       showBranchTab();
-      break;
-    case "todo":
-      todoView.openTab();
-      if (store.current) connection.send({ type: "todo", id: store.current });
       break;
     case "context":
       context.openTab();
@@ -1336,10 +957,8 @@ function refreshOpenTab() {
 
 // --- header -----------------------------------------------------------------
 
-/* The conversation's title lives on its tab now, and the chips it used to sit
- * beside live in the chat pane's own bar. */
 function setHeader() {
-  centre.setChatTitle(store.title);
+  $("chat-title").textContent = store.title || "—";
   $("chat-sub").textContent = store.mode && store.mode !== "agent" ? store.modeLabel() : "";
 
   const model = $("chip-model");
@@ -1349,14 +968,6 @@ function setHeader() {
       el("span", { class: "picker-dot" }),
       el("span", { class: "picker-label" }, store.modelLabel())
     );
-  }
-
-  const todo = $("chip-todo");
-  const list = store.todos;
-  todo.hidden = !list?.has_todos;
-  if (list?.has_todos) {
-    todo.textContent = `todo ${list.done}/${list.total}`;
-    todo.classList.toggle("is-done", list.total > 0 && list.done === list.total);
   }
 
   const branch = $("chip-branch");
@@ -1392,18 +1003,45 @@ store.watch("branch", setHeader);
 store.watch("current", setHeader);
 store.watch("spendSession", setHeader);
 store.watch("liveTurn", setHeader);
-store.watch("todos", setHeader);
 store.watch("turnStats", () => context.onUsageChanged());
 store.watch("liveTurn", () => context.onUsageChanged());
 
 $("chip-model").addEventListener("click", openModels);
 $("chip-branch").addEventListener("click", showBranchTab);
-$("chip-todo").addEventListener("click", todoView.openTab);
 $("chip-spend").addEventListener("click", () => context.openTab("usage"));
 
-// Renaming moved onto the conversation's own tab: click the active chat tab a
-// second time and the label becomes an input. views/stage.js owns that, and
-// calls back through `onRename` above.
+// The title renames in place: click it, type, Enter. Blur cancels — commits
+// belong to an explicit keypress, not to focus wandering off.
+$("chat-title").addEventListener("click", () => {
+  if (!store.current) return;
+  const title = $("chat-title");
+  const input = el("input", { class: "chat-title-input", type: "text", value: store.title });
+  title.replaceWith(input);
+  input.focus();
+  input.select();
+
+  // Enter restores explicitly and the input's blur fires right after — the
+  // second call must be a no-op, not a DOM exception.
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    input.replaceWith(title);
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      const next = input.value.trim();
+      if (next && next !== store.title) {
+        connection.send({ type: "rename", id: store.current, title: next });
+        store.set({ title: next });
+        title.textContent = next;
+      }
+      restore();
+    }
+    if (event.key === "Escape") restore();
+  });
+  input.addEventListener("blur", restore);
+});
 
 $("archive-chat").addEventListener("click", (event) => {
   if (!store.current) return;
@@ -1415,7 +1053,6 @@ $("archive-chat").addEventListener("click", (event) => {
     onConfirm: () => {
       connection.send({ type: "archive", id });
       store.set({ current: null, title: "", branch: null, branchGraph: null });
-      terminals.setSession(null);
       setHeader();
       transcript.showEmpty("Archived", "Pick another conversation, or start a new one.");
       toast("Conversation archived.", {
@@ -1455,34 +1092,10 @@ mountSessions({
     connection.send({ type: "unarchive", id });
     toast("Conversation restored.");
   },
-  /* Brings a sub-agent's own tab forward.
-   *
-   * No host round trip: the child's stream is already rendered into its tab, so
-   * the sidebar row is a jump link. Falls back to the inline block in the
-   * conversation if the tab has gone — which happens only for a child whose
-   * conversation is no longer open. */
-  onRevealAgent: (id) => {
-    if (centre.focusAgent(id)) return;
-    revealInlineAgent(id);
-  },
 });
 
 transcript.mountTranscript({
   onInspect: () => context.openTab("request"),
-  /* Answers from an `ask_user` form go through the ordinary send path: they are
-   * a user message, they belong in the log as one, and reusing `send` means the
-   * pending row, the composer lock and the failure handling all apply without a
-   * second mechanism. Returns whether the socket took it, as the composer does. */
-  onAnswer: (text) => {
-    if (!store.current) {
-      toast("No conversation open — the answers were not sent.", { tone: "error" });
-      return false;
-    }
-    const sent = connection.send({ type: "send", id: store.current, text, attachments: [] });
-    if (sent) beginPending(text, []);
-    else toast("Not connected — the answers were not sent.", { tone: "error" });
-    return sent;
-  },
 });
 
 const composer = mountComposer({
@@ -1501,9 +1114,6 @@ const composer = mountComposer({
   onStop: () => {
     if (store.current) connection.send({ type: "turn-cancel", id: store.current });
   },
-  // The @-mention index is built from `workspace-list` frames, which the host
-  // answers directly — so mentions need the raw socket, not the send path.
-  sendFrame: (frame) => connection.send(frame),
 });
 
 // The status bar polls the host, so it needs a live socket: it asks on every

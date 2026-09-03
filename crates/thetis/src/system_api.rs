@@ -12,7 +12,7 @@
 //! worker, all bounded by a timeout so a wedged worker degrades to "unknown"
 //! instead of hanging the frame.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,15 +36,11 @@ pub fn handles(frame_type: &str) -> bool {
 }
 
 /// Handles one frame, returning the reply frames to send on this socket.
-pub async fn handle(
-    grip: &Arc<Grip>,
-    principal: &crate::auth::Principal,
-    _frame: &Value,
-) -> Vec<String> {
-    vec![status(grip, principal).await.to_string()]
+pub async fn handle(grip: &Arc<Grip>, _frame: &Value) -> Vec<String> {
+    vec![status(grip).await.to_string()]
 }
 
-async fn status(grip: &Arc<Grip>, principal: &crate::auth::Principal) -> Value {
+async fn status(grip: &Arc<Grip>) -> Value {
     let trunk = trunk_facts(grip).await;
     let ui = ui_facts(grip).await;
     let fleet = fleet_facts(grip).await;
@@ -72,11 +68,9 @@ async fn status(grip: &Arc<Grip>, principal: &crate::auth::Principal) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "wit": crate::pipeline::kernel_wit_fingerprint(),
         "uptime_s": STARTED.get().map(|t| t.elapsed().as_secs()),
-        // The asker's own conversations, or everyone's when this connection
-        // is showing everyone's: the count should match the sidebar.
         "sessions": grip
             .persist
-            .list_sessions_owned(principal.list_owner(), false)
+            .list_sessions(false)
             .await
             .map(|s| s.len())
             .unwrap_or(0),

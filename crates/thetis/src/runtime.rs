@@ -11,12 +11,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::component::{HasSelf, Linker, ResourceTable};
-use wasmtime::{
-    Config as WasmConfig, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
-};
+use wasmtime::{Config as WasmConfig, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
 
 use crate::bindings;
 use crate::config::Config;
@@ -72,20 +70,11 @@ pub struct Budget {
     /// runaway would not also trip here. What actually distinguishes a wedged
     /// guest is that it stops talking to the host, which is what this measures.
     pub slice: Duration,
-    /// Set when the user stops the turn. Not a violation on its own: see
-    /// [`Budget::cancelled`].
-    cancel_requested: Option<Instant>,
+    pub cancelled: bool,
+    /// Raised from outside while the guest is running — the Stop button.
+    /// Checked at every epoch tick, so it lands even mid-tool-call.
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
-
-/// How long a stopped guest is given to return from `handle-turn` of its own
-/// accord before it is trapped.
-///
-/// A trap works, but it costs: the turn ends as an incident rather than a clean
-/// stop, and the agent's own "cancelled" bookkeeping never runs. A cooperative
-/// guest notices the cancel at its next checkpoint and returns within
-/// microseconds, so this window is almost never spent — it exists so that a
-/// guest which ignores the signal still cannot keep running.
-const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 impl Budget {
     pub fn new(label: impl Into<String>, slice: Duration) -> Self {
@@ -98,7 +87,8 @@ impl Budget {
             seen_calls: 0,
             last_import: "-",
             slice,
-            cancel_requested: None,
+            cancelled: false,
+            cancel_flag: None,
         }
     }
 
@@ -129,36 +119,21 @@ impl Budget {
         }
     }
 
-    /// Asks the guest to stop, starting its grace window.
-    ///
-    /// Idempotent: a user who presses stop repeatedly must not keep pushing the
-    /// deadline out, so the first request is the one that counts.
-    pub fn cancel(&mut self) {
-        if self.cancel_requested.is_none() {
-            self.cancel_requested = Some(Instant::now());
-        }
-    }
-
-    /// Whether a stop has been requested for this call.
-    pub fn cancel_requested(&self) -> bool {
-        self.cancel_requested.is_some()
+    /// Attaches the session's Stop flag, so cancellation reaches a guest that
+    /// is not returning to its own checkpoints.
+    pub fn watching(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel_flag = Some(flag);
+        self
     }
 
     fn violation(&self) -> Option<String> {
-        // Only once the grace window has run out. Trapping the instant the stop
-        // arrives would deny a cooperative guest the chance to return cleanly,
-        // which is the difference between a turn that ends as "stopped" and one
-        // that ends as a crash the watchdog might roll the agent back for.
-        if let Some(at) = self.cancel_requested {
-            if at.elapsed() > CANCEL_GRACE {
-                return Some(format!(
-                    "{}: stopped by the user, and did not return within {CANCEL_GRACE:?}",
-                    self.label
-                ));
-            }
-            // Still within the window: do not charge the spin timer either, or
-            // a guest winding down would trip that instead.
-            return None;
+        let stopped = self
+            .cancel_flag
+            .as_ref()
+            .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false);
+        if self.cancelled || stopped {
+            return Some(format!("{}: cancelled by orchestrator", self.label));
         }
         let spinning = self.last_yield.elapsed();
         if spinning > self.slice {
@@ -184,8 +159,6 @@ pub struct HostState {
     /// Session this call acts on behalf of. Imports use it to scope access so a
     /// guest cannot reach into a session it was not invoked for.
     pub session_id: Option<String>,
-    pub principal: Option<Arc<crate::auth::Principal>>,
-    pub policy: Arc<crate::policy::EffectivePolicy>,
     pub streams: HashMap<u64, StreamHandle>,
     pub next_stream_id: u64,
     /// Aspects the guest asked to swap at the end of this call (self-modification
@@ -240,11 +213,9 @@ impl Runtime {
         let ticker = engine.clone();
         std::thread::Builder::new()
             .name("thetis-epoch".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(EPOCH_TICK);
-                    ticker.increment_epoch();
-                }
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticker.increment_epoch();
             })
             .context("spawning epoch ticker")?;
 
@@ -296,8 +267,6 @@ impl Runtime {
             grip,
             budget,
             session_id,
-            principal: None,
-            policy: self.cfg.auth.local_policy.clone(),
             streams: HashMap::new(),
             next_stream_id: 1,
             pending_swaps: Vec::new(),
@@ -402,21 +371,6 @@ fn build_linker(engine: &Engine, caps: Caps) -> Result<Linker<HostState>> {
             bindings::terminal::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
             bindings::control::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
             bindings::configuration::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
-            // Delegation: only the agent may spawn agents. Registered here
-            // before `world agent` imports it, which is what lets the contract
-            // change land on a host that already answers. Registering an
-            // import no guest asks for is harmless — an unused entry in the
-            // linker's table.
-            bindings::delegation::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
-            // Transcript recall. Registered here while the interface is still
-            // staged, for the same reason delegation was: an import no guest
-            // asks for yet is a harmless entry in the linker's table, and
-            // having it answered first is what lets the contract change land
-            // without a window where the agent cannot instantiate.
-            //
-            // Agent-only. The chat surface already receives the event log
-            // through its own frames and has no use for a second route to it.
-            bindings::transcripts::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
         }
         Caps::Gateway => {
             bindings::session::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
@@ -475,6 +429,20 @@ mod tests {
     }
 
     #[test]
+    fn the_stop_flag_ends_a_turn_that_never_checks_its_inbox() {
+        // The Stop button used to be an inbox message only, so a guest inside
+        // a long tool call never saw it. The budget watches the flag directly.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b = Budget::new("turn", Duration::from_secs(3600)).watching(flag.clone());
+        assert!(b.violation().is_none(), "nothing is wrong yet");
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            b.violation().unwrap().contains("cancelled"),
+            "raising the flag must end the turn without waiting for the slice"
+        );
+    }
+
+    #[test]
     fn host_time_is_not_charged_to_the_guest() {
         // A slow host import used to be billed as guest spin time, trapping a
         // healthy turn as "likely an infinite loop".
@@ -497,69 +465,9 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_is_not_an_instant_violation() {
-        // A cooperative guest notices the stop at its next checkpoint and
-        // returns cleanly. Trapping it immediately would turn every successful
-        // stop into a crash, which is what the watchdog rolls components back
-        // for — so the grace window is load-bearing, not politeness.
+    fn cancellation_is_a_violation() {
         let mut b = Budget::new("turn", Duration::from_secs(60));
-        b.cancel();
-        assert!(b.cancel_requested());
-        assert!(
-            b.violation().is_none(),
-            "a guest must be given the chance to return"
-        );
-    }
-
-    #[test]
-    fn a_guest_that_ignores_a_stop_is_eventually_trapped() {
-        let mut b = Budget::new("turn", Duration::from_secs(60));
-        b.cancel();
-        // Reach back past the grace window rather than sleeping through it.
-        b.cancel_requested = Some(Instant::now() - (CANCEL_GRACE + Duration::from_millis(50)));
-        let v = b.violation().expect("the window has run out");
-        assert!(v.contains("stopped by the user"), "{v}");
-    }
-
-    #[test]
-    fn repeated_stops_do_not_extend_the_grace_window() {
-        // Someone jabbing the stop button must not keep resetting the deadline
-        // and thereby let a wedged guest run forever.
-        let mut b = Budget::new("turn", Duration::from_secs(60));
-        b.cancel_requested = Some(Instant::now() - (CANCEL_GRACE + Duration::from_millis(50)));
-        b.cancel();
-        assert!(
-            b.violation().is_some(),
-            "a second stop must not push the deadline out"
-        );
-    }
-
-    #[test]
-    fn a_stopped_guest_is_not_also_accused_of_spinning() {
-        // While winding down, the guest is not making host calls. That must
-        // read as "stopping", not as an infinite loop — the wrong message here
-        // sent every stop to the watchdog as agent misbehaviour.
-        let mut b = Budget::new("turn", Duration::from_millis(1));
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(
-            b.violation().unwrap().contains("infinite loop"),
-            "spin is still detected when no stop is pending"
-        );
-        b.cancel();
-        assert!(
-            b.violation().is_none(),
-            "a stopping guest must not be reported as a runaway"
-        );
-    }
-
-    #[test]
-    fn spin_detection_survives_the_grace_window() {
-        let mut b = Budget::new("turn", Duration::from_millis(1));
-        b.cancel();
-        b.cancel_requested = Some(Instant::now() - (CANCEL_GRACE + Duration::from_millis(50)));
-        std::thread::sleep(Duration::from_millis(5));
-        // Both conditions hold; the stop is the more useful explanation.
-        let v = b.violation().expect("should trip");
-        assert!(v.contains("stopped by the user"), "{v}");
+        b.cancelled = true;
+        assert!(b.violation().unwrap().contains("cancelled"));
     }
 }
