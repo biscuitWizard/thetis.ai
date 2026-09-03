@@ -562,13 +562,36 @@ impl Store {
             }
             let events = self.events(&meta.id, 0)?;
 
-            let last_marker = events.iter().rev().find(|r| {
-                matches!(
-                    r.event,
-                    SessionEvent::TurnStarted
-                        | SessionEvent::TurnFinished(_)
-                        | SessionEvent::Incident(_)
-                )
+            // Did we ask for this? Read — and consumed — before anything else
+            // looks at the log, because it changes what the log *means*. See
+            // the marker scan below, and the resume budget further down.
+            //
+            // Clearing a flag writes an empty value rather than removing the
+            // row, so presence alone does not mean set.
+            let expected = self
+                .kv_get(&meta.id, EXPECTED_RESTART_KEY)?
+                .is_some_and(|v| !v.is_empty());
+            if expected {
+                self.kv_put(&meta.id, EXPECTED_RESTART_KEY, "")?;
+            }
+
+            // Where the turn stands. Only `turn-started` and `turn-finished`
+            // are boundaries; an incident counts as an ending because a turn
+            // that dies saying why often never reaches `turn-finished`.
+            //
+            // Except when the interruption was ours. A kernel rebuild
+            // announces itself in the log — "restarting onto it now" — and
+            // *then* kills the worker mid-turn. Read as an ending, that
+            // announcement made every such restart look like a turn that had
+            // already stopped, so the session was skipped, its dangling
+            // `turn-started` never repaired and its turn never resumed. Three
+            // turns in one conversation sat dead that way until somebody
+            // typed "Continue". With the flag set, our own announcement is
+            // not evidence that anything ended.
+            let last_marker = events.iter().rev().find(|r| match &r.event {
+                SessionEvent::TurnStarted | SessionEvent::TurnFinished(_) => true,
+                SessionEvent::Incident(_) => !expected,
+                _ => false,
             });
             if !matches!(last_marker.map(|r| &r.event), Some(SessionEvent::TurnStarted)) {
                 continue;
@@ -591,8 +614,6 @@ impl Store {
             // model reads this as context for why its last step went missing.
             self.append_event(&meta.id, SessionEvent::SystemNote(note.to_string()))?;
 
-            // Clearing a flag writes an empty value rather than removing the
-            // row, so presence alone does not mean set.
             let opted_out = self
                 .kv_get(&meta.id, NO_RESUME_KEY)?
                 .is_some_and(|v| !v.is_empty());
@@ -601,23 +622,18 @@ impl Store {
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
 
-            // Did we ask for this? Adopting a rebuilt kernel means stopping
-            // the worker mid-turn on purpose, and that is the supported way to
-            // pick up your own changes — several agents do it repeatedly in one
-            // turn. Counting it as a death spent the whole budget on healthy
-            // work and abandoned the turn with "interrupted 2 times".
+            // `expected` was read above. Adopting a rebuilt kernel means
+            // stopping the worker mid-turn on purpose, and that is the
+            // supported way to pick up your own changes — several agents do it
+            // repeatedly in one turn. Counting it as a death spent the whole
+            // budget on healthy work and abandoned the turn with "interrupted
+            // 2 times".
             //
             // The guard itself dates from the single-process orchestrator,
             // where a turn that died really did take everything with it. With
             // a worker per conversation a dying turn costs only its own worker,
             // so the budget is only meant for a turn that crashes it *by
             // itself*, repeatedly.
-            let expected = self
-                .kv_get(&meta.id, EXPECTED_RESTART_KEY)?
-                .is_some_and(|v| !v.is_empty());
-            if expected {
-                self.kv_put(&meta.id, EXPECTED_RESTART_KEY, "")?;
-            }
 
             // Has the turn got anywhere since it was last interrupted?
             //
@@ -1384,6 +1400,106 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
                 .iter()
                 .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))),
             "a turn making progress must never be abandoned"
+        );
+    }
+
+    // The exact log a kernel rebuild leaves behind, and the reason three turns
+    // in one conversation sat dead until somebody typed "Continue":
+    //
+    //   turn-started ... tool-call(wait) ... incident("Restarting onto it now")
+    //
+    // The scan read that trailing incident as the turn's ending, skipped the
+    // session, and so never repaired the dangling call or resumed the turn.
+    #[test]
+    fn our_own_restart_announcement_does_not_end_the_turn_it_interrupts() {
+        let (store, _d) = temp_store();
+        let id = mid_turn(&store, "rebuilding its own kernel", Some("call-1"));
+
+        // What `request_restart` records before the process goes away, and
+        // what `build_then_restart` writes just before it does.
+        store.expect_restart(&id).unwrap();
+        store
+            .append_event(
+                &id,
+                SessionEvent::Incident(
+                    "The orchestrator rebuilt from your changes and passed its startup probe. \
+                     Restarting onto it now."
+                        .into(),
+                ),
+            )
+            .unwrap();
+
+        let found = store
+            .reconcile_interrupted_turns("picked back up", &[], None)
+            .unwrap();
+        assert_eq!(found.len(), 1, "the turn was interrupted, not finished");
+        assert!(found[0].resume, "and `resume: true` was what was asked for");
+
+        // The tool call the restart cut off has to be answered, or the next
+        // request carries a call with no result and the provider rejects it.
+        let events = store.events(&id, 0).unwrap();
+        assert!(
+            events.iter().any(|r| matches!(
+                &r.event,
+                SessionEvent::ToolResult(o) if o.call_id == "call-1" && !o.ok
+            )),
+            "the interrupted call was never answered"
+        );
+    }
+
+    // An incident is still an ending when it was not our doing — a turn that
+    // died reporting why must not be resumed on the strength of this change.
+    #[test]
+    fn an_unexpected_incident_still_reads_as_the_turn_ending() {
+        let (store, _d) = temp_store();
+        let id = mid_turn(&store, "a turn that broke", None);
+        store
+            .append_event(
+                &id,
+                SessionEvent::Incident("transport error: the model provider went away".into()),
+            )
+            .unwrap();
+
+        let found = store
+            .reconcile_interrupted_turns("picked back up", &[], None)
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "nothing asked for this interruption, so the incident ends the turn"
+        );
+    }
+
+    // The marker is one-shot in both directions: spending it on a session that
+    // turns out not to be interrupted must not leave it armed for a later
+    // crash that nobody asked for.
+    #[test]
+    fn an_unused_restart_marker_is_still_consumed() {
+        let (store, _d) = temp_store();
+        let id = mid_turn(&store, "restarted between turns", None);
+        // The turn ended cleanly before the restart landed.
+        finish_turn(&store, &id);
+        store.expect_restart(&id).unwrap();
+
+        assert!(
+            store
+                .reconcile_interrupted_turns("picked back up", &[], None)
+                .unwrap()
+                .is_empty(),
+            "a finished turn is not interrupted"
+        );
+
+        // Now a real crash, with an incident and no `turn-finished`. The spent
+        // marker must not excuse it.
+        store.append_event(&id, SessionEvent::TurnStarted).unwrap();
+        store
+            .append_event(&id, SessionEvent::Incident("it fell over".into()))
+            .unwrap();
+        assert!(
+            store
+                .reconcile_interrupted_turns("picked back up", &[], None)
+                .unwrap()
+                .is_empty(),
+            "the marker was consumed by the sweep that did not need it"
         );
     }
 
