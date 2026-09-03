@@ -12,8 +12,8 @@ use crate::thetis::grip::types::{
     ModTarget, SessionEvent, SshHostInfo, TerminalOpen, TerminalOutput, ToolManifest,
 };
 use crate::thetis::grip::{
-    branch, configuration, control, delegation, devkit, hostfs, sandbox, skills, sys, terminal,
-    tooling, transcripts,
+    branch, configuration, control, delegation, devkit, hostfs, sandbox, session, skills, sys,
+    terminal, tooling, transcripts,
 };
 use crate::todos;
 use serde_json::{Value, json};
@@ -579,8 +579,19 @@ fn configuration_tools() -> Vec<ToolDef> {
             ),
         },
         ToolDef {
+            name: "model_info",
+            description: "What model this conversation is actually running on, and where that \
+                 came from: the id the provider reported serving on the last completed turn, \
+                 the session's own override, and the configured default. Use this rather than \
+                 read_config('llm.model') when asked what model you are — config is read only \
+                 at startup and is per-worktree, so the file can disagree with reality.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
+        },
+        ToolDef {
             name: "read_config",
-            description: "Read one setting by its dotted path, e.g. 'llm.model'.",
+            description: "Read one setting by its dotted path, e.g. 'llm.model'. For the model \
+                 currently in use, prefer model_info: this reads the file, not what is running.",
             mutating: false,
             parameters: obj(
                 json!({ "key": string_prop("Dotted path of the setting.") }),
@@ -2344,6 +2355,41 @@ pub fn invoke(session_id: &str, mode: &str, name: &str, args_json: &str) -> Resu
                 .map(format_setting)
                 .collect::<Vec<_>>()
                 .join("\n"))
+        }
+        "model_info" => {
+            let mut out = Vec::new();
+
+            // Ground truth first: what the endpoint said it served. Absent only
+            // on the very first turn, before any stream has finished.
+            match sys::kv_get(session_id, crate::SERVED_MODEL_KEY) {
+                Some(served) if !served.is_empty() => out.push(format!(
+                    "running on: {served}\n  (reported by the provider on the last completed turn)"
+                )),
+                _ => out.push(
+                    "running on: not yet known — no completed turn in this session to \
+                     report one. The intended model is below."
+                        .to_string(),
+                ),
+            }
+
+            let session_override = session::get_session(session_id)
+                .map(|m| m.model)
+                .filter(|m| !m.is_empty());
+            match &session_override {
+                Some(m) => out.push(format!("session override: {m} (takes precedence)")),
+                None => out.push("session override: none".to_string()),
+            }
+
+            let configured = configuration::get("llm.model")
+                .map(|e| e.value)
+                .unwrap_or_else(|| "<unset>".to_string());
+            out.push(format!(
+                "configured default: {configured}\n  (llm.model, read at startup from this \
+                 worktree's own thetis.toml — a later edit does not apply until restart, and \
+                 other conversations have their own copy)"
+            ));
+
+            Ok(out.join("\n"))
         }
         "read_config" => {
             let key = req_str(&args, "key")?;
@@ -4394,6 +4440,34 @@ mod coverage_tests {
                 );
             }
         }
+    }
+
+    /// The honest answer to "what model are you?" must be available in the two
+    /// situations it is actually asked in: a bare conversation with no tool
+    /// group loaded, and a read-only plan-mode one. `model_info` is in `core`
+    /// precisely so neither can scope it away, and this pins that down — the
+    /// coverage test above deliberately skips `core`, so without this nothing
+    /// would catch the tool being defined but never offered.
+    #[test]
+    fn the_running_model_can_always_be_asked_for() {
+        let def = configuration_tools()
+            .into_iter()
+            .find(|t| t.name == "model_info")
+            .expect("`model_info` is not defined");
+
+        // Read-only, so a plan-mode conversation keeps it. If this ever flips,
+        // the one mode that cannot change anything also cannot say what it is.
+        assert!(!def.mutating, "`model_info` only reads; it must not be gated as mutating");
+
+        // In `core`, so no amount of tool scoping withholds it. `core` is
+        // always_on, which is the whole point: "what model are you?" arrives
+        // with no group loaded.
+        assert!(
+            crate::groups::builtin_active("model_info", &["core".to_string()]),
+            "`model_info` is not in an active `core` group, so a plain \
+             'what model are you?' falls back to reading the config file — \
+             which is exactly what answered wrongly before."
+        );
     }
 
     /// `restart_orchestrator` mutates, and a read-only mode must withhold it.
