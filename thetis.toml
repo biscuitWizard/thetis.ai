@@ -214,7 +214,7 @@ session_spend_limit_usd = 0.0
 # Tool and exec output is truncated to this before it reaches the model.
 max_tool_output_bytes = 32768
 max_attachment_bytes = 8388608
-max_attachments = 8
+max_attachments = 24
 
 # Prompt caching. Providers differ in kind, not just in syntax: Anthropic
 # caches nothing unless the request marks where, while OpenAI and Google cache

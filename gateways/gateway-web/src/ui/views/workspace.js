@@ -65,8 +65,10 @@ function when(ms) {
   return ms ? new Date(ms).toLocaleString() : "";
 }
 
-/** The raw-bytes URL for a workspace path, encoded a segment at a time. */
-function rawUrl(rel) {
+/** The raw-bytes URL for a workspace path, encoded a segment at a time.
+ *  Exported because the composer's @-mentions read file bytes over the same
+ *  route rather than through frames, and two spellings of this would drift. */
+export function rawUrl(rel) {
   const segments = rel.split("/").filter(Boolean).map(encodeURIComponent);
   return `/workspace/file/${segments.join("/")}`;
 }
