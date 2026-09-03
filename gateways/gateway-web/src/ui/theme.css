@@ -118,6 +118,13 @@
   /* Layout */
   --sidebar-w: 272px;
   --measure: 48rem;
+  /* The portrait columns either side of the transcript. Two widths: the first
+     is what a merely roomy window affords, the second what a wide one does.
+     They are a ceiling as well as a basis — the columns shrink below these
+     rather than growing past them, so the conversation never drifts off the
+     zone's centre line. */
+  --portrait-w: 132px;
+  --portrait-w-lg: 208px;
   /* The system status bar's height. Anything that pins itself to the bottom of
      the viewport clears this rather than guessing. */
   --statusbar-h: 26px;
