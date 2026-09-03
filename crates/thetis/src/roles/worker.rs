@@ -68,8 +68,8 @@ impl Handler for WorkerHandler {
                     Ok(Value::Null)
                 }
                 "cancel" => {
-                    let stopped = grip.cancel(&session()?).await;
-                    Ok(serde_json::json!({ "stopped": stopped }))
+                    grip.cancel(&session()?).await;
+                    Ok(Value::Null)
                 }
                 "resume" => {
                     grip.resume(&session()?).await;
@@ -170,10 +170,6 @@ impl Handler for WorkerHandler {
                     if if_idle && grip.is_busy() {
                         return Ok(serde_json::json!({ "busy": true }));
                     }
-                    // Said out loud, because `exit` is otherwise indistinguishable
-                    // from being killed: a worker that vanishes silently gives
-                    // whoever is debugging it nothing to go on.
-                    tracing::info!(if_idle, "shutting down on request");
                     let grip = grip.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -226,7 +222,6 @@ pub async fn run(
 
     let handler = Arc::new(WorkerHandler::default());
     crate::offload::spawn_stall_detector();
-    spawn_orphan_watch();
     let (peer, connection) = Peer::spawn(stream, handler.clone());
     let connection = tokio::spawn(connection);
     ipc::handshake(&peer, "worker").await?;
@@ -283,35 +278,6 @@ pub async fn run(
     let _ = connection.await;
     tracing::info!("gateway hung up; worker exiting");
     Ok(())
-}
-
-/// Exits if the gateway goes away.
-///
-/// A worker exists to serve one conversation on behalf of one gateway; with
-/// that gateway gone there is nowhere to persist anything, and a worker left
-/// behind would hold a worktree and its shells indefinitely. The kernel can
-/// signal this for us — `PR_SET_PDEATHSIG` — but only on the death of the
-/// *thread* that forked, which for a tokio parent is an arbitrary thread that
-/// may retire while the process is perfectly healthy. That killed
-/// conversations mid-turn. Watching `getppid` instead asks the question we
-/// actually mean, and a reparented process is unambiguous: init adopted us
-/// because the gateway is gone.
-fn spawn_orphan_watch() {
-    let parent = unsafe { libc::getppid() };
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let now = unsafe { libc::getppid() };
-            if now != parent {
-                tracing::warn!(
-                    was = parent,
-                    now,
-                    "the gateway is gone; exiting rather than squatting on this worktree"
-                );
-                std::process::exit(0);
-            }
-        }
-    });
 }
 
 fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {

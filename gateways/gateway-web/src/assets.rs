@@ -35,9 +35,6 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/views/workspace.js", mime: JS, body: include_str!("ui/views/workspace.js") },
     Asset { path: "/views/rail.js", mime: JS, body: include_str!("ui/views/rail.js") },
     Asset { path: "/views/context.js", mime: JS, body: include_str!("ui/views/context.js") },
-    // The `ask_user` form. Lives in the transcript rather than the rail: the
-    // questions are a message, and answering them is answering the agent.
-    Asset { path: "/views/askuser.js", mime: JS, body: include_str!("ui/views/askuser.js") },
     // The system status bar along the foot of the shell: trunk's version, the
     // build being served, the worker fleet, and the machine.
     Asset { path: "/views/statusbar.js", mime: JS, body: include_str!("ui/views/statusbar.js") },

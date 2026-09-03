@@ -399,10 +399,10 @@ impl Grip {
             TurnError::Reported("no agent component is loaded".to_string())
         })?;
 
-        // The turn's stop signal is carried by the session's `CancelFlag`,
-        // which host imports await directly; the budget only enforces the
-        // grace window once one has been raised.
-        let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
+        let mut budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
+        if let Some(flag) = self.sessions.take_cancel_flag(session_id) {
+            budget = budget.watching(flag);
+        }
         let mut store = self.runtime.new_store(
             self.clone(),
             Caps::Agent,
@@ -551,11 +551,10 @@ impl Grip {
         Ok(())
     }
 
-    /// Stops the turn running for a session. Reports whether there was one.
-    pub async fn cancel(self: &Arc<Self>, session_id: &str) -> bool {
+    pub async fn cancel(self: &Arc<Self>, session_id: &str) {
         match &self.role {
             Role::Gateway(router) => {
-                match crate::workers::call_session(
+                if let Err(e) = crate::workers::call_session(
                     self,
                     router,
                     session_id,
@@ -564,21 +563,11 @@ impl Grip {
                 )
                 .await
                 {
-                    Ok(v) => v.get("stopped").and_then(serde_json::Value::as_bool).unwrap_or(true),
-                    Err(e) => {
-                        tracing::warn!(session = %session_id, error = %e, "cancel did not reach the worker");
-                        false
-                    }
+                    tracing::warn!(session = %session_id, error = %e, "cancel did not reach the worker");
                 }
             }
             Role::Worker(_) => self.sessions.cancel(session_id),
         }
-    }
-
-    /// The stop signal for a session, for host imports that must abandon a wait
-    /// when the user presses stop.
-    pub fn cancel_flag(&self, session_id: &str) -> Option<Arc<crate::session::CancelFlag>> {
-        self.sessions.cancel_flag(session_id)
     }
 
     /// Picks an interrupted turn back up.
@@ -614,21 +603,6 @@ impl Grip {
         if let Ok(mut map) = self.tool_manifests.write() {
             map.remove(name);
         }
-    }
-
-    /// Takes a aspect out of service, the mirror of [`install_component`].
-    ///
-    /// Used when a aspect's source is gone: without this the loader keeps serving
-    /// the last artifact forever, so a deleted tool stays callable and every
-    /// rebuild fails with "no crate found". Order matters — drop the manifest
-    /// first, because `tool_registry` filters the manifest map by what the
-    /// loader holds, and a reader between the two writes must see a tool that
-    /// is missing rather than one that is loaded but undescribed.
-    pub fn uninstall_component(&self, aspect: &Aspect) {
-        if let Aspect::Tool(name) = aspect {
-            self.forget_tool(name);
-        }
-        self.loader.remove(aspect);
     }
 
     /// Installs a component, keeping the tool registry in step with the loader.

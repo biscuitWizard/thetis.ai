@@ -197,71 +197,6 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
                 &[],
             ),
         },
-        // --- asking the user ------------------------------------------------
-        //
-        // Deliberately not mutating: it changes nothing outside the
-        // conversation, and a read-only mode is exactly where asking a
-        // question matters most — it is the only thing such a session can do
-        // besides read. That is also what lets Discord use it.
-        ToolDef {
-            name: "ask_user",
-            description:
-                "Ask the user one or more questions and have them answered in the interface \
-                 rather than in prose. Each question is either multiple choice or open ended; \
-                 every choice question also offers a free-text answer of the user's own, and \
-                 every question can be skipped. Use this whenever you need input to go on — a \
-                 decision between options, a missing detail, a preference — and prefer it to \
-                 writing questions into your reply, because the user gets something to click \
-                 and the answers come back labelled. All the questions are presented at once. \
-                 End your turn after calling this: the answers arrive as the user's next \
-                 message.",
-            mutating: false,
-            parameters: obj(
-                json!({
-                    "intro": string_prop(
-                        "One line of context shown above the questions, e.g. why you are \
-                         asking. Optional."
-                    ),
-                    "questions": {
-                        "type": "array",
-                        "description": "The questions, in the order they should be answered. At least one.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": string_prop(
-                                    "Short key naming this question, used to label the answer \
-                                     when it comes back, e.g. 'colour'. Optional."
-                                ),
-                                "question": string_prop("The question, worded as you would say it."),
-                                "type": {
-                                    "type": "string",
-                                    "enum": ["choice", "open"],
-                                    "description":
-                                        "'choice' for multiple choice, 'open' for free text. \
-                                         Defaults to 'choice' when options are given, 'open' \
-                                         otherwise.",
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description":
-                                        "The choices, for a choice question. A free-text \
-                                         'something else' box and a skip control are added for \
-                                         you — do not put them in this list.",
-                                },
-                                "allow_multiple": {
-                                    "type": "boolean",
-                                    "description": "Let the user pick more than one option. Defaults to false.",
-                                },
-                            },
-                            "required": ["question"],
-                            "additionalProperties": false,
-                        },
-                    },
-                }),
-                &["questions"],
-            ),
-        },
         // --- skills ---------------------------------------------------------
         //
         // The system prompt names skills but never carries their instructions.
@@ -404,14 +339,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
             name: "restart_orchestrator",
             description:
                 "Restart this conversation's own runtime — no other conversation notices. \
-                 Needed for changes to settings read only at startup, and for changes to \
-                 the orchestrator's own source under crates/. Do NOT build the \
-                 orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
-                 this rebuilds it for you, in the background, and reports the result here. \
-                 A build that fails restarts nothing and gives you the compiler error; a \
-                 binary that will not start is probed and rejected before it is adopted. \
-                 This turn continues afterwards unless you say otherwise; say why first, \
-                 because the restart happens just after your turn ends.",
+                 Needed for changes to settings read only at startup, or to run a kernel \
+                 you rebuilt in this branch (build it first with \
+                 `cargo build --release -p thetis` in a terminal; the new binary is \
+                 probed before it is adopted, and a broken one falls back). This turn \
+                 continues afterwards unless you say otherwise; say why first, because \
+                 the restart happens just after your turn ends.",
             mutating: true,
             parameters: obj(
                 json!({
@@ -655,11 +588,7 @@ fn devkit_tools() -> Vec<ToolDef> {
     let target_prop = json!({
         "type": "string",
         "description": "What to edit: 'self' for your own loop, 'gateway:<name>' for a chat \
-                        interface, or 'tool:<name>' for one of your tools. Editing a gateway \
-                        changes only YOUR copy: the interface every browser loads is trunk's \
-                        until your work is merged. To see your own version, open \
-                        /preview/<this session id>/ — it serves your build against the real \
-                        running system. Never start a second Thetis to look at a UI change.",
+                        interface, or 'tool:<name>' for one of your tools.",
     });
 
     vec![
@@ -932,7 +861,6 @@ pub fn invoke(
     match name {
         "remember" => remember(session_id, &args),
         "recall" => recall(session_id, &args),
-        "ask_user" => ask_user(&args),
 
         "skill_fetch" => skills::fetch(
             &req_str(&args, "id")?,
@@ -1172,119 +1100,6 @@ pub fn invoke(
         // Anything else must be a hot-loaded tool component.
         other => tooling::invoke(other, session_id, args_json),
     }
-}
-
-// --- asking the user --------------------------------------------------------
-//
-// One call presents a whole form. See `ask_user` for why it does not block.
-
-/// The largest number of questions one call may present.
-///
-/// A form long enough to scroll past is a form nobody finishes, and Discord
-/// allows only five component rows per message, so this is both a UX limit and
-/// a wire limit.
-const MAX_QUESTIONS: usize = 5;
-/// Choices per question. Discord's select menu allows 25 options, and one is
-/// spent on "something else", so 24 is the real ceiling.
-const MAX_OPTIONS: usize = 24;
-
-/// Presents questions to the user and returns immediately.
-///
-/// The tool does not wait for an answer, and cannot: a turn is a single pass
-/// and the user's reply arrives as their next message, which starts the turn
-/// after this one. So the work here is validation and normalisation — the tool
-/// call event is what the surfaces render, and both the browser and Discord
-/// read the normalised form out of `arguments_json`. Rejecting a malformed
-/// question here rather than in a renderer means one error message instead of
-/// two silently different behaviours.
-fn ask_user(args: &Value) -> Result<String, String> {
-    let raw = args
-        .get("questions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "missing required argument 'questions' (an array)".to_string())?;
-
-    if raw.is_empty() {
-        return Err("'questions' was empty; ask at least one question".to_string());
-    }
-    if raw.len() > MAX_QUESTIONS {
-        return Err(format!(
-            "{} questions is too many to answer at once; ask at most {MAX_QUESTIONS} and follow \
-             up next turn",
-            raw.len()
-        ));
-    }
-
-    let mut summary = Vec::new();
-    for (index, item) in raw.iter().enumerate() {
-        let position = index + 1;
-        let question = item
-            .get("question")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-            .ok_or_else(|| format!("question {position} has no 'question' text"))?;
-
-        let options: Vec<&str> = item
-            .get("options")
-            .and_then(Value::as_array)
-            .map(|opts| {
-                opts.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|o| !o.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // The kind is inferred when it is not stated, because a model that
-        // supplies options plainly means a choice question, and refusing on a
-        // missing field it did not need would be pedantry.
-        let kind = match item.get("type").and_then(Value::as_str) {
-            Some("choice") => "choice",
-            Some("open") => "open",
-            Some(other) => {
-                return Err(format!(
-                    "question {position} has type '{other}'; use 'choice' or 'open'"
-                ))
-            }
-            None if options.is_empty() => "open",
-            None => "choice",
-        };
-
-        if kind == "choice" {
-            if options.is_empty() {
-                return Err(format!(
-                    "question {position} is multiple choice but lists no options; give some \
-                     options, or use type 'open'"
-                ));
-            }
-            if options.len() > MAX_OPTIONS {
-                return Err(format!(
-                    "question {position} has {} options; at most {MAX_OPTIONS} can be shown",
-                    options.len()
-                ));
-            }
-        }
-
-        summary.push(match kind {
-            "choice" => format!(
-                "  {position}. {question}\n     options: {}",
-                options.join(" / ")
-            ),
-            _ => format!("  {position}. {question}\n     open ended"),
-        });
-    }
-
-    // Said back plainly, because this string is what the model reads next. It
-    // has to stop the model from also asking in prose, and from waiting for an
-    // answer inside this turn.
-    Ok(format!(
-        "Put {} question(s) to the user:\n{}\n\nEvery choice question also offers a free-text \
-         answer, and every question can be skipped. End your turn now — the answers arrive as \
-         the user's next message. Do not ask these again in your reply.",
-        raw.len(),
-        summary.join("\n")
-    ))
 }
 
 // --- memory tools -----------------------------------------------------------
