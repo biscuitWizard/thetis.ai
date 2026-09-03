@@ -29,7 +29,7 @@ the surface got sloppy the last time.
 
 | Zone | Width | Job | Never |
 |---|---|---|---|
-| Sidebar | `--sidebar-w` 272px | Navigate conversations: search, recency groups, archived | Hold a feature. The workspace explorer lived here once and was unfindable |
+| Sidebar | `--sidebar-w` 272px | Navigate conversations: search, recency groups, archived — and say what each is doing now | Hold a feature. The workspace explorer lived here once and was unfindable |
 | Main | Tab strip + stage; the chat pane keeps `--measure` 48rem, centred | The stage: the conversation, plus a tab per sub-agent and per open file | Let another tab displace the conversation's own — it is tab 0 and never closes |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
 
@@ -130,6 +130,18 @@ of filled buttons pulls the eye away from the content it acts on.
 Status is a 6–8px dot or an outlined pill, in `--ok` / `--warn` / `--err`. Never
 colour a whole row to say "this failed".
 
+**In progress is a sheen, not a spinner.** A working conversation's sidebar row
+shows its current step — `Thinking`, `Writing a reply`, or a tool's bare name in
+mono — as text with a brighter band gliding through it (`background-clip:
+text` over a moving gradient), a pulsing accent dot, and a fainter wash
+sweeping the row underneath. Both run off `--sheen` and a per-row `--phase`
+set inline from wall time, so the list can be redrawn on every step without the
+sheen snapping back to the start, and every working row moves in unison. Under
+`prefers-reduced-motion` the sheen is removed, not slowed: the text goes solid
+`--text` and the dot holds still. Waiting on the reader is `--warn`, a failed
+turn is `--err`, and neither animates — motion means the agent is doing
+something, and only that.
+
 ## Hard rules
 
 These are not preferences. Breaking one has bitten this codebase.
@@ -212,6 +224,18 @@ These are not preferences. Breaking one has bitten this codebase.
     the sockets `watching` that session, so anything derived from another
     conversation — the sidebar's titles and previews — goes stale in a tab that
     was not watching. Re-ask on open rather than assuming a push arrived.
+
+    **The one exception is `activity`, and it exists because of this rule.**
+    The host folds every worker frame into a small per-conversation snapshot
+    (`crates/thetis/src/activity.rs`: working / waiting / failed / idle, the
+    current step, steps, cost, running sub-agents) and pushes a change to
+    *every* socket whose principal may see the session, watched or not. The
+    `sessions` list carries the same snapshot per row (`activity`) so a fresh
+    tab is right on first paint. The sidebar draws live state from
+    `store.activity` and nothing else; the transcript still learns its own
+    conversation's state from the event stream. Merge the two sources by the
+    snapshot's `rev`, never by arrival — a push and a list reply travel on
+    different paths and cross.
 
 ## Component vocabulary
 
@@ -332,7 +356,10 @@ about the diff:
 | A number the user asked for is missing | It is on the wire and dropped | Render it; check `render.rs` before adding a field |
 | A panel sits stale while the agent works | Nothing invalidates it | Add the tab to `INVALIDATED_BY` |
 | Totals read zero during a long turn | Accounting hangs off `turn-finished` | Accumulate each `assistant` frame's usage |
-| A sidebar row keeps an old title | The tab was not subscribed to that session | Re-ask for the list on open |
+| A sidebar row keeps an old title | The tab was not subscribed to that session | Re-ask for the list on open; `app.js` also re-lists on every `activity` state change |
+| A sidebar row says "working" after the turn ended | A `sessions` reply computed before the push arrived after it | Merge by the snapshot's `rev` (`mergeActivity`), not by arrival |
+| The sheen jumps back to the start on every step | The row was rebuilt and its CSS animation restarted | `--phase` inline from `Date.now() % SHEEN_MS`; keep `SHEEN_MS` equal to `--sheen` |
+| Background conversations never light up | The host predates `activity.rs` | Every row reads idle; nothing to fix client-side |
 | Every tab label is 0px wide, strip is a row of close buttons | `.stage-tab { min-width: 0 }` lets a dozen tabs shrink to nothing | A width floor (`min-width: 7.5rem`), so they overflow and the strip scrolls |
 | Activating a tab appears to do nothing | The tab is scrolled off the strip's right edge | `scrollIntoView({block:"nearest"})` on every `drawStrip` |
 | A streaming delta lands in the wrong copy of a sub-agent | Two homes sharing one `live`/`open` cursor | Per-home cursors in `inAgent()` |
