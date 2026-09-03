@@ -178,6 +178,9 @@ fn restart_tools() -> Vec<ToolDef> {
              this rebuilds it for you, in the background, and reports the result here. \
              A build that fails restarts nothing and gives you the compiler error; a \
              binary that will not start is probed and rejected before it is adopted. \
+             Ask once: a rebuild takes minutes, and while one is running a second call \
+             starts nothing and changes nothing. Every outcome arrives here on its own, \
+             so silence means it is still building, not that the request was lost. \
              This turn continues afterwards unless you say otherwise; say why first, \
              because the restart happens just after your turn ends.",
         mutating: true,
