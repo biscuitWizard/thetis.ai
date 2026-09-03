@@ -380,7 +380,7 @@ enabled = true
 # happen well before the provider starts refusing, not at the cliff edge.
 window_tokens = 200000
 # Compact when the context passes this fraction of the window...
-compact_threshold = 0.6
+compact_threshold = 1.0
 # ...and shed until it is back under this one. Summarizing stops at the first
 # round boundary that gets under the target, so a long conversation sheds what
 # it must and keeps the rest.

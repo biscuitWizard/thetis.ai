@@ -1342,7 +1342,7 @@ mod spec {
                 // Deliberately below any real window: the point is to compact
                 // well before the provider starts refusing, not at the cliff.
                 window_tokens: 200_000,
-                compact_threshold: 0.6,
+                compact_threshold: 1.0,
                 compact_target: 0.25,
                 // Empty means "whatever the session is using".
                 summary_model: String::new(),
@@ -2226,7 +2226,7 @@ impl Config {
             context: ContextSettings {
                 enabled: env.parse("THETIS_COMPACT", file.context.enabled),
                 window: env.parse("THETIS_CONTEXT_WINDOW", file.context.window_tokens).max(1),
-                compact_threshold: file.context.compact_threshold.clamp(0.05, 0.99),
+                compact_threshold: file.context.compact_threshold.clamp(0.05, 1.0),
                 compact_target: file.context.compact_target.clamp(0.01, 0.95),
                 summary_model: env.string("THETIS_SUMMARY_MODEL")
                     .unwrap_or(file.context.summary_model),
