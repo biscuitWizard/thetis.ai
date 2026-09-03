@@ -141,7 +141,7 @@ fn normalise(path: &Path) -> PathBuf {
 
 /// `std::fs::canonicalize` returns `\\?\` paths on Windows, which do not
 /// compare cleanly against ordinary ones.
-fn canonical(path: &Path) -> PathBuf {
+pub(crate) fn canonical(path: &Path) -> PathBuf {
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let text = resolved.to_string_lossy();
     match text.strip_prefix(r"\\?\") {
@@ -189,7 +189,7 @@ fn require_enabled(cfg: &Config) -> Result<()> {
 /// handed back from the workspace would be read again from the project root and
 /// either miss or, worse, hit a different file of the same name. Preopens are
 /// checked before the plain roots for exactly that reason.
-fn display(cfg: &Config, path: &Path) -> String {
+pub(crate) fn display(cfg: &Config, path: &Path) -> String {
     for dir in &cfg.wasi.dirs {
         let Ok(relative) = path.strip_prefix(dir) else {
             continue;
@@ -591,15 +591,38 @@ pub fn read_file_range(cfg: &Config, raw: &str, offset: u32, limit: u32) -> Resu
         ));
     }
 
+    // Two bounds, not one. `limit` counts lines, but the real constraint on a
+    // tool result is bytes, and a file of long lines blows the byte budget long
+    // before it reaches the line limit. Bounding only by lines meant this
+    // function believed it had shown everything, emitted no footer, and left the
+    // caller to cut the text blind — losing the footer with it. So stop at
+    // whichever bound comes first and report honestly either way.
+    // Leave headroom under the tool-output cap so the footer, and the caller's
+    // own framing, still fit without triggering a spill.
+    let byte_budget = cfg.max_tool_output_bytes.saturating_sub(2_048).max(4_096);
+
     let mut out = String::new();
+    let mut shown_end = start - 1;
+    let mut stopped_early = false;
     for (i, line) in text.lines().enumerate().skip(start - 1).take(limit) {
-        out.push_str(&format!("{:>6}\t{}\n", i + 1, clip(line)));
+        let rendered = format!("{:>6}\t{}\n", i + 1, clip(line));
+        if !out.is_empty() && out.len() + rendered.len() > byte_budget {
+            stopped_early = true;
+            break;
+        }
+        out.push_str(&rendered);
+        shown_end = i + 1;
     }
 
-    let shown_end = (start + limit - 1).min(total);
+    let shown_end = shown_end.max(start - 1);
     if shown_end < total {
+        let reason = if stopped_early {
+            " (stopped at the output size limit)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "\n[lines {start}-{shown_end} of {total}; read on with offset {}]\n",
+            "\n[lines {start}-{shown_end} of {total}{reason}; read on with offset {}]\n",
             shown_end + 1
         ));
     } else if start > 1 {
@@ -1286,6 +1309,60 @@ mod tests {
         assert!(format!("{err:#}").contains("deleting is off"), "{err:#}");
         // Reading and writing still work.
         assert!(read_file(&cfg, "src/main.rs").is_ok());
+    }
+
+    /// The proven regression: a file of long lines exceeds the byte budget well
+    /// before the 2000-line default, and used to come back with no footer at all
+    /// — so the caller cut it blind and the model was left with no way to read on.
+    #[test]
+    fn a_read_bounded_by_bytes_still_says_how_to_continue() {
+        let (cfg, _d) = fixture();
+        let wide = "a".repeat(290);
+        let body: String = std::iter::repeat(wide).take(400).collect::<Vec<_>>().join("\n");
+        write_file(&cfg, "wide.txt", &body).expect("write");
+
+        let out = read_file_range(&cfg, "wide.txt", 0, 0).expect("reads");
+        assert!(
+            out.len() <= cfg.max_tool_output_bytes,
+            "must fit the tool-output budget, got {}",
+            out.len()
+        );
+        assert!(
+            out.contains("read on with offset"),
+            "a partial read must say how to continue: {}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(
+            out.contains("stopped at the output size limit"),
+            "and why it stopped"
+        );
+    }
+
+    /// Reading on from the offset the footer gave must actually advance.
+    #[test]
+    fn the_offered_offset_reads_the_next_window() {
+        let (cfg, _d) = fixture();
+        let body: String = (1..=400)
+            .map(|i| format!("line{i} {}", "b".repeat(280)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&cfg, "wide.txt", &body).expect("write");
+
+        let first = read_file_range(&cfg, "wide.txt", 0, 0).expect("reads");
+        let marker = "read on with offset ";
+        let at = first.find(marker).expect("footer") + marker.len();
+        let next: u32 = first[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("a number");
+
+        let second = read_file_range(&cfg, "wide.txt", next, 0).expect("reads on");
+        assert!(
+            second.contains(&format!("line{next} ")),
+            "reading on starts at the line the footer promised"
+        );
     }
 
     #[test]

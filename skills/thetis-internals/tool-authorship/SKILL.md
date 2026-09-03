@@ -314,9 +314,19 @@ almost always work; anything wanting a C toolchain or its own TLS does not.
 There is deliberately no wall-clock ceiling. The budget measures time spent
 *not* talking to the host, because that distinguishes a wedged guest from a slow
 one; a guest that is merely computing gets `UpdateDeadline::Yield` so it cannot
-hold a runtime thread solid. Output past the cap is cut at a char boundary and
-annotated `[truncated: N of M bytes shown]` (`Grip::truncate`) — so paginate or
-summarise inside the tool rather than relying on the cut.
+hold a runtime thread solid.
+
+Output past the cap is **spilled, not merely cut**: `Grip::cap_output` hands it to
+`crate::spill::cap`, which writes the whole text to
+`/workspace/tool-output/<tool>-<millis>.txt` and returns the head, the tail, and
+the path, so nothing is lost and `read_path` and `search_files` can window and
+grep it. Keeping the tail is deliberate — a head-only cut destroyed the
+resumption footer a well-behaved tool writes at the end.
+
+Do not rely on that fallback. It is a safety net for output you could not bound,
+and it still costs the head and tail in context. Bound inside the tool, and see
+[bounded-tool-output](skill:bounded-tool-output) for which of window, search,
+handle, spill or summary to reach for.
 
 Confirm current values with `list_config`; the numbers above are defaults.
 
@@ -372,7 +382,7 @@ fault to report, not an instruction to unload the system's own moving parts.
 | Build refused: `argument schema is not valid JSON` | `args_schema_json` is not JSON | Build it with `json!({...}).to_string()` |
 | `tool '<name>' crashed: ...` | The component trapped. Reported as a tool result, not a trap, so the conversation survives | Fix it. Repeated failures in the watchdog window trip the breaker and reset the aspect to its last green build |
 | Refused: "changes things, and this conversation is in \<mode\> mode" | Read-only enforced at dispatch, not just in the list | Switch modes, or declare `"read-only"` if it truly only reads |
-| Result ends `[truncated: ...]` | Output exceeded the cap | Trim inside the tool |
+| Result says `[... N of M bytes not shown here ...]` and names a spill file | Output exceeded the cap, so the kernel spilled it | Read the spill path with `read_path`/`search_files` for now; then bound the tool at source — see [bounded-tool-output](skill:bounded-tool-output) |
 | A setting you added is not visible | Config is read at startup | `restart_orchestrator` |
 | Build times out or blocks for a very long time | `build.timeout_secs` is 900, but every worktree builds into its own `target/` and shares one cargo lock. Several conversations building at once serialise, and `Blocking waiting for file lock on build directory` can last tens of minutes | Check `pgrep -af 'cargo (build\|test)'` before concluding anything is wedged. Detach a long kernel build with `setsid nohup ... > /tmp/log 2>&1 &` so a restart does not kill it, and poll the log |
 | A tool reads a different setting than `thetis.toml` says, or a config test fails only on a machine with credentials | The environment beats the file, per scope. A real `NOTION_TOKEN` overrides `[tools.notion] token` everywhere, tests included | Working as designed. Assert on a fictional `zz*` scope in tests, and check the environment before disbelieving the file |

@@ -437,10 +437,24 @@ pub fn path_segment(value: &str) -> String {
 pub fn object_path_segment(value: &str) -> Result<String, String> {
     let value = value.trim();
     if let Some(id) = value.strip_prefix('#') {
+        // A UUID object id, as `Display for Obj` and `compact_wire` render one:
+        // `#RRRRRR-TTTTTTTTTT` in hex. Its CURIE is `uuid:` plus the same text,
+        // per `ObjectRef::parse_curie`. Checked before the numeric case because
+        // a plain `#-5` and a UUID both contain a dash, and without this a
+        // caller could not pass an id back that a listing had just shown it.
+        if let Some((first, rest)) = id.split_once('-') {
+            let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+            if first.len() == 6 && rest.len() == 10 && hex(first) && hex(rest) {
+                return Ok(path_segment(&format!("uuid:{id}")));
+            }
+        }
         if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c == '-') {
             return Ok(path_segment(&format!("oid:{id}")));
         }
-        return Err("invalid numeric object reference".into());
+        return Err(format!(
+            "invalid object reference {value:?}: expected #number, a UUID id such as \
+             #0011E5-9CB7359F34, or a mooR CURIE such as oid:36 or sysobj:system"
+        ));
     }
     if value.starts_with("oid:") || value.starts_with("uuid:") || value.starts_with("sysobj:") || value.starts_with("match(\"") {
         return Ok(path_segment(value));
@@ -566,11 +580,138 @@ pub fn moo_literal(value: &Value) -> Result<String, String> {
     }
 }
 
+/// Strips the FlatBuffers union wrappers out of a decoded wire response.
+///
+/// The web host serializes the same tagged enums it uses for the ZeroMQ RPC
+/// protocol, so a plain `to_string_pretty` of a verb list spends five levels of
+/// nesting on every integer:
+///
+/// ```text
+/// {"names":[{"value":"aliases"}],"location":{"obj":{"ObjId":{"id":1}}}}
+/// {"names":["aliases"],"location":"#1"}
+/// ```
+///
+/// `#1`'s verb list measured 40,968 bytes before this and 6,090 after — the same
+/// information, because nothing is summarised or dropped. This is worth doing
+/// before any cap: a cut is a loss, whereas deleting a wrapper that means
+/// nothing is free, and it is what keeps these results under the cap at all.
+///
+/// The rule that makes it safe: this protocol's union tags are CamelCase
+/// (`ClientSuccess`, `VerbsReply`, `ObjId`, `VarInt`) while its real field names
+/// are snake_case (`arg_spec`, `names`, `owner`). So a single-key object is a
+/// wrapper — and can be unwrapped — exactly when its key is CamelCase or one of
+/// the known plumbing names. Anything else is kept, including unknown tags, so a
+/// protocol addition shows up rather than vanishing.
+pub fn compact_wire(value: &Value) -> Value {
+    /// A chain of single-key wrappers ending in an object id, rendered the way
+    /// mooR itself renders one.
+    ///
+    /// Two forms reach us, because a server with `use_uuobjids` on mixes them
+    /// in a single list:
+    ///
+    /// * `ObjId{id}` — a plain numbered object, `#36`.
+    /// * `UuObjId{packed_value}` — a time-ordered id whose `u64` packs an
+    ///   autoincrement, six bits of randomness and a millisecond timestamp.
+    ///   `#{first_group:06X}-{epoch_ms:010X}`, matching `UuObjid::to_uuid_string`
+    ///   and `Display for Obj` in `crates/var/src/obj.rs`. Leaving it as the raw
+    ///   integer would put a number in front of a caller that no other tool
+    ///   accepts back.
+    fn as_objid(v: &Value) -> Option<String> {
+        let map = v.as_object()?;
+        if map.len() != 1 {
+            return None;
+        }
+        let (key, inner) = map.iter().next()?;
+        match key.as_str() {
+            "ObjId" => {
+                let fields = inner.as_object()?;
+                if fields.len() == 1 {
+                    return Some(format!("#{}", fields.get("id")?.as_u64()?));
+                }
+                None
+            }
+            "UuObjId" => {
+                let fields = inner.as_object()?;
+                if fields.len() != 1 {
+                    return None;
+                }
+                let packed = fields.get("packed_value")?.as_u64()?;
+                // The same field layout as schema/src/packed_id.rs.
+                let autoincrement = (packed >> 46) & 0xFFFF;
+                let rng = (packed >> 40) & 0x3F;
+                let epoch_ms = packed & 0x00FF_FFFF_FFFF;
+                let first_group = (autoincrement << 6) | rng;
+                Some(format!("#{first_group:06X}-{epoch_ms:010X}"))
+            }
+            _ => as_objid(inner),
+        }
+    }
+
+    /// Whether a single-key object's key carries no information.
+    fn is_wrapper(key: &str) -> bool {
+        matches!(key, "value" | "reply" | "result" | "obj" | "variant")
+            || key.starts_with(|c: char| c.is_ascii_uppercase())
+    }
+
+    if let Some(id) = as_objid(value) {
+        return Value::String(id);
+    }
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(compact_wire).collect()),
+        Value::Object(map) => {
+            if map.len() == 1 {
+                let (key, inner) = map.iter().next().expect("len checked");
+                if is_wrapper(key) {
+                    return compact_wire(inner);
+                }
+            }
+            Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), compact_wire(v)))
+                    .collect(),
+            )
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Caps a result, keeping the head, and says how to reach the rest.
+///
+/// The old version stopped at `...[truncated: N bytes total]`, which tells the
+/// caller its answer is incomplete and gives it nothing to do about that. The
+/// only recoveries available are re-asking for a narrower slice or reading the
+/// spilled copy the host leaves in the workspace, so the note names both. Cutting
+/// on a line boundary matters here because objdef and pretty JSON are read by
+/// line, and half a line reads as a syntax error rather than as a cut.
 pub fn bounded(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes { return text.into(); }
-    let mut end = max_bytes.saturating_sub(64).min(text.len());
+    // The note costs about 240 bytes. Subtracting it from a small budget can
+    // leave nothing at all, and a note with no excerpt attached is the one
+    // outcome with no value to anyone: the caller learns neither the content
+    // nor anything it did not already know. Keep a floor of real text and let
+    // the result run slightly over instead — the host's cap is the real
+    // backstop, and it spills rather than cutting.
+    let mut end = max_bytes.saturating_sub(240).max(max_bytes / 2).min(text.len());
     while !text.is_char_boundary(end) { end -= 1; }
-    format!("{}\n...[truncated: {} bytes total]", &text[..end], text.len())
+    // Prefer the last line break in the final 10%, so the excerpt ends on a
+    // whole line where the text has any.
+    if let Some(nl) = text[..end].rfind('\n') {
+        if nl > end.saturating_sub(end / 10) { end = nl; }
+    }
+    let shown_lines = text[..end].lines().count();
+    let total_lines = text.lines().count();
+    format!(
+        "{}\n\n...[cut here: showed {} of {} bytes, lines 1-{} of {}. \
+Ask for a narrower slice — a single verb or property rather than a whole object, \
+or this tool's offset/limit where it has them. The complete output is also spilled \
+to a file under /workspace/tool-output/, which read_path and search_files can window \
+and grep.]",
+        &text[..end],
+        end,
+        text.len(),
+        shown_lines,
+        total_lines,
+    )
 }
 
 impl HttpResponse {
@@ -757,6 +898,107 @@ mod tests {
     // -----------------------------------------------------------------------
     // Config resolution
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Wire compaction
+    // -----------------------------------------------------------------------
+
+    /// One verb, exactly as `GET /v1/verbs/oid:1?inherited=true` returns it on
+    /// mooR 2.0.0-dev. Copied from a live response rather than invented, because
+    /// the whole point of `compact_wire` is knowing which keys are plumbing.
+    #[test]
+    fn compaction_strips_the_union_wrappers_and_keeps_every_field() {
+        let live = json!({
+            "result": { "ClientSuccess": { "reply": { "reply": { "VerbsReply": { "verbs": [{
+                "arg_spec": [{ "value": "this" }, { "value": "none" }, { "value": "this" }],
+                "d": true,
+                "location": { "obj": { "ObjId": { "id": 1 } } },
+                "names": [{ "value": "aliases" }],
+                "owner": { "obj": { "ObjId": { "id": 36 } } },
+                "r": true, "w": false, "x": true
+            }] } } } } }
+        });
+
+        assert_eq!(
+            compact_wire(&live),
+            json!({ "verbs": [{
+                "arg_spec": ["this", "none", "this"],
+                "d": true,
+                "location": "#1",
+                "names": ["aliases"],
+                "owner": "#36",
+                "r": true, "w": false, "x": true
+            }] }),
+            "compaction should drop only the wrappers"
+        );
+    }
+
+    /// A whole response can be a single value buried in wrappers: `GET
+    /// /v1/objects/oid:1` is 459 pretty bytes that mean `#1`.
+    #[test]
+    fn a_response_that_is_only_wrappers_compacts_to_its_value() {
+        let live = json!({
+            "result": { "ClientSuccess": { "reply": { "reply": { "ResolveResult": {
+                "result": { "variant": { "VarObj": { "obj": { "obj": { "ObjId": { "id": 1 } } } } } }
+            } } } } }
+        });
+        assert_eq!(compact_wire(&live), json!("#1"));
+    }
+
+    /// Real field names must survive even when they look structural, and an
+    /// unknown CamelCase tag must not take its payload with it silently.
+    #[test]
+    fn informative_keys_are_never_unwrapped() {
+        // A single-key object whose key is snake_case is data, not a wrapper.
+        let data = json!({ "verbs": [1, 2] });
+        assert_eq!(compact_wire(&data), data);
+
+        // Multi-key objects are never unwrapped, whatever the keys are called.
+        let multi = json!({ "value": 1, "other": 2 });
+        assert_eq!(compact_wire(&multi), multi);
+
+        // An ObjId with extra fields is not the shape we know, so it is kept
+        // rather than guessed at.
+        let odd = json!({ "ObjId": { "id": 1, "generation": 7 } });
+        assert_eq!(compact_wire(&odd), json!({ "id": 1, "generation": 7 }));
+    }
+
+    /// An id this family prints must be one this family accepts back. A
+    /// listing that shows `#0011E5-9CB7359F34` is useless if no tool takes it.
+    #[test]
+    fn a_rendered_uuid_id_round_trips_as_an_object_reference() {
+        assert_eq!(
+            object_path_segment("#0011E5-9CB7359F34").unwrap(),
+            "uuid:0011E5-9CB7359F34"
+        );
+        // Plain numbered objects, including negatives, keep the oid: form.
+        assert_eq!(object_path_segment("#36").unwrap(), "oid:36");
+        assert_eq!(object_path_segment("#-1").unwrap(), "oid:-1");
+        // Not the UUID shape: wrong group lengths, or non-hex.
+        for bad in ["#11E5-9CB7359F34", "#0011E5-9CB7359F3", "#00ZZE5-9CB7359F34"] {
+            assert!(
+                object_path_segment(bad).is_err(),
+                "{bad} should not parse as an object reference"
+            );
+        }
+    }
+
+    /// A UUID object id must render as mooR renders it, not as the packed
+    /// integer — a caller cannot pass `5037535855484724` to any other tool.
+    ///
+    /// The expected strings come from a live `/v1/objects/query?parent=oid:1`
+    /// on a server with `use_uuobjids` enabled.
+    #[test]
+    fn uuid_object_ids_are_rendered_the_way_moor_renders_them() {
+        for (packed, expected) in [
+            (5037535855484724u64, "#0011E5-9CB7359F34"),
+            (253123655460440414u64, "#038346-9F9FF7C95E"),
+            (105895750294515354u64, "#017837-9FB3872E9A"),
+        ] {
+            let live = json!({ "obj": { "UuObjId": { "packed_value": packed } } });
+            assert_eq!(compact_wire(&live), json!(expected), "packed {packed}");
+        }
+    }
 
     #[test]
     fn base_url_defaults_when_config_has_nothing() {
@@ -990,8 +1232,27 @@ mod tests {
     fn bounded_output_is_utf8_safe() {
         let value = "雪".repeat(200);
         let clipped = bounded(&value, 128);
-        assert!(clipped.contains("truncated"));
         assert!(clipped.len() < value.len());
+        // Multi-byte characters must not be cut in half: the excerpt is still
+        // valid UTF-8 by construction, so check the boundary held by counting.
+        assert!(clipped.starts_with('雪'));
+    }
+
+    /// A cap that says only "this is incomplete" leaves the caller nothing to
+    /// do but guess or re-run the same call, so the note has to name a way on.
+    /// This asserts the contract rather than the old `truncated` wording.
+    #[test]
+    fn a_bounded_result_says_how_to_get_the_rest() {
+        let clipped = bounded(&"x\n".repeat(40_000), 4_000);
+        for expected in ["cut here", "narrower slice", "/workspace/tool-output/"] {
+            assert!(
+                clipped.contains(expected),
+                "the note should mention {expected:?}: {}",
+                &clipped[clipped.len().saturating_sub(400)..]
+            );
+        }
+        // And it goes last, where a reader ends up.
+        assert!(clipped.trim_end().ends_with(']'));
     }
 
     #[test]

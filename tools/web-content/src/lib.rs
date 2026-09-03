@@ -19,10 +19,21 @@ use std::time::Duration;
 
 /// Fetching many pages at once is the fastest way to blow the context window.
 const MAX_URLS: usize = 10;
-/// Per page. The host caps tool output as well, so this is the polite limit
-/// rather than the enforced one.
+/// Per page, when only one page was asked for.
 const DEFAULT_CHARS: i64 = 6_000;
 const MAX_CHARS: i64 = 40_000;
+
+/// Everything this tool returns, across every page, aims to stay under this.
+///
+/// The per-page default used to ignore how many pages were requested, so ten
+/// URLs at the 6,000-char default came to 60,000 — comfortably over the host's
+/// cap, meaning the ordinary "read these search results" call was cut off
+/// mid-page every time. The budget is shared out instead, so asking for more
+/// pages gives less of each rather than losing the last ones entirely.
+const TOTAL_CHARS: i64 = 24_000;
+/// Below this a page excerpt is too short to be worth having; better to refuse
+/// and let the caller ask for fewer pages.
+const MIN_PER_PAGE: i64 = 1_200;
 
 struct Component;
 
@@ -44,8 +55,14 @@ impl Guest for Component {
                     },
                     "max_characters": {
                         "type": "integer",
-                        "description": format!("Characters of text per page. Defaults to \
-                                                {DEFAULT_CHARS}, maximum {MAX_CHARS}.")
+                        "description": format!("Characters of text per page. By default the \
+                                                {TOTAL_CHARS}-character total budget is shared \
+                                                across the URLs requested (at most \
+                                                {DEFAULT_CHARS} each), so more pages means less \
+                                                of each. Set this to override, up to \
+                                                {MAX_CHARS} — but a large value times several \
+                                                URLs will be spilled to a file rather than \
+                                                returned inline.")
                     },
                     "livecrawl": {
                         "type": "string",
@@ -90,11 +107,16 @@ impl Guest for Component {
             ));
         }
 
-        let max_chars = args
-            .get("max_characters")
-            .and_then(Value::as_i64)
-            .unwrap_or(DEFAULT_CHARS)
-            .clamp(200, MAX_CHARS);
+        // An explicit request is honoured up to the hard ceiling; the caller may
+        // genuinely want one long page. Otherwise share the total budget out
+        // across the pages asked for, so N URLs cannot silently overrun the cap.
+        let asked = args.get("max_characters").and_then(Value::as_i64);
+        let max_chars = match asked {
+            Some(n) => n.clamp(200, MAX_CHARS),
+            None => (TOTAL_CHARS / urls.len() as i64)
+                .min(DEFAULT_CHARS)
+                .max(MIN_PER_PAGE),
+        };
 
         let mut body = json!({
             "urls": urls,
