@@ -72,6 +72,70 @@ impl HostState {
             }
         }
     }
+
+    /// This call's stop signal, if it is running on behalf of a session.
+    fn cancel_flag(&self) -> Option<Arc<crate::session::CancelFlag>> {
+        let session = self.session_id.as_deref()?;
+        self.grip.cancel_flag(session)
+    }
+
+    /// Whether the user has already pressed stop for this call's session.
+    fn cancelled(&self) -> bool {
+        self.cancel_flag().is_some_and(|f| f.raised())
+    }
+
+    /// Runs a blocking host operation, abandoning it if the turn is stopped.
+    ///
+    /// This is what makes the stop button work during the calls that actually
+    /// take time — a terminal command, a build, a model stream. Those await
+    /// inside the host, where neither the guest's own inbox checkpoints nor the
+    /// epoch deadline can reach them: epoch interruption only fires while the
+    /// guest is executing wasm, so a guest parked in a host import was
+    /// uninterruptible for as long as the import took. Racing the work against
+    /// the stop signal is the only thing that can cut that short.
+    ///
+    /// The abandoned work is not killed, just stopped being waited for. That is
+    /// deliberate: a half-written file or a half-finished build is worse than
+    /// one that runs to completion with nobody listening. Terminal commands are
+    /// the exception and are handled in [`crate::terminal`], which can leave the
+    /// command running in its shell and return the output so far.
+    ///
+    /// Marks the budget on the way out, so a guest that ignores the returned
+    /// error still cannot continue: its next wasm instruction traps.
+    async fn interruptible<T>(
+        &mut self,
+        what: &str,
+        work: impl std::future::Future<Output = T>,
+    ) -> std::result::Result<T, String> {
+        let Some(flag) = self.cancel_flag() else {
+            // No session, so nothing to stop: a probe or a gateway call.
+            return Ok(work.await);
+        };
+        // Already stopped before the work began — do not start it at all.
+        if flag.raised() {
+            self.budget.cancel();
+            return Err(stopped_message(what));
+        }
+
+        let outcome = tokio::select! {
+            // Biased so that a stop raised at the same moment the work
+            // finishes does not discard a result that is already in hand.
+            biased;
+            done = work => Ok(done),
+            () = flag.cancelled() => Err(stopped_message(what)),
+        };
+
+        if outcome.is_err() {
+            tracing::info!(what, "abandoning a host call: the turn was stopped");
+            self.budget.cancel();
+        }
+        outcome
+    }
+}
+
+/// What the guest is told when its call was cut short by the user.
+fn stopped_message(what: &str) -> String {
+    format!("{what} was interrupted: you stopped this turn")
 }
 
 // --- sys -------------------------------------------------------------------
@@ -204,11 +268,22 @@ impl session::Host for HostState {
     async fn poll_inbox(&mut self, session_id: String) -> Result<Vec<InboxItem>> {
         self.budget.entered_host("poll_inbox");
         self.scope_ok(&session_id)?;
-        let items = self.grip().sessions.drain_inbox(&session_id);
-        // A cancel request must also stop the guest even if it ignores the
-        // item, so arm the budget's cancellation flag.
+        let mut items = self.grip().sessions.drain_inbox(&session_id);
+
+        // The flag, not the queue, is the authority on whether the turn was
+        // stopped. A queue item can be consumed by an earlier poll and then
+        // forgotten — the guest that read it might discard it, or drain the
+        // inbox at a checkpoint it does not act on — whereas the flag stays
+        // raised for the rest of the turn. Synthesizing the item here means
+        // every poll after a stop reports it, however the guest is written.
+        if self.cancelled() && !items.iter().any(|i| matches!(i, InboxItem::Cancel)) {
+            items.push(InboxItem::Cancel);
+        }
+
+        // A cancel must also stop a guest that ignores the item, so arm the
+        // budget: the next wasm instruction after this call then traps.
         if items.iter().any(|i| matches!(i, InboxItem::Cancel)) {
-            self.budget.cancelled = true;
+            self.budget.cancel();
         }
         Ok(items)
     }
@@ -455,16 +530,44 @@ impl llm::Host for HostState {
         stream_id: u64,
     ) -> Result<std::result::Result<StreamChunk, LlmError>> {
         self.budget.entered_host("stream_next");
+        // Checked before awaiting the next chunk rather than only after: a
+        // model that is still talking would otherwise stream a whole answer
+        // into a turn the user has already stopped.
+        if self.cancelled() {
+            self.budget.cancel();
+            self.streams.remove(&stream_id);
+            return Ok(Err(LlmError::Transport(stopped_message("the completion"))));
+        }
+
+        let flag = self.cancel_flag();
         let chunk = {
             let Some(handle) = self.streams.get_mut(&stream_id) else {
                 return Ok(Err(LlmError::BadRequest(format!(
                     "unknown stream id {stream_id}"
                 ))));
             };
-            handle.next().await
+            match flag {
+                Some(flag) => {
+                    tokio::select! {
+                        biased;
+                        chunk = handle.next() => chunk,
+                        () = flag.cancelled() => {
+                            Err(LlmError::Transport(stopped_message("the completion")))
+                        }
+                    }
+                }
+                None => handle.next().await,
+            }
         };
         // Time spent waiting on the model is not the guest spinning.
         self.yielded();
+
+        if self.cancelled() {
+            // Dropping the handle closes the upstream HTTP response, so the
+            // provider stops generating tokens nobody will read.
+            self.streams.remove(&stream_id);
+            self.budget.cancel();
+        }
 
         if let Ok(chunk) = &chunk {
             self.record_usage(chunk);
@@ -553,10 +656,21 @@ impl tooling::Host for HostState {
         self.budget.entered_host("invoke");
         self.scope_ok(&session_id)?;
         let grip = self.grip.clone();
-        let result = grip.invoke_tool(&name, &session_id, &args_json).await;
+        // A tool can spend a long time on the network. Stopping the turn should
+        // not mean waiting for it, and certainly should not mean the remaining
+        // tools in the batch run afterwards.
+        let result = self
+            .interruptible(
+                &format!("the tool '{name}'"),
+                grip.invoke_tool(&name, &session_id, &args_json),
+            )
+            .await;
         // Running a tool can take real time; that is not the agent spinning.
         self.yielded();
-        Ok(result)
+        Ok(match result {
+            Ok(inner) => inner,
+            Err(stopped) => Err(stopped),
+        })
     }
 
     async fn mcp_list_tools(&mut self) -> Result<Vec<ToolManifest>> {
@@ -964,15 +1078,30 @@ impl terminal::Host for HostState {
         };
 
         tracing::info!(terminal = %id, %command, "running a command");
-        let result = grip
-            .terminals
-            .run(&grip.cfg, &id, &command, timeout)
-            .await
-            .map_err(|e| format!("{e:#}"));
+        // A stop must not have to wait out the command's timeout, which is
+        // exactly the wait it is trying to cut short. The shell keeps running —
+        // killing it would leave the session in an unknown state — but the
+        // output collected so far comes back straight away.
+        let cancel = self.cancel_flag();
+        let result = self
+            .interruptible(
+                "the command",
+                grip.terminals.run_until(
+                    &grip.cfg,
+                    &id,
+                    &command,
+                    timeout,
+                    cancel,
+                ),
+            )
+            .await;
         // A command can legitimately take a long time; that is not the guest
         // spinning, so the budget's spin timer restarts here.
         self.yielded();
-        Ok(result)
+        Ok(match result {
+            Ok(inner) => inner.map_err(|e| format!("{e:#}")),
+            Err(stopped) => Err(stopped),
+        })
     }
 
     async fn read(&mut self, id: String) -> Result<std::result::Result<String, String>> {
