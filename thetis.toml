@@ -633,6 +633,19 @@ timeout_secs = 30
 # installation_id = 12345678
 timeout_secs = 30
 
+[tools.bq]
+credentials_path = "secrets/bq-adc.json"
+project = "market-party-289715"
+location = "US"
+max_bytes_billed = 53687091200
+
+[tools.fb-retention]
+dataset = "analytics_249556675"
+credentials_path = "secrets/bq-adc.json"
+project = "market-party-289715"
+location = "US"
+max_bytes_billed = 53687091200
+
 # The Discord bot. Off until a token is set.
 #
 # The safety property here is `mode`: every session the bot creates is stamped
