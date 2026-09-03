@@ -270,6 +270,42 @@ pub fn uptime() -> Duration {
     STARTED.get().map(|t| t.elapsed()).unwrap_or_default()
 }
 
+/// Free space, in bytes, on the filesystem holding `path`.
+fn free_bytes(path: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+/// A release build of the orchestrator needs room for its own target
+/// directory, and every conversation that builds one has its own.
+///
+/// Checked before starting rather than discovered half way: a build that runs
+/// the disk out does not just fail, it takes the database and every other
+/// conversation's build with it. Refusing early is recoverable; a full disk on
+/// a machine that is also serving is not.
+const KERNEL_BUILD_HEADROOM: u64 = 20 * 1024 * 1024 * 1024;
+
+fn refuse_if_disk_is_tight(cfg: &crate::config::Config) -> Result<()> {
+    let Some(free) = free_bytes(&cfg.root) else {
+        return Ok(()); // cannot tell; do not block on a failed syscall
+    };
+    if free >= KERNEL_BUILD_HEADROOM {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    bail!(
+        "not enough disk to rebuild the orchestrator safely: {:.1} GiB free, and a release \
+         build of it needs room for its own target directory (this conversation has one, and \
+         so does every other). Nothing was built or restarted. Ask the user to reclaim space \
+         — `cargo clean` in an idle checkout is usually the quickest.",
+        gib(free)
+    )
+}
+
 /// Whether the kernel binary in this checkout is older than the source it is
 /// built from.
 ///
@@ -355,6 +391,11 @@ fn build_then_restart(grip: Arc<Grip>, reason: String, session_id: String) {
                     .await;
             }
         };
+
+        if let Err(e) = refuse_if_disk_is_tight(&grip.cfg) {
+            note(format!("{e:#}")).await;
+            return;
+        }
 
         tracing::info!(session = %session_id, "building this branch's kernel before restarting");
         match build_kernel(&grip.cfg).await {
