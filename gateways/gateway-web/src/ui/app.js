@@ -25,6 +25,7 @@ import * as rail from "./views/rail.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
 import * as transcript from "./views/transcript.js";
+import { mountTerminals } from "./views/terminal.js";
 
 // --- status -----------------------------------------------------------------
 
@@ -65,6 +66,24 @@ const connection = new Connection({
 connection.onOpen(() => {
   connection.send({ type: "hello" });
   if (store.current) connection.send({ type: "open", id: store.current });
+});
+
+// Mounted before the frame handlers below, which refer to it. The drawer asks
+// for its own list rather than being told: a reconnect, a conversation switch
+// and a newly opened shell all funnel through the same request.
+const terminals = mountTerminals({
+  onRequest: (id) => connection.send({ type: "terminals", id }),
+  // `id` is the conversation everywhere on this socket, so the shell goes in
+  // its own field rather than overloading it.
+  onKill: (terminal) =>
+    connection.send({ type: "terminal-close", id: store.current, terminal }),
+});
+
+// A reconnect replays `open` for the same conversation, which `setSession`
+// short-circuits — so the drawer would keep whatever it had from before the
+// socket dropped, having missed every feed frame in between. Re-ask here.
+connection.onOpen(() => {
+  if (store.current) connection.send({ type: "terminals", id: store.current });
 });
 
 connection
@@ -137,6 +156,9 @@ connection
     // The rail persists across conversations, so whatever tab is open follows
     // to the one now on screen.
     refreshOpenTab();
+    // The drawer belongs to the conversation, so it drops the previous one's
+    // emulators and asks for this one's shells.
+    terminals.setSession(frame.session);
   })
 
   .on("settings", (frame) => {
@@ -236,6 +258,26 @@ connection
 
   .on("debug-request", context.onFrame)
 
+  // The shells this conversation has open, in full: sent on opening a
+  // conversation and whenever one is created or reaped.
+  .on("terminals", terminals.onList)
+  // One piece of live shell activity — a command, a burst of output, an exit.
+  // Pushed by the worker as it happens rather than polled: watching a build
+  // scroll is the entire point of the drawer.
+  .on("terminal", terminals.onFeed)
+  // The outcome of the drawer's own kill button. The list is not rebuilt from
+  // this: the `closed` feed event that follows is what removes the row, so a
+  // shell killed from another tab disappears the same way. This only has to
+  // report a failure, since success is already visible.
+  .on("terminal-close", (frame) => {
+    if (frame.session && frame.session !== store.current) return;
+    if (!frame.ok) {
+      toast(frame.message || `Could not close ${frame.id || "that shell"}.`, { tone: "error" });
+    } else if (frame.note) {
+      toast(frame.note, { tone: "info" });
+    }
+  })
+
   .on("turn-cancel", (frame) => {
     if (frame.session && frame.session !== store.current) return;
     if (!frame.ok) toast(frame.message || "The turn could not be stopped.", { tone: "error" });
@@ -274,7 +316,7 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive)/.test(frame.message || "")) return;
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-)/.test(frame.message || "")) return;
     // An error naming the frame it answers is that frame's verdict. A `send`
     // that reached the host and then failed — a worker that will not start,
     // say — arrives exactly this way, and the composer is locked behind an
@@ -1073,6 +1115,7 @@ $("archive-chat").addEventListener("click", (event) => {
     onConfirm: () => {
       connection.send({ type: "archive", id });
       store.set({ current: null, title: "", branch: null, branchGraph: null });
+      terminals.setSession(null);
       setHeader();
       transcript.showEmpty("Archived", "Pick another conversation, or start a new one.");
       toast("Conversation archived.", {

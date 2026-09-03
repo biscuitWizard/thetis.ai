@@ -42,6 +42,7 @@ pub mod embeddings;
 pub mod skill_index;
 pub mod skill_manager;
 pub mod skills;
+pub mod sshhosts;
 pub mod aspect;
 pub mod store;
 pub mod system_api;
