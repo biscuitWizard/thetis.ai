@@ -1942,3 +1942,173 @@ body { display: flex; flex-direction: column; }
 @media (max-width: 1240px) { .statusbar { gap: var(--gap-3); } .sb-drop-3 { display: none; } }
 @media (max-width: 1080px) { .sb-drop-2 { display: none; } }
 @media (max-width: 880px)  { .sb-drop-1 { display: none; } }
+
+/* --- terminal drawer -----------------------------------------------------------
+   The shells the agent has open, along the foot of the conversation column.
+
+   Docked, not floating: it is the last child of `.main`, so opening it shortens
+   the transcript instead of covering it — the same reasoning that makes every
+   inspector a rail tab. It stops at `.main`'s edge, above the composer's zone
+   and inside the status bar, because it describes this conversation's sandbox
+   rather than the installation.
+
+   Height is animated and set inline by the view, so nothing here fixes it. */
+
+.terminal-dock {
+  flex: 0 0 auto;
+  /* The inline height is authoritative while animating; these bound it. */
+  min-height: 0;
+  max-height: 72vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+  background: var(--term-bg);
+  border-top: 1px solid var(--hairline);
+  transition: height var(--med) var(--ease);
+}
+/* Dragging must track the pointer exactly, so the easing that makes opening
+   feel deliberate is exactly what makes resizing feel like lag. */
+.terminal-dock.is-dragging { transition: none; }
+.terminal-dock.is-collapsed { height: auto !important; }
+.terminal-dock.is-collapsed .term-body,
+.terminal-dock.is-collapsed .term-foot { display: none; }
+.terminal-dock.is-collapsed .term-collapse svg { transform: rotate(180deg); }
+
+/* The resize handle: a 5px strip over the top border, widened to the whole
+   width so it is easy to hit without being visible. */
+.term-grip {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 5px;
+  cursor: ns-resize;
+  z-index: 2;
+}
+.term-grip:hover { background: var(--accent-edge); }
+
+.term-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: var(--gap-1) var(--gap-3) var(--gap-1) var(--gap-2);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--hairline);
+  min-width: 0;
+}
+.term-head-actions { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+.term-collapse svg { transition: transform var(--fast) var(--ease); }
+
+/* Tabs scroll rather than wrap: the drawer's height is the user's, and a second
+   row of tabs silently eating it is not. */
+.term-tabs {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.term-tabs::-webkit-scrollbar { display: none; }
+
+.term-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+.term-tab:hover { background: var(--surface-3); color: var(--text); }
+.term-tab.is-active {
+  background: var(--accent-wash);
+  border-color: var(--accent-edge);
+  color: var(--accent);
+}
+/* Output arrived in a tab you are not looking at. A dot, not a colour wash:
+   an inactive shell printing a line is information, not a problem. */
+.term-tab.has-activity .term-tab-label { color: var(--text); font-weight: 600; }
+.term-tab-label { font-size: var(--text-xs); }
+.term-tab-note { color: var(--text-faint); font-size: var(--text-xs); opacity: .8; }
+/* An ssh host, outlined rather than filled: it labels the tab, it is not a
+   status. Only present on a remote session, so a local tab reads as before. */
+.term-tab-host {
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-1);
+  padding: 0 4px;
+  max-width: 8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.term-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex: 0 0 auto;
+}
+.term-dot.is-ok { background: var(--ok); }
+.term-dot.is-done { background: var(--text-faint); }
+.term-dot.is-busy { background: var(--warn); animation: pulse 1.4s var(--ease) infinite; }
+
+.term-empty {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  padding: 0 var(--gap-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.term-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--gap-2) 0 var(--gap-2) var(--gap-3);
+  overflow: hidden;
+}
+/* xterm measures its container, so the pane must fill the body exactly — a
+   percentage height here is what stops the emulator sizing itself to one row. */
+.term-pane { width: 100%; height: 100%; }
+
+.term-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  padding: 3px var(--gap-3);
+  background: var(--surface-1);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.term-cwd { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; min-width: 3rem; }
+.term-meta { flex: 0 0 auto; opacity: .8; }
+
+/* Shown only if the vendored emulator fails to load: the transcript is still
+   worth reading unstyled, and an empty black box would look like a hang. */
+.term-fallback { padding: var(--gap-3); font-size: var(--text-sm); color: var(--text-dim); }
+.term-fallback pre {
+  max-height: 40vh;
+  overflow: auto;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+.term-fallback-note { color: var(--err); font-size: var(--text-xs); }
+
+/* The header chip that reveals the drawer once it has been hidden. */
+.term-chip { display: inline-flex; align-items: center; gap: 6px; }
+.term-chip.is-on { color: var(--accent); border-color: var(--accent-edge); }
+.term-chip.is-busy .term-dot.is-busy { background: var(--warn); }

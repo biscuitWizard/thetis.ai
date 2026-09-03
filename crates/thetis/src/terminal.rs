@@ -20,6 +20,49 @@ use tokio::process::{Child, ChildStdin, Command};
 use crate::bindings::types::{TerminalInfo, TerminalOutput};
 use crate::config::Config;
 
+/// How much of a session's transcript is kept for the UI's terminal drawer.
+/// The tail only: a browser joining late wants the last screenful, not the
+/// whole history of a `cargo build`.
+const MAX_DISPLAY_BYTES: usize = 96 * 1024;
+
+/// The shared prefix of every completion marker, so a watcher can recognise
+/// one without knowing which command it belongs to.
+const MARKER_PREFIX: &str = "__thetis_done_";
+
+/// One piece of shell activity, as the terminal drawer sees it.
+///
+/// Deliberately separate from `read`, which *consumes* the buffer because the
+/// agent's own `terminal_read` is defined that way: a viewer that stole the
+/// agent's output would break the tool it is meant to be showing. So the pump
+/// tees every line — once into the agent's buffer, once here.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TerminalFeed {
+    pub id: String,
+    /// `opened`, `command`, `output`, `exit` or `closed`.
+    pub kind: String,
+    pub text: String,
+    pub cwd: String,
+    pub shell: String,
+    /// The ssh host, empty for a local shell. Carried on every event so a tab
+    /// created by an `opened` frame is labelled without a second lookup.
+    pub remote: String,
+}
+
+/// A session as the drawer draws it: what `list` reports, plus the transcript
+/// so a tab that opens mid-command has something to show.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TerminalView {
+    pub id: String,
+    pub cwd: String,
+    pub shell: String,
+    pub alive: bool,
+    pub commands: u32,
+    pub transcript: String,
+    /// The ssh host the session runs on, empty for a local shell. A drawer tab
+    /// has to say which machine a command ran on.
+    pub remote: String,
+}
+
 /// What to open, gathered into one struct because the argument list had grown
 /// past the point where positional `Option`s were readable.
 #[derive(Debug, Default, Clone)]
@@ -74,6 +117,9 @@ struct Session {
     pgid: i32,
     /// Everything the shell has written that `read` has not yet returned.
     buffer: Arc<Mutex<String>>,
+    /// The same output, kept for anyone watching rather than consuming: the
+    /// browser's terminal drawer. Capped to its tail.
+    display: Arc<Mutex<String>>,
     commands: u32,
     last_used: Instant,
 }
@@ -146,15 +192,71 @@ fn signal_children(pgid: i32, leader: i32, sig: i32) {
     }
 }
 
-#[derive(Default)]
 pub struct Terminals {
     sessions: tokio::sync::Mutex<HashMap<String, Session>>,
     counter: std::sync::atomic::AtomicU64,
+    /// Shell activity, for anything that wants to watch rather than drive: the
+    /// worker mirrors this up to the gateway, which fans it out to the browser
+    /// tabs on that conversation. A broadcast channel because there may be no
+    /// subscriber at all — the common case — and dropping into a void must cost
+    /// nothing and block nobody.
+    feed_tx: tokio::sync::broadcast::Sender<TerminalFeed>,
+}
+
+impl Default for Terminals {
+    fn default() -> Self {
+        let (feed_tx, _) = tokio::sync::broadcast::channel(512);
+        Self {
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            counter: std::sync::atomic::AtomicU64::new(0),
+            feed_tx,
+        }
+    }
 }
 
 impl Terminals {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Subscribes to shell activity across every session in this worker.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<TerminalFeed> {
+        self.feed_tx.subscribe()
+    }
+
+    fn announce(&self, id: &str, kind: &str, text: String, cwd: &str, shell: &str, remote: &str) {
+        let _ = self.feed_tx.send(TerminalFeed {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            text,
+            cwd: cwd.to_string(),
+            shell: shell.to_string(),
+            remote: remote.to_string(),
+        });
+    }
+
+    /// Every session with its transcript, for a browser tab that has just
+    /// opened the drawer and has no history of its own.
+    pub async fn views(&self) -> Vec<TerminalView> {
+        let mut sessions = self.sessions.lock().await;
+        let mut out: Vec<TerminalView> = sessions
+            .values_mut()
+            .map(|s| TerminalView {
+                id: s.id.clone(),
+                cwd: s.cwd.clone(),
+                shell: s.shell.clone(),
+                alive: matches!(s.child.try_wait(), Ok(None)),
+                commands: s.commands,
+                remote: s.remote.clone(),
+                transcript: s
+                    .display
+                    .lock()
+                    .map(|d| d.clone())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     fn require_enabled(cfg: &Config) -> Result<()> {
@@ -266,15 +368,7 @@ impl Terminals {
             child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?,
         ));
         let buffer = Arc::new(Mutex::new(String::new()));
-
-        // Both streams feed one buffer, so interleaved output reads the way it
-        // would in a real terminal.
-        if let Some(stdout) = child.stdout.take() {
-            pump(stdout, buffer.clone(), cfg.terminal.max_output_bytes);
-        }
-        if let Some(stderr) = child.stderr.take() {
-            pump(stderr, buffer.clone(), cfg.terminal.max_output_bytes);
-        }
+        let display = Arc::new(Mutex::new(String::new()));
 
         let id = format!(
             "term-{}",
@@ -283,40 +377,76 @@ impl Terminals {
                 + 1
         );
 
+        // Both streams feed one buffer, so interleaved output reads the way it
+        // would in a real terminal. The tee into `display` and the feed is what
+        // the drawer renders; the agent's own buffer is untouched.
+        let watch = Watch {
+            display: display.clone(),
+            feed: self.feed_tx.clone(),
+            id: id.clone(),
+        };
+        if let Some(stdout) = child.stdout.take() {
+            pump(
+                stdout,
+                buffer.clone(),
+                cfg.terminal.max_output_bytes,
+                watch.clone(),
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            pump(stderr, buffer.clone(), cfg.terminal.max_output_bytes, watch);
+        }
+
+        // Hoisted out of the struct literal because the drawer's `opened`
+        // event needs the same three values, and a remote session's are not
+        // simply `dir` and the configured shell.
+        //
+        // A remote session's directory is unknown until the far side says so;
+        // the first command's marker fills it in.
+        let cwd = match &host {
+            Some(host) if !host.remote_cwd.is_empty() => host.remote_cwd.clone(),
+            Some(_) => "(remote)".to_string(),
+            None => dir.display().to_string(),
+        };
+        let shell = match &host {
+            Some(host) => format!("ssh {}", host.destination()),
+            None => cfg.terminal.shell.clone(),
+        };
+        let remote = host.as_ref().map(|h| h.name.clone()).unwrap_or_default();
+
         sessions.insert(
             id.clone(),
             Session {
                 id: id.clone(),
                 name: spec.name.unwrap_or_default().trim().to_string(),
-                // A remote session's directory is unknown until the far side
-                // says so; the first command's marker fills it in.
-                cwd: match &host {
-                    Some(host) if !host.remote_cwd.is_empty() => host.remote_cwd.clone(),
-                    Some(_) => "(remote)".to_string(),
-                    None => dir.display().to_string(),
-                },
-                shell: match &host {
-                    Some(host) => format!("ssh {}", host.destination()),
-                    None => cfg.terminal.shell.clone(),
-                },
-                remote: host.as_ref().map(|h| h.name.clone()).unwrap_or_default(),
+                cwd: cwd.clone(),
+                shell: shell.clone(),
+                remote: remote.clone(),
                 pty: host.as_ref().is_some_and(|h| h.pty),
                 pending: None,
                 child,
                 stdin,
                 buffer,
+                display,
                 pgid,
                 commands: 0,
                 last_used: Instant::now(),
             },
         );
+        drop(sessions);
 
         tracing::info!(
             terminal = %id,
             dir = %dir.display(),
-            remote = %host.as_ref().map(|h| h.name.clone()).unwrap_or_default(),
+            remote = %remote,
             "terminal session opened"
         );
+
+        // Announced before the connection check, not after, so that a remote
+        // session which fails to come up still shows its tab — the ssh error
+        // arrives as ordinary output, and a tab that appears and then says
+        // "exited" explains the failure far better than one that never appears.
+        self.announce(&id, "opened", String::new(), &cwd, &shell, &remote);
 
         // An ssh session that cannot connect otherwise looks like a healthy
         // session whose every command times out — and the reason ssh gives (a
@@ -324,7 +454,6 @@ impl Terminals {
         // by the time anyone asks. So prove the far side answers before handing
         // the id back, and report ssh's own words if it does not.
         if host.is_some() {
-            drop(sessions);
             if let Err(e) = self.confirm_remote(cfg, &id).await {
                 let _ = self.close(&id).await;
                 return Err(e);
@@ -366,7 +495,14 @@ impl Terminals {
             return Err(anyhow!("no terminal session {id}"));
         };
         session.terminate().await;
+        let (cwd, shell, remote) = (
+            session.cwd.clone(),
+            session.shell.clone(),
+            session.remote.clone(),
+        );
+        drop(sessions);
         tracing::info!(terminal = %id, "terminal session closed");
+        self.announce(id, "closed", String::new(), &cwd, &shell, &remote);
         Ok(format!("closed {id}"))
     }
 
@@ -691,7 +827,7 @@ impl Terminals {
         }
 
         let marker = format!(
-            "__thetis_done_{}__",
+            "{MARKER_PREFIX}{}__",
             self.counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
@@ -701,7 +837,7 @@ impl Terminals {
         // stdin, and a script larger than the pipe buffer parks there — and
         // holding the map lock across that froze every other terminal call,
         // including the `terminal_list` someone would use to diagnose it.
-        let (buffer, stdin, pgid, leader) = {
+        let (buffer, display, stdin, pgid, leader, cwd, shell) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(id)
@@ -719,11 +855,21 @@ impl Terminals {
             session.last_used = Instant::now();
             (
                 session.buffer.clone(),
+                session.display.clone(),
                 session.stdin.clone(),
                 session.pgid,
                 session.child.id().unwrap_or(0) as i32,
+                session.cwd.clone(),
+                session.shell.clone(),
             )
         };
+
+        // The command itself, echoed into the watcher's transcript. A shell fed
+        // from a pipe prints no prompt and no echo, so without this the drawer
+        // would show output with nothing to say what produced it.
+        let prompt = format!("$ {command}\n");
+        append_display(&display, &prompt);
+        self.announce(id, "command", prompt, &cwd, &shell, &remote);
 
         {
             let script = format!("{command}\n{}\n", echo_marker(cfg, &marker));
@@ -798,19 +944,29 @@ impl Terminals {
                 // The session's directory is only known here, so this is also
                 // where `terminal_list` stops going stale after a `cd`.
                 let mut sessions = self.sessions.lock().await;
+                let mut now_at = cwd.clone();
                 let note = match sessions.get_mut(id) {
                     Some(session) => {
                         // The exit status now travels as a field, so the note
                         // only has to carry what the field cannot: a move.
                         let note = completion.note(&session.cwd);
                         if let Some(cwd) = completion.cwd {
-                            session.cwd = cwd;
+                            session.cwd = cwd.clone();
+                            now_at = cwd;
                         }
                         note
                     }
                     None => String::new(),
                 };
                 text.push_str(&note);
+                drop(sessions);
+
+                // The exit status, for the watcher. `note` is empty for a
+                // command that worked and stayed put, which is the majority —
+                // the drawer wants the status either way, so it is sent as its
+                // own field rather than as prose.
+                let status = completion.exit_code.unwrap_or(0);
+                self.announce(id, "exit", status.to_string(), &now_at, &shell, &remote);
 
                 return Ok(TerminalOutput {
                     output: text,
@@ -883,6 +1039,19 @@ impl Terminals {
                          host to make interrupts possible.]"
                     ));
                 }
+                // The watcher sees no marker and no exit line, so without this
+                // the drawer would sit on a spinning busy dot for good.
+                let why = if stopped {
+                    "stopped"
+                } else if !interrupted_remotely {
+                    "timed out — still running on the remote host"
+                } else {
+                    "timed out"
+                };
+                let line = format!("[{why}]\n");
+                append_display(&display, &line);
+                self.announce(id, "output", line, &cwd, &shell, &remote);
+                self.announce(id, "exit", "timeout".into(), &cwd, &shell, &remote);
                 return Ok(TerminalOutput {
                     output,
                     timed_out: true,
@@ -907,6 +1076,16 @@ impl Terminals {
                 // would survive holding its pipes — and, until fd 3 became
                 // close-on-exec, the gateway socket itself.
                 signal_group(session.pgid, libc::SIGKILL);
+                // A tab with the drawer open would otherwise keep a tab for a
+                // shell that no longer exists, forever.
+                let _ = self.feed_tx.send(TerminalFeed {
+                    id: id.clone(),
+                    kind: "closed".into(),
+                    text: String::new(),
+                    cwd: session.cwd.clone(),
+                    shell: session.shell.clone(),
+                    remote: session.remote.clone(),
+                });
                 return false;
             }
             true
@@ -916,8 +1095,16 @@ impl Terminals {
     /// Kills every session, for shutdown.
     pub async fn close_all(&self) {
         let mut sessions = self.sessions.lock().await;
-        for (_, mut session) in sessions.drain() {
+        for (id, mut session) in sessions.drain() {
             session.terminate().await;
+            let _ = self.feed_tx.send(TerminalFeed {
+                id,
+                kind: "closed".into(),
+                text: String::new(),
+                cwd: session.cwd.clone(),
+                shell: session.shell.clone(),
+                remote: session.remote.clone(),
+            });
         }
     }
 }
@@ -1018,8 +1205,29 @@ impl Completion {
     }
 }
 
+/// Where a pump tees output for anyone watching the session.
+#[derive(Clone)]
+struct Watch {
+    display: Arc<Mutex<String>>,
+    feed: tokio::sync::broadcast::Sender<TerminalFeed>,
+    id: String,
+}
+
+/// Appends to a transcript, keeping only its tail.
+fn append_display(display: &Arc<Mutex<String>>, text: &str) {
+    let Ok(mut buf) = display.lock() else { return };
+    buf.push_str(text);
+    if buf.len() > MAX_DISPLAY_BYTES * 2 {
+        let mut cut = buf.len() - MAX_DISPLAY_BYTES;
+        while cut < buf.len() && !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        *buf = buf.split_off(cut);
+    }
+}
+
 /// Reads lines from a stream into the shared buffer.
-fn pump<R>(stream: R, buffer: Arc<Mutex<String>>, cap: usize)
+fn pump<R>(stream: R, buffer: Arc<Mutex<String>>, cap: usize, watch: Watch)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -1044,14 +1252,37 @@ where
             let line = String::from_utf8_lossy(&raw);
             let line = line.strip_suffix('\n').unwrap_or(&line);
             let line = line.strip_suffix('\r').unwrap_or(line);
-            let Ok(mut buf) = buffer.lock() else { return };
-            buf.push_str(line);
-            buf.push('\n');
-            // Keep the tail: a runaway command must not grow this without bound.
-            if buf.len() > cap * 4 {
-                let keep = buf.len() - cap * 2;
-                *buf = buf.split_off(keep);
+            {
+                let Ok(mut buf) = buffer.lock() else { return };
+                buf.push_str(line);
+                buf.push('\n');
+                // Keep the tail: a runaway command must not grow this without
+                // bound.
+                if buf.len() > cap * 4 {
+                    let keep = buf.len() - cap * 2;
+                    *buf = buf.split_off(keep);
+                }
             }
+            // The tee for anyone watching. The completion marker is protocol,
+            // not output — it carries the exit status and the working directory
+            // — so it is filtered here rather than shown to a human as a line
+            // of gibberish after every command.
+            if line.contains(MARKER_PREFIX) {
+                continue;
+            }
+            let text = format!("{line}\n");
+            append_display(&watch.display, &text);
+            // cwd, shell and remote are left empty on an output event: the
+            // drawer already has them from `opened`, and the pump would have to
+            // take the sessions lock on every line to restate them.
+            let _ = watch.feed.send(TerminalFeed {
+                id: watch.id.clone(),
+                kind: "output".into(),
+                text,
+                cwd: String::new(),
+                shell: String::new(),
+                remote: String::new(),
+            });
         }
     });
 }
