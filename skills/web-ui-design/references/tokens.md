@@ -84,13 +84,23 @@ composer, `--r-pill` for pills and the send button.
 ### Turn avatars
 
 A `.turn-avatar` tile per turn — `--avatar-lg` (44px), `--r-md`, cropped
-`object-position: top center` — in a gutter to the **left of the text column**,
-not inside the byline. Squares, not portrait crops: squares line up down the
+`object-position: top center` — in a gutter **outside the text column**, not
+inside the byline. Squares, not portrait crops: squares line up down the
 transcript's edge and keep a face in frame whatever the source ratio.
 
-**How the gutter is made, and why this way.** `--avatar-gutter` is added to the
-*left padding of the scroll container*, and the tile is `position: absolute`
-into it (`right: calc(100% + var(--gap-3))` against a `position: relative` row).
+**There is a gutter on each side: the agent left, the user right**, and each
+byline aligns to its own side (`.row.user .row-head { justify-content: flex-end }`).
+Which margin holds a picture says whose turn it is before any text is read. It
+also fixes a defect of the one-sided version: with padding on the left only, the
+whole conversation sat off-centre in the window by half a gutter. Symmetric
+padding puts it back (`column_centred` true at every width measured).
+
+**How the gutters are made, and why this way.** `--avatar-gutter` is added to
+the *left and right padding of the scroll container*, and the tile is
+`position: absolute` into its side (`right: calc(100% + var(--gap-3))` against a
+`position: relative` row; the user's overrides with `right: auto` and a matching
+`left`). Setting `left` without clearing `right` stretches the tile across the
+entire row, since both would apply.
 Every centred child of the transcript is `max-width: --measure; margin: 0 auto`,
 so shrinking the content box moves all of them together — rows, tool cards,
 meta lines, ask forms, the compaction card — with no per-element change. Seven
@@ -100,10 +110,11 @@ the same left padding so the composer stays on the text's axis.
 Two things this gets right that are easy to get wrong:
 
 - **Padding, not margin.** Margin is slack that vanishes as the window narrows,
-  and an avatar positioned into vanished slack lands on the sidebar. Reserved
-  padding shrinks the text column instead — recoverable, and it never overlaps.
-  Verified at 760px with a rail panel docked: `main_w` 506, text down to 440px,
-  `tile_clear_of_sidebar` still true, nothing overflowing.
+  and an avatar positioned into vanished slack lands on the sidebar or the rail.
+  Reserved padding shrinks the text column instead — recoverable, and it never
+  overlaps. Verified with a rail panel docked at 1440px (`main_w` 764, both
+  gutters still 80px, `clear_of_panel` and `clear_of_sidebar` true) and down to
+  760px, nothing overflowing at any width.
 - **Out of flow, so the byline is untouched.** The tile is a child of the row,
   not of `.row-head`, so the name still starts at the text column's left edge
   (`head_starts_at_row` true) whether or not a face is present.
@@ -116,7 +127,17 @@ for the same reason.
 Three rows are built outside the normal `row()` path and each needs the tile
 adding by hand: the optimistic "sending" row in `showPending`, and the streaming
 row, which must keep its avatar when the final message replaces the streamed
-text. All three are worth re-checking after any change here.
+text. All three are worth re-checking after any change here — measured: one tile
+each, 12px gap, correct side, `showing: ["img"]` through the delta→final swap.
+
+**Measuring alignment: do not measure the flex container.** `.row-head` is a
+full-width flex row, so its rect spans the whole column whatever
+`justify-content` does — asserting on it reported *both* `head_at_left` and
+`head_at_right` true and would have passed a completely unaligned byline. Select
+the text node and measure a `Range` over it instead. And when the head holds more
+than a name — the pending row appends a "sending" flag — it is the *last* child
+that touches the right edge, so assert on the flag's box and merely that the name
+is inboard of it, not that the name itself is flush.
 
 Both roles come from `<template>` elements in `index.html`, cloned per row, so
 the markup for a face lives in one place rather than in each renderer.

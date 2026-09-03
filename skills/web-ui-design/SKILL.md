@@ -26,10 +26,10 @@ the surface got sloppy the last time.
 | Main | `--measure` 48rem, centred | The conversation: transcript, composer | Get replaced by another view |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
 
-Inside Main, each turn carries an avatar in a gutter to the left of the text
-column — yours on your rows, the agent's on its own. The gutter is left padding
-on the scroll container, so every centred child moves together and the text keeps
-its measure. See `references/tokens.md`.
+Inside Main, each turn carries an avatar in a gutter outside the text column —
+the agent's on the left, the user's on the right, with each byline aligned to its
+own side. The gutters are side padding on the scroll container, so every centred
+child moves together and the text keeps its measure. See `references/tokens.md`.
 
 **The one structural rule: an inspector is a rail tab, not a modal.** The rail
 docks — the chat reflows beside it and stays readable and typable with anything
@@ -251,6 +251,8 @@ about the diff:
 | An `<svg>` will not hide, no error | `.hidden = true` on an SVGElement sets a dead JS property | `setHidden(node, true)` from `lib/dom.js` |
 | A flex row's children spill past their column | A flex item will not shrink below its content | `min-width: 0` on the one that should give way |
 | Something needs to sit beside the centred column | Adding a sibling column reflows everything | Pad the scroll container and position into the padding; every `margin: 0 auto` child follows |
+| An alignment assertion passes both ways at once | Measuring a full-width flex container, not its content | Measure a `Range` over the text node |
+| An absolutely-positioned element spans its whole row | `left` set without clearing the inherited `right` | `right: auto` alongside the new `left` |
 | Colour looks off in one place only | Literal hex or a typo'd token | Token from `theme.css` |
 | A panel covers the chat | Built as a modal instead of a rail tab | `rail.open` |
 | Handler throws on the second call | Two paths both tearing down (Enter *and* blur) | Make teardown idempotent |

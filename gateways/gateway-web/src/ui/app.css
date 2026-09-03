@@ -480,32 +480,45 @@ body { display: flex; flex-direction: column; }
 .chip-quiet.is-live { color: var(--warn); }
 
 /* --- turn avatars -----------------------------------------------------------
-   A face per turn, in a gutter to the left of the conversation — outside the
-   text column, not inside the byline.
+   A face per turn, in a gutter beside the conversation — outside the text
+   column, not inside the byline. There is a gutter on each side: the agent's
+   face sits in the left one, yours in the right, so a glance at which margin
+   holds a picture says whose turn it is before any text is read.
 
-   How the gutter is made: --avatar-gutter is added to the *left padding of the
-   scroll container*, and the avatar is absolutely positioned into it. Every
-   centred child of the transcript is `max-width: --measure; margin: 0 auto`, so
-   shrinking the content box moves all of them together — rows, tool cards, meta
-   lines, ask forms and the compaction card stay on one axis with no per-element
-   change. The composer wrap takes the same padding, which is what keeps the
-   composer aligned with the text above it.
+   How the gutters are made: --avatar-gutter is added to the left *and* right
+   padding of the scroll container, and each avatar is absolutely positioned
+   into its side. Every centred child of the transcript is
+   `max-width: --measure; margin: 0 auto`, so shrinking the content box moves
+   all of them together — rows, tool cards, meta lines, ask forms and the
+   compaction card stay on one axis with no per-element change. The composer
+   wrap takes the same padding, which is what keeps the composer aligned with
+   the text above it.
+
+   Symmetry is also why the text column reads as centred: with a gutter on one
+   side only, the conversation sat off-centre in the window by half a gutter.
 
    Padding rather than margin is the point: margin is slack that vanishes when
-   the window narrows, and an avatar in vanished slack overlaps the sidebar.
-   Reserved padding shrinks the text column instead, which is recoverable and
-   never overlaps.
+   the window narrows, and an avatar in vanished slack overlaps the sidebar or
+   the rail. Reserved padding shrinks the text column instead, which is
+   recoverable and never overlaps.
 
    The avatar is out of flow, so the byline's flex row is untouched and the name
-   still starts at the text column's left edge. */
+   still sits at its own edge of the text column. */
 .turn-avatar {
   position: absolute;
-  /* Right-aligned within the gutter, so the picture hugs the text it belongs to
-     rather than drifting toward the sidebar as the gutter changes. */
+  /* Pulled to the inner edge of the gutter, so the picture hugs the text it
+     belongs to rather than drifting outward as the gutter changes. */
   right: calc(100% + var(--gap-3));
   top: 0;
   width: var(--avatar-lg);
   height: var(--avatar-lg);
+}
+/* Yours mirrors into the right-hand gutter. `right: auto` is required: the base
+   rule's `right` would otherwise win alongside `left` and stretch the tile
+   across the whole row. */
+.turn-avatar.is-user {
+  right: auto;
+  left: calc(100% + var(--gap-3));
 }
 .turn-img,
 .turn-mark {
@@ -561,11 +574,10 @@ body { display: flex; flex-direction: column; }
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  /* The extra left padding is the avatar gutter. Because every child centres
-     itself in the content box, this one declaration shifts the whole
-     conversation over and makes room beside it — see .turn-avatar. */
-  padding: var(--gap-6) var(--gap-5) var(--gap-4)
-           calc(var(--gap-5) + var(--avatar-gutter));
+  /* The extra padding on each side is the avatar gutter. Because every child
+     centres itself in the content box, this one declaration narrows the whole
+     conversation and makes room either side of it — see .turn-avatar. */
+  padding: var(--gap-6) calc(var(--gap-5) + var(--avatar-gutter)) var(--gap-4);
   outline: none;
   scroll-behavior: smooth;
 }
@@ -586,7 +598,13 @@ body { display: flex; flex-direction: column; }
   text-transform: uppercase;
   color: var(--text-faint);
 }
-.row.user .row-head { color: var(--accent); }
+/* Your byline sits at the right edge, under your avatar, so the name and the
+   face it names read as one unit. The row-head is already a flex row, so
+   justify-content also carries the "sending" flag along with the name. */
+.row.user .row-head {
+  color: var(--accent);
+  justify-content: flex-end;
+}
 .row.assistant .row-head { color: var(--ok); }
 
 .bubble-text {
@@ -999,11 +1017,11 @@ body { display: flex; flex-direction: column; }
 
 /* --- composer ------------------------------------------------------------- */
 
-/* The left padding matches the transcript's, gutter included, so the composer
-   sits on the same axis as the text it will join rather than being centred on
-   the zone and looking off by half a gutter. */
+/* The side padding matches the transcript's, both gutters included, so the
+   composer sits on the same axis as the text it will join rather than being
+   centred on the zone and looking off by half a gutter. */
 .composer-wrap {
-  padding: 0 var(--gap-5) var(--gap-3) calc(var(--gap-5) + var(--avatar-gutter));
+  padding: 0 calc(var(--gap-5) + var(--avatar-gutter)) var(--gap-3);
   flex: 0 0 auto;
 }
 
@@ -1964,11 +1982,10 @@ body { display: flex; flex-direction: column; }
     --avatar-gutter: 42px;
   }
   .transcript {
-    padding: var(--gap-4) var(--gap-3) var(--gap-3)
-             calc(var(--gap-3) + var(--avatar-gutter));
+    padding: var(--gap-4) calc(var(--gap-3) + var(--avatar-gutter)) var(--gap-3);
   }
   .composer-wrap {
-    padding: 0 var(--gap-3) var(--gap-2) calc(var(--gap-3) + var(--avatar-gutter));
+    padding: 0 calc(var(--gap-3) + var(--avatar-gutter)) var(--gap-2);
   }
   .chat-head { padding: var(--gap-3); }
   .composer-hint { display: none; }
