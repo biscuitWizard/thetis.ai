@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 mod compaction;
 mod groups;
 mod tools;
+mod workspace;
 
 struct Component;
 
@@ -522,6 +523,16 @@ impl Turn {
             if !mode.prompt.trim().is_empty() {
                 prompt.push_str(&format!("\n\n# Mode: {}\n{}", mode.label, mode.prompt));
             }
+        }
+
+        // What the shared workspace is for, and one level of what is in it.
+        // Withholding this had the same failure mode as withholding a tool: the
+        // directory exists and is reachable, and a model that has never been
+        // told so simply works around it — puts a clone in its own checkout, or
+        // spends calls rediscovering the tree. One level only, so the section
+        // stays short and stable enough not to break the prompt cache.
+        if let Some(section) = workspace::section(sys::config_get("workspace_dir").as_deref()) {
+            prompt.push_str(&section);
         }
 
         let universal = skills::universal();
