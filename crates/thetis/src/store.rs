@@ -23,6 +23,21 @@ pub struct Interrupted {
     pub resume: bool,
 }
 
+/// How far a session has got, read while its turn is still running.
+///
+/// Deliberately three numbers and no interpretation: a caller that wants to
+/// say "busy" or "stuck" has the elapsed time to compare them against, and the
+/// judgement belongs where the words are written rather than here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionProgress {
+    /// USD recorded against this session by the spend ledger so far.
+    pub cost_usd: f64,
+    /// Events in its log.
+    pub events: u64,
+    /// When it last appended one. 0 for a session with no log at all.
+    pub activity_ms: u64,
+}
+
 /// Set while a restart is pending that the agent asked not to resume.
 const NO_RESUME_KEY: &str = "__no_resume";
 /// How many times running this turn has ended in an interruption.
@@ -331,6 +346,40 @@ impl Store {
             }
         }
         out.sort_by_key(|r| r.created_ms);
+        Ok(out)
+    }
+
+    /// What a session has done *while it is still doing it*.
+    ///
+    /// The sub-agent registry only learns what a child cost when the child
+    /// settles, so a parent watching seven busy children saw seven identical
+    /// `$0.0000` lines however hard they were working — and, having no way to
+    /// tell busy from stuck, eventually cancelled all seven. These are the two
+    /// places that *do* move during a turn: the spend ledger, written after
+    /// every completion, and the session's own metadata, restamped on every
+    /// appended event.
+    pub fn session_progress(&self, session_id: &str) -> Result<SessionProgress> {
+        let meta = self.get_session(session_id)?;
+        Ok(SessionProgress {
+            cost_usd: self.get_spend(session_id)?,
+            events: meta.as_ref().map(|m| m.event_count).unwrap_or(0),
+            activity_ms: meta.map(|m| m.updated_ms).unwrap_or(0),
+        })
+    }
+
+    /// Every sub-agent row in the database, whoever owns it.
+    ///
+    /// Only the startup sweep wants this: everything else asks by parent or by
+    /// root, because everything else is acting for one conversation.
+    pub fn all_subagents(&self) -> Result<Vec<SubagentRow>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(SUBAGENTS)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (_, v) = entry?;
+            out.push(serde_json::from_slice(v.value())?);
+        }
+        out.sort_by_key(|r: &SubagentRow| r.created_ms);
         Ok(out)
     }
 
@@ -1424,6 +1473,37 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         store.add_spend(&s.id, 0.25).unwrap();
         let total = store.add_spend(&s.id, 0.5).unwrap();
         assert!((total - 0.75).abs() < f64::EPSILON);
+    }
+
+    // The numbers a parent needs while a child is still working. Reading them
+    // from the row instead gives 0.0 and nothing else until the child settles,
+    // which is what made a working fan-out look like a hung one.
+    #[test]
+    fn progress_is_readable_before_a_session_has_finished_anything() {
+        let (store, _d) = temp_store();
+        let s = store.create_session(None, "agent").unwrap();
+
+        let fresh = store.session_progress(&s.id).unwrap();
+        assert_eq!(fresh.cost_usd, 0.0);
+        assert_eq!(fresh.events, 0);
+
+        store.add_spend(&s.id, 1.25).unwrap();
+        store.append_event(&s.id, SessionEvent::TurnStarted).unwrap();
+        store
+            .append_event(&s.id, SessionEvent::SystemNote("working".into()))
+            .unwrap();
+
+        let moving = store.session_progress(&s.id).unwrap();
+        assert!((moving.cost_usd - 1.25).abs() < f64::EPSILON);
+        assert_eq!(moving.events, 2);
+        assert!(moving.activity_ms > 0, "the clock has to move too");
+    }
+
+    #[test]
+    fn progress_for_a_session_that_does_not_exist_is_zero_not_an_error() {
+        let (store, _d) = temp_store();
+        let p = store.session_progress("never-created").unwrap();
+        assert_eq!(p, SessionProgress::default());
     }
 
     #[test]

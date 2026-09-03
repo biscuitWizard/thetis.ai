@@ -137,6 +137,12 @@ pub struct Grip {
     /// Turns currently in flight. What "idle" means for a worker: a long
     /// agentic turn generates no inbound traffic, and must not read as quiet.
     turns_running: std::sync::atomic::AtomicUsize,
+    /// Stamps each turn-count report to the gateway. Notes are fire and
+    /// forget and each is sent from its own task, so two reports can land out
+    /// of order — and a stale "1" arriving after the "0" that ended the turn
+    /// would leave the gateway showing a turn that finished. The receiver
+    /// keeps the highest stamp it has seen and drops anything older.
+    turn_report_seq: std::sync::atomic::AtomicU64,
     /// Rung when a sub-agent finishes, so a parent parked in `delegation::wait`
     /// wakes at once rather than at its next backstop poll. Worker-local, which
     /// is sufficient because a child always runs in its parent's worker.
@@ -159,9 +165,12 @@ pub struct TurnGuard {
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        self.grip
+        let running = self
+            .grip
             .turns_running
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_sub(1);
+        self.grip.report_turns(running);
     }
 }
 
@@ -289,6 +298,7 @@ impl Grip {
             rebuild_wanted: std::sync::Mutex::new(std::collections::HashSet::new()),
             build_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             turns_running: std::sync::atomic::AtomicUsize::new(0),
+            turn_report_seq: std::sync::atomic::AtomicU64::new(0),
             settle_bell: crate::delegation::SettleBell::default(),
         }))
     }
@@ -328,11 +338,44 @@ impl Grip {
 
     /// Marks a turn as running until the guard drops.
     pub fn begin_turn(self: &Arc<Self>) -> TurnGuard {
-        self.turns_running
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let running = self
+            .turns_running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.report_turns(running);
         TurnGuard {
             grip: self.clone(),
         }
+    }
+
+    /// Tells the gateway how many turns this worker is running.
+    ///
+    /// The counter is per process, and turns run in workers, so the gateway's
+    /// own was always zero — `/admin/waits` reported "nothing is running"
+    /// while a worker was twelve minutes into a turn, which is exactly the
+    /// question that page exists to answer. Pushed rather than polled so the
+    /// admin page cannot block on a worker that is itself wedged.
+    fn report_turns(self: &Arc<Self>, running: usize) {
+        let Role::Worker(peer) = &self.role else {
+            return;
+        };
+        // A guard can be dropped from anywhere, including an unwind off the
+        // runtime; without a handle there is nothing to spawn onto and the
+        // count simply goes unreported.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Stamped before the spawn, so the order the reports were *made* in
+        // survives the order their tasks happen to run in.
+        let seq = self
+            .turn_report_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let peer = peer.clone();
+        handle.spawn(async move {
+            peer.notify("turns", serde_json::json!({ "running": running, "seq": seq }))
+                .await;
+        });
     }
 
     /// Whether a turn is running right now.
