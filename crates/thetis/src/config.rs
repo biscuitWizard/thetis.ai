@@ -630,7 +630,7 @@ impl Config {
                 t.entry("endpoint".to_string())
                     .or_insert_with(|| toml::Value::String(self.browser.base_url()));
                 t.entry("token".to_string())
-                    .or_insert_with(|| toml::Value::String(crate::browser::token().to_string()));
+                    .or_insert_with(|| toml::Value::String(crate::browser::token(self).to_string()));
                 t.entry("enabled".to_string())
                     .or_insert_with(|| toml::Value::Boolean(self.browser.enabled));
             }
