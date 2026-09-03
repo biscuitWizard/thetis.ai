@@ -26,10 +26,10 @@ the surface got sloppy the last time.
 | Main | `--measure` 48rem, centred | The conversation: transcript, composer | Get replaced by another view |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
 
-Inside Main, each turn's byline carries a small avatar tile beside the name —
-yours on your rows, the agent's on its own. It sits inside the row's `--measure`
-column, so it costs the conversation no width and needs no breakpoint. See
-`references/tokens.md`.
+Inside Main, each turn carries an avatar in a gutter to the left of the text
+column — yours on your rows, the agent's on its own. The gutter is left padding
+on the scroll container, so every centred child moves together and the text keeps
+its measure. See `references/tokens.md`.
 
 **The one structural rule: an inspector is a rail tab, not a modal.** The rail
 docks — the chat reflows beside it and stays readable and typable with anything
@@ -53,6 +53,19 @@ Do not "improve" the surface back into either of these.
    people who already know the surface; it is not information architecture. It
    would leave every panel still hidden. Worth adding *on top of* the rail one
    day, never in place of it.
+
+### Ask which box, before building
+
+A layout request usually names a *neighbour* ("next to the name", "beside the
+chat") and not a *box*, and those underdetermine the arrangement. Turn avatars
+were built three times: flanking portrait columns, then inline in the byline,
+then — correctly — in a gutter outside the text column. Each version satisfied a
+plain reading of the words. What settled it was a pair of before/after
+screenshots.
+
+So when a request could mean two arrangements, spend the cheap move first: say
+which one you are about to build, or ask for a sketch. A wrong layout costs a
+full verification cycle, and the user has to look at it to know it is wrong.
 
 ## Aesthetic
 
@@ -237,6 +250,7 @@ about the diff:
 | An element will not hide | A component rule sets `display` | Use the `hidden` attribute |
 | An `<svg>` will not hide, no error | `.hidden = true` on an SVGElement sets a dead JS property | `setHidden(node, true)` from `lib/dom.js` |
 | A flex row's children spill past their column | A flex item will not shrink below its content | `min-width: 0` on the one that should give way |
+| Something needs to sit beside the centred column | Adding a sibling column reflows everything | Pad the scroll container and position into the padding; every `margin: 0 auto` child follows |
 | Colour looks off in one place only | Literal hex or a typo'd token | Token from `theme.css` |
 | A panel covers the chat | Built as a modal instead of a rail tab | `rail.open` |
 | Handler throws on the second call | Two paths both tearing down (Enter *and* blur) | Make teardown idempotent |

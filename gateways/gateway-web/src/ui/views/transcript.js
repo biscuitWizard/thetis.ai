@@ -13,7 +13,7 @@ import { $, AGENT_NAME, clear, el } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { askCard, parseAsk } from "./askuser.js";
-import { bylineAvatar as avatarFor } from "./avatars.js";
+import { turnAvatar as avatarFor } from "./avatars.js";
 
 /** The tool whose call renders as a form instead of a tool row. */
 const ASK_TOOL = "ask_user";
@@ -104,10 +104,10 @@ export function showPending({ text, attachments, note }) {
   pendingNode = el(
     "div",
     { class: "row user is-pending" },
+    avatarFor("user"),
     el(
       "div",
       { class: "row-head" },
-      avatarFor("user"),
       "you",
       el("span", { class: "row-flag" }, "sending")
     ),
@@ -163,16 +163,22 @@ function toBottom(instant) {
 
 // --- pieces -----------------------------------------------------------------
 
-/* One turn: a byline, then whatever the turn said.
+/* One turn: an avatar in the gutter, a byline, then whatever the turn said.
+ *
+ * The avatar is a child of the row rather than of the byline, and CSS lifts it
+ * out of flow into the transcript's left gutter. That is what puts it outside
+ * the conversation instead of inline with the name, and it means the byline's
+ * own layout is unaffected by whether a face is present.
  *
  * `role` picks the avatar as well as the colour — "user" and "assistant" are
- * the two that have a face, and any other role (a system note, a tool) gets a
- * byline with no tile rather than a blank square. */
+ * the two that have a face, and any other role (a system note, a tool) gets no
+ * avatar rather than a blank tile. */
 function row(role, who, ...content) {
   const node = el(
     "div",
     { class: `row ${role}` },
-    el("div", { class: "row-head" }, avatarFor(role), who),
+    avatarFor(role),
+    el("div", { class: "row-head" }, who),
     ...content
   );
   root.append(node);

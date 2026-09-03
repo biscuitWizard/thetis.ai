@@ -479,39 +479,50 @@ body { display: flex; flex-direction: column; }
 /* Still climbing: the figure includes a turn that has not finished paying. */
 .chip-quiet.is-live { color: var(--warn); }
 
-/* --- byline avatars ---------------------------------------------------------
-   A small square face at the head of every turn, in the byline beside the name.
+/* --- turn avatars -----------------------------------------------------------
+   A face per turn, in a gutter to the left of the conversation — outside the
+   text column, not inside the byline.
 
-   Deliberately inside .row rather than in a gutter beside it: the row keeps its
-   --measure column and its full text width at every window size, so this costs
-   the conversation nothing and needs no width threshold to be safe.
+   How the gutter is made: --avatar-gutter is added to the *left padding of the
+   scroll container*, and the avatar is absolutely positioned into it. Every
+   centred child of the transcript is `max-width: --measure; margin: 0 auto`, so
+   shrinking the content box moves all of them together — rows, tool cards, meta
+   lines, ask forms and the compaction card stay on one axis with no per-element
+   change. The composer wrap takes the same padding, which is what keeps the
+   composer aligned with the text above it.
 
-   Sized off the byline's own line-height so the avatar, the name and the
-   timestamp share one baseline strip instead of the picture pushing the text
-   around. */
-.byline-avatar {
-  flex: 0 0 auto;
-  position: relative;
-  display: inline-flex;
-  width: var(--avatar-sm);
-  height: var(--avatar-sm);
+   Padding rather than margin is the point: margin is slack that vanishes when
+   the window narrows, and an avatar in vanished slack overlaps the sidebar.
+   Reserved padding shrinks the text column instead, which is recoverable and
+   never overlaps.
+
+   The avatar is out of flow, so the byline's flex row is untouched and the name
+   still starts at the text column's left edge. */
+.turn-avatar {
+  position: absolute;
+  /* Right-aligned within the gutter, so the picture hugs the text it belongs to
+     rather than drifting toward the sidebar as the gutter changes. */
+  right: calc(100% + var(--gap-3));
+  top: 0;
+  width: var(--avatar-lg);
+  height: var(--avatar-lg);
 }
-.byline-img,
-.byline-mark {
+.turn-img,
+.turn-mark {
   width: 100%;
   height: 100%;
-  /* Square, unlike a character portrait: at this size a 3:4 crop reads as a
-     sliver, and square tiles line up down the left edge of the transcript. */
+  /* Square, not a portrait crop: squares line up down the transcript's edge, and
+     `cover` from the top keeps a face in frame whatever the source ratio. */
   object-fit: cover;
   object-position: top center;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   background: var(--surface-2);
   box-shadow: inset 0 0 0 1px var(--hairline);
 }
 /* The drawn fallback keeps the tile but insets a glyph, rather than scaling a
    two-path SVG to fill it. */
-.byline-mark {
-  padding: 18%;
+.turn-mark {
+  padding: 22%;
   color: var(--hairline-strong);
 }
 
@@ -547,18 +558,21 @@ body { display: flex; flex-direction: column; }
 
 .transcript {
   flex: 1 1 auto;
-  /* min-width because the transcript is now a row flex item inside .stage: a
-     flex item will not shrink below its content otherwise, so a wide code block
-     would push the portraits out rather than scrolling. */
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--gap-6) var(--gap-5) var(--gap-4);
+  /* The extra left padding is the avatar gutter. Because every child centres
+     itself in the content box, this one declaration shifts the whole
+     conversation over and makes room beside it — see .turn-avatar. */
+  padding: var(--gap-6) var(--gap-5) var(--gap-4)
+           calc(var(--gap-5) + var(--avatar-gutter));
   outline: none;
   scroll-behavior: smooth;
 }
 
-.row { max-width: var(--measure); margin: 0 auto var(--gap-5); }
+/* position: relative so an avatar can be positioned out of the row's flow while
+   still being anchored to it. */
+.row { max-width: var(--measure); margin: 0 auto var(--gap-5); position: relative; }
 .row:last-child { margin-bottom: var(--gap-3); }
 
 .row-head {
@@ -985,7 +999,13 @@ body { display: flex; flex-direction: column; }
 
 /* --- composer ------------------------------------------------------------- */
 
-.composer-wrap { padding: 0 var(--gap-5) var(--gap-3); flex: 0 0 auto; }
+/* The left padding matches the transcript's, gutter included, so the composer
+   sits on the same axis as the text it will join rather than being centred on
+   the zone and looking off by half a gutter. */
+.composer-wrap {
+  padding: 0 var(--gap-5) var(--gap-3) calc(var(--gap-5) + var(--avatar-gutter));
+  flex: 0 0 auto;
+}
 
 .composer {
   max-width: var(--measure);
@@ -1929,9 +1949,27 @@ body { display: flex; flex-direction: column; }
 }
 
 @media (max-width: 860px) {
-  :root { --sidebar-w: 210px; }
-  .transcript { padding: var(--gap-4) var(--gap-3) var(--gap-3); }
-  .composer-wrap { padding: 0 var(--gap-3) var(--gap-2); }
+  :root {
+    --sidebar-w: 210px;
+    /* The avatar shrinks rather than going away: at this width a 56px gutter is
+       a seventh of the text column, but the face is still the fastest way to
+       tell whose turn a row is. Both tokens move together so the gutter stays
+       proportional to what sits in it — and the padding rules below are written
+       in terms of the gutter, so they follow automatically. Dropping the gutter
+       here instead would leave the avatar positioned outside the row, over the
+       sidebar. */
+    --avatar-lg: 30px;
+    /* Avatar + --gap-3, the offset .turn-avatar uses. Less than that and the
+       tile hangs out of the padding box over the sidebar. */
+    --avatar-gutter: 42px;
+  }
+  .transcript {
+    padding: var(--gap-4) var(--gap-3) var(--gap-3)
+             calc(var(--gap-3) + var(--avatar-gutter));
+  }
+  .composer-wrap {
+    padding: 0 var(--gap-3) var(--gap-2) calc(var(--gap-3) + var(--avatar-gutter));
+  }
   .chat-head { padding: var(--gap-3); }
   .composer-hint { display: none; }
   .branch-actions .ghost-btn { padding: 3px 6px; }
