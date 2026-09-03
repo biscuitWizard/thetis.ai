@@ -1,7 +1,7 @@
 /* The composer: text, attachments, the mode and model pickers, and the stop
  * button that appears while a turn is running. */
 
-import { $, clear, el, icon } from "../lib/dom.js";
+import { $, AGENT_NAME, clear, el, icon } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { toast } from "../lib/toast.js";
 import { Picker } from "./picker.js";
@@ -32,7 +32,7 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
   // --- pickers --------------------------------------------------------------
 
   const modePicker = new Picker($("mode-picker"), {
-    title: "How Thetis should work in this conversation",
+    title: `How ${AGENT_NAME} should work in this conversation`,
     options: () => store.modes.map((m) => ({ id: m.id, label: m.label, note: m.description })),
     selected: () => store.mode,
     render: () => store.modeLabel(),
@@ -289,7 +289,7 @@ export function mountComposer({ onSend, onSetMode, onSetModel, onSetBase, onShow
       ? store.creating
         ? "Creating the conversation…"
         : "Sending…"
-      : "Message Thetis…";
+      : `Message ${AGENT_NAME}…`;
     form.classList.toggle("is-locked", busy);
     $("attach").disabled = busy;
     updateSendState();
