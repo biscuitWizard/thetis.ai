@@ -53,6 +53,21 @@ store.watch("pending", (pending) => {
 
 // --- connection -------------------------------------------------------------
 
+// A configured avatar is an arbitrary URL, so it can 404, be blocked, or point
+// at something that is not an image. The brand is the first thing on screen and
+// must not degrade to a broken-image glyph: fall back to the built-in mark,
+// which is always in the markup for exactly this reason.
+function wireAvatar() {
+  const img = $("#brand-avatar");
+  const mark = $("#brand-mark");
+  if (!img || !mark) return;
+  img.addEventListener("error", () => {
+    img.hidden = true;
+    mark.hidden = false;
+  });
+}
+wireAvatar();
+
 const connection = new Connection({
   onStatus: (state, text) => {
     // A dropped socket cannot be carrying a submission any more, and leaving
