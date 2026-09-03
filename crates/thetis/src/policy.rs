@@ -115,6 +115,145 @@ impl EffectivePolicy {
     pub fn denies_group(&self, id: &str) -> bool {
         self.deny_groups.iter().any(|v| v == id)
     }
+    /// The narrower of two policies, field by field.
+    ///
+    /// This is what makes a shared conversation safe. A turn's authority is
+    /// `policy(speaker) ∩ ceiling(session)`, so neither speaking in someone
+    /// else's conversation nor owning a conversation someone else speaks in can
+    /// raise anybody above their own account. Every field composes towards
+    /// *less*: grants are ANDed, denials unioned, limits minimised.
+    ///
+    /// Deliberately total rather than clever. Every field is named explicitly
+    /// and `intersect_is_exhaustive_over_every_field` destructures the struct so
+    /// that a field added later fails to compile here instead of silently
+    /// passing through at whichever side happened to be wider.
+    pub fn intersect(&self, other: &Self) -> Self {
+        // Capability denial goes through `denies`, not the raw set, so that a
+        // `read_only` side contributes its implied write denials to the result
+        // as real entries rather than relying on the flag surviving.
+        let denied: BTreeSet<Cap> = Cap::all()
+            .iter()
+            .copied()
+            .filter(|cap| self.denies(*cap) || other.denies(*cap))
+            .collect();
+
+        // A model has to be allowed by both. Asking `allows_model` rather than
+        // intersecting the lists is what keeps an unrestricted side from
+        // wrongly narrowing a restricted one to the catalogue it happens to
+        // list: unrestricted means "any id the provider will take".
+        let mut models: Vec<String> = Vec::new();
+        for id in self.models.iter().chain(other.models.iter()) {
+            if !models.contains(id) && self.allows_model(id) && other.allows_model(id) {
+                models.push(id.clone());
+            }
+        }
+        let models_restricted = self.models_restricted || other.models_restricted;
+
+        // Modes are always a closed list, so this is a plain intersection.
+        let modes: Vec<String> = self
+            .modes
+            .iter()
+            .filter(|m| other.modes.contains(m))
+            .cloned()
+            .collect();
+
+        let default_model = first_allowed(
+            &[&self.default_model, &other.default_model],
+            |id| self.allows_model(id) && other.allows_model(id),
+        )
+        .or_else(|| models.first().cloned())
+        .unwrap_or_default();
+        let default_mode = first_allowed(&[&self.default_mode, &other.default_mode], |id| {
+            modes.iter().any(|m| m == id)
+        })
+        .or_else(|| modes.first().cloned())
+        .unwrap_or_default();
+
+        Self {
+            admin: self.admin && other.admin,
+            read_only: self.read_only || other.read_only,
+            denied,
+            models,
+            default_model,
+            modes,
+            default_mode,
+            deny_tools: union_patterns(&self.deny_tools, &other.deny_tools),
+            deny_groups: union_patterns(&self.deny_groups, &other.deny_groups),
+            spend_limit_usd: tighter_limit(self.spend_limit_usd, other.spend_limit_usd),
+            max_children: self.max_children.min(other.max_children),
+            see_all_sessions: self.see_all_sessions && other.see_all_sessions,
+            models_restricted,
+        }
+    }
+
+    /// Whether this policy grants nothing `other` does not.
+    ///
+    /// The guard against a grant that widens. Nothing in `resolve` prevents a
+    /// layer writing `admin = true`, so anywhere a policy is chosen rather than
+    /// inherited — a fork's ceiling, a delegated child — the choice is checked
+    /// against the authority making it.
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        if self.admin && !other.admin {
+            return false;
+        }
+        if self.see_all_sessions && !other.see_all_sessions {
+            return false;
+        }
+        // A read-only ceiling cannot be escaped by a policy that is not.
+        if other.read_only && !self.read_only {
+            return false;
+        }
+        // Everything the wider side denies, the narrower side must deny too.
+        if Cap::all()
+            .iter()
+            .any(|cap| other.denies(*cap) && !self.denies(*cap))
+        {
+            return false;
+        }
+        if self.max_children > other.max_children {
+            return false;
+        }
+        // Zero means no ceiling, so it is the widest value rather than the
+        // narrowest. Comparing the numbers directly would read an unlimited
+        // budget as the tightest one there is.
+        match (self.spend_limit_usd, other.spend_limit_usd) {
+            (_, o) if o <= 0.0 => {}
+            (s, _) if s <= 0.0 => return false,
+            (s, o) if s > o => return false,
+            _ => {}
+        }
+        // Every model this policy would allow, the other must allow.
+        if other.models_restricted {
+            if !self.models_restricted {
+                return false;
+            }
+            if self.models.iter().any(|m| !other.allows_model(m)) {
+                return false;
+            }
+        }
+        if self.modes.iter().any(|m| !other.allows_mode(m)) {
+            return false;
+        }
+        // Pattern equality, not pattern subsumption: a conservative check that
+        // can refuse a grant which is in fact narrow, but never admits one that
+        // is wide.
+        if other
+            .deny_tools
+            .iter()
+            .any(|p| !self.deny_tools.contains(p))
+        {
+            return false;
+        }
+        if other
+            .deny_groups
+            .iter()
+            .any(|p| !self.deny_groups.contains(p))
+        {
+            return false;
+        }
+        true
+    }
+
     pub fn unrestricted(
         models: &[crate::config::ModelSpec],
         default_model: &str,
@@ -137,6 +276,37 @@ impl EffectivePolicy {
             see_all_sessions: false,
             models_restricted: false,
         }
+    }
+}
+
+/// The first candidate a predicate accepts. Used to keep a default that both
+/// sides of an intersection still permit.
+fn first_allowed(candidates: &[&String], ok: impl Fn(&str) -> bool) -> Option<String> {
+    candidates
+        .iter()
+        .find(|c| !c.is_empty() && ok(c))
+        .map(|c| (*c).clone())
+}
+
+/// Every pattern either side denies, without duplicates. Denials union because
+/// each one only ever removes something.
+fn union_patterns(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out = a.to_vec();
+    for p in b {
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// The tighter of two spend ceilings, where zero means "no ceiling".
+fn tighter_limit(a: f64, b: f64) -> f64 {
+    match (a, b) {
+        (a, b) if a <= 0.0 && b <= 0.0 => 0.0,
+        (a, b) if a <= 0.0 => b,
+        (a, b) if b <= 0.0 => a,
+        (a, b) => a.min(b),
     }
 }
 
@@ -327,6 +497,253 @@ mod tests {
         assert_eq!(p.models, ["b"]);
         assert_eq!(p.default_model, "b");
     }
+    // --- intersection ------------------------------------------------------
+    //
+    // The rule the whole multi-user model rests on:
+    //     effective(turn) = policy(speaker) ∩ ceiling(session)
+
+    /// Destructures `EffectivePolicy` so that adding a field without deciding
+    /// how it intersects is a compile error here rather than a silent hole. If
+    /// this stops compiling, add the field to `intersect` and to this list —
+    /// do not add `..` to the pattern.
+    #[test]
+    fn intersect_is_exhaustive_over_every_field() {
+        let EffectivePolicy {
+            admin: _,
+            read_only: _,
+            denied: _,
+            models: _,
+            default_model: _,
+            modes: _,
+            default_mode: _,
+            deny_tools: _,
+            deny_groups: _,
+            spend_limit_usd: _,
+            max_children: _,
+            see_all_sessions: _,
+            models_restricted: _,
+        } = base();
+    }
+
+    #[test]
+    fn intersect_takes_the_narrower_of_each_grant() {
+        let mut wide = base();
+        wide.admin = true;
+        wide.see_all_sessions = true;
+        wide.max_children = 8;
+        wide.spend_limit_usd = 0.0; // unlimited
+
+        let mut narrow = base();
+        narrow.admin = false;
+        narrow.see_all_sessions = false;
+        narrow.max_children = 2;
+        narrow.spend_limit_usd = 5.0;
+
+        let got = wide.intersect(&narrow);
+        assert!(!got.admin, "admin has to be granted by both sides");
+        assert!(!got.see_all_sessions);
+        assert_eq!(got.max_children, 2);
+        assert_eq!(
+            got.spend_limit_usd, 5.0,
+            "an unlimited side must not erase a real ceiling"
+        );
+        // Order cannot matter, or the answer would depend on which side is
+        // called the speaker.
+        let flipped = narrow.intersect(&wide);
+        assert_eq!(flipped.admin, got.admin);
+        assert_eq!(flipped.max_children, got.max_children);
+        assert_eq!(flipped.spend_limit_usd, got.spend_limit_usd);
+    }
+
+    /// Your question, as an assertion: a read-only speaker in a write-enabled
+    /// conversation gets read-only.
+    #[test]
+    fn a_read_only_speaker_cannot_write_in_a_permissive_conversation() {
+        let ceiling = base(); // write-enabled conversation
+        let mut speaker = base();
+        speaker.read_only = true;
+
+        let got = speaker.intersect(&ceiling);
+        assert!(got.read_only);
+        assert!(got.denies(Cap::FilesystemWrite));
+        assert!(got.denies(Cap::Terminal));
+        assert!(got.denies(Cap::Devkit));
+        assert!(!got.denies(Cap::FilesystemRead), "reading is still fine");
+    }
+
+    /// The same rule from the other direction: an admin speaking in a
+    /// conversation whose ceiling is read-only — a Discord channel — gets
+    /// read-only. This is what makes the Discord guarantee hard.
+    #[test]
+    fn an_admin_speaking_under_a_read_only_ceiling_gets_read_only() {
+        // A Discord ceiling as `config.rs` actually builds it: read-only, not
+        // admin, delegation denied.
+        let mut ceiling = base();
+        ceiling.read_only = true;
+        ceiling.admin = false;
+        ceiling.denied.insert(Cap::Delegation);
+
+        let mut admin = base();
+        admin.admin = true;
+
+        let got = admin.intersect(&ceiling);
+        assert!(got.read_only);
+        assert!(!got.admin);
+        assert!(got.denies(Cap::Devkit));
+        assert!(got.denies(Cap::Delegation));
+    }
+
+    #[test]
+    fn intersect_unions_denials_and_keeps_implied_ones() {
+        let mut a = base();
+        a.denied.insert(Cap::Transcripts);
+        let mut b = base();
+        b.read_only = true; // implies the write denials
+
+        let got = a.intersect(&b);
+        assert!(got.denied.contains(&Cap::Transcripts), "explicit denial");
+        assert!(
+            got.denied.contains(&Cap::FilesystemWrite),
+            "a denial implied by read_only must be materialised in the set, \
+             not left to depend on the flag"
+        );
+    }
+
+    #[test]
+    fn intersect_narrows_models_and_modes() {
+        let mut a = base();
+        a.models = vec!["a".into(), "b".into()];
+        a.models_restricted = true;
+        a.modes = vec!["agent".into(), "chat".into()];
+        a.default_mode = "agent".into();
+
+        let mut b = base();
+        b.models = vec!["b".into(), "c".into()];
+        b.models_restricted = true;
+        b.modes = vec!["chat".into()];
+        b.default_mode = "chat".into();
+
+        let got = a.intersect(&b);
+        assert_eq!(got.models, ["b"], "only what both allow");
+        assert_eq!(got.default_model, "b", "a default both sides still permit");
+        assert_eq!(got.modes, ["chat"]);
+        assert_eq!(got.default_mode, "chat");
+    }
+
+    /// An unrestricted side means "any id the provider takes", so it must not
+    /// silently narrow a restricted side down to its own catalogue.
+    #[test]
+    fn an_unrestricted_side_does_not_narrow_a_restricted_one() {
+        let unrestricted = base(); // models_restricted = false
+        let mut restricted = base();
+        restricted.models = vec!["only-this".into()];
+        restricted.models_restricted = true;
+
+        let got = unrestricted.intersect(&restricted);
+        assert!(got.models_restricted);
+        assert!(got.allows_model("only-this"));
+        assert!(!got.allows_model("something-else"));
+    }
+
+    // --- the subset invariant (H4) -----------------------------------------
+
+    #[test]
+    fn a_policy_is_a_subset_of_itself() {
+        let p = base();
+        assert!(p.is_subset_of(&p));
+    }
+
+    #[test]
+    fn is_subset_of_refuses_every_way_of_widening() {
+        let narrow = {
+            let mut p = base();
+            p.admin = false;
+            p.see_all_sessions = false;
+            p.read_only = true;
+            p.max_children = 1;
+            p.spend_limit_usd = 1.0;
+            // Not a write capability: `read_only` already implies those, so
+            // dropping one of them would not actually widen anything and the
+            // assertion below would pass for the wrong reason.
+            p.denied.insert(Cap::Transcripts);
+            p.deny_tools = vec!["moo-*".into()];
+            p.deny_groups = vec!["web".into()];
+            p
+        };
+
+        // Each of these is the same policy with exactly one grant widened.
+        let mut admin = narrow.clone();
+        admin.admin = true;
+        assert!(!admin.is_subset_of(&narrow), "admin");
+
+        let mut see_all = narrow.clone();
+        see_all.see_all_sessions = true;
+        assert!(!see_all.is_subset_of(&narrow), "see_all_sessions");
+
+        let mut writable = narrow.clone();
+        writable.read_only = false;
+        assert!(!writable.is_subset_of(&narrow), "read_only");
+
+        let mut children = narrow.clone();
+        children.max_children = 9;
+        assert!(!children.is_subset_of(&narrow), "max_children");
+
+        let mut unlimited = narrow.clone();
+        unlimited.spend_limit_usd = 0.0;
+        assert!(
+            !unlimited.is_subset_of(&narrow),
+            "zero means unlimited, which is wider than any real ceiling"
+        );
+
+        let mut undenied = narrow.clone();
+        undenied.denied.remove(&Cap::Transcripts);
+        assert!(!undenied.is_subset_of(&narrow), "a dropped capability denial");
+
+        let mut tools = narrow.clone();
+        tools.deny_tools.clear();
+        assert!(!tools.is_subset_of(&narrow), "a dropped tool denial");
+
+        let mut groups = narrow.clone();
+        groups.deny_groups.clear();
+        assert!(!groups.is_subset_of(&narrow), "a dropped group denial");
+    }
+
+    #[test]
+    fn a_genuinely_narrower_policy_is_accepted() {
+        let mut wide = base();
+        wide.admin = true;
+        wide.max_children = 8;
+
+        let mut narrow = wide.clone();
+        narrow.admin = false;
+        narrow.read_only = true;
+        narrow.max_children = 2;
+        narrow.spend_limit_usd = 3.0;
+        narrow.denied.insert(Cap::Transcripts);
+
+        assert!(narrow.is_subset_of(&wide));
+        assert!(!wide.is_subset_of(&narrow));
+    }
+
+    /// The two functions have to agree, or a ceiling could be applied and then
+    /// fail its own check.
+    #[test]
+    fn an_intersection_is_always_a_subset_of_both_sides() {
+        let mut a = base();
+        a.admin = true;
+        a.spend_limit_usd = 10.0;
+        a.denied.insert(Cap::Transcripts);
+
+        let mut b = base();
+        b.read_only = true;
+        b.max_children = 2;
+        b.deny_groups = vec!["web".into()];
+
+        let got = a.intersect(&b);
+        assert!(got.is_subset_of(&a), "not a subset of the first side");
+        assert!(got.is_subset_of(&b), "not a subset of the second side");
+    }
+
     #[test]
     fn core_is_undeniable() {
         let l = PolicyLayer {

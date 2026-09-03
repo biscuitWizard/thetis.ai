@@ -24,8 +24,8 @@ fn err(msg: impl Into<String>) -> wasmtime::Error {
 }
 
 use crate::bindings::types::{
-    Attachment, CompactionProgress, CompileReport, ConfigEntry, Dependency, EventRecord,
-    ExecResult, FsEntry, InboxItem, LlmError, LogLevel, ModTarget, ModeInfo, ModelInfo,
+    Account, Attachment, CompactionProgress, CompileReport, ConfigEntry, Dependency, EventRecord,
+    ExecResult, FsEntry, InboxItem, LlmError, LogLevel, ModTarget, ModeInfo, ModelInfo, Participant,
     SessionEvent, SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen,
     TerminalOutput, ToolManifest,
 };
@@ -86,6 +86,30 @@ impl HostState {
         } else {
             Ok(())
         }
+    }
+
+    /// The workspace capabilities, for a filesystem call that turns out to
+    /// touch `/workspace`.
+    ///
+    /// The shared workspace has its own two capabilities because it is shared:
+    /// an account can be given the machine's own files and not the tree every
+    /// other conversation reads, or the reverse. They were enforced only in the
+    /// browser's HTTP routes, so an agent denied `WorkspaceWrite` could still
+    /// write there through `write_file` — the path is rewritten to its real
+    /// location before any check saw it, and `FilesystemWrite` was the only
+    /// gate. This closes that by asking where the path actually lands.
+    ///
+    /// Layered on top of the filesystem capabilities rather than replacing
+    /// them: reaching the workspace needs both.
+    fn require_workspace(&self, path: &str, write: bool) -> Result<()> {
+        if !crate::hostfs::is_workspace_path(&self.grip.cfg, path) {
+            return Ok(());
+        }
+        self.require(crate::policy::Cap::Workspace)?;
+        if write {
+            self.require(crate::policy::Cap::WorkspaceWrite)?;
+        }
+        Ok(())
     }
 
     fn grip(&self) -> &Grip {
@@ -582,7 +606,18 @@ impl session::Host for HostState {
         // routes through `spawn`, which registers what it starts.
         self.scope_ok(&session_id)?;
         let grip = self.grip.clone();
-        grip.submit(&session_id, message, attachments).await.wt()?;
+        // The author is this turn's own principal, never anything the guest
+        // supplies: a guest that could name an author could name a better one.
+        // `surface` is `web` because this import exists for the browser's
+        // gateway; nothing else reaches it.
+        let author = self.principal.as_ref().map(|p| crate::bindings::types::Author {
+            id: p.user_id.clone(),
+            display: p.display_name.clone(),
+            surface: "web".into(),
+        });
+        grip.submit(&session_id, message, attachments, author)
+            .await
+            .wt()?;
         // Submitting can materialize a branch worker — worktree, spawn, aspect
         // loading — which is host time, not guest spinning.
         self.yielded();
@@ -635,6 +670,147 @@ impl session::Host for HostState {
             .await
             .wt()?;
         Ok(())
+    }
+
+    async fn participants(&mut self, session_id: String) -> Result<Vec<Participant>> {
+        self.budget.entered_host("participants");
+        self.may_access(&session_id)?;
+        let rows = self.grip().persist.participants(&session_id).await.wt()?;
+        let owner = self
+            .grip()
+            .persist
+            .owner_of_root(&session_id)
+            .await
+            .wt()?
+            .unwrap_or_default();
+        let auth = &self.grip().cfg.auth;
+        let describe = |account: String, added_by: String, added_ms: i64, owner: bool| Participant {
+            display: auth
+                .user(&account)
+                .map(|u| u.name.clone())
+                .unwrap_or_else(|| account.clone()),
+            read_only: auth.policy_for(&account).read_only,
+            account,
+            added_by,
+            added_ms,
+            owner,
+        };
+        // The owner leads the list. They hold no participant row — ownership
+        // is its own table — so they are described from the owner id rather
+        // than read out of `participants`.
+        let mut out = vec![describe(owner, String::new(), 0, true)];
+        out.extend(
+            rows.into_iter()
+                .map(|r| describe(r.account, r.added_by, r.added_ms as i64, false)),
+        );
+        Ok(out)
+    }
+
+    /// Invites an account. The native side checks that the caller owns the
+    /// conversation; this only refuses obvious nonsense early so the browser
+    /// gets a useful message instead of a store error.
+    async fn add_participant(
+        &mut self,
+        session_id: String,
+        account: String,
+    ) -> Result<std::result::Result<(), String>> {
+        self.budget.entered_host("add_participant");
+        self.may_access(&session_id)?;
+        let Some(me) = self.principal.as_ref().map(|p| p.user_id.clone()) else {
+            return Ok(Err("only a signed-in account may invite".into()));
+        };
+        if !self.grip().cfg.auth.users_mode {
+            return Ok(Err(
+                "inviting needs accounts turned on (auth.mode = \"users\")".into(),
+            ));
+        }
+        // Resolve through `user()` so the invitation stores the canonical id
+        // and an account typed in the wrong case still works.
+        let Some(spec) = self.grip().cfg.auth.user(&account) else {
+            return Ok(Err(format!("no account called `{account}`")));
+        };
+        let account = spec.id.clone();
+        if account == me {
+            return Ok(Err("you are already here".into()));
+        }
+        Ok(
+            match self
+                .grip()
+                .persist
+                .add_participant(&session_id, &account, &me)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            },
+        )
+    }
+
+    async fn remove_participant(
+        &mut self,
+        session_id: String,
+        account: String,
+    ) -> Result<std::result::Result<(), String>> {
+        self.budget.entered_host("remove_participant");
+        self.may_access(&session_id)?;
+        let Some(me) = self.principal.as_ref().map(|p| p.user_id.clone()) else {
+            return Ok(Err("only a signed-in account may remove a participant".into()));
+        };
+        match self
+            .grip()
+            .persist
+            .remove_participant(&session_id, &account, &me)
+            .await
+        {
+            Ok(_) => {
+                // A turn this person triggered is running under *their*
+                // authority, and they no longer have any here. Leaving it to
+                // finish would let a revoked participant's instructions carry
+                // on being acted on after the revocation.
+                self.grip.cancel_turn_by(&session_id, &account).await;
+                Ok(Ok(()))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn invitable_accounts(&mut self, session_id: String) -> Result<Vec<Account>> {
+        self.budget.entered_host("invitable_accounts");
+        self.may_access(&session_id)?;
+        // The account list is not public. Only the owner is offered it,
+        // because only the owner can act on it — and anyone else asking is
+        // enumerating users.
+        let owner = self
+            .grip()
+            .persist
+            .owner_of_root(&session_id)
+            .await
+            .wt()?
+            .unwrap_or_default();
+        let me = self.principal.as_ref().map(|p| p.user_id.clone());
+        if me.as_deref() != Some(owner.as_str()) {
+            return Ok(Vec::new());
+        }
+        let already = self
+            .grip()
+            .persist
+            .participants(&session_id)
+            .await
+            .wt()?
+            .into_iter()
+            .map(|r| r.account)
+            .collect::<Vec<_>>();
+        let auth = &self.grip().cfg.auth;
+        Ok(auth
+            .users
+            .iter()
+            .filter(|u| u.id != owner && !already.iter().any(|a| a == &u.id))
+            .map(|u| Account {
+                id: u.id.clone(),
+                display: u.name.clone(),
+                read_only: u.policy.read_only,
+            })
+            .collect())
     }
 }
 
@@ -914,6 +1090,7 @@ impl sandbox::Host for HostState {
         _timeout_ms: u32,
     ) -> Result<ExecResult> {
         self.budget.entered_host("exec");
+        self.require(crate::policy::Cap::Sandbox)?;
         Ok(ExecResult {
             exit_code: -1,
             stdout: String::new(),
@@ -930,6 +1107,7 @@ impl sandbox::Host for HostState {
         _contents: String,
     ) -> Result<std::result::Result<(), String>> {
         self.budget.entered_host("write_file");
+        self.require(crate::policy::Cap::Sandbox)?;
         Ok(Err(SANDBOX_UNAVAILABLE.to_string()))
     }
 
@@ -939,6 +1117,7 @@ impl sandbox::Host for HostState {
         _path: String,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("read_file");
+        self.require(crate::policy::Cap::Sandbox)?;
         Ok(Err(SANDBOX_UNAVAILABLE.to_string()))
     }
 
@@ -948,12 +1127,16 @@ impl sandbox::Host for HostState {
         _path: String,
     ) -> Result<std::result::Result<Vec<String>, String>> {
         self.budget.entered_host("list_files");
+        self.require(crate::policy::Cap::Sandbox)?;
         Ok(Err(SANDBOX_UNAVAILABLE.to_string()))
     }
 
     async fn available(&mut self) -> Result<bool> {
         self.budget.entered_host("available");
-        Ok(false)
+        // Off in this build regardless, but the policy still decides: if the
+        // sandbox is ever implemented, an account denied it must not have the
+        // family appear in its prompt.
+        Ok(false && !self.policy.denies(crate::policy::Cap::Sandbox))
     }
 }
 
@@ -1009,13 +1192,16 @@ impl tooling::Host for HostState {
             }
         }
         let grip = self.grip.clone();
+        // The tool runs with this turn's authority, so it cannot be a way
+        // around per-speaker resolution.
+        let speaker = self.principal.as_ref().map(|p| p.user_id.clone());
         // A tool can spend a long time on the network. Stopping the turn should
         // not mean waiting for it, and certainly should not mean the remaining
         // tools in the batch run afterwards.
         let result = self
             .interruptible(
                 &format!("the tool '{name}'"),
-                grip.invoke_tool(&name, &session_id, &args_json),
+                grip.invoke_tool(&name, &session_id, &args_json, speaker.as_deref()),
             )
             .await;
         // Running a tool can take real time; that is not the agent spinning.
@@ -1336,6 +1522,10 @@ impl delegation::Host for HostState {
         self.require(crate::policy::Cap::Delegation)?;
         let parent = self.delegating_session()?;
         let grip = self.grip.clone();
+        // This turn's own effective policy becomes the child's ceiling, so a
+        // child is bounded by whoever delegated rather than by whoever owns
+        // the conversation.
+        let ceiling = self.policy.as_ref().clone();
         let out = crate::delegation::spawn(
             &grip,
             &parent,
@@ -1346,6 +1536,7 @@ impl delegation::Host for HostState {
                 model: req.model,
                 mode: req.mode,
             },
+            Some(ceiling),
         )
         .await
         .map(|row| info_from_row(&row, grip.cfg.subagents.max_result_bytes))
@@ -1713,6 +1904,7 @@ impl hostfs::Host for HostState {
     async fn read_file(&mut self, path: String) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("read_file");
         self.require(crate::policy::Cap::FilesystemRead)?;
+        self.require_workspace(&path, false)?;
         let grip = self.grip.clone();
         Ok(
             crate::offload::blocking(|| crate::hostfs::read_file(&grip.cfg, &path))
@@ -1728,6 +1920,7 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("write_file");
         self.require(crate::policy::Cap::FilesystemWrite)?;
+        self.require_workspace(&path, true)?;
         let grip = self.grip.clone();
         let result =
             crate::offload::blocking(|| crate::hostfs::write_file(&grip.cfg, &path, &contents));
@@ -1743,6 +1936,7 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<Vec<FsEntry>, String>> {
         self.budget.entered_host("list_dir");
         self.require(crate::policy::Cap::FilesystemRead)?;
+        self.require_workspace(&path, false)?;
         let grip = self.grip.clone();
         Ok(
             crate::offload::blocking(|| crate::hostfs::list_dir(&grip.cfg, &path))
@@ -1757,6 +1951,7 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("delete_path");
         self.require(crate::policy::Cap::FilesystemDelete)?;
+        self.require_workspace(&path, true)?;
         let grip = self.grip.clone();
         let result =
             crate::offload::blocking(|| crate::hostfs::delete_path(&grip.cfg, &path, recursive));
@@ -1778,6 +1973,7 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("read_file_range");
         self.require(crate::policy::Cap::FilesystemRead)?;
+        self.require_workspace(&path, false)?;
         let grip = self.grip.clone();
         Ok(crate::offload::blocking(|| {
             crate::hostfs::read_file_range(&grip.cfg, &path, offset, limit)
@@ -1795,6 +1991,7 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("edit_file");
         self.require(crate::policy::Cap::FilesystemWrite)?;
+        self.require_workspace(&path, true)?;
         let grip = self.grip.clone();
         let result = crate::offload::blocking(|| {
             crate::hostfs::edit_file(&grip.cfg, &path, &old_text, &new_text, replace_all)
@@ -1815,6 +2012,9 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("search_files");
         self.require(crate::policy::Cap::FilesystemRead)?;
+        if let Some(p) = path.as_deref() {
+            self.require_workspace(p, false)?;
+        }
         let grip = self.grip.clone();
         // Searching a large tree blocks on the filesystem for long enough to
         // starve the runtime's other tasks, so it runs on the blocking pool.
@@ -1848,6 +2048,9 @@ impl hostfs::Host for HostState {
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("find_files");
         self.require(crate::policy::Cap::FilesystemRead)?;
+        if let Some(p) = path.as_deref() {
+            self.require_workspace(p, false)?;
+        }
         let grip = self.grip.clone();
         let cfg = grip.cfg.clone();
         let joined = tokio::task::spawn_blocking(move || {
@@ -2653,6 +2856,17 @@ mod tests {
                 ("async fn search(", "Transcripts"),
             ]),
             ("impl tooling::Host for HostState {", &[("async fn invoke(", "ComponentTools")]),
+            // The sandbox family had no `require` anywhere at all: the
+            // capability existed in the table, was reported to the browser,
+            // and gated nothing. Stubbed out in this build, so the refusal is
+            // currently invisible — which is exactly why it needs pinning
+            // here rather than being left until the sandbox is implemented.
+            ("impl sandbox::Host for HostState {", &[
+                ("async fn exec(", "Sandbox"),
+                ("async fn write_file(", "Sandbox"),
+                ("async fn read_file(", "Sandbox"),
+                ("async fn list_files(", "Sandbox"),
+            ]),
         ];
         for (marker, methods) in matrix {
             let block = src
@@ -2698,6 +2912,36 @@ mod tests {
         let terminal = src.split("impl terminal::Host for HostState {").nth(1).unwrap();
         let ssh = terminal.split("async fn ssh_available(").nth(1).unwrap();
         assert!(ssh.split("    async fn ").next().unwrap().contains("Cap::Ssh"));
+
+        // The shared workspace has its own two capabilities, and they were
+        // enforced only in the browser's HTTP routes — so an agent denied
+        // `WorkspaceWrite` still wrote there through `write_file`, because the
+        // path is rewritten to its real location before any check saw it and
+        // `FilesystemWrite` was the only gate. Every filesystem import that
+        // takes a path must therefore ask where the path actually lands.
+        let fs = src.split("impl hostfs::Host for HostState {").nth(1).unwrap();
+        let fs = fs.split("\nimpl ").next().unwrap();
+        for (method, write) in [
+            ("async fn read_file(", false),
+            ("async fn read_file_range(", false),
+            ("async fn list_dir(", false),
+            ("async fn search_files(", false),
+            ("async fn find_files(", false),
+            ("async fn write_file(", true),
+            ("async fn edit_file(", true),
+            ("async fn delete_path(", true),
+        ] {
+            let body = fs.split(method).nth(1).unwrap();
+            let body = body.split("    async fn ").next().unwrap_or(body);
+            let want = format!("require_workspace(&path, {write})");
+            let want_opt = format!("require_workspace(p, {write})");
+            assert!(
+                body.contains(&want) || body.contains(&want_opt),
+                "`{method}` does not call `{want}`, so `Cap::Workspace`\
+                 {} is not enforced for a path inside the shared workspace",
+                if write { "/`Cap::WorkspaceWrite`" } else { "" }
+            );
+        }
 
         // Catalogues and the model gate.
         let sys = src.split("impl sys::Host for HostState {").nth(1).unwrap();

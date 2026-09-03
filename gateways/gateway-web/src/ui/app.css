@@ -1070,6 +1070,14 @@ body { display: flex; flex-direction: column; }
   right: auto;
   left: calc(100% + var(--gap-3));
 }
+/* Another participant in a shared conversation. There is nowhere to get their
+   picture from — the stored avatar is the reader's own — so this tile is always
+   the drawn mark, and it is tinted so a row that is not yours is legible as
+   such at a glance rather than only from its byline. */
+.turn-avatar.is-user.is-other .turn-mark {
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 12%, var(--surface-2));
+}
 .turn-img,
 .turn-mark {
   width: 100%;
@@ -2133,6 +2141,24 @@ body { display: flex; flex-direction: column; }
 .todo-content { color: var(--text); font-size: var(--text-sm); }
 .todo-active { color: var(--warn); font-size: var(--text-xs); margin-top: var(--gap-1); }
 .todo-id { color: var(--text-faint); font-size: var(--text-xs); margin-top: var(--gap-1); }
+
+/* The People panel. */
+.participant { display: flex; align-items: flex-start; gap: var(--gap-3); padding: var(--gap-3); border: 1px solid var(--hairline); border-radius: var(--radius-sm); }
+.participant.is-owner { border-color: color-mix(in oklab, var(--accent) 35%, var(--hairline)); }
+.participant-copy { min-width: 0; flex: 1; }
+.participant-name { color: var(--text); font-size: var(--text-sm); display: flex; align-items: baseline; gap: var(--gap-2); flex-wrap: wrap; }
+.participant-you, .participant-tag { font-size: var(--text-xs); color: var(--text-faint); border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 0 4px; }
+.participant-tag { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 40%, var(--hairline)); }
+.participant-meta { display: flex; align-items: baseline; gap: var(--gap-2); flex-wrap: wrap; margin-top: var(--gap-1); font-size: var(--text-xs); color: var(--text-faint); }
+/* Read-write is the notable state in a shared conversation, so it is the one
+ * that gets the colour; read-only stays quiet. */
+.participant-standing { color: var(--warn); }
+.participant-standing.is-read-only { color: var(--text-faint); }
+.participant-remove, .participant-invite { flex: none; font-size: var(--text-xs); color: var(--text-dim); background: none; border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 2px 8px; cursor: pointer; }
+.participant-remove:hover { color: var(--err); border-color: color-mix(in oklab, var(--err) 45%, var(--hairline)); }
+.participant-invite:hover { color: var(--accent); border-color: color-mix(in oklab, var(--accent) 45%, var(--hairline)); }
+.participant-invite-row { display: flex; gap: var(--gap-2); align-items: center; }
+.participant-picker { flex: 1; min-width: 0; font: inherit; font-size: var(--text-xs); color: var(--text); background: var(--surface-2); border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 3px 6px; }
 
 .card {
   background: var(--surface-2);

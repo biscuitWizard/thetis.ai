@@ -95,7 +95,16 @@ async fn last_settled_seq(grip: &Arc<Grip>, session_id: &str) -> u64 {
 }
 
 pub enum SessionMsg {
-    User(UserMsg),
+    User {
+        msg: UserMsg,
+        /// The account that sent it, when one is known.
+        ///
+        /// Carried beside the WIT record rather than inside it: `user-msg` is a
+        /// shared contract, and the turn needs the speaker before that contract
+        /// can be widened. Once `user-msg` carries an author this becomes the
+        /// same value in two places, and the record is the one that persists.
+        speaker: Option<String>,
+    },
     /// Continue a turn that was cut short, with no new user input. The agent is
     /// stateless between turns, so carrying on simply means running one again:
     /// it rebuilds its context from the log, which now records the interruption.
@@ -178,6 +187,12 @@ struct Handle {
     tx: mpsc::UnboundedSender<SessionMsg>,
     inbox: Arc<Mutex<VecDeque<InboxItem>>>,
     cancel: Arc<CancelFlag>,
+    /// Who the turn in flight belongs to, published by the actor so a caller
+    /// outside can tell whose turn is running. Needed because revoking
+    /// someone's access has to stop the turn they are the author of, and only
+    /// that one: stopping the owner's work because a guest was removed would
+    /// make removal a denial-of-service.
+    speaker: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Default)]
@@ -191,18 +206,31 @@ impl SessionActors {
     }
 
     /// Sends a user message to a session, spawning its actor on first use.
+    ///
+    /// `author` says who it came from. The turn's authority is resolved from
+    /// `author.id`, so a conversation with several participants gives each of
+    /// them their own permissions and no one else's.
     pub fn submit(
         &self,
         grip: &Arc<Grip>,
         session_id: &str,
         message: String,
         attachments: Vec<Attachment>,
+        author: Option<crate::bindings::types::Author>,
     ) {
         let tx = self.ensure(grip, session_id);
-        let _ = tx.send(SessionMsg::User(UserMsg {
-            text: message,
-            attachments,
-        }));
+        // The speaker is derived from the author rather than passed beside it,
+        // so the identity the transcript records and the identity the
+        // permissions come from cannot disagree.
+        let speaker = author.as_ref().map(|a| a.id.clone());
+        let _ = tx.send(SessionMsg::User {
+            msg: UserMsg {
+                text: message,
+                attachments,
+                author,
+            },
+            speaker,
+        });
     }
 
     /// Picks up a turn that was interrupted, spawning the actor if needed.
@@ -234,6 +262,31 @@ impl SessionActors {
         h.cancel.raise();
         // The inbox item too, so a well-behaved guest stops at its next
         // checkpoint with a tidy "cancelled" rather than by trapping.
+        push(&h.inbox, InboxItem::Cancel);
+        true
+    }
+
+    /// Stops the running turn only if `account` is the one who started it.
+    ///
+    /// This is revocation, not a stop button: when someone is removed from a
+    /// conversation, a turn running under their authority has to end, because
+    /// the permissions it is using were theirs and are now withdrawn. The
+    /// owner's own turn must survive, or removing a participant would be a way
+    /// to interrupt whatever the owner was doing.
+    ///
+    /// Reports whether a turn was actually stopped.
+    pub fn cancel_turn_by(&self, session_id: &str, account: &str) -> bool {
+        let Ok(handles) = self.handles.read() else {
+            return false;
+        };
+        let Some(h) = handles.get(session_id) else {
+            return false;
+        };
+        let theirs = matches!(h.speaker.lock().ok().as_deref(), Some(Some(s)) if s == account);
+        if !theirs {
+            return false;
+        }
+        h.cancel.raise();
         push(&h.inbox, InboxItem::Cancel);
         true
     }
@@ -281,12 +334,14 @@ impl SessionActors {
         let (tx, rx) = mpsc::unbounded_channel();
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let cancel = Arc::new(CancelFlag::default());
+        let speaker = Arc::new(Mutex::new(None));
         handles.insert(
             session_id.to_string(),
             Handle {
                 tx: tx.clone(),
                 inbox: inbox.clone(),
                 cancel: cancel.clone(),
+                speaker: speaker.clone(),
             },
         );
 
@@ -296,6 +351,7 @@ impl SessionActors {
             rx,
             inbox,
             cancel,
+            speaker,
         ));
         tx
     }
@@ -307,28 +363,51 @@ async fn actor(
     mut rx: mpsc::UnboundedReceiver<SessionMsg>,
     inbox: Arc<Mutex<VecDeque<InboxItem>>>,
     cancel: Arc<CancelFlag>,
+    published_speaker: Arc<Mutex<Option<String>>>,
 ) {
     // Set when a turn ends with unconsumed nudges: those are user input that
     // never reached the model, so they start a follow-up turn instead of being
     // silently dropped.
     let mut start_immediately = false;
+    // A message from someone other than the turn's speaker, which must not be
+    // injected into that turn — it becomes the next turn instead, under its own
+    // author's authority. See the mid-turn arm below.
+    let mut deferred: VecDeque<(UserMsg, Option<String>)> = VecDeque::new();
+    // Who this turn belongs to; its authority is resolved from this.
+    let mut speaker: Option<String> = None;
 
     loop {
         if !start_immediately {
-            match rx.recv().await {
-                None => return, // registry dropped; session is going away
-                // Nothing to append: the log already holds the user message
-                // this turn is answering.
-                Some(SessionMsg::Resume) => {
-                    tracing::info!(session = %session_id, "resuming an interrupted turn");
+            // A message deferred from someone else's turn is next in line, and
+            // starts a turn of its own rather than waiting on the channel.
+            if let Some((msg, from)) = deferred.pop_front() {
+                speaker = from;
+                if let Err(e) = grip
+                    .append_event(&session_id, SessionEvent::UserMessage(msg))
+                    .await
+                {
+                    tracing::error!(session = %session_id, error = %e, "failed to log user message");
+                    continue;
                 }
-                Some(SessionMsg::User(msg)) => {
-                    if let Err(e) = grip
-                        .append_event(&session_id, SessionEvent::UserMessage(msg))
-                        .await
-                    {
-                        tracing::error!(session = %session_id, error = %e, "failed to log user message");
-                        continue;
+            } else {
+                match rx.recv().await {
+                    None => return, // registry dropped; session is going away
+                    // Nothing to append: the log already holds the user message
+                    // this turn is answering. The speaker is not known from a
+                    // resume, so authority falls back to the owner.
+                    Some(SessionMsg::Resume) => {
+                        speaker = None;
+                        tracing::info!(session = %session_id, "resuming an interrupted turn");
+                    }
+                    Some(SessionMsg::User { msg, speaker: from }) => {
+                        speaker = from;
+                        if let Err(e) = grip
+                            .append_event(&session_id, SessionEvent::UserMessage(msg))
+                            .await
+                        {
+                            tracing::error!(session = %session_id, error = %e, "failed to log user message");
+                            continue;
+                        }
                     }
                 }
             }
@@ -357,10 +436,16 @@ async fn actor(
             tracing::error!(session = %session_id, error = %e, "failed to log turn start");
         }
 
+        // Publish whose turn this is before the first host call, so a
+        // revocation arriving mid-turn can see it.
+        if let Ok(mut published) = published_speaker.lock() {
+            *published = speaker.clone();
+        }
+
         // Held across the whole select loop: a worker running a turn must
         // never look idle to the reaper, however long the model thinks.
         let _running = grip.begin_turn();
-        let turn = grip.run_turn(&session_id);
+        let turn = grip.run_turn(&session_id, speaker.as_deref());
         tokio::pin!(turn);
 
         let outcome = loop {
@@ -370,7 +455,24 @@ async fn actor(
                     // Input during a turn steers the turn in flight.
                     // A nudge is text only: an image mid-turn would need the
                     // model to re-read the whole message, so those start a new turn.
-                    Some(SessionMsg::User(msg)) => {
+                    Some(SessionMsg::User { msg, speaker: from }) => {
+                        // Only the turn's own speaker may steer it. A nudge is
+                        // injected into a turn that is *already running* under
+                        // someone's authority, so accepting one from anybody
+                        // else would let a read-only participant put
+                        // instructions inside an admin's turn — no new turn, no
+                        // fresh policy resolution, nothing in between. Defer it
+                        // instead: it becomes the next turn, resolved under its
+                        // own author's policy.
+                        if from.as_deref() != speaker.as_deref() {
+                            tracing::info!(
+                                session = %session_id,
+                                "a message from another participant arrived mid-turn; \
+                                 queued as its own turn rather than steering this one"
+                            );
+                            deferred.push_back((msg, from));
+                            continue;
+                        }
                         let _ = grip
                             .append_event(&session_id, SessionEvent::Nudge(msg.text.clone()))
                             .await;
@@ -548,6 +650,13 @@ async fn actor(
             // even if settling failed, or it waits out its whole deadline over
             // a database hiccup.
             grip.settle_bell.ring();
+        }
+
+        // No turn is running now, so nobody is its speaker. Cleared rather than
+        // left stale so a revocation between turns does not stop the next
+        // person's turn by matching a name that has already finished.
+        if let Ok(mut published) = published_speaker.lock() {
+            *published = None;
         }
 
         // Anything the agent never picked up becomes the seed of the next turn.
@@ -840,5 +949,58 @@ mod tests {
             "an unknown session cannot be stopped"
         );
         assert!(actors.cancel_flag("nobody").is_none());
+        assert!(
+            !actors.cancel_turn_by("nobody", "alice"),
+            "nor revoked out of"
+        );
+    }
+
+    /// Revoking someone's access stops their turn and nobody else's.
+    ///
+    /// The asymmetry is the whole point. A turn running under a removed
+    /// participant's authority has to end, because that authority is gone. But
+    /// stopping the *owner's* turn because a guest was removed would turn
+    /// "remove someone" into "interrupt whatever the owner is doing", which is
+    /// a denial of service dressed up as an access control.
+    #[test]
+    fn revocation_stops_only_the_removed_person_s_turn() {
+        let actors = SessionActors::new();
+        // A live handle, as `ensure` would leave one: no real actor, because
+        // what is under test is the speaker match, not the turn.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(CancelFlag::default());
+        cancel.begin_turn();
+        let speaker = Arc::new(Mutex::new(Some("guest".to_string())));
+        actors.handles.write().unwrap().insert(
+            "s1".to_string(),
+            Handle {
+                tx,
+                inbox: Arc::new(Mutex::new(VecDeque::new())),
+                cancel: cancel.clone(),
+                speaker: speaker.clone(),
+            },
+        );
+
+        // The owner's turn is not the guest's to stop.
+        assert!(!actors.cancel_turn_by("s1", "owner"));
+        assert!(!cancel.raised(), "somebody else's removal stopped the turn");
+
+        // The speaker's own removal does stop it.
+        assert!(actors.cancel_turn_by("s1", "guest"));
+        assert!(cancel.raised());
+
+        // Between turns nobody is the speaker, so a removal finds nothing to
+        // stop rather than matching a name that has already finished.
+        *speaker.lock().unwrap() = None;
+        let idle = Arc::new(CancelFlag::default());
+        idle.begin_turn();
+        actors
+            .handles
+            .write()
+            .unwrap()
+            .get_mut("s1")
+            .map(|h| h.cancel = idle.clone());
+        assert!(!actors.cancel_turn_by("s1", "guest"));
+        assert!(!idle.raised());
     }
 }

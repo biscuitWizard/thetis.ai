@@ -23,6 +23,24 @@ use crate::runtime::Runtime;
 use crate::workers::WORKER_SOCKET_FD;
 use crate::{watchdog, watcher};
 
+/// The author on an inbound `submit` frame, or `None` if it names nobody.
+///
+/// Separate from the `submit` arm so it can be tested against the frame shapes
+/// that actually arrive, which is the whole reason it is lenient. The gateway
+/// runs trunk's binary while a branch worker runs its own, so a frame from an
+/// older gateway simply has no `author` key — and one from a newer one could
+/// have a shape this build does not know. Both must yield an unattributed
+/// message, because a hard parse here would reject every message crossing that
+/// gap rather than merely losing the byline on it.
+fn author_on_frame(params: &Value) -> Option<crate::bindings::types::Author> {
+    params
+        .get("author")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        // An empty id names no principal, and would render as a blank byline.
+        .filter(|a: &crate::bindings::types::Author| !a.id.is_empty())
+}
+
 /// What the worker does with requests the gateway sends it.
 #[derive(Default)]
 struct WorkerHandler {
@@ -60,11 +78,27 @@ impl Handler for WorkerHandler {
                         params.get("attachments").cloned().unwrap_or(Value::Null),
                     )
                     .unwrap_or_default();
-                    grip.submit(&session()?, message, attachments).await?;
+                    // Degrades to `None` rather than failing — see
+                    // `author_on_frame`, which is where the reasoning lives.
+                    let author = author_on_frame(&params);
+                    grip.submit(&session()?, message, attachments, author)
+                        .await?;
                     Ok(Value::Null)
                 }
                 "cancel" => {
                     let stopped = grip.cancel(&session()?).await;
+                    Ok(serde_json::json!({ "stopped": stopped }))
+                }
+                // Revocation: stops the turn only if the named account is its
+                // speaker. The account is decided by the gateway from the
+                // signed-in principal, never by anything in the worker.
+                "cancel_turn_by" => {
+                    let account = params
+                        .get("account")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let stopped = grip.cancel_turn_by(&session()?, &account).await;
                     Ok(serde_json::json!({ "stopped": stopped }))
                 }
                 "resume" => {
@@ -619,6 +653,41 @@ async fn bring_up(grip: &Arc<Grip>, aspect: &Aspect) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_author_is_read_off_a_submit_frame() {
+        let a = author_on_frame(&json!({
+            "author": { "id": "alice", "display": "Alice", "surface": "web" }
+        }))
+        .expect("a well-formed author is taken");
+        assert_eq!(a.id, "alice");
+        assert_eq!(a.display, "Alice");
+    }
+
+    #[test]
+    fn a_frame_from_an_older_gateway_is_unattributed_not_rejected() {
+        // The gateway runs trunk's binary while a branch worker runs its own,
+        // so this is the shape that arrives across that gap for real. Failing
+        // here would reject the *message*, not just its byline.
+        assert!(author_on_frame(&json!({ "session": "s", "message": "hi" })).is_none());
+        assert!(author_on_frame(&json!({ "author": null })).is_none());
+    }
+
+    #[test]
+    fn an_unrecognisable_author_is_dropped_rather_than_trusted() {
+        // A shape this build does not understand, and an author naming nobody.
+        // Both must read as absent: an empty id resolves to no principal, and
+        // letting it through would put a blank byline in the transcript and an
+        // empty speaker into policy resolution.
+        assert!(author_on_frame(&json!({ "author": "alice" })).is_none());
+        assert!(author_on_frame(&json!({ "author": { "id": "alice" } })).is_none());
+        assert!(
+            author_on_frame(&json!({
+                "author": { "id": "", "display": "Nobody", "surface": "web" }
+            }))
+            .is_none()
+        );
+    }
 
     #[test]
     fn child_frame_is_addressed_to_the_root_conversation() {
