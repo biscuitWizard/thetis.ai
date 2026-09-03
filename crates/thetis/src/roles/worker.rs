@@ -170,6 +170,10 @@ impl Handler for WorkerHandler {
                     if if_idle && grip.is_busy() {
                         return Ok(serde_json::json!({ "busy": true }));
                     }
+                    // Said out loud, because `exit` is otherwise indistinguishable
+                    // from being killed: a worker that vanishes silently gives
+                    // whoever is debugging it nothing to go on.
+                    tracing::info!(if_idle, "shutting down on request");
                     let grip = grip.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
