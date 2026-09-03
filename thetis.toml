@@ -580,6 +580,8 @@ retries = 3
 base_url = "http://10.10.10.1:7892"
 timeout_secs = 10
 request_timeout_secs = 30
+username = "Zero"
+password = "MaxPasswordLol"
 # Put credentials in gitignored thetis.local.toml or environment overlays:
 # username = "thetis-programmer"
 # password = "..."
