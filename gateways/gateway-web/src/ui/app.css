@@ -697,6 +697,77 @@ body { display: flex; flex-direction: column; }
 .file-status { font-size: var(--text-xs); color: var(--text-faint); }
 .file-status.is-error { color: var(--err); }
 
+/* The plan tab.
+ *
+ * Reads as a document, not as a form: the body is prose at the same measure the
+ * transcript uses, so a plan and the conversation about it look like the same
+ * kind of thing. The two pieces of chrome earn their place — the action bar,
+ * because approving a plan is the one moment a reader wants a button, and the
+ * note strip, because that is the moment they want to add a caveat. */
+.plan-body {
+  display: block;
+  padding: var(--gap-5);
+  font-size: var(--text-sm);
+  line-height: 1.65;
+  color: var(--text);
+}
+.plan-body > * { max-width: var(--measure); margin-inline: auto; }
+
+/* Execute and its two pickers travel together at the right of the bar, so the
+   mode and the model read as arguments to the button rather than as standing
+   settings of the pane. */
+/* The plan's bar carries pickers whose menus have to escape it, so it cannot
+   inherit `.stage-bar`'s overflow clip — that clip exists to keep a long file
+   path from spilling, and this bar has no long path in it. `position: relative`
+   plus a z-index above the body keeps the escaped menu painted over the
+   document rather than under it. */
+.stage-bar.is-plan {
+  overflow: visible;
+  position: relative;
+  z-index: 2;
+}
+
+/* `flex-wrap` rather than `flex: none`: the group is two pickers plus Execute,
+   which is wider than a narrow pane, and with the bar no longer clipping its
+   overflow an unshrinkable group would hang visibly over the edge instead of
+   being quietly cut. Wrapping keeps every control on screen and reachable,
+   which is the property that matters for the button that runs the plan. */
+.plan-exec {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+}
+.plan-exec .picker { flex: none; }
+
+.plan-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: var(--gap-2) var(--gap-5);
+  border-top: 1px solid var(--hairline);
+}
+/* Two rows tall and no taller: an invitation to add a sentence, not a second
+   composer. Anything longer belongs in the conversation. */
+.plan-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--gap-2);
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  resize: none;
+  outline: none;
+}
+.plan-note:focus { border-color: var(--accent); }
+.plan-note::placeholder { color: var(--text-faint); }
+
 /* A sub-agent's tab is its stream at full width, so the block's own framing —
    the border, the fold, the accent stripe — is dropped and only the rules that
    make a child's rows read as a child's remain. */
@@ -1713,6 +1784,17 @@ body { display: flex; flex-direction: column; }
 }
 @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 
+/* A picker in a bar at the *top* of a pane, rather than in the composer at the
+   foot of the screen. Without this the menu is positioned above a pill that is
+   already near y=0, so it lands off the top of the viewport with every option
+   unclickable — measured, not guessed. */
+.picker-menu.drops-down {
+  bottom: auto;
+  top: calc(100% + 6px);
+  animation: fall var(--med) var(--ease);
+}
+@keyframes fall { from { opacity: 0; transform: translateY(-4px); } }
+
 .picker-item {
   display: block;
   width: 100%;
@@ -2509,7 +2591,11 @@ body { display: flex; flex-direction: column; }
   /* Narrow: the tab is a name, not a name plus its accounting. */
   .stage-tab { max-width: 10rem; }
   .stage-tab-note { display: none; }
-  .chat-bar, .stage-bar, .file-foot { padding: var(--gap-2) var(--gap-3); }
+  .chat-bar, .stage-bar, .file-foot, .plan-foot { padding: var(--gap-2) var(--gap-3); }
+  .plan-body { padding: var(--gap-3); }
+  /* The action bar wraps rather than squeezing Execute off the edge: on a narrow
+     screen the button is the one thing on this pane that must stay reachable. */
+  .stage-bar.is-plan { flex-wrap: wrap; }
   .file-editor { padding: var(--gap-3); }
   .composer-hint { display: none; }
   .branch-actions .ghost-btn { padding: 3px 6px; }

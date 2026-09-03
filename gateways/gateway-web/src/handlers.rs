@@ -123,6 +123,18 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
         "user-avatar" => vec![user_avatar()],
         "user-avatar-set" => set_user_avatar(frame, id),
 
+        // The plan document. `plan-read` is what the plan tab draws from;
+        // `plan-execute` is the Execute button, which is a mode switch, an
+        // optional model switch and a submit in one click.
+        "plan" => match id {
+            Some(session) => vec![plan(session)],
+            None => vec![error("plan requires an id")],
+        },
+        "plan-execute" => match id {
+            Some(session) => execute_plan(session, frame),
+            None => vec![error("plan-execute requires an id")],
+        },
+
         "model-save" => save_model(frame, id),
         "model-remove" => remove_model(frame, id),
         "model-restore" => restore_model(frame, id),
@@ -878,6 +890,165 @@ fn reset_tool_groups(session_id: &str) -> Vec<GatewayAction> {
     vec![tools(session_id)]
 }
 
+// --- the plan document ------------------------------------------------------
+//
+// The agent writes the plan into its session KV scope; this reads it out for the
+// plan tab. Read straight from the store rather than asked of the agent, for the
+// same reason the tool-group panel is: asking the agent needs a live worker, and
+// the plan tab must draw on a reload of a conversation that is sitting idle.
+//
+// `PLAN_KEY` is duplicated from `agents/agent-core/src/plan.rs` — separate
+// components cannot share a constant. Grep for the literal if you change it.
+const PLAN_KEY: &str = "__plan";
+
+
+/// The plan as the tab needs it: the document, plus enough for the tab to say
+/// whether what it is showing is current.
+fn plan(session_id: &str) -> GatewayAction {
+    let stored = sys::kv_get(session_id, PLAN_KEY)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+
+    let field = |key: &str| {
+        stored
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let body = field("body");
+
+    reply(json!({
+        "type": "plan",
+        "session": session_id,
+        "title": field("title"),
+        "body": body,
+        "revision": stored.get("revision").and_then(Value::as_u64).unwrap_or(0),
+        "updated_ms": stored.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
+        // The modes the Execute dropdown may switch into, and the models it may
+        // pick. Sent with the plan so the tab needs no second round trip, and so
+        // it can never offer a mode that would refuse to carry the plan out.
+        "modes": executable_modes(),
+        "models": model_options(),
+        "has_plan": !body.trim().is_empty(),
+    }))
+}
+
+/// Modes that can actually execute: the ones that are not read-only.
+///
+/// Asked of the host rather than hardcoded, because a mode is a configuration
+/// entry and this gateway must not have its own list. If configuration somehow
+/// has no writable mode, the list comes back empty and the tab says so — better
+/// than offering a button that would hand the plan to a mode unable to act.
+fn executable_modes() -> Vec<Value> {
+    sys::list_modes()
+        .into_iter()
+        .filter(|m| !m.read_only)
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "label": if m.label.trim().is_empty() { m.id.clone() } else { m.label.clone() },
+            })
+        })
+        .collect()
+}
+
+/// The model picker's options for the Execute dropdown, from the same merged
+/// catalogue the composer's picker uses, so the two never disagree.
+fn model_options() -> Vec<Value> {
+    merged_models()
+        .into_iter()
+        .filter(|m| !m.hidden)
+        .map(|m| json!({ "id": m.id, "label": m.label }))
+        .collect()
+}
+
+/// The Execute button: switch mode, optionally switch model, then submit.
+///
+/// The submitted message names the plan and tells the agent to read it with
+/// `plan_read` rather than carrying a copy of the body. That matters: the plan
+/// may be long, it is already addressable, and a pasted copy would be a second
+/// version of the document that starts going stale the moment a step is revised.
+/// Which mode a click on Execute should switch the conversation into.
+///
+/// Split out from `execute_plan` and given `(id, read_only)` pairs rather than
+/// the host's own type so it can be tested: this is the one branchy part of the
+/// path, and every branch of it is a refusal the user sees on the tab.
+///
+/// An unknown mode is refused rather than passed through. `set-session-mode`
+/// accepts anything, and the agent then treats an unrecognised mode as writable
+/// — a fail-open worth one check to avoid, since the click means "go and do
+/// this". An empty request means the tab offered no choice, which is the
+/// first-load case, so the first writable mode stands in.
+fn choose_mode(modes: &[(String, bool)], requested: &str) -> Result<String, String> {
+    if requested.is_empty() {
+        return modes
+            .iter()
+            .find(|(_, read_only)| !read_only)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| "no writable mode is configured".to_string());
+    }
+    match modes.iter().find(|(id, _)| id == requested) {
+        Some((id, false)) => Ok(id.clone()),
+        Some((id, true)) => Err(format!(
+            "mode '{id}' is read-only, so it cannot carry a plan out"
+        )),
+        None => Err(format!("unknown mode '{requested}'")),
+    }
+}
+
+fn execute_plan(session_id: &str, frame: &Value) -> Vec<GatewayAction> {
+    let stored = sys::kv_get(session_id, PLAN_KEY)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let body = stored
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if body.trim().is_empty() {
+        return vec![error("there is no plan to execute yet")];
+    }
+
+    let requested = frame.get("mode").and_then(Value::as_str).unwrap_or("");
+    let modes: Vec<(String, bool)> = sys::list_modes()
+        .into_iter()
+        .map(|m| (m.id, m.read_only))
+        .collect();
+    let mode = match choose_mode(&modes, requested) {
+        Ok(mode) => mode,
+        Err(message) => return vec![error(message)],
+    };
+
+    host::set_session_mode(session_id, &mode);
+    if let Some(model) = slug_of(frame, "model") {
+        host::set_session_model(session_id, &model);
+    }
+
+    let note = frame
+        .get("note")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut message = String::from(
+        "Execute the plan. Read it with `plan_read` first — it is the authority, not this \
+         message, and it may have been revised since it was written. Work through it in order. \
+         As each step lands, mark it done in the plan with `plan_edit` so the plan tab shows \
+         where you are; if a step turns out to be wrong, revise it there and say why rather \
+         than quietly doing something else.",
+    );
+    if !note.is_empty() {
+        message.push_str("\n\nFrom the user, alongside the plan:\n");
+        message.push_str(note);
+    }
+
+    host::submit(session_id, &message, &[]);
+    vec![
+        session_settings(session_id),
+        sessions(),
+        reply(json!({ "type": "accepted", "session": session_id })),
+    ]
+}
+
 fn session_settings(session_id: &str) -> GatewayAction {
     let meta = host::get_session(session_id);
     reply(json!({
@@ -1042,4 +1213,80 @@ fn parse_attachments(frame: &Value) -> Vec<Attachment> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Tests for the parts of this module that are pure. Most of it talks to the
+/// host and cannot run here, but the plan's mode choice is exactly the kind of
+/// branching that is worth pinning: every arm of it is a refusal the user reads
+/// on the plan tab, and `cargo test` in this directory runs natively.
+#[cfg(test)]
+mod tests {
+    use super::choose_mode;
+
+    fn modes() -> Vec<(String, bool)> {
+        vec![
+            ("agent".into(), false),
+            ("plan".into(), true),
+            ("chat".into(), true),
+        ]
+    }
+
+    #[test]
+    fn a_writable_mode_is_taken_as_asked() {
+        assert_eq!(choose_mode(&modes(), "agent").unwrap(), "agent");
+    }
+
+    /// Executing *into* plan mode would withhold every tool that could carry the
+    /// plan out, so the click has to be refused rather than half-honoured.
+    #[test]
+    fn a_read_only_mode_is_refused_by_name() {
+        let err = choose_mode(&modes(), "plan").unwrap_err();
+        assert!(err.contains("plan"), "{err}");
+        assert!(err.contains("read-only"), "{err}");
+    }
+
+    /// The fail-open this check exists to prevent: the host accepts any mode
+    /// string, and the agent treats one it does not recognise as writable.
+    #[test]
+    fn an_unknown_mode_is_refused_rather_than_passed_through() {
+        let err = choose_mode(&modes(), "wishful").unwrap_err();
+        assert!(err.contains("unknown mode"), "{err}");
+        assert!(err.contains("wishful"), "{err}");
+    }
+
+    /// No choice offered — the first-load case, before a `plan` frame has told
+    /// the tab which modes exist.
+    #[test]
+    fn no_request_falls_back_to_the_first_writable_mode() {
+        assert_eq!(choose_mode(&modes(), "").unwrap(), "agent");
+    }
+
+    /// Order matters for that fallback: it must skip read-only modes rather
+    /// than taking whatever is listed first.
+    #[test]
+    fn the_fallback_skips_a_read_only_mode_listed_first() {
+        let ordered = vec![
+            ("plan".into(), true),
+            ("chat".into(), true),
+            ("wild".into(), false),
+        ];
+        assert_eq!(choose_mode(&ordered, "").unwrap(), "wild");
+    }
+
+    /// Configuration with nothing writable in it. The tab disables Execute for
+    /// this case, but the handler must not rely on the client to do so.
+    #[test]
+    fn with_no_writable_mode_at_all_it_refuses() {
+        let all_read_only = vec![("plan".into(), true), ("chat".into(), true)];
+        assert!(choose_mode(&all_read_only, "").is_err());
+        assert!(choose_mode(&all_read_only, "plan").is_err());
+    }
+
+    /// An empty mode list is what a host that failed to load configuration
+    /// returns. It must be a refusal, not a panic on `[0]`.
+    #[test]
+    fn an_empty_mode_list_refuses_instead_of_panicking() {
+        assert!(choose_mode(&[], "").is_err());
+        assert!(choose_mode(&[], "agent").is_err());
+    }
 }
