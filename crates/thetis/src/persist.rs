@@ -14,6 +14,7 @@ use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
 use crate::ipc::Peer;
 use crate::store::Store;
 use crate::subagents::SubagentRow;
+use crate::transcripts::{ConversationSummary, SearchQuery, SearchReport, TranscriptEntry};
 
 #[derive(Clone)]
 pub enum Persist {
@@ -295,6 +296,77 @@ impl Persist {
         )
     }
 
+    // --- transcripts ----------------------------------------------------------
+    //
+    // Read-only recall across every conversation. See `transcripts.rs` for why
+    // these are not pinned to the caller's own session the way `store.events`
+    // is, and `serve_store_call` below for the arms that serve them.
+
+    pub async fn conversations(
+        &self,
+        include_archived: bool,
+        include_subagents: bool,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>> {
+        delegate!(
+            self,
+            "store.conversations",
+            |s| crate::transcripts::Transcripts::new(s).conversations(
+                include_archived,
+                include_subagents,
+                limit
+            ),
+            json!({
+                "include_archived": include_archived,
+                "include_subagents": include_subagents,
+                "limit": limit,
+            })
+        )
+    }
+
+    pub async fn conversation_subagents(&self, root_id: &str) -> Result<Vec<ConversationSummary>> {
+        delegate!(
+            self,
+            "store.conversation_subagents",
+            |s| crate::transcripts::Transcripts::new(s).subagents(root_id),
+            json!({ "root": root_id })
+        )
+    }
+
+    pub async fn read_transcript(
+        &self,
+        session_id: &str,
+        from_seq: u64,
+        limit: usize,
+        max_chars: usize,
+    ) -> Result<Vec<TranscriptEntry>> {
+        delegate!(
+            self,
+            "store.read_transcript",
+            |s| crate::transcripts::Transcripts::new(s).read(
+                session_id,
+                from_seq,
+                limit,
+                max_chars
+            ),
+            json!({
+                "id": session_id,
+                "from_seq": from_seq,
+                "limit": limit,
+                "max_chars": max_chars,
+            })
+        )
+    }
+
+    pub async fn search_transcripts(&self, query: &SearchQuery) -> Result<SearchReport> {
+        delegate!(
+            self,
+            "store.search_transcripts",
+            |s| crate::transcripts::Transcripts::new(s).search(query),
+            json!({ "query": query })
+        )
+    }
+
     // --- skill vectors ----------------------------------------------------------
 
     pub async fn skill_vector(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -347,6 +419,12 @@ impl Persist {
 /// session-management and shared-store methods (create/list/get/rename/
 /// archive/kv/skill-vector) stay open, because the agent legitimately manages
 /// other conversations and shared state through them.
+///
+/// The `store.conversations` / `read_transcript` / `search_transcripts` /
+/// `conversation_subagents` arms are open too, and are the one place where a
+/// worker reads a conversation that is not its own. They are read-only by
+/// construction — see `crate::transcripts` — which is what separates them from
+/// the arms above.
 pub async fn serve_store_call(
     store: &Store,
     method: &str,
@@ -514,6 +592,53 @@ fn serve_store_call_inner(
         "store.cancel_subagent" => to_value(
             crate::subagents::Subagents::new(store).mark_cancelled(get_str(&params, "child")?)?,
         ),
+        // Transcript recall. These four are the *only* arms that name a session
+        // and deliberately skip `own_session`, and the exemption is the feature
+        // rather than an oversight: an agent asking "have I solved this before"
+        // or "what did that sub-agent actually find" has to read logs its own
+        // session did not write.
+        //
+        // What makes that safe to grant is that none of them can write. They
+        // route to `crate::transcripts`, which holds no write path at all — a
+        // property pinned by a test in that module, because the read was widened
+        // on precisely that promise. The mutating arms above keep `own_session`
+        // untouched, so a worker still cannot forge an event into another
+        // conversation, drain its budget or unstick its turn.
+        "store.conversations" => {
+            let include_archived = params
+                .get("include_archived")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let include_subagents = params
+                .get("include_subagents")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+            to_value(crate::transcripts::Transcripts::new(store).conversations(
+                include_archived,
+                include_subagents,
+                limit,
+            )?)
+        }
+        "store.conversation_subagents" => to_value(
+            crate::transcripts::Transcripts::new(store).subagents(get_str(&params, "root")?)?,
+        ),
+        "store.read_transcript" => {
+            let from = params.get("from_seq").and_then(Value::as_u64).unwrap_or(0);
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let max_chars = params.get("max_chars").and_then(Value::as_u64).unwrap_or(0) as usize;
+            to_value(crate::transcripts::Transcripts::new(store).read(
+                get_str(&params, "id")?,
+                from,
+                limit,
+                max_chars,
+            )?)
+        }
+        "store.search_transcripts" => {
+            let query: crate::transcripts::SearchQuery =
+                serde_json::from_value(params.get("query").cloned().unwrap_or(Value::Null))?;
+            to_value(crate::transcripts::Transcripts::new(store).search(&query)?)
+        }
         "store.skill_vector" => to_value(store.skill_vector(get_str(&params, "key")?)),
         "store.put_skill_vector" => {
             let vector: Vec<u8> =
@@ -620,5 +745,79 @@ mod tests {
 
         // Errors cross the boundary as errors.
         assert!(remote.rename_session("nope", "t").await.is_err());
+    }
+
+    /// The transcript arms must work through the *remote* arm specifically.
+    ///
+    /// This is the test that would have caught the mistake worth recording
+    /// here: the four `store.*` transcript methods are served by the **gateway**
+    /// process, not by the worker that calls them. A worker can therefore be
+    /// running a kernel that has them while the gateway is not, and the symptom
+    /// is `unknown store method store.conversations` from a tree where the arm
+    /// is plainly present. The local arm passing proves nothing about that path,
+    /// so every method is asserted across the wire.
+    #[tokio::test]
+    async fn transcript_recall_works_across_the_worker_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(gw_stream, Arc::new(GatewaySide(store.clone())));
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        let parent = store.create_session(Some("the parent".into()), "agent").unwrap();
+        let child = store.create_session(None, "agent").unwrap();
+        crate::subagents::Subagents::new(&store)
+            .register(&parent.id, &child.id, "scout", "go and look", "", "", "plan", 0)
+            .unwrap();
+        store
+            .append_event(
+                &parent.id,
+                SessionEvent::Nudge("the redb lock was the problem".into()),
+            )
+            .unwrap();
+
+        // The catalogue.
+        let listed = remote.conversations(false, false, 0).await.unwrap();
+        assert!(listed.iter().any(|c| c.id == parent.id));
+        assert!(
+            !listed.iter().any(|c| c.id == child.id),
+            "a sub-agent is not a conversation unless asked for"
+        );
+
+        // The sub-agent tree, for a conversation that is not the caller's own —
+        // the caller here has no session at all.
+        let kids = remote.conversation_subagents(&parent.id).await.unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].label, "scout");
+
+        // A windowed read.
+        let entries = remote.read_transcript(&parent.id, 0, 0, 0).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].text.contains("redb lock"));
+
+        // And search, with the query record surviving serialisation both ways.
+        let report = remote
+            .search_transcripts(&crate::transcripts::SearchQuery {
+                pattern: "redb lock".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.total_matches, 1);
+        assert_eq!(report.hits[0].session_id, parent.id);
+
+        // A bad pattern is an error on the far side, not a panic or an empty
+        // result that reads as "no matches".
+        assert!(remote
+            .search_transcripts(&crate::transcripts::SearchQuery {
+                pattern: "[unclosed".into(),
+                ..Default::default()
+            })
+            .await
+            .is_err());
     }
 }
