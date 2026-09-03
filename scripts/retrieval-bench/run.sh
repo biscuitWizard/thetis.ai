@@ -109,7 +109,7 @@ lift_into() {
     # itself one of the knobs worth sweeping.
     if [[ -f "$dest/lifted/skill_index.rs" ]]; then
         sed -i \
-            -e 's/^fn \(dense_scores\|bm25_scores\|absorb_into_parents\|promote_parents\)/pub fn \1/' \
+            -e 's/^fn \(dense_scores\|bm25_scores\|absorb_into_parents\|promote_parents\|cosine\)/pub fn \1/' \
             -e 's/^const \(CANDIDATE_POOL\|BM25_K1\|BM25_B\)/pub const \1/' \
             "$dest/lifted/skill_index.rs"
     fi

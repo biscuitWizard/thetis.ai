@@ -493,15 +493,88 @@ async fn admin_branch_action(
             };
 
             crate::publish::push_public(root).await?;
-            Ok(format!(
+            let mut message = format!(
                 "exported {} commit(s) and published {} as '{}' on origin",
                 export.commits,
                 &head[..12.min(head.len())],
                 crate::publish::REMOTE_BRANCH
-            ))
+            );
+
+            // Benchmark results ride along, but never hold up the publish that
+            // the operator actually asked for: trunk is already on the remote by
+            // this point, so a failure here is reported and nothing more.
+            match publish_bench_results(&grip, root).await {
+                Ok(Some(bench)) => message.push_str(&format!(
+                    "; published {} benchmark file(s) as '{}' ({} datapoint(s))",
+                    bench.files,
+                    crate::bench::BENCH_REMOTE_BRANCH,
+                    bench.datapoints
+                )),
+                Ok(None) => message.push_str("; no benchmark results to publish"),
+                Err(err) => {
+                    tracing::warn!(error = %err, "publishing benchmark results failed");
+                    message.push_str(&format!("; benchmark results not published ({err})"));
+                }
+            }
+
+            Ok(message)
         }
         other => anyhow::bail!("unknown action '{other}'"),
     }
+}
+
+/// Regenerates the benchmark charts and puts them on `bench-results`.
+///
+/// Returns `Ok(None)` when there is nothing to publish, which covers every
+/// ordinary reason the benchmark cannot run here: no generator script in this
+/// checkout, no built harness, no corpus, no embeddings key. None of those are
+/// faults of the publish the operator asked for.
+async fn publish_bench_results(
+    grip: &Grip,
+    root: &crate::gitctl::GitCtl,
+) -> anyhow::Result<Option<crate::bench::BenchPublish>> {
+    let repo = &grip.cfg.root;
+    let script = repo.join("scripts/retrieval-bench/publish-graphs.sh");
+    if !script.is_file() {
+        tracing::debug!(script = %script.display(), "no benchmark generator; skipping");
+        return Ok(None);
+    }
+
+    // Staging goes under artifacts, not a temp dir: the charts are worth
+    // looking at after a publish, and artifacts is already the place for build
+    // output that outlives the run that made it.
+    let staging = grip.cfg.paths.artifacts.join("bench-results");
+
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg(&script)
+        .arg("--staging")
+        .arg(&staging)
+        .current_dir(repo)
+        .kill_on_drop(true);
+
+    // A cold run has to embed the corpus, which is minutes of network; a warm
+    // one is seconds. The generator itself degrades rather than hanging, so
+    // this bound only catches a genuinely stuck child.
+    let out = crate::control::run_child(
+        cmd,
+        std::time::Duration::from_secs(900),
+        "the benchmark chart generator",
+    )
+    .await?;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        anyhow::bail!(
+            "the chart generator exited {}: {}",
+            out.status.code().unwrap_or(-1),
+            stderr.lines().last().unwrap_or("no output").trim()
+        );
+    }
+    for line in stderr.lines() {
+        tracing::info!(target: "bench", "{}", line);
+    }
+
+    crate::bench::publish_bench(root, &staging).await
 }
 
 async fn admin_page(State(grip): State<Arc<Grip>>) -> Html<String> {
