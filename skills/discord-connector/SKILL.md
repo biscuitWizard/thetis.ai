@@ -135,8 +135,50 @@ the end-to-end behaviour. Reverting `may_reuse_session` to `existing.is_some()`
 makes those integration tests fail with the same id on both sides of the
 assertion, which is what the bug looked like.
 
+## Streaming a reply: two pieces, not one
+
+`stream_reply` in `mod.rs` keeps **`settled`** (the text of assistant steps that
+have finished) apart from **`buffer`** (the current step's deltas), and `visible()`
+joins them for every write. That split is forced by the events disagreeing about
+what they carry:
+
+| Event | Means |
+|---|---|
+| `StreamDelta` | *append* this fragment to the step in flight |
+| `AssistantMessage` | the step's **whole** final text |
+
+Held in one string, `AssistantMessage` overwrites everything the deltas built, so
+a turn that narrates, calls a tool, then narrates again loses its opening
+paragraph from the channel. Only the *last* step would survive.
+
+Two rules keep the message honest on a long turn:
+
+- **Flush when a step ends,** in the `AssistantMessage` arm, not only on the
+  interval and at `TurnFinished`. Deltas flush on a timer, so the text arriving
+  between the last tick and the model turning to a tool call is still unsent —
+  and a turn that then spends ten minutes in tools leaves a **half-finished
+  sentence** on screen for all of it. That is what "streaming broke" looks like
+  from the outside, and it needs no error to happen. The step's text is final, so
+  there is nothing to wait for; the interval still bounds the streaming case, so
+  it costs at most one extra edit per step.
+- **Text already said is never replaced by a progress note.** The plain
+  `ToolInvocation` arm checks `visible(...)`, not the delta buffer, or a tool
+  call after some narration would take back what was said.
+
+`Incident` appends to `settled` and clears `buffer` for the same reason: it
+belongs to no step, so the next `AssistantMessage` must not overwrite it.
+
+`visible()` is pure and unit-tested (`discord::tests`), which is the only part of
+the streaming path testable without a token — the edit cadence is not.
+
 ## Things learned the hard way
 
+- **A stalled-looking reply is usually not a transport fault.** A truncated
+  message that never updates means unflushed buffer plus a turn still working,
+  not a broken socket. Check whether the worker is still burning tokens
+  (`journalctl -u thetis | grep "token usage"`) before touching the stream code:
+  a live worker and no `could not edit a Discord reply` warning rules out the
+  edit path entirely.
 - **Fatal close codes must not be retried.** 4004 (bad token) and 4013/4014
   (missing privileged intents) never succeed, and reconnecting in a loop is how
   an address gets rate-limited. `api::is_fatal_close` stops the connector and
