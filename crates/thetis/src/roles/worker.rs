@@ -438,6 +438,12 @@ fn tag_frame(frame: String, tag: &crate::delegation::ChildTag) -> String {
     obj.insert("agent".into(), json!(tag.child_id));
     obj.insert("agent_label".into(), json!(tag.label));
     obj.insert("agent_parent".into(), json!(tag.parent_id));
+    // The outer worker notification is routed to the root conversation, and the
+    // browser also filters on the frame's own `session`. Keep those two routing
+    // keys aligned: leaving the child's id here made every live child frame get
+    // delivered and then discarded by the UI, while refresh appeared to repair
+    // it because history already renders child events with the root id.
+    obj.insert("session".into(), json!(tag.root_id));
     serde_json::to_string(&value).unwrap_or(frame)
 }
 
@@ -608,4 +614,29 @@ async fn bring_up(grip: &Arc<Grip>, aspect: &Aspect) -> Result<()> {
         "loaded"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_frame_is_addressed_to_the_root_conversation() {
+        let tag = crate::delegation::ChildTag {
+            child_id: "child".into(),
+            parent_id: "parent".into(),
+            root_id: "root".into(),
+            label: "research".into(),
+        };
+        let tagged = tag_frame(
+            serde_json::json!({"type": "event", "session": "child", "kind": "turn-started"})
+                .to_string(),
+            &tag,
+        );
+        let value: Value = serde_json::from_str(&tagged).unwrap();
+        assert_eq!(value["session"], "root");
+        assert_eq!(value["agent"], "child");
+        assert_eq!(value["agent_parent"], "parent");
+        assert_eq!(value["agent_label"], "research");
+    }
 }
