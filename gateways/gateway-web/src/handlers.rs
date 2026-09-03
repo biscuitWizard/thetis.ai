@@ -705,6 +705,7 @@ fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
         ("web-browser-", "browser"),
         ("web-", "web"),
         ("git-", "github"),
+        ("moo-", "moo"),
     ] {
         if name.starts_with(prefix) && known(id) {
             return id.to_string();

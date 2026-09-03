@@ -576,6 +576,20 @@ send_settle_ms = 400
 greeting = "hello from configuration"
 retries = 3
 
+[tools.moo]
+base_url = "http://10.10.10.1:7892"
+timeout_secs = 10
+request_timeout_secs = 30
+# Put credentials in gitignored thetis.local.toml or environment overlays:
+# username = "thetis-programmer"
+# password = "..."
+# wizard_username = "thetis-wizard"
+# wizard_password = "..."
+# Credentials are exchanged at /auth/connect and cached per base URL/identity.
+# moo-reconnect clears and refreshes that cache. Captured task deadlines default
+# to the daemon setting (normally 60s) and cannot exceed 300000 ms. Normal API
+# request bodies are limited to 1 MiB by mooR web-host.
+
 # The Notion tool group. Every `notion-*` tool inherits this block, so the
 # credential is named once rather than eleven times: `tool_config_json` merges
 # `[tools.notion]` under `[tools.notion-<x>]`, with the specific block winning.
