@@ -717,6 +717,153 @@ interface delegation {
       -> result<list<event-record>, string>;
 }
 
+// Reading and searching conversation logs, across the whole database.
+//
+// Every other route into the event log is scoped to one conversation:
+// `session.events` is pinned by the host to the session the call is for, and
+// `delegation.child-transcript` admits only the caller's own children. Those
+// scopes stop a worker writing into, forging events for, or draining the budget
+// of a conversation that is not its own.
+//
+// This interface is deliberately outside them, because what it offers is
+// recall — "have I solved this before", "what did that sub-agent actually
+// find", "which conversation was it where this build broke" — and none of those
+// can be answered from one log. Three properties make the wider read something
+// the host is willing to grant:
+//
+//   1. It is read-only. There is no append, no rename, no settle. A caller
+//      gains the ability to see another conversation and nothing else.
+//   2. It is bounded. Every function caps what it returns and reports when the
+//      answer is partial, so a scan cannot quietly exhaust a context window.
+//   3. Text is clipped host-side, so a log full of large tool results cannot
+//      turn one call into a multi-megabyte response.
+//
+// Agent-only. The chat surface already has the log through its own frames.
+interface transcripts {
+  /// One conversation as a catalogue entry.
+  ///
+  /// The sub-agent fields are empty strings for a top-level conversation rather
+  /// than being optional: a flat record is cheaper to read on both sides, and
+  /// "no label" and "empty label" mean the same thing here.
+  record conversation-summary {
+    id: string,
+    title: string,
+    mode: string,
+    /// Model override; empty means the grip default.
+    model: string,
+    preview: string,
+    created-ms: u64,
+    updated-ms: u64,
+    event-count: u64,
+    archived: bool,
+    /// True when this is a sub-agent's session rather than one a person began.
+    is-subagent: bool,
+    /// The session that spawned it; empty for a top-level conversation.
+    parent-id: string,
+    /// The top-level conversation it belongs to.
+    root-id: string,
+    /// The sub-agent's short label.
+    label: string,
+    /// running | done | failed | cancelled, for a sub-agent.
+    state: string,
+    /// The brief a sub-agent was given.
+    task: string,
+  }
+
+  /// One line of a transcript, projected from an event and already clipped.
+  record transcript-entry {
+    seq: u64,
+    ts-ms: u64,
+    /// user | assistant | tool-call | tool-result | tool-failed | nudge | note
+    /// | incident | modification | branch-op | turn-finished | compacted.
+    kind: string,
+    text: string,
+    /// Characters cut from `text`; 0 when it is whole. So a caller can say
+    /// "there was more" rather than quoting a sentence that stops mid-word as
+    /// though it were the whole record.
+    elided: u64,
+  }
+
+  record transcript-hit {
+    session-id: string,
+    title: string,
+    is-subagent: bool,
+    /// The sub-agent's label, so a hit in a child is attributable without a
+    /// second lookup.
+    label: string,
+    seq: u64,
+    ts-ms: u64,
+    kind: string,
+    /// The matching line, clipped.
+    text: string,
+  }
+
+  /// What a search found, and how sure it is that this is all of it.
+  record search-report {
+    hits: list<transcript-hit>,
+    /// Conversations with at least one match.
+    matched-conversations: u64,
+    /// Matches found, including any past the hit cap.
+    total-matches: u64,
+    /// Conversations actually opened.
+    scanned-conversations: u64,
+    /// True when the hit cap stopped the scan.
+    capped: bool,
+    /// True when a bound was reached before every conversation was read. The
+    /// scan is newest-first, so an incomplete answer is missing the oldest.
+    incomplete: bool,
+  }
+
+  record search-query {
+    /// Rust regex syntax. Prefix `(?i)` to ignore case.
+    pattern: string,
+    /// One conversation, or empty for every one.
+    session-id: string,
+    include-archived: bool,
+    include-subagents: bool,
+    /// Whether *successful* tool output is searched. Off is the useful default:
+    /// tool output is most of the bytes in a transcript and most of the noise,
+    /// and a pattern matching a file's contents matches it in every
+    /// conversation that ever read that file.
+    ///
+    /// Failed tool results are searched either way. They are short, and they
+    /// are what someone grepping for an error is looking for.
+    include-tool-output: bool,
+    /// 0 for the host default; clamped to the host's ceiling.
+    max-results: u64,
+    /// Characters per hit. 0 for the host default.
+    max-chars: u64,
+  }
+
+  /// Conversations, most recently active first.
+  ///
+  /// Sub-agents are excluded unless asked for: a busy database holds many more
+  /// child sessions than conversations, and mixing them buries the latter.
+  /// `limit` of 0 means all of them.
+  conversations: func(include-archived: bool, include-subagents: bool, limit: u64)
+      -> result<list<conversation-summary>, string>;
+
+  /// One conversation's own summary, sub-agent or not.
+  conversation: func(session-id: string) -> result<conversation-summary, string>;
+
+  /// The sub-agents under a conversation, whatever their depth.
+  ///
+  /// Unlike `delegation.children` this answers for any conversation, not only
+  /// the caller's, and reports a whole tree rather than one generation.
+  subagents: func(root-id: string) -> result<list<conversation-summary>, string>;
+
+  /// A window of one conversation's transcript, oldest first.
+  ///
+  /// `from-seq` is exclusive, matching `session.events`, so paging is
+  /// `from-seq = last seq seen`. `limit` and `max-chars` of 0 take the host
+  /// defaults; both are clamped to host ceilings.
+  read: func(session-id: string, from-seq: u64, limit: u64, max-chars: u64)
+      -> result<list<transcript-entry>, string>;
+
+  /// Searches transcripts for a regular expression, newest conversation first.
+  search: func(query: search-query) -> result<search-report, string>;
+}
+
 // The read-only view of the same corpus, for the chat surface.
 //
 // Separate from `skills` so the gateway can show what the agent knows without
@@ -969,6 +1116,11 @@ world agent {
   // and is enforced by the host instead — `available` answers false for a
   // child, and `spawn` refuses one outright.
   import delegation;
+  // Reading and searching conversation logs. Agent-only: the chat surface
+  // already receives the log through its own frames. Unlike every other route
+  // into the log this one is not scoped to the calling session, which is what
+  // makes recall across conversations possible — and why it is read-only.
+  import transcripts;
 
   // Runs one full agentic turn for a session. The agent is stateless across
   // turns: it rehydrates from the session log every time.
@@ -1023,9 +1175,10 @@ world gateway {
 // Nothing exports from here and no guest builds it. Entries are temporary: an
 // interface graduates to the world that needs it.
 world host-staging {
-  // Empty. `delegation` graduated to `world agent` once the host was live.
-  // Leave the world here: the next contract addition needs the same staging
-  // step, and rediscovering why is more expensive than keeping four lines.
+  // Empty. `delegation` and `transcripts` both graduated to `world agent` once
+  // the host was live. Leave the world here: the next contract addition needs
+  // the same staging step, and rediscovering why is more expensive than
+  // keeping four lines.
 }
 
 world tool {

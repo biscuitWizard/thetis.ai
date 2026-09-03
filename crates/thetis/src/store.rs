@@ -264,6 +264,39 @@ impl Store {
         Ok(out)
     }
 
+    /// Every session, with its sub-agent registry row when it has one.
+    ///
+    /// The counterpart to [`Self::list_sessions`], which drops children because
+    /// the sidebar wants conversations. Transcript search wants the opposite
+    /// default available to it: a sub-agent's log is often exactly what someone
+    /// is looking for, and it is the caller's business whether to include it.
+    ///
+    /// Both tables are read in **one** transaction, so a sub-agent registered
+    /// while this runs cannot be seen as a top-level conversation. Doing it as
+    /// two calls was the obvious shape and had that race in it.
+    pub fn sessions_with_subagent_rows(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<(SessionMeta, Option<SubagentRow>)>> {
+        let txn = self.db.begin_read()?;
+        let sessions = txn.open_table(SESSIONS)?;
+        let children = txn.open_table(SUBAGENTS)?;
+        let mut out = Vec::new();
+        for row in sessions.iter()? {
+            let (id, v) = row?;
+            let meta: SessionMeta = serde_json::from_slice(v.value())?;
+            if !include_archived && meta.archived {
+                continue;
+            }
+            let child = match children.get(id.value())? {
+                Some(c) => Some(serde_json::from_slice::<SubagentRow>(c.value())?),
+                None => None,
+            };
+            out.push((meta, child));
+        }
+        Ok(out)
+    }
+
     // --- sub-agents ---------------------------------------------------------
 
     pub fn put_subagent(&self, row: &SubagentRow) -> Result<()> {
