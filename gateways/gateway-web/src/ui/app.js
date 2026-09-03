@@ -239,7 +239,14 @@ connection
 
   .on("tools", (frame) => {
     if (frame.session !== store.current) return;
-    store.set({ tools: frame.tools || [] });
+    store.set({
+      tools: frame.tools || [],
+      toolGroups: frame.groups || [],
+      toolGroupsActive: frame.active || [],
+      toolGroupReasons: frame.reasons || {},
+      toolGroupingOn: frame.grouping === true,
+      toolGroupsRouted: frame.routed === true,
+    });
     if (rail.isOpen("tools")) drawTools();
   })
 
@@ -618,88 +625,151 @@ function drawSkills() {
   });
 }
 
-// The domains tools are grouped into, in the order the panel shows them, each
-// with a sentence saying what the group covers. A tool whose group is not in
-// this list (a connected MCP tool, say) still appears — after these, by name.
-const TOOL_GROUP_ORDER = [
-  "Files",
-  "Shell",
-  "Code & tools",
-  "Version control",
-  "Git",
-  "Skills",
-  "Memory",
-  "Configuration",
-  "Web",
-  "Notion",
-  "Other",
-];
-
-const TOOL_GROUP_NOTE = {
-  Files: "Reading and writing files — the shared workspace and the sandbox filesystem.",
-  Shell: "Running commands and interactive terminal sessions, locally and on registered ssh hosts.",
-  "Code & tools": "Editing its own source and tools, managing dependencies, and restarting the orchestrator.",
-  "Version control": "The conversation's sandbox branch — status, history, updating from trunk and merging back.",
-  Git: "Remote repositories on GitHub, as the app's own [bot] identity — reading files, commits, branches, PRs, and cloning a real working tree.",
-  Skills: "Finding, reading, writing and linting skills.",
-  Memory: "Durable notes this conversation can set and recall later.",
-  Configuration: "Reading and changing settings.",
-  Web: "Searching the web and fetching page content.",
-  Notion: "Reading and writing a Notion workspace — pages, databases and comments.",
-  Other: "Tools outside the named domains, including anything a connected server provides.",
-};
-
 /* Which tool groups the user has unfolded. Groups open collapsed — a dozen
  * domains of paragraph-length descriptions is not a scannable list — and this
  * set survives the redraws that `INVALIDATED_BY` triggers, so a group the user
  * opened does not snap shut when the agent builds a tool. */
 const openToolGroups = new Set();
 
+/* Sends a new active set and waits for the reply.
+ *
+ * The host answers with the whole `tools` frame rather than an acknowledgement,
+ * so the panel redraws from what the store now holds rather than from what this
+ * hoped it wrote. That matters here because the agent repairs the pin on read —
+ * always-on groups are forced back in — so an optimistic update could show a
+ * state that will not survive the next turn.
+ */
+function setToolGroups(ids) {
+  connection.send({ type: "tool-groups-set", id: store.current, groups: ids });
+}
+
 function drawTools() {
   const tools = store.tools || [];
+  const groups = store.toolGroups || [];
+  const active = new Set(store.toolGroupsActive || []);
+  const reasons = store.toolGroupReasons || {};
+  const grouping = store.toolGroupingOn === true;
+  const routed = store.toolGroupsRouted === true;
 
-  // Bucket by the group the host tagged each tool with, then lay the buckets
-  // out in a fixed domain order so the surface reads the same every time; any
-  // unexpected group falls in after the known ones, alphabetically.
+  // Bucket by the group the agent's own table puts each tool in. Table order is
+  // the panel's order: it is already the order the tool block is serialised in,
+  // so the panel reads the way the prompt does.
   const byGroup = new Map();
   for (const tool of tools) {
-    const group = tool.group || "Other";
-    if (!byGroup.has(group)) byGroup.set(group, []);
-    byGroup.get(group).push(tool);
+    const id = tool.group || "extra";
+    if (!byGroup.has(id)) byGroup.set(id, []);
+    byGroup.get(id).push(tool);
   }
+
+  // Groups the table declares but this mode has no tools for — every BigQuery
+  // tool in a read-only mode, say — are still listed, because "attached and
+  // empty" and "not attached" are different states and a panel that showed only
+  // populated groups could not tell them apart.
   const ordered = [
-    ...TOOL_GROUP_ORDER.filter((g) => byGroup.has(g)),
-    ...[...byGroup.keys()].filter((g) => !TOOL_GROUP_ORDER.includes(g)).sort(),
+    ...groups.map((g) => g.id),
+    ...[...byGroup.keys()].filter((id) => !groups.some((g) => g.id === id)).sort(),
   ];
 
-  const blocks = ordered.map((group) => {
-    const items = byGroup.get(group);
+  const blocks = ordered.map((id) => {
+    const group = groups.find((g) => g.id === id) || { id, brief: "", always_on: false };
+    const items = byGroup.get(id) || [];
+    const attached = active.has(id);
+    const locked = group.always_on === true;
+
     return panel.collapsibleSection(
       {
-        title: group,
+        title: group.id,
+        mono: true,
         count: items.length,
-        note: TOOL_GROUP_NOTE[group],
-        open: openToolGroups.has(group),
+        note: group.brief,
+        open: openToolGroups.has(id),
         onToggle: (open) => {
-          if (open) openToolGroups.add(group);
-          else openToolGroups.delete(group);
+          if (open) openToolGroups.add(id);
+          else openToolGroups.delete(id);
         },
+        // No switches until the agent has published a table: without one there
+        // is no group vocabulary, so a press could only guess at ids.
+        aside: grouping && groups.length
+          ? panel.toolGroupAside(group, {
+              attached,
+              reason: reasons[id],
+              locked,
+              onToggle: (attach) => {
+                const next = attach
+                  ? [...active, id]
+                  : [...active].filter((a) => a !== id);
+                setToolGroups(next);
+              },
+            })
+          : undefined,
       },
       items.map(panel.toolItem)
     );
   });
 
+  // What the panel is actually claiming, said once at the top rather than left
+  // to be inferred from which cards are dimmed.
+  const attachedCount = ordered.filter((id) => active.has(id)).length;
+  const loaded = tools.filter((t) => t.attached !== false).length;
+  const parts = [`${tools.length} available in ${store.modeLabel()} mode`];
+  if (grouping) {
+    parts.push(`${loaded} in the prompt`);
+    parts.push(`${attachedCount}/${ordered.length} groups attached`);
+  } else {
+    parts.push(`${ordered.length} group${ordered.length === 1 ? "" : "s"}`);
+  }
+
+  const head = [];
+  if (grouping && routed) {
+    head.push(
+      el(
+        "button",
+        {
+          type: "button",
+          class: "ghost-btn sm",
+          title:
+            "Discard this override and let the agent choose the groups again from its own evidence on the next turn.",
+          onClick: () => connection.send({ type: "tool-groups-reset", id: store.current }),
+        },
+        "Reset routing"
+      )
+    );
+  }
+
   rail.open({
     id: "tools",
     title: "Tools",
-    subtitle: tools.length
-      ? `${tools.length} available in ${store.modeLabel()} mode · ${ordered.length} group${ordered.length === 1 ? "" : "s"}`
-      : undefined,
+    subtitle: tools.length ? parts.join(" · ") : undefined,
+    head,
     items: tools,
-    blocks: tools.length ? blocks : undefined,
+    blocks: tools.length ? [toolScopeNote(grouping, routed), ...blocks] : undefined,
     empty: "No tools are available in this mode.",
     renderItem: panel.toolItem,
   });
+}
+
+/* One line saying whether scoping is doing anything, because every state below
+ * it looks the same otherwise: with scoping off, every group reads as attached
+ * and no switch appears, which is indistinguishable from a conversation that
+ * happened to be routed everything. */
+function toolScopeNote(grouping, routed) {
+  if (!grouping) {
+    return el(
+      "p",
+      { class: "panel-note is-inline" },
+      "Scoping is off, so every tool below is in the prompt. Turn on ",
+      el("code", { class: "mono" }, "tool_groups.grouping_enabled"),
+      " to attach groups by task instead."
+    );
+  }
+  if (!routed) {
+    return el(
+      "p",
+      { class: "panel-note is-inline" },
+      "Nothing has been routed yet — until the first message every group is attached. Send a message, or attach groups by hand."
+    );
+  }
+  return null;
 }
 
 /* The models inspector: the only tab that writes.
@@ -833,7 +903,14 @@ function openSkills() {
 
 function openTools() {
   if (!store.current) return toast("Open a conversation first — the tool set depends on its mode.");
-  store.set({ tools: [] });
+  // Cleared together: a stale group set drawn against a fresh tool list would
+  // dim the wrong cards for as long as the round trip takes.
+  store.set({
+    tools: [],
+    toolGroups: [],
+    toolGroupsActive: [],
+    toolGroupReasons: {},
+  });
   rail.open({ id: "tools", title: "Tools", items: undefined, renderItem: () => null });
   connection.send({ type: "tools", id: store.current });
 }
