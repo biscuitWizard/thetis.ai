@@ -22,7 +22,7 @@ const RENDERER_MAX_CALLS: u64 = 5_000;
 
 /// The gateway serving the browser UI, named in configuration.
 fn gateway_aspect(grip: &Arc<Grip>) -> Aspect {
-    Aspect::gateway(&grip.cfg.primary_gateway)
+    Aspect::gateway(&grip.cfg().primary_gateway)
 }
 
 async fn fresh_instance(
@@ -47,7 +47,7 @@ async fn instance_of(
     loaded: Arc<crate::loader::LoadedComponent>,
     principal: Option<Arc<crate::auth::Principal>>,
 ) -> Result<(Store<HostState>, Gateway, u64)> {
-    let budget = Budget::probe(label, grip.cfg.probe_budget);
+    let budget = Budget::probe(label, grip.cfg().probe_budget);
     let mut store = if let Some(p) = principal {
         grip.gateway_store(budget, p)
     } else {
@@ -166,7 +166,7 @@ impl Renderer {
         // last-yield mark keeps ageing between events, and would eventually
         // read as a guest that had stopped talking to the host.
         warm.store.data_mut().budget =
-            Budget::probe("gateway render-event", self.grip.cfg.probe_budget);
+            Budget::probe("gateway render-event", self.grip.cfg().probe_budget);
 
         match warm
             .instance
@@ -208,14 +208,14 @@ pub async fn preview_component(
     let store = grip
         .local_store()
         .context("previews are a gateway concern")?;
-    let branches = crate::branches::Branches::new(grip.cfg.clone(), store.clone());
+    let branches = crate::branches::Branches::new(grip.cfg().clone(), store.clone());
     let row = branches
         .get(session_id)?
         .with_context(|| format!("{session_id} has no branch yet, so it has nothing to preview"))?;
 
     let aspect = gateway_aspect(grip);
     let key =
-        crate::pipeline::cache_key_with(branches.root_git(), &grip.cfg, &row.branch_ref, &aspect)
+        crate::pipeline::cache_key_with(branches.root_git(), &grip.cfg(), &row.branch_ref, &aspect)
             .await
             .context("could not key this branch's gateway build")?;
 

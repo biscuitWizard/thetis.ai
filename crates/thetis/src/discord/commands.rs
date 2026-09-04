@@ -37,7 +37,7 @@ pub struct Invoker {
 /// fallback is not an account — it carries the read-only Discord policy and
 /// names no principal — but it is a stable id, which is what the caller needs.
 fn account_of(grip: &Arc<Grip>, invoker: &Invoker, key: &str) -> String {
-    grip.cfg
+    grip.cfg()
         .auth
         .owner_for_discord(&invoker.user_id, &format!("discord:{key}"))
 }
@@ -295,7 +295,7 @@ pub async fn run(
                 .await?
                 .ok_or_else(|| anyhow!("the session vanished"))?;
             let model = if meta.model.is_empty() {
-                grip.cfg.model.clone()
+                grip.cfg().model.clone()
             } else {
                 meta.model.clone()
             };
@@ -322,7 +322,7 @@ pub async fn run(
 
         "models" => {
             let list = grip
-                .cfg
+                .cfg()
                 .models
                 .iter()
                 .map(|m| format!("• `{}` — {}", m.id, m.label))
@@ -345,9 +345,9 @@ pub async fn run(
                 let current = meta
                     .map(|m| m.model)
                     .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| grip.cfg.model.clone());
+                    .unwrap_or_else(|| grip.cfg().model.clone());
                 format!("Model: `{current}`. Give me an id to change it, or /models to see them.")
-            } else if grip.cfg.models.iter().any(|m| m.id == argument) {
+            } else if grip.cfg().models.iter().any(|m| m.id == argument) {
                 grip.persist.set_model(&session_id, argument).await?;
                 format!("Model set to `{argument}`.")
             } else {

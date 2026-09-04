@@ -73,11 +73,14 @@ pub enum Choices {
     Static(&'static [&'static str]),
 }
 
-/// Whether the running process would pick a change up.
+/// Whether the running process picks a change up on reload.
 ///
-/// Everything is `Required` today: configuration is read once at boot. The
-/// variant exists so a setting that becomes hot-reloadable can say so without
-/// the surfaces changing shape.
+/// `Live` means every reader takes the setting from `Grip::cfg()` at the
+/// moment it needs it, so swapping the configuration is enough. `Required`
+/// means something was built from it once — a listener, a WebAssembly engine,
+/// a supervised child, a ticker — and only a restart rebuilds that. The rule
+/// for a new setting: read it through `grip.cfg()` at use and mark it `Live`;
+/// capture it at boot and mark it `Required`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restart {
     Required,
@@ -119,6 +122,52 @@ const fn fc(
     choices: Choices,
 ) -> Field {
     Field { key, kind, section, help, env, restart: Restart::Required, choices }
+}
+
+/// Sections whose every setting is read at use, through `Grip::cfg()`.
+/// A field outside these sections is `Required`; a field inside is `Live`
+/// unless `RESTART_ANYWAY` names it.
+const LIVE_SECTIONS: &[&str] = &[
+    "llm", "agent", "subagents", "budgets", "limits", "context", "cache", "tool_groups", "build",
+    "devkit", "filesystem", "terminal", "control", "discord", "auth", "server", "tools",
+];
+
+/// Settings in a live section that are nonetheless baked in at boot.
+const RESTART_ANYWAY: &[&str] = &[
+    // The streaming HTTP client is built once with this read timeout.
+    "llm.request_timeout_secs",
+    // WebAssembly memory ceilings are set on the engine.
+    "limits.agent_memory_mb",
+    "limits.tool_memory_mb",
+    "limits.gateway_memory_mb",
+    // Worker builds are keyed by it and it is pinned into their environment.
+    "build.target_dir",
+    // The connector is started once, on this token, in this mode.
+    "discord.enabled",
+    "discord.bot_token",
+    "discord.mode",
+    // Users mode changes the whole routing shape and runs a one-time claim.
+    "auth.mode",
+    "auth.claim_unowned",
+    // The listener is bound once; the gateway component is chosen once.
+    "server.bind",
+    "server.primary_gateway",
+];
+
+pub fn restart_for(key: &str) -> Restart {
+    let section = key.split('.').next().unwrap_or(key);
+    if LIVE_SECTIONS.contains(&section) && !RESTART_ANYWAY.contains(&key) {
+        Restart::Live
+    } else {
+        Restart::Required
+    }
+}
+
+/// Whether a list section is read at use. All of them are: the catalogues
+/// through `list_models`/`list_modes`/`resolve_model`, the accounts through
+/// `policy_for` on every turn and `auth.user` on every sign-in.
+pub fn table_is_live(_id: &str) -> bool {
+    true
 }
 
 pub const FIELDS: &[Field] = &[

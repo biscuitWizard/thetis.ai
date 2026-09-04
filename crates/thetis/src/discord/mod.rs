@@ -58,7 +58,7 @@ const FORK_NOTE: &str = "discord:forked ";
 /// Returns without spawning anything when there is no token, which is the
 /// ordinary case for an install that does not use Discord.
 pub fn spawn(grip: Arc<Grip>) -> Result<()> {
-    let cfg = &grip.cfg.discord;
+    let cfg = &grip.cfg().discord;
 
     if !cfg.enabled {
         tracing::debug!("the Discord connector is disabled");
@@ -73,7 +73,8 @@ pub fn spawn(grip: Arc<Grip>) -> Result<()> {
     // than trusting it. `read_only()` in the agent treats an unknown mode as
     // full access, so a typo would otherwise hand a public chat surface the dev
     // kit. Refuse to start instead, and say why.
-    let mode = grip.cfg.mode(&cfg.mode).ok_or_else(|| {
+    let current = grip.cfg();
+    let mode = current.mode(&cfg.mode).ok_or_else(|| {
         anyhow!(
             "the Discord connector is configured for mode '{}', which does not exist. \
              Refusing to start: an unknown mode would be treated as full access.",
@@ -137,7 +138,7 @@ pub fn spawn(grip: Arc<Grip>) -> Result<()> {
 /// Reconnect loop. A dropped socket is normal operation on Discord, not a
 /// failure, so this backs off and resumes rather than giving up.
 async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
-    let rest = Rest::new(token.clone(), grip.cfg.request_timeout)?;
+    let rest = Rest::new(token.clone(), grip.cfg().request_timeout)?;
     let mut backoff = Duration::from_secs(1);
     let mut resume: Option<(String, u64)> = None;
     let mut bot_id = String::new();
@@ -174,7 +175,7 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                             // when it already matches, because the rate limit
                             // here is about two changes an hour and a restart
                             // must not burn it re-setting the same name.
-                            let wanted = grip.cfg.agent_name.clone();
+                            let wanted = grip.cfg().agent_name.clone();
                             if !rename_attempted && !wanted.is_empty() && bot_name != wanted {
                                 rename_attempted = true;
                                 match rest.set_username(&wanted).await {
@@ -207,7 +208,7 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                                 match rest
                                     .register_commands(
                                         &application_id,
-                                        commands::schema(&grip.cfg.discord),
+                                        commands::schema(&grip.cfg().discord),
                                     )
                                     .await
                                 {
@@ -406,7 +407,7 @@ async fn new_code(grip: &Grip) -> String {
 
 async fn issue_code(grip: &Grip, issuer: &str) -> String {
     let code = new_code(grip).await;
-    let expiry = std::time::Instant::now() + grip.cfg.discord.pairing_code_ttl;
+    let expiry = std::time::Instant::now() + grip.cfg().discord.pairing_code_ttl;
     if let Ok(mut map) = codes().lock() {
         map.retain(|_, (_, exp)| *exp > std::time::Instant::now());
         map.insert(code.clone(), (issuer.to_string(), expiry));
@@ -437,7 +438,7 @@ async fn redeem_code(grip: &Grip, code: &str, user_id: &str) -> bool {
 // --- message handling ------------------------------------------------------
 
 async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> Result<()> {
-    let cfg = grip.cfg.discord.clone();
+    let cfg = grip.cfg().discord.clone();
     let paired = paired_users(&grip).await;
 
     // A pairing code is the one thing an unauthorized user may send, so it is
@@ -499,7 +500,7 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
     // `discord:` policy and nothing more. Resolved before routing, because
     // which conversation this message belongs to depends on the account.
     let account = grip
-        .cfg
+        .cfg()
         .auth
         .owner_for_discord(&msg.author_id, &format!("discord:{key}"));
     let author = policy::author_of(&msg, &account);
@@ -525,7 +526,7 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
 /// an interaction never passes through `decide`, so leaving it out would make
 /// every command reachable by anyone who can see the bot.
 async fn handle_command(grip: Arc<Grip>, rest: Rest, interaction: Interaction) -> Result<()> {
-    let cfg = grip.cfg.discord.clone();
+    let cfg = grip.cfg().discord.clone();
     let paired = paired_users(&grip).await;
 
     if !cfg.authorized(&interaction.user_id, &paired) {
@@ -887,7 +888,7 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
     // component interaction never passes through `decide`, so without this
     // anyone who can see the message could answer in someone else's name.
     let paired = paired_users(&grip).await;
-    if !grip.cfg.discord.authorized(&component.user_id, &paired) {
+    if !grip.cfg().discord.authorized(&component.user_id, &paired) {
         tracing::info!(user = %component.user_id,
             "refused an ask_user interaction from an unauthorized Discord user");
         return rest
@@ -1098,7 +1099,7 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
     // above, so this is the same identity either way; taking it from the state
     // rather than the click keeps it that way if that check ever changes.
     let account = grip
-        .cfg
+        .cfg()
         .auth
         .owner_for_discord(&state.user_id, &format!("discord:{}", state.channel_id));
     let author = crate::bindings::types::Author {
@@ -1207,7 +1208,7 @@ async fn reassert_ceiling(grip: &Grip, session_id: &str) -> Result<()> {
             tracing::warn!(session = %session_id,
                 "a Discord conversation had no ceiling; restamping it");
             grip.persist
-                .set_ceiling(session_id, &grip.cfg.auth.discord_policy)
+                .set_ceiling(session_id, &grip.cfg().auth.discord_policy)
                 .await
                 .context("restamping a Discord conversation's ceiling")
         }
@@ -1240,12 +1241,12 @@ pub(crate) async fn new_session_for(
     let title = format!("Discord {key}");
     let synthetic_owner = format!("discord:{key}");
     let owner = grip
-        .cfg
+        .cfg()
         .auth
         .owner_for_discord(discord_user_id, &synthetic_owner);
     let meta = grip
         .persist
-        .create_session(Some(title), &grip.cfg.discord.mode, &owner)
+        .create_session(Some(title), &grip.cfg().discord.mode, &owner)
         .await?;
 
     // Stamped before the channel is mapped to it. A conversation reachable from
@@ -1253,7 +1254,7 @@ pub(crate) async fn new_session_for(
     // bound account's own policy is exactly what Discord must not confer.
     if let Err(e) = grip
         .persist
-        .set_ceiling(&meta.id, &grip.cfg.auth.discord_policy)
+        .set_ceiling(&meta.id, &grip.cfg().auth.discord_policy)
         .await
     {
         // Fail closed: leave the channel unmapped rather than pointing it at a
@@ -1263,7 +1264,7 @@ pub(crate) async fn new_session_for(
     }
 
     grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
-    tracing::info!(session = %meta.id, %key, mode = %grip.cfg.discord.mode,
+    tracing::info!(session = %meta.id, %key, mode = %grip.cfg().discord.mode,
         "created a Discord session");
     Ok(meta.id)
 }
@@ -1383,7 +1384,7 @@ async fn fork_session_for(
     account: &str,
     parent: Option<&str>,
 ) -> Result<String> {
-    let ceiling = grip.cfg.auth.policy_for(account);
+    let ceiling = grip.cfg().auth.policy_for(account);
 
     // A fork with the Discord ceiling would be a fork in name only, and one
     // with no ceiling row at all would resolve to the speaker's bare policy —
@@ -1452,7 +1453,7 @@ async fn stream_reply(
     user_id: String,
     mut events: tokio::sync::broadcast::Receiver<crate::bindings::types::OutboundEvent>,
 ) -> Result<()> {
-    let interval = grip.cfg.discord.stream_edit_interval;
+    let interval = grip.cfg().discord.stream_edit_interval;
     /* What a multi-step turn shows is two pieces, not one.
      *
      * `settled` is the text of assistant steps that have finished; `buffer` is

@@ -127,7 +127,7 @@ pub enum ContractCheck {
 pub async fn reconcile_wit_contract(grip: &Arc<Grip>) -> ContractCheck {
     reconcile_against(
         kernel_wit_fingerprint(),
-        checkout_wit_fingerprint(&grip.cfg).as_deref(),
+        checkout_wit_fingerprint(&grip.cfg()).as_deref(),
         grip.git.as_ref(),
     )
     .await
@@ -286,7 +286,7 @@ impl ContractCheck {
 /// source, the WIT contract it binds against, and the build settings.
 /// `None` when the checkout is not a git repo or the aspect is untracked there.
 pub async fn aspect_cache_key(grip: &Arc<Grip>, rev: &str, aspect: &Aspect) -> Option<String> {
-    cache_key_with(grip.git.as_ref()?, &grip.cfg, rev, aspect).await
+    cache_key_with(grip.git.as_ref()?, &grip.cfg(), rev, aspect).await
 }
 
 /// As [`aspect_cache_key`], for callers holding a checkout that is not this
@@ -482,7 +482,7 @@ async fn cache_green(
     let Some(key) = aspect_cache_key(grip, "HEAD", aspect).await else {
         return;
     };
-    let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg.aspect_source_rel(aspect)) {
+    let (aspect_tree, wit_tree) = match (&grip.git, grip.cfg().aspect_source_rel(aspect)) {
         (Some(git), Some(rel)) => (
             git.tree_oid("HEAD", &rel)
                 .await
@@ -553,7 +553,7 @@ pub async fn build_and_activate_with(
     //    report, not an instruction to remove ourselves.
     if matches!(aspect, Aspect::Tool(_))
         && !grip
-            .cfg
+            .cfg()
             .aspect_source_dir(aspect)
             .join("Cargo.toml")
             .is_file()
@@ -654,7 +654,7 @@ pub async fn build_and_activate_with(
     //
     //    `refresh_lockfile` means the caller is deliberately retrying after
     //    changing dependencies, so it always gets a real attempt.
-    let fingerprint = source_fingerprint(&grip.cfg, aspect);
+    let fingerprint = source_fingerprint(&grip.cfg(), aspect);
     if !opts.refresh_lockfile {
         if let Some(fp) = &fingerprint {
             if let Some(previous) = grip.known_bad_build(aspect, fp) {
@@ -687,7 +687,7 @@ pub async fn build_and_activate_with(
     };
 
     // 3. Compile.
-    let build = grip.builder.build_with(&grip.cfg, aspect, opts).await?;
+    let build = grip.builder.build_with(&grip.cfg(), aspect, opts).await?;
     if !build.success {
         return remember(
             "compilation failed; the running revision is unchanged".to_string(),
@@ -812,7 +812,7 @@ pub(crate) async fn smoke_test(
         Aspect::Gateway(_) => Caps::Gateway,
         Aspect::Tool(_) => Caps::Tool,
     };
-    let budget = Budget::probe(format!("{aspect} smoke test"), grip.cfg.probe_budget);
+    let budget = Budget::probe(format!("{aspect} smoke test"), grip.cfg().probe_budget);
     let mut store = grip.runtime.new_store(grip.clone(), caps, budget, None);
     let linker = grip.runtime.linker(caps);
 
@@ -909,7 +909,7 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
         .as_ref()
         .ok_or_else(|| anyhow!("this process has no checkout to reset"))?;
     let rel = grip
-        .cfg
+        .cfg()
         .aspect_source_rel(aspect)
         .ok_or_else(|| anyhow!("{aspect} lives outside the checkout"))?;
 
@@ -938,7 +938,7 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     let (commit, key) = match target {
         Some(found) => found,
         None => {
-            let contract = checkout_wit_fingerprint(&grip.cfg);
+            let contract = checkout_wit_fingerprint(&grip.cfg());
             let kernel = kernel_wit_fingerprint();
             if contract.as_deref().is_some_and(|fp| fp != kernel) {
                 return Err(anyhow!(
@@ -955,7 +955,7 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     };
 
     // The watcher would read the restore as a fresh edit and rebuild over it.
-    grip.suppress_watch(aspect, grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch(aspect, grip.cfg().watchdog.watch_suppression);
     git.sync_paths_to(&commit, &rel).await?;
     let short = &commit[..12.min(commit.len())];
     grip.commit_worktree(&format!("watchdog: reset {aspect} to green {short}"))

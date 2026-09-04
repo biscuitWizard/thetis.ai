@@ -92,7 +92,7 @@ pub async fn report_failure(grip: &Arc<Grip>, aspect: &Aspect, detail: &str) -> 
 /// is discovered before a user runs into it.
 pub fn spawn_prober(grip: Arc<Grip>) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(grip.cfg.watchdog.probe_interval);
+        let mut ticker = tokio::time::interval(grip.cfg().watchdog.probe_interval);
         // Default `Burst` behaviour replays every tick missed while a probe (or
         // a rollback) was slow, back to back. That turned "three failures in
         // two minutes" — the breaker's whole meaning — into three failures in
@@ -118,7 +118,7 @@ async fn probe_agent(grip: &Arc<Grip>) -> anyhow::Result<()> {
         return Ok(()); // nothing loaded yet; not a failure
     };
 
-    let budget = Budget::probe("agent health probe", grip.cfg.probe_budget);
+    let budget = Budget::probe("agent health probe", grip.cfg().probe_budget);
     let mut store = grip
         .runtime
         .new_store(grip.clone(), Caps::Agent, budget, None);

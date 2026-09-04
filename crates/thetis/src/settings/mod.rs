@@ -12,8 +12,10 @@
 //!   unbootable — the one failure mode there is no recovering from in-band.
 //! * **Redaction.** Secrets can be written but never read back.
 //!
-//! Nothing is applied live: the process reads its configuration once at
-//! startup. `set` says so, and the agent has a restart tool to finish the job.
+//! A write is applied as it lands: the caller reloads the configuration
+//! (`Grip::reload_config`), which puts every setting read at use into force
+//! and names the few built in at boot as waiting for a restart. `schema`
+//! says which is which.
 //!
 //! Two files, one rule. `thetis.toml` is committed; `thetis.local.toml` beside
 //! it is not, and holds the accounts, their hashes and every secret. A write
@@ -169,9 +171,7 @@ fn setting(key: &str, value: String, scalar: bool) -> Setting {
         },
         key: key.to_string(),
         editable,
-        // Configuration is read once at startup; nothing here takes effect
-        // until the process comes back.
-        live: false,
+        live: schema::restart_for(key) == schema::Restart::Live,
     }
 }
 
@@ -314,8 +314,7 @@ pub fn set(cfg: &Config, key: &str, value: &str) -> Result<String> {
 
     tracing::warn!(%key, file = %file_name(&target), "configuration changed");
     Ok(format!(
-        "{key}: {} -> {} (written to {}). Configuration is read at startup, so \
-         restart Thetis for this to take effect.",
+        "{key}: {} -> {} (written to {})",
         if previous.is_empty() {
             "unset".to_string()
         } else {
@@ -324,6 +323,91 @@ pub fn set(cfg: &Config, key: &str, value: &str) -> Result<String> {
         shown(value),
         file_name(&target),
     ))
+}
+
+// --- what is on disk, for telling a reload what changed ------------------------
+
+/// Every configured value as the files and the environment hold it now,
+/// unmasked, keyed by setting — `llm.model` — or by list entry —
+/// `users[ada]`. Two of these, taken at different times, say exactly what
+/// changed in between; that is how a reload knows what it applied and what
+/// still waits for a restart.
+pub type Snapshot = std::collections::BTreeMap<String, String>;
+
+pub fn snapshot(cfg: &Config) -> Result<Snapshot> {
+    let defaults = defaults_document();
+    let file = document_at(&cfg.config_path)?;
+    let overlay = document_at(&cfg.local_overlay())?;
+    let mut out = Snapshot::new();
+
+    for field in schema::FIELDS {
+        let path: Vec<&str> = field.key.split('.').collect();
+        let mut value = [&overlay, &file, &defaults]
+            .iter()
+            .find_map(|doc| traverse(doc, &path).and_then(Item::as_value).map(render))
+            .unwrap_or_default();
+        if let Some(env) = field.env {
+            if let Some(v) = std::env::var(env).ok().filter(|v| !v.trim().is_empty()) {
+                value = v;
+            }
+        }
+        out.insert(field.key.to_string(), value);
+    }
+    for (doc, _) in [(&file, "file"), (&overlay, "local")] {
+        let mut leaves = Vec::new();
+        walk(doc.as_item(), "", &mut leaves);
+        for leaf in leaves {
+            if !leaf.editable
+                || schema::field(&leaf.key).is_some()
+                || schema::table(&leaf.key).is_some()
+                || schema::TABLES.iter().any(|t| leaf.key.starts_with(&format!("{}.", t.id)))
+            {
+                continue;
+            }
+            let path: Vec<&str> = leaf.key.split('.').collect();
+            let raw = traverse(doc, &path).and_then(Item::as_value).map(render).unwrap_or_default();
+            out.insert(leaf.key, raw);
+        }
+    }
+    for table in schema::TABLES {
+        let path: Vec<&str> = table.id.split('.').collect();
+        let holder = if matches!(traverse(&overlay, &path), Some(Item::ArrayOfTables(_))) {
+            &overlay
+        } else {
+            &file
+        };
+        if let Some(Item::ArrayOfTables(array)) = traverse(holder, &path) {
+            for entry in array.iter() {
+                let id = entry.get("id").and_then(Item::as_str).unwrap_or_default();
+                out.insert(
+                    format!("{}[{id}]", table.id),
+                    item_to_json(&Item::Table(entry.clone())).to_string(),
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The keys whose value differs between two snapshots, in key order.
+pub fn changed(before: &Snapshot, after: &Snapshot) -> Vec<String> {
+    let mut keys: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Whether a change to a snapshot key is picked up by a reload.
+pub fn is_live(key: &str) -> bool {
+    match key.split_once('[') {
+        Some((table, _)) => schema::table_is_live(table),
+        None => schema::restart_for(key) == schema::Restart::Live,
+    }
 }
 
 // --- the described view ------------------------------------------------------
@@ -430,7 +514,7 @@ pub fn describe(cfg: &Config, prefix: Option<&str>) -> Result<Vec<Described>> {
             env: field.env,
             secret: is_secret(field.key) || field.kind == Kind::Secret,
             editable: locked_reason(field.key).is_none(),
-            restart_required: field.restart == schema::Restart::Required,
+            restart_required: schema::restart_for(field.key) == schema::Restart::Required,
             choices: choices_for(cfg, field.choices),
         });
     }
@@ -479,7 +563,7 @@ pub fn describe(cfg: &Config, prefix: Option<&str>) -> Result<Vec<Described>> {
             env: None,
             secret: kind == Kind::Secret,
             editable: locked_reason(&key).is_none(),
-            restart_required: true,
+            restart_required: schema::restart_for(&key) == schema::Restart::Required,
             choices: Vec::new(),
         });
     }
@@ -727,8 +811,7 @@ pub fn save_entry(
     )?;
     tracing::warn!(section, id, file = %file_name(&target), "configuration changed");
     Ok(format!(
-        "{section}: {} {id} (written to {}). Configuration is read at startup, so restart \
-         Thetis for this to take effect.",
+        "{section}: {} {id} (written to {})",
         if created { "added" } else { "updated" },
         file_name(&target)
     ))
@@ -752,8 +835,7 @@ pub fn remove_entry(cfg: &Config, section: &str, id: &str) -> Result<String> {
     write_validated(cfg, &target, &doc.to_string(), &format!("removing {id} from {section}"))?;
     tracing::warn!(section, id, file = %file_name(&target), "configuration changed");
     Ok(format!(
-        "{section}: removed {id} (written to {}). Configuration is read at startup, so \
-         restart Thetis for this to take effect.",
+        "{section}: removed {id} (written to {})",
         file_name(&target)
     ))
 }
@@ -1247,6 +1329,7 @@ data = "data"
         )
         .unwrap();
         assert!(report.contains("added"), "{report}");
+        assert_eq!(snapshot(&cfg).unwrap().get("models[openai/gpt-4o]").map(|v| v.contains("GPT-4o")), Some(true));
 
         let rows = entries(&cfg, "models").unwrap();
         assert_eq!(rows.len(), 2);
@@ -1314,5 +1397,36 @@ data = "data"
         let err = save_entry(&cfg, "models", "x/y", &serde_json::json!({ "provider": "nowhere" })).unwrap_err();
         assert!(format!("{err:#}").contains("invalid"), "{err:#}");
         assert_eq!(std::fs::read_to_string(&cfg.config_path).unwrap(), before);
+    }
+
+    // --- snapshots, for reloads -------------------------------------------------
+
+    #[test]
+    fn a_snapshot_sees_a_change_and_says_whether_it_is_live() {
+        let (cfg, _d) = fixture();
+        let before = snapshot(&cfg).unwrap();
+        assert_eq!(before.get("agent.max_iterations").map(String::as_str), Some("32"));
+        assert!(before.contains_key("models[anthropic/claude-sonnet-4.5]"));
+        assert!(before.get("llm.api_key").unwrap().contains("sk-or-v1"), "unmasked on purpose");
+
+        set(&cfg, "agent.max_iterations", "40").unwrap();
+        set(&cfg, "server.bind", "127.0.0.1:7778").unwrap();
+        save_entry(&cfg, "modes", "chat", &serde_json::json!({ "read_only": true })).unwrap();
+        let after = snapshot(&cfg).unwrap();
+
+        let keys = changed(&before, &after);
+        assert_eq!(keys, vec!["agent.max_iterations", "modes[chat]", "server.bind"]);
+        assert!(is_live("agent.max_iterations"));
+        assert!(is_live("modes[chat]"));
+        assert!(!is_live("server.bind"));
+        assert!(!is_live("limits.agent_memory_mb"), "engine limits are baked in");
+        assert!(is_live("tools.notion.version"), "tool blocks are read per invocation");
+    }
+
+    #[test]
+    fn the_setting_view_reports_liveness_from_the_schema() {
+        let (cfg, _d) = fixture();
+        assert!(get(&cfg, "llm.model").unwrap().unwrap().live);
+        assert!(!get(&cfg, "server.bind").unwrap().unwrap().live);
     }
 }

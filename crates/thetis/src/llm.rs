@@ -21,11 +21,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::bindings::types::{FinishInfo, LlmError, StreamChunk, TokenUsage, ToolCall};
-use crate::config::Config;
 
 pub struct LlmClient {
     http: reqwest::Client,
-    cfg: Arc<Config>,
+    /// Followed, not pinned: a reload changes the model, the providers and
+    /// the retry policy for the next request.
+    cfg: crate::config::SharedConfig,
     /// The last fully-prepared streaming request body — exactly what went to
     /// the provider, minus the auth header (which is never in the body). The
     /// caller reads it back after `open_stream` and persists it for the web
@@ -129,7 +130,7 @@ fn describe_attempt(result: &Result<reqwest::Response, reqwest::Error>) -> Strin
 }
 
 impl LlmClient {
-    pub fn new(cfg: Arc<Config>) -> Result<Self> {
+    pub fn new(cfg: crate::config::SharedConfig) -> Result<Self> {
         // `read_timeout`, not `timeout`. reqwest's `timeout` is a *total*
         // deadline: it runs from connect until the body has finished. For a
         // streaming completion the body only finishes when generation does, so
@@ -144,7 +145,7 @@ impl LlmClient {
         // as it keeps producing. Non-streaming callers restore a total deadline
         // per request, where it is the correct shape.
         let http = reqwest::Client::builder()
-            .read_timeout(cfg.request_timeout)
+            .read_timeout(cfg.load().request_timeout)
             .build()?;
         Ok(Self {
             http,
@@ -200,14 +201,15 @@ impl LlmClient {
                 .as_object_mut()
                 .ok_or_else(|| LlmError::BadRequest("request must be a JSON object".into()))?;
 
+            let cfg = self.cfg.load_full();
             let requested = obj
                 .get("model")
                 .and_then(serde_json::Value::as_str)
                 .filter(|m| !m.trim().is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(|| self.cfg.model.clone());
+                .unwrap_or_else(|| cfg.model.clone());
 
-            let resolved = self.cfg.resolve_model(&requested);
+            let resolved = cfg.resolve_model(&requested);
             let provider_id = resolved.provider.id.clone();
 
             obj.insert("model".into(), resolved.wire_model.clone().into());
@@ -278,7 +280,7 @@ impl LlmClient {
 
         // Last, and only once the model is settled: which provider is about to
         // serve this decides whether breakpoints help or merely cost writes.
-        let marked = crate::cache::apply(&mut body, &model, &self.cfg.cache);
+        let marked = crate::cache::apply(&mut body, &model, &self.cfg.load().cache);
         if marked > 0 {
             tracing::debug!(%model, breakpoints = marked, "prompt cache breakpoints applied");
         }
@@ -303,10 +305,10 @@ impl LlmClient {
         streaming: bool,
         session: Option<&str>,
     ) -> Result<reqwest::Response, LlmError> {
-        let provider = self
-            .cfg
+        let cfg = self.cfg.load_full();
+        let provider = cfg
             .provider(provider_id)
-            .unwrap_or_else(|| self.cfg.fallback_provider());
+            .unwrap_or_else(|| cfg.fallback_provider());
         // Which replica serves this. A rotating counter spreads load evenly,
         // which is right for throughput and wrong for caching: the prompt cache
         // is per-endpoint, so a conversation that rotates pays a full cache
@@ -349,7 +351,7 @@ impl LlmClient {
             if !streaming {
                 // A non-streaming call has a bounded body, so a total deadline
                 // is meaningful and is what the setting has always meant.
-                req = req.timeout(self.cfg.request_timeout);
+                req = req.timeout(self.cfg.load().request_timeout);
             }
             if let Some(key) = &provider.api_key {
                 req = req.bearer_auth(key.expose());
@@ -375,7 +377,7 @@ impl LlmClient {
                 Err(e) => e.is_timeout() || e.is_connect() || e.is_request(),
             };
 
-            if retryable && attempt < self.cfg.max_retries {
+            if retryable && attempt < self.cfg.load().max_retries {
                 // Exponential backoff with a little jitter from the attempt index.
                 let delay = Duration::from_millis(400 * (1 << attempt) + (attempt as u64 * 37));
                 // What actually went wrong, which this line used to omit
@@ -399,7 +401,7 @@ impl LlmClient {
                         // The log counts attempts from zero; a person reading a
                         // conversation counts from one.
                         attempt: attempt + 1,
-                        attempts: self.cfg.max_retries + 1,
+                        attempts: self.cfg.load().max_retries + 1,
                         elapsed,
                         error: why,
                     });
@@ -1075,6 +1077,7 @@ fn strip_private_markers(body: &mut serde_json::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     /// A client with OpenRouter plus one local llama.cpp-style provider, which
     /// is the arrangement the multi-provider support exists for.
@@ -1104,7 +1107,7 @@ mod tests {
             provider: "local".into(),
             wire_model: "qwen3-30b-a3b".into(),
         }];
-        LlmClient::new(Arc::new(cfg)).expect("client builds")
+        LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).expect("client builds")
     }
 
     /// A one-shot stand-in for a local llama.cpp server: accepts one request,
@@ -1186,7 +1189,7 @@ mod tests {
             provider: "local".into(),
             wire_model: "deepseek-v4-flash".into(),
         }];
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let client = LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap();
 
         let mut stream = client
             .open_stream(
@@ -1312,7 +1315,7 @@ mod tests {
         }];
         cfg.default_provider = "local".into();
         cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let client = LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         client.on_retry(tx);
@@ -1380,7 +1383,7 @@ mod tests {
         }];
         cfg.default_provider = "local".into();
         cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let client = LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap();
 
         let mut stream = client
             .open_stream(r#"{"model":"local/x","messages":[{"role":"user","content":"hi"}]}"#)
@@ -1454,7 +1457,8 @@ mod tests {
     #[test]
     fn one_conversation_stays_on_one_replica() {
         let client = two_provider_client();
-        let provider = client.cfg.provider("local").unwrap();
+        let cfg = client.cfg.load_full();
+        let provider = cfg.provider("local").unwrap();
         let slot_for = |session: &str| -> String {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1812,7 +1816,7 @@ mod tests {
         }];
         cfg.default_provider = "slow".into();
         cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let client = LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap();
         let mut handle = client
             .open_stream(r#"{"model":"slow/trickle","messages":[{"role":"user","content":"hi"}]}"#)
             .await
@@ -1875,7 +1879,7 @@ mod tests {
         }];
         cfg.default_provider = "stall".into();
         cfg.models = Vec::new();
-        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+        let client = LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap();
         let mut handle = client
             .open_stream(r#"{"model":"stall/wedged","messages":[{"role":"user","content":"hi"}]}"#)
             .await

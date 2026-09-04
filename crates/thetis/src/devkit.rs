@@ -96,13 +96,13 @@ pub fn resolve_path(grip: &Arc<Grip>, aspect: &Aspect, relative: &str) -> Result
 
     if let Some(why) = protected_reason(
         &names,
-        &grip.cfg.devkit.protected_files,
-        &grip.cfg.devkit.protected_dirs,
+        &grip.cfg().devkit.protected_files,
+        &grip.cfg().devkit.protected_dirs,
     ) {
         return Err(anyhow!("{why}"));
     }
 
-    let root = grip.cfg.aspect_source_dir(aspect);
+    let root = grip.cfg().aspect_source_dir(aspect);
     let full = root.join(candidate);
 
     // Belt and braces: even after the component checks, confirm the result is
@@ -169,7 +169,7 @@ pub async fn new_tool(grip: &Arc<Grip>, name: &str, description: &str) -> Compil
         return report_error(&aspect_label, format!("{e:#}"));
     }
     let aspect = Aspect::tool(name);
-    let dir = grip.cfg.aspect_source_dir(&aspect);
+    let dir = grip.cfg().aspect_source_dir(&aspect);
     if dir.exists() {
         return report_error(
             &aspect_label,
@@ -185,7 +185,7 @@ pub async fn new_tool(grip: &Arc<Grip>, name: &str, description: &str) -> Compil
 }
 
 fn scaffold(grip: &Arc<Grip>, aspect: &Aspect, name: &str, description: &str) -> Result<()> {
-    let templates = grip.cfg.paths.templates.join("tool-template");
+    let templates = grip.cfg().paths.templates.join("tool-template");
     let cargo = std::fs::read_to_string(templates.join("Cargo.toml.template"))?;
     let lib = std::fs::read_to_string(templates.join("lib.rs.template"))?;
 
@@ -200,7 +200,7 @@ fn scaffold(grip: &Arc<Grip>, aspect: &Aspect, name: &str, description: &str) ->
             .replace("{{description}}", &safe_description)
     };
 
-    let dir = grip.cfg.aspect_source_dir(aspect);
+    let dir = grip.cfg().aspect_source_dir(aspect);
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("Cargo.toml"), render(&cargo))?;
     std::fs::write(dir.join("src").join("lib.rs"), render(&lib))?;
@@ -287,13 +287,13 @@ pub async fn add_dependency(
         Ok(aspect) => aspect,
         Err(report) => return report,
     };
-    let dir = grip.cfg.aspect_source_dir(&aspect);
+    let dir = grip.cfg().aspect_source_dir(&aspect);
 
     // Keep the manifest as it was, so a dependency that does not resolve can be
     // rolled back out rather than leaving the crate unbuildable.
     let restore = std::fs::read_to_string(dir.join("Cargo.toml")).ok();
 
-    if let Err(e) = crate::manifest::add(&dir, dep, &grip.cfg.build.allowed_crates) {
+    if let Err(e) = crate::manifest::add(&dir, dep, &grip.cfg().build.allowed_crates) {
         return report_error(&aspect.key(), format!("{e:#}"));
     }
 
@@ -314,7 +314,7 @@ pub async fn remove_dependency(grip: &Arc<Grip>, target: &ModTarget, name: &str)
         Ok(aspect) => aspect,
         Err(report) => return report,
     };
-    let dir = grip.cfg.aspect_source_dir(&aspect);
+    let dir = grip.cfg().aspect_source_dir(&aspect);
     let restore = std::fs::read_to_string(dir.join("Cargo.toml")).ok();
 
     if let Err(e) = crate::manifest::remove(&dir, name) {
@@ -335,13 +335,13 @@ pub fn list_dependencies(
     target: &ModTarget,
 ) -> std::result::Result<Vec<crate::manifest::Dependency>, String> {
     let aspect = target_to_aspect(target).map_err(|e| format!("{e:#}"))?;
-    let dir = grip.cfg.aspect_source_dir(&aspect);
+    let dir = grip.cfg().aspect_source_dir(&aspect);
     crate::manifest::list(&dir).map_err(|e| format!("{e:#}"))
 }
 
 /// A rebuild that is allowed to refresh the lockfile.
 async fn build_deps(grip: &Arc<Grip>, aspect: &Aspect, note: &str) -> CompileReport {
-    grip.suppress_watch(aspect, grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch(aspect, grip.cfg().watchdog.watch_suppression);
 
     let opts = crate::builder::BuildOptions {
         refresh_lockfile: true,
@@ -362,7 +362,7 @@ fn aspect_with_source(
         Err(e) => return Err(report_error("unknown", format!("{e:#}"))),
     };
     if !grip
-        .cfg
+        .cfg()
         .aspect_source_dir(&aspect)
         .join("Cargo.toml")
         .is_file()
@@ -390,7 +390,7 @@ pub fn list_files(
     target: &ModTarget,
 ) -> std::result::Result<Vec<String>, String> {
     let aspect = target_to_aspect(target).map_err(|e| format!("{e:#}"))?;
-    let root = grip.cfg.aspect_source_dir(&aspect);
+    let root = grip.cfg().aspect_source_dir(&aspect);
     if !root.is_dir() {
         return Err(format!("{aspect} has no source tree"));
     }
@@ -429,7 +429,7 @@ fn locate(
         Ok(s) => s,
         Err(e) => return Err(report_error("unknown", format!("{e:#}"))),
     };
-    if !grip.cfg.aspect_source_dir(&aspect).is_dir() {
+    if !grip.cfg().aspect_source_dir(&aspect).is_dir() {
         return Err(report_error(
             &aspect.key(),
             format!("{aspect} has no source tree on disk"),
@@ -444,7 +444,7 @@ fn locate(
 async fn build(grip: &Arc<Grip>, aspect: &Aspect, origin: Origin, note: &str) -> CompileReport {
     // The watcher would otherwise queue a second, redundant build for the same
     // edit a moment later.
-    grip.suppress_watch(aspect, grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch(aspect, grip.cfg().watchdog.watch_suppression);
 
     match pipeline::build_and_activate(grip, aspect, origin, note).await {
         Ok(outcome) => report_from(outcome),

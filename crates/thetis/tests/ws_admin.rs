@@ -257,23 +257,53 @@ async fn an_administrator_sees_the_whole_panel_and_a_user_sees_nothing() {
     let users_table = tables.iter().find(|t| t["id"] == "users").unwrap();
     assert!(users_table["columns"].as_array().unwrap().iter().any(|c| c["key"] == "password"));
 
-    // --- a setting round-trips -----------------------------------------------
+    // --- a live setting round-trips and is applied at once ----------------------
     let iterations = rows.iter().find(|f| f["key"] == "agent.max_iterations").unwrap();
+    assert_eq!(iterations["restart_required"], false, "{iterations}");
     let before = iterations["value"].as_str().unwrap().to_string();
     let bumped = (before.parse::<i64>().unwrap() + 1).to_string();
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "agent.max_iterations", "value": bumped })).await;
     let result = admin_reply(&mut admin, "admin-result").await;
     assert_eq!(result["ok"], true, "{result}");
     assert_eq!(result["op"], "set-field");
-    assert!(result["message"].as_str().unwrap().contains("written to"), "{result}");
+    let message = result["message"].as_str().unwrap();
+    assert!(message.contains("written to"), "{result}");
+    assert!(message.contains("applied agent.max_iterations immediately"), "{result}");
     let fresh = admin_reply(&mut admin, "admin-fields").await;
     assert_eq!(fresh["prefix"], "agent");
     let now = fresh["fields"].as_array().unwrap().iter().find(|f| f["key"] == "agent.max_iterations").unwrap();
     assert_eq!(now["value"], bumped);
+    let after = admin_reply(&mut admin, "admin-overview").await;
+    assert_eq!(after["pending_restart"].as_array().unwrap().len(), 0, "a live change never waits: {after}");
     // Put it back.
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "agent.max_iterations", "value": before })).await;
     assert_eq!(admin_reply(&mut admin, "admin-result").await["ok"], true);
     let _ = admin_reply(&mut admin, "admin-fields").await;
+    let _ = admin_reply(&mut admin, "admin-overview").await;
+
+    // --- a boot-bound setting waits for a restart, until it is put back ------------
+    let memory = rows.iter().find(|f| f["key"] == "limits.agent_memory_mb").unwrap();
+    assert_eq!(memory["restart_required"], true, "{memory}");
+    let was = memory["value"].as_str().unwrap().to_string();
+    let more = (was.parse::<i64>().unwrap() + 1).to_string();
+    send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "limits.agent_memory_mb", "value": more })).await;
+    let result = admin_reply(&mut admin, "admin-result").await;
+    assert_eq!(result["ok"], true, "{result}");
+    assert!(result["message"].as_str().unwrap().contains("need a restart") || result["message"].as_str().unwrap().contains("needs a restart"), "{result}");
+    let _ = admin_reply(&mut admin, "admin-fields").await;
+    let pending = admin_reply(&mut admin, "admin-overview").await;
+    assert_eq!(pending["pending_restart"], serde_json::json!(["limits.agent_memory_mb"]), "{pending}");
+    send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "limits.agent_memory_mb", "value": was })).await;
+    assert_eq!(admin_reply(&mut admin, "admin-result").await["ok"], true);
+    let _ = admin_reply(&mut admin, "admin-fields").await;
+    let cleared = admin_reply(&mut admin, "admin-overview").await;
+    assert_eq!(cleared["pending_restart"].as_array().unwrap().len(), 0, "putting the value back clears it: {cleared}");
+
+    // --- reload from disk reports rather than refuses --------------------------
+    send(&mut admin, serde_json::json!({ "type": "admin", "op": "reload" })).await;
+    let reloaded = admin_reply(&mut admin, "admin-result").await;
+    assert_eq!(reloaded["ok"], true, "{reloaded}");
+    assert!(reloaded["message"].as_str().unwrap().contains("nothing changed"), "{reloaded}");
 
     // --- a value the loader refuses is refused ------------------------------
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "server.bind", "value": "not-an-address" })).await;

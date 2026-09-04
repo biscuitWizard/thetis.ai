@@ -891,7 +891,7 @@ fn mutation_replies(cfg: &Config, op: &str, path: &str, message: &str) -> Vec<St
 mod tests {
     use super::*;
 
-    /// `resolve` and the operations only read `grip.cfg.wasi.dirs`, so the
+    /// `resolve` and the operations only read `grip.cfg().wasi.dirs`, so the
     /// path logic is tested against a config rather than a whole grip.
     fn fixture() -> (Config, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

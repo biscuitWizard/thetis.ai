@@ -170,13 +170,13 @@ pub fn action(id: &str) -> Option<&'static ActionInfo> {
 }
 
 pub fn restart_available(grip: &Grip) -> bool {
-    grip.cfg.control.allow_restart
+    grip.cfg().control.allow_restart
 }
 
 /// Gathers the overview. Every source is best-effort: a git error or a missing
 /// store empties its section rather than hiding the rest.
 pub async fn overview(grip: &Arc<Grip>) -> Overview {
-    let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
+    let root = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
     let trunk_name = root
         .current_branch()
         .await
@@ -247,7 +247,7 @@ pub async fn overview(grip: &Arc<Grip>) -> Overview {
         .and_then(|store| store.owners_map().ok())
         .unwrap_or_default();
     let accounts = grip
-        .cfg
+        .cfg()
         .auth
         .users
         .iter()
@@ -279,11 +279,11 @@ pub async fn overview(grip: &Arc<Grip>) -> Overview {
         accounts,
         private_dirs,
         sessions,
-        local_mode: !grip.cfg.auth.users_mode,
-        admin_enabled: grip.cfg.admin_enabled,
+        local_mode: !grip.cfg().auth.users_mode,
+        admin_enabled: grip.cfg().admin_enabled,
         restart_available: restart_available(grip),
-        config_path: grip.cfg.config_path.display().to_string(),
-        overlay_path: grip.cfg.local_overlay().display().to_string(),
+        config_path: grip.cfg().config_path.display().to_string(),
+        overlay_path: grip.cfg().local_overlay().display().to_string(),
     }
 }
 
@@ -294,7 +294,7 @@ pub async fn act(grip: &Arc<Grip>, action: &str, target: &str) -> Result<String>
         anyhow::bail!("admin actions run on the gateway");
     };
     let store = grip.local_store().context("gateway has no local store")?;
-    let branches = crate::branches::Branches::new(grip.cfg.clone(), store.clone());
+    let branches = crate::branches::Branches::new(grip.cfg().clone(), store.clone());
 
     let result = match action {
         // Break glass: put trunk's checkout at an earlier commit. Forward
@@ -453,7 +453,7 @@ pub async fn act(grip: &Arc<Grip>, action: &str, target: &str) -> Result<String>
 
 /// Ends every login the account holds, on every device. Returns how many.
 pub fn sign_out_everywhere(grip: &Grip, user: &str) -> Result<u32> {
-    if grip.cfg.auth.user(user).is_none() {
+    if grip.cfg().auth.user(user).is_none() {
         anyhow::bail!("unknown user '{user}'");
     }
     let store = grip.local_store().context("gateway has no local store")?;
@@ -487,7 +487,7 @@ pub async fn waits(grip: &Arc<Grip>) -> serde_json::Value {
     // the kernel whether the lock is actually taken, and only name a pid when
     // it is — reporting a stale one as live sent more than one investigation
     // after a process that had exited hours before.
-    let lock = grip.cfg.build_lock_path();
+    let lock = grip.cfg().build_lock_path();
     let build_lock_held = crate::builder::lock_is_held(&lock);
     let build_lock = std::fs::read_to_string(&lock)
         .ok()

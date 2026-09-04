@@ -46,8 +46,10 @@ spend, sign out everywhere, and the `[[users]]` / `[[roles]]` entries
 themselves), the model, provider and mode catalogues, and every setting in
 `thetis.toml` with its help text and where its value comes from. Writes are
 validated against the whole configuration before they land; accounts and
-secrets go to `thetis.local.toml`, everything else to `thetis.toml`, and a
-banner offers the restart that applies them. `/admin`, rendered by the
+secrets go to `thetis.local.toml`, everything else to `thetis.toml`. A saved
+setting is applied at once, to the gateway and every live worker, wherever it
+is read at use; the few that are built in at boot are marked, and a banner
+names what waits for a restart and offers it. `/admin`, rendered by the
 orchestrator with no WebAssembly in its path, keeps the same trunk, worker,
 account and publishing controls as plain forms for when the UI itself is
 broken.

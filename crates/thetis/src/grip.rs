@@ -77,7 +77,11 @@ pub struct RenderedFrame {
 }
 
 pub struct Grip {
-    pub cfg: Arc<Config>,
+    /// Swappable: see `Grip::cfg` and `Grip::reload_config`.
+    config: crate::config::SharedConfig,
+    /// What the files held at boot and at the last reload, so a reload can
+    /// say what it applied and what still needs a restart.
+    config_state: std::sync::Mutex<ConfigState>,
     pub persist: Persist,
     pub role: Role,
     /// This worker's checkout. Every green build, skill edit, and turn end
@@ -225,7 +229,138 @@ impl Drop for BuildGuard {
     }
 }
 
+/// The two points a reload is measured against.
+struct ConfigState {
+    /// The files as this process first read them. A restart-bound setting is
+    /// pending exactly while it differs from this.
+    boot: crate::settings::Snapshot,
+    /// The files as of the last reload.
+    current: crate::settings::Snapshot,
+}
+
+/// What a reload did.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ReloadReport {
+    /// Settings whose new value is now in force.
+    pub applied: Vec<String>,
+    /// Settings whose value on disk differs from what this process booted
+    /// with and cannot be picked up without a restart. Cumulative across
+    /// reloads, and cleared by putting the value back.
+    pub pending_restart: Vec<String>,
+    /// Live workers that reloaded alongside this process, and those that did not.
+    pub workers_reloaded: u32,
+    pub workers_failed: u32,
+}
+
+impl ReloadReport {
+    /// One sentence, for wherever the outcome is shown.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        match self.applied.len() {
+            0 => {}
+            1 => parts.push(format!("applied {} immediately", self.applied[0])),
+            n => parts.push(format!("applied {n} settings immediately")),
+        }
+        if !self.pending_restart.is_empty() {
+            parts.push(format!(
+                "{} need{} a restart: {}",
+                self.pending_restart.len(),
+                if self.pending_restart.len() == 1 { "s" } else { "" },
+                self.pending_restart.join(", ")
+            ));
+        }
+        if self.workers_failed > 0 {
+            parts.push(format!(
+                "{} live worker(s) did not reload",
+                self.workers_failed
+            ));
+        } else if self.workers_reloaded > 0 {
+            parts.push(format!("{} live worker(s) reloaded", self.workers_reloaded));
+        }
+        if parts.is_empty() {
+            "nothing changed".to_string()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
 impl Grip {
+    /// The configuration as of now. A snapshot: hold it for one call, not
+    /// across a whole task, so a reload reaches the next call.
+    pub fn cfg(&self) -> Arc<Config> {
+        self.config.load_full()
+    }
+
+    /// Reads the configuration files again and puts the result in force.
+    ///
+    /// The same load as at boot — same root, same files, same environment —
+    /// so what comes back is what a restart would have produced. Everything
+    /// that reads through `cfg()` sees it from its next call; what was built
+    /// at boot does not, and the report names those settings as pending a
+    /// restart, for as long as the files differ from what the process booted
+    /// with. A file that would not load is refused and nothing changes, the
+    /// same guard `settings::set` applies before writing.
+    ///
+    /// On the gateway, every live worker is asked to do the same to its own
+    /// files. A worker's checkout has its branch's copy of `thetis.toml`, so
+    /// a change to trunk's reaches it when the branch takes trunk in; the
+    /// local overlay is shared and reaches it at once.
+    pub async fn reload_config(self: &Arc<Self>) -> anyhow::Result<ReloadReport> {
+        let fresh = Arc::new(Config::load()?);
+        let snapshot = crate::settings::snapshot(&fresh)?;
+        let mut report = ReloadReport::default();
+        {
+            let mut state = self.config_state.lock().unwrap_or_else(|e| e.into_inner());
+            for key in crate::settings::changed(&state.current, &snapshot) {
+                if crate::settings::is_live(&key) {
+                    report.applied.push(key);
+                }
+            }
+            report.pending_restart = crate::settings::changed(&state.boot, &snapshot)
+                .into_iter()
+                .filter(|k| !crate::settings::is_live(k))
+                .collect();
+            state.current = snapshot;
+        }
+        self.config.store(fresh);
+        if !report.applied.is_empty() {
+            tracing::warn!(applied = %report.applied.join(", "), "configuration reloaded");
+        }
+
+        if let Role::Gateway(router) = &self.role {
+            for session in router.live_sessions().await {
+                let Some(peer) = router.live_peer(&session).await else { continue };
+                match peer
+                    .call_within("config.reload", serde_json::Value::Null, std::time::Duration::from_secs(10))
+                    .await
+                {
+                    Ok(_) => report.workers_reloaded += 1,
+                    Err(e) => {
+                        tracing::warn!(session = %session, error = %e, "worker did not reload its configuration");
+                        report.workers_failed += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// The restart-bound settings whose value on disk differs from boot.
+    pub fn pending_restart(&self) -> Vec<String> {
+        let state = self.config_state.lock().unwrap_or_else(|e| e.into_inner());
+        crate::settings::changed(&state.boot, &state.current)
+            .into_iter()
+            .filter(|k| !crate::settings::is_live(k))
+            .collect()
+    }
+
+    /// The shared handle itself, for a long-lived component that must follow
+    /// reloads rather than pin one configuration.
+    pub fn shared_config(&self) -> crate::config::SharedConfig {
+        self.config.clone()
+    }
+
     /// The gateway-role grip: the process that owns the database, the
     /// listener, and the worker fleet.
     pub fn gateway(
@@ -262,7 +397,6 @@ impl Grip {
             Role::Worker(_) => Some(crate::gitctl::GitCtl::new(cfg.root.clone())),
             Role::Gateway(_) => None,
         };
-        let llm = Arc::new(LlmClient::new(cfg.clone())?);
         let (events_tx, _) = broadcast::channel(1024);
         let (frames_tx, _) = broadcast::channel(1024);
 
@@ -272,9 +406,16 @@ impl Grip {
             persist.clone(),
         )?);
         let cfg_for_breakers = cfg.clone();
+        let boot = crate::settings::snapshot(&cfg).unwrap_or_default();
+        let config: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from(cfg));
+        let llm = Arc::new(LlmClient::new(config.clone())?);
 
         Ok(Arc::new(Self {
-            cfg,
+            config,
+            config_state: std::sync::Mutex::new(ConfigState {
+                current: boot.clone(),
+                boot,
+            }),
             persist,
             role,
             git,
@@ -533,7 +674,7 @@ impl Grip {
         let policy = if matches!(&self.role, Role::Worker(_)) {
             self.persist.session_policy(id, acting.as_deref()).await.map(Arc::new).unwrap_or_else(|error| {
                 tracing::warn!(session = id, %error, "could not load session policy; denying worker capabilities");
-                let mut denied = self.cfg.auth.local_policy.as_ref().clone();
+                let mut denied = self.cfg().auth.local_policy.as_ref().clone();
                 denied.admin = false;
                 denied.read_only = true;
                 denied.see_all_sessions = false;
@@ -545,19 +686,20 @@ impl Grip {
             // the speaker's policy, narrowed by the conversation's ceiling.
             match &acting {
                 Some(who) => {
-                    let mut resolved = self.cfg.auth.policy_for(who).as_ref().clone();
+                    let mut resolved = self.cfg().auth.policy_for(who).as_ref().clone();
                     if let Ok(Some(ceiling)) = self.persist.ceiling_of(id).await {
                         resolved = resolved.intersect(&ceiling);
                     }
                     Arc::new(resolved)
                 }
-                None => self.cfg.auth.local_policy.clone(),
+                None => self.cfg().auth.local_policy.clone(),
             }
         };
         // The principal is the speaker too, so spend and ownership checks
         // inside the turn attribute to whoever actually asked for the work.
+        let cfg = self.cfg();
         let principal = acting.map(|who| {
-            let user = self.cfg.auth.user(&who);
+            let user = cfg.auth.user(&who);
             Arc::new(crate::auth::Principal::new(
                 who.clone(),
                 user.map(|u| u.name.clone()).unwrap_or_else(|| who.clone()),
@@ -597,7 +739,7 @@ impl Grip {
         // The turn's stop signal is carried by the session's `CancelFlag`,
         // which host imports await directly; the budget only enforces the
         // grace window once one has been raised.
-        let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
+        let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg().wasm_slice);
         let mut store = self
             .session_store(Caps::Agent, budget, session_id, speaker)
             .await;
@@ -656,13 +798,13 @@ impl Grip {
             .ok()
             .flatten()
             .map(|m| m.mode)
-            .unwrap_or_else(|| self.cfg.default_mode.clone());
+            .unwrap_or_else(|| self.cfg().default_mode.clone());
 
         let Some(loaded) = self.loader.get(&Aspect::Agent) else {
             return Vec::new();
         };
 
-        let budget = Budget::probe("agent list-tools", self.cfg.probe_budget);
+        let budget = Budget::probe("agent list-tools", self.cfg().probe_budget);
         // A probe, so the owner's view is the right one: this answers "what
         // does this conversation offer", not "what may this speaker do".
         let mut store = self
@@ -714,23 +856,23 @@ impl Grip {
         if self.persist.get_session(session_id).await?.is_none() {
             return Err(anyhow!("no such session: {session_id}"));
         }
-        if attachments.len() > self.cfg.max_attachments {
+        if attachments.len() > self.cfg().max_attachments {
             return Err(anyhow!(
                 "too many attachments: {} (limit {})",
                 attachments.len(),
-                self.cfg.max_attachments
+                self.cfg().max_attachments
             ));
         }
         for a in &attachments {
             // base64 inflates by 4/3; compare against the decoded size the
             // limit is expressed in.
             let decoded = a.data_base64.len() / 4 * 3;
-            if decoded > self.cfg.max_attachment_bytes {
+            if decoded > self.cfg().max_attachment_bytes {
                 return Err(anyhow!(
                     "attachment '{}' is {} bytes, over the {} byte limit",
                     a.name,
                     decoded,
-                    self.cfg.max_attachment_bytes
+                    self.cfg().max_attachment_bytes
                 ));
             }
         }
@@ -916,7 +1058,7 @@ impl Grip {
             .get(aspect)
             .ok_or_else(|| anyhow!("{aspect} is not loaded"))?;
 
-        let budget = Budget::probe(format!("{aspect} describe"), self.cfg.probe_budget);
+        let budget = Budget::probe(format!("{aspect} describe"), self.cfg().probe_budget);
         let mut store = self
             .runtime
             .new_store(self.clone(), Caps::Tool, budget, None);
@@ -978,9 +1120,9 @@ impl Grip {
 
         // Scoped to this tool: it is handed its own settings and never sees
         // another's.
-        let config_json = self.cfg.tool_config_json(name);
+        let config_json = self.cfg().tool_config_json(name);
 
-        let budget = Budget::new(format!("tool {name}"), self.cfg.tool_budget);
+        let budget = Budget::new(format!("tool {name}"), self.cfg().tool_budget);
         // A tool runs with the authority of whoever asked for the turn, not
         // the conversation's owner — otherwise a component tool would be the
         // way around per-speaker resolution.
@@ -1033,7 +1175,7 @@ impl Grip {
 
     /// As `truncate`, but names the source so a spilled file is identifiable.
     pub fn cap_output(&self, label: &str, text: String) -> String {
-        crate::spill::cap(&self.cfg, label, text).text
+        crate::spill::cap(&self.cfg(), label, text).text
     }
 
     // --- watcher suppression ------------------------------------------------

@@ -9,6 +9,10 @@
 //! Nothing here decides who may do what. The host refuses a caller who is
 //! not an administrator on every import, and `available` lets the panel know
 //! that up front. Adding an op is one arm in `dispatch`.
+//!
+//! Every write is applied by the host as it lands; the result message says
+//! what took effect and what waits for a restart, and the `admin-overview`
+//! that follows each write carries the pending list for the banner.
 
 use crate::handlers::reply;
 use crate::thetis::grip::admin as host;
@@ -147,9 +151,12 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
             let value = frame.get("value").and_then(Value::as_str).unwrap_or_default();
             let outcome = host::set_field(&key, value);
             let section = key.split('.').next().unwrap_or_default().to_string();
+            // The overview follows because it carries what now awaits a
+            // restart, which a write can add to or clear.
             vec![
                 result("set-field", outcome, json!({ "key": key })),
                 fields(Some(&section)),
+                overview(),
             ]
         }
         "entries" => {
@@ -177,6 +184,7 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
                     json!({ "section": section, "id": id }),
                 ),
                 entries(&section),
+                overview(),
             ]
         }
         "remove-entry" => {
@@ -192,8 +200,10 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
                     json!({ "section": section, "id": id }),
                 ),
                 entries(&section),
+                overview(),
             ]
         }
+        "reload" => vec![result("reload", host::reload(), json!({})), overview(), fields(None)],
         "restart" => {
             let reason = field(frame, "reason");
             vec![result("restart", host::restart(&reason), json!({}))]

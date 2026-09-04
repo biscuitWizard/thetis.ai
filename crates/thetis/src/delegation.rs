@@ -188,7 +188,7 @@ pub async fn spawn(
     req: SpawnRequest,
     ceiling: Option<crate::policy::EffectivePolicy>,
 ) -> Result<SubagentRow> {
-    let cfg = &grip.cfg;
+    let cfg = &grip.cfg();
     if !cfg.subagents.enabled {
         bail!("delegation is switched off (subagents.enabled = false)");
     }
@@ -410,7 +410,7 @@ pub async fn wait(
     predicate: &WaitFor,
     timeout: Duration,
 ) -> Result<WaitOutcome> {
-    let cap = Duration::from_secs(grip.cfg.subagents.max_wait_secs);
+    let cap = Duration::from_secs(grip.cfg().subagents.max_wait_secs);
     let timeout = timeout.min(cap);
     let deadline = Instant::now() + timeout;
     let cancel = grip.cancel_flag(parent_id);

@@ -219,6 +219,14 @@ impl Handler for WorkerHandler {
                         .collect();
                     Ok(serde_json::to_value(map)?)
                 }
+                // The gateway applied a configuration change and asks this
+                // worker to read its own files again. The overlay is shared,
+                // so accounts and secrets arrive at once; the branch's
+                // thetis.toml is its own.
+                "config.reload" => {
+                    let report = grip.reload_config().await?;
+                    Ok(serde_json::to_value(report)?)
+                }
                 "shutdown" => {
                     // The reaper asks politely (if_idle); a worker mid-turn or
                     // mid-build declines rather than dying under its work.
@@ -311,7 +319,7 @@ pub async fn run(session: Option<String>, worktree: Option<std::path::PathBuf>) 
 
     // Bring every aspect up. An aspect that will not start leaves the rest
     // running; the gateway's /admin stays available for a manual rollback.
-    for aspect in pipeline::discover_aspects(&grip.cfg) {
+    for aspect in pipeline::discover_aspects(&grip.cfg()) {
         if let Err(e) = bring_up(&grip, &aspect).await {
             match contract.is_sound() {
                 true => tracing::error!(%aspect, error = %e, "aspect failed to start"),

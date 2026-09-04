@@ -232,8 +232,8 @@ pub fn dummy_hash() -> &'static str {
     DUMMY.get_or_init(|| hash_password("not-a-password").unwrap_or_default())
 }
 pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
-    if !g.cfg.auth.users_mode {
-        return Some(Principal::local(&g.cfg));
+    if !g.cfg().auth.users_mode {
+        return Some(Principal::local(&g.cfg()));
     }
     let hash = token_hash(&cookie_value(h)?);
     let st = g.local_store()?;
@@ -243,12 +243,13 @@ pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
         let _ = st.remove_login(&hash);
         return None;
     }
-    let Some(u) = g.cfg.auth.user(&row.user_id) else {
+    let cfg = g.cfg();
+    let Some(u) = cfg.auth.user(&row.user_id) else {
         let _ = st.remove_login(&hash);
         return None;
     };
     if now.saturating_sub(row.last_seen_ms) > 60_000 {
-        let _ = st.touch_login(&hash, now, now + g.cfg.auth.session_ttl.as_millis() as u64);
+        let _ = st.touch_login(&hash, now, now + g.cfg().auth.session_ttl.as_millis() as u64);
     }
     Some(Principal::from_user(u))
 }
