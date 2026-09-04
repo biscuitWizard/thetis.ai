@@ -30,8 +30,8 @@ use crate::bindings::types::{
     TerminalOutput, ToolManifest,
 };
 use crate::bindings::{
-    branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, sys,
-    terminal, tooling, transcripts,
+    admin, branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session,
+    sys, terminal, tooling, transcripts,
 };
 use crate::grip::Grip;
 use crate::runtime::HostState;
@@ -2696,6 +2696,304 @@ impl skills_view::Host for HostState {
         let out = diags(mgr.lint(""));
         self.yielded();
         Ok(out)
+    }
+}
+
+
+// --- admin ------------------------------------------------------------------
+//
+// The operator's controls, for the control panel. The whole interface is
+// gated on one question, asked on every call: is the store's principal an
+// administrator, and is the console enabled at all. A store with no principal
+// — the renderer, an asset request, the pipeline's smoke test — is refused the
+// same way, as an error the guest can report rather than a trap that would
+// fail the validation gate.
+
+impl HostState {
+    fn require_admin(&self) -> std::result::Result<(), String> {
+        if !self.grip().cfg.admin_enabled {
+            return Err("the admin console is disabled (server.admin_enabled)".into());
+        }
+        match &self.principal {
+            Some(p) if p.is_admin() => Ok(()),
+            Some(_) => Err("administrators only".into()),
+            None => Err("no one is signed in for this call".into()),
+        }
+    }
+}
+
+fn admin_field(d: crate::settings::Described) -> admin::Field {
+    admin::Field {
+        key: d.key,
+        value: d.value,
+        default_value: d.default_value,
+        kind: d.kind.to_string(),
+        section: d.section,
+        help: d.help.to_string(),
+        source: d.source.to_string(),
+        env: d.env.map(str::to_string),
+        secret: d.secret,
+        editable: d.editable,
+        restart_required: d.restart_required,
+        choices: d.choices,
+    }
+}
+
+impl admin::Host for HostState {
+    async fn available(&mut self) -> Result<bool> {
+        self.budget.entered_host("admin.available");
+        Ok(self.require_admin().is_ok())
+    }
+
+    async fn overview(&mut self) -> Result<std::result::Result<admin::AdminOverview, String>> {
+        self.budget.entered_host("admin.overview");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        let grip = self.grip.clone();
+        let view = crate::admin::overview(&grip).await;
+        self.yielded();
+        Ok(Ok(admin::AdminOverview {
+            trunk_name: view.trunk_name,
+            trunk_head: view.trunk_head,
+            commits: view
+                .commits
+                .into_iter()
+                .map(|c| admin::CommitRow {
+                    rev: c.rev,
+                    subject: c.subject,
+                    author: c.author,
+                    head: c.head,
+                })
+                .collect(),
+            branches: view
+                .branches
+                .into_iter()
+                .map(|b| admin::BranchRow {
+                    session_id: b.session_id,
+                    title: b.title,
+                    branch_ref: b.branch_ref,
+                    live: b.live,
+                    ahead: b.ahead,
+                    behind: b.behind,
+                    state: b.state,
+                    kernel: b.kernel,
+                })
+                .collect(),
+            accounts: view
+                .accounts
+                .into_iter()
+                .map(|a| admin::AccountRow {
+                    id: a.id,
+                    name: a.name,
+                    role: a.role,
+                    admin: a.admin,
+                    read_only: a.read_only,
+                    sees_all: a.sees_all,
+                    conversations: a.conversations,
+                    logins: a.logins,
+                    spend_usd: a.spend_usd,
+                })
+                .collect(),
+            private_dirs: view.private_dirs,
+            sessions: view.sessions,
+            local_mode: view.local_mode,
+            admin_enabled: view.admin_enabled,
+            restart_available: view.restart_available,
+            config_path: view.config_path,
+            overlay_path: view.overlay_path,
+        }))
+    }
+
+    async fn waits(&mut self) -> Result<std::result::Result<String, String>> {
+        self.budget.entered_host("admin.waits");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        let grip = self.grip.clone();
+        let body = crate::admin::waits(&grip).await;
+        self.yielded();
+        Ok(Ok(body.to_string()))
+    }
+
+    async fn actions(&mut self) -> Result<Vec<admin::ActionInfo>> {
+        self.budget.entered_host("admin.actions");
+        Ok(crate::admin::ACTIONS
+            .iter()
+            .map(|a| admin::ActionInfo {
+                id: a.id.to_string(),
+                label: a.label.to_string(),
+                description: a.description.to_string(),
+                confirm: a.confirm.to_string(),
+                needs_target: a.needs_target,
+                destructive: a.destructive,
+            })
+            .collect())
+    }
+
+    async fn act(
+        &mut self,
+        action: String,
+        target: String,
+    ) -> Result<std::result::Result<String, String>> {
+        self.budget.entered_host("admin.act");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        if crate::admin::action(&action).is_none() {
+            return Ok(Err(format!("unknown action '{action}'")));
+        }
+        let grip = self.grip.clone();
+        let who = self.principal.as_ref().map(|p| p.user_id.clone()).unwrap_or_default();
+        tracing::warn!(action = %action, target = %target, user = %who, "admin action from the control panel");
+        let result = crate::admin::act(&grip, &action, &target).await;
+        self.yielded();
+        Ok(result.map_err(|e| format!("{e:#}")))
+    }
+
+    async fn sign_out_everywhere(
+        &mut self,
+        account: String,
+    ) -> Result<std::result::Result<u32, String>> {
+        self.budget.entered_host("admin.sign-out-everywhere");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        Ok(crate::admin::sign_out_everywhere(self.grip(), &account).map_err(|e| format!("{e:#}")))
+    }
+
+    async fn sections(&mut self) -> Result<Vec<admin::SectionInfo>> {
+        self.budget.entered_host("admin.sections");
+        Ok(crate::settings::schema::SECTIONS
+            .iter()
+            .map(|(id, label, help)| admin::SectionInfo {
+                id: id.to_string(),
+                label: label.to_string(),
+                help: help.to_string(),
+            })
+            .collect())
+    }
+
+    async fn fields(
+        &mut self,
+        prefix: Option<String>,
+    ) -> Result<std::result::Result<Vec<admin::Field>, String>> {
+        self.budget.entered_host("admin.fields");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        Ok(crate::settings::describe(&self.grip().cfg, prefix.as_deref())
+            .map(|all| all.into_iter().map(admin_field).collect())
+            .map_err(|e| format!("{e:#}")))
+    }
+
+    async fn set_field(
+        &mut self,
+        key: String,
+        value: String,
+    ) -> Result<std::result::Result<String, String>> {
+        self.budget.entered_host("admin.set-field");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        let grip = self.grip.clone();
+        let result = crate::settings::set(&grip.cfg, &key, &value);
+        self.yielded();
+        Ok(result.map_err(|e| format!("{e:#}")))
+    }
+
+    async fn tables(&mut self) -> Result<Vec<admin::TableInfo>> {
+        self.budget.entered_host("admin.tables");
+        let cfg = &self.grip().cfg;
+        Ok(crate::settings::schema::TABLES
+            .iter()
+            .map(|t| admin::TableInfo {
+                id: t.id.to_string(),
+                label: t.label.to_string(),
+                help: t.help.to_string(),
+                columns: t
+                    .columns
+                    .iter()
+                    .map(|c| admin::Column {
+                        key: c.key.to_string(),
+                        kind: c.kind.name().to_string(),
+                        help: c.help.to_string(),
+                        required: c.required,
+                        choices: crate::settings::choices_for(cfg, c.choices),
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    async fn entries(
+        &mut self,
+        section: String,
+    ) -> Result<std::result::Result<Vec<admin::Entry>, String>> {
+        self.budget.entered_host("admin.entries");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        Ok(crate::settings::entries(&self.grip().cfg, &section)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|e| admin::Entry {
+                        section: section.clone(),
+                        id: e.id,
+                        source: e.source.to_string(),
+                        fields_json: e.fields.to_string(),
+                    })
+                    .collect()
+            })
+            .map_err(|e| format!("{e:#}")))
+    }
+
+    async fn save_entry(
+        &mut self,
+        section: String,
+        id: String,
+        fields_json: String,
+    ) -> Result<std::result::Result<String, String>> {
+        self.budget.entered_host("admin.save-entry");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        let fields: serde_json::Value = match serde_json::from_str(&fields_json) {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("fields are not valid JSON: {e}"))),
+        };
+        let grip = self.grip.clone();
+        let result = crate::settings::save_entry(&grip.cfg, &section, &id, &fields);
+        self.yielded();
+        Ok(result.map_err(|e| format!("{e:#}")))
+    }
+
+    async fn remove_entry(
+        &mut self,
+        section: String,
+        id: String,
+    ) -> Result<std::result::Result<String, String>> {
+        self.budget.entered_host("admin.remove-entry");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        let grip = self.grip.clone();
+        let result = crate::settings::remove_entry(&grip.cfg, &section, &id);
+        self.yielded();
+        Ok(result.map_err(|e| format!("{e:#}")))
+    }
+
+    async fn restart(&mut self, reason: String) -> Result<std::result::Result<String, String>> {
+        self.budget.entered_host("admin.restart");
+        if let Err(why) = self.require_admin() {
+            return Ok(Err(why));
+        }
+        let grip = self.grip.clone();
+        let who = self.principal.as_ref().map(|p| p.user_id.clone()).unwrap_or_default();
+        tracing::warn!(user = %who, reason = %reason, "restart requested from the control panel");
+        Ok(crate::admin::restart(&grip, &reason)
+            .await
+            .map_err(|e| format!("{e:#}")))
     }
 }
 

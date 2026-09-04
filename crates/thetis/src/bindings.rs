@@ -84,3 +84,9 @@ pub use agent::thetis::grip::{
 /// world rather than the agent's, because only the gateway imports it.
 #[allow(unused_imports)]
 pub use gateway::thetis::grip::skills_view;
+
+/// The operator's controls. Staged: implemented and linked for the gateway
+/// ahead of `world gateway` importing it. Once it graduates, this becomes
+/// `gateway::thetis::grip::admin` and nothing else changes.
+#[allow(unused_imports)]
+pub use staging::thetis::grip::admin;

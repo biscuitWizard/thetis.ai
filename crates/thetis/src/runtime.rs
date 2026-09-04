@@ -423,6 +423,10 @@ fn build_linker(engine: &Engine, caps: Caps) -> Result<Linker<HostState>> {
             // The read-only view only. A gateway renders skills; it never
             // writes them, so it is not given the interface that could.
             bindings::skills_view::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
+            // The operator's controls. Every call checks the principal the
+            // store was built for, so handing the interface to every gateway
+            // instance grants nothing by itself.
+            bindings::admin::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
         }
         Caps::Tool => {
             bindings::sandbox::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;

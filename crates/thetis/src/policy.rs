@@ -317,7 +317,7 @@ fn pattern_denies(patterns: &[String], name: &str) -> bool {
     })
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyLayer {
     pub admin: Option<bool>,

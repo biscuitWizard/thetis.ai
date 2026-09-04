@@ -7,6 +7,7 @@
 //! rebuilt, validated, and rolled back while the system keeps running.
 
 pub mod activity;
+pub mod admin;
 pub mod aspect;
 pub mod auth;
 pub mod bindings;
