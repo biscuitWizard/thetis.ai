@@ -184,6 +184,10 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
         "model-remove" => remove_model(frame, id),
         "model-restore" => restore_model(frame, id),
 
+        // The control panel. One frame type with an `op`, routed in its own
+        // module: the host refuses every op for anyone but an administrator.
+        "admin" => crate::admin::dispatch(frame),
+
         other => vec![error(format!("unknown frame type: {other}"))],
     }
 }
