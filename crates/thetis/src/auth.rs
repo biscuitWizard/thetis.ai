@@ -40,12 +40,15 @@ pub const LOCAL_OWNER: &str = "local";
 
 impl Principal {
     pub fn new(user_id: String, display_name: String, role: String, policy: Arc<EffectivePolicy>) -> Self {
+        // Administrators land on the installation-wide conversation list. They
+        // can still use the sidebar control to narrow the tab back to their own.
+        let view_all = policy.admin;
         Self {
             user_id,
             display_name,
             role,
             policy,
-            view_all: Arc::new(AtomicBool::new(false)),
+            view_all: Arc::new(AtomicBool::new(view_all)),
         }
     }
     pub fn is_admin(&self) -> bool {
@@ -69,7 +72,7 @@ impl Principal {
     }
     /// May this principal see everyone's conversations at all.
     pub fn may_see_all(&self) -> bool {
-        self.policy.see_all_sessions
+        self.is_admin() || self.policy.see_all_sessions
     }
     /// Is this connection currently asking for everyone's conversations.
     /// Never true for someone the policy does not allow it.
@@ -497,7 +500,7 @@ mod tests {
         assert_eq!(d["admin"], false);
         assert_eq!(d["workspace"], "read");
         assert_eq!(d["see_all"], true);
-        assert_eq!(d["viewing_all"], false, "off until the toggle is used");
+        assert_eq!(d["viewing_all"], false, "a non-admin starts personal");
         assert_eq!(p.list_owner(), Some("bob"));
         p.set_view_all(true);
         assert_eq!(p.describe()["viewing_all"], true);
@@ -508,8 +511,22 @@ mod tests {
         assert!(!denied.contains(&"workspace".to_string()));
         assert_eq!(d["local"], false);
 
+        // Admins start on the installation-wide list without having to opt in,
+        // even when a custom admin role omitted the narrower see-all grant.
+        let mut admin_policy = EffectivePolicy::unrestricted(&[], "m", &[], "agent", 2);
+        admin_policy.see_all_sessions = false;
+        let admin = Principal::new(
+            "ada".into(),
+            "Ada".into(),
+            "admin".into(),
+            Arc::new(admin_policy),
+        );
+        assert!(admin.may_see_all());
+        assert_eq!(admin.list_owner(), None);
+
         // Someone without the grant cannot toggle their way past it.
         let mut narrow = EffectivePolicy::unrestricted(&[], "m", &[], "agent", 2);
+        narrow.admin = false;
         narrow.see_all_sessions = false;
         let p = Principal::new("eve".into(), "Eve".into(), "dev".into(), Arc::new(narrow));
         p.set_view_all(true);

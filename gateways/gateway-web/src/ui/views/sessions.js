@@ -1,4 +1,4 @@
-/* The conversation sidebar: navigation and nothing else.
+/* The conversation sidebar: navigation and nothing else, grouped by user for administrators.
  *
  * Search filters as you type; active conversations group by recency; archived
  * ones live in a collapsed section at the bottom, openable and restorable
@@ -129,7 +129,8 @@ export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
   const matches = (session) =>
     !query ||
     (session.title || "").toLowerCase().includes(query) ||
-    (session.preview || "").toLowerCase().includes(query);
+    (session.preview || "").toLowerCase().includes(query) ||
+    (session.owner_name || session.owner || "").toLowerCase().includes(query);
 
   /* The clock at the row's right edge. It carries what it measures from in
    * `data-since` so the ticker can move every clock without redrawing the
@@ -235,11 +236,6 @@ export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
         el(
           "div",
           { class: "session-title" },
-          // Somebody else's, when the sidebar is showing everyone's. The host
-          // adds `owner` only then, and only to rows that are not the viewer's.
-          session.owner && !session.mine
-            ? el("span", { class: "session-owner", title: `Belongs to ${session.owner}` }, session.owner_name || session.owner)
-            : null,
           el("span", { class: "session-title-text" }, session.title || "Untitled"),
           modeTag ? el("span", { class: "session-mode", title: `Running in ${modeTag} mode` }, modeTag) : null,
           clock(activity, session)
@@ -278,20 +274,64 @@ export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
         : null
     );
 
+  const countWorking = (sessions) =>
+    sessions.filter((s) => activityOf(s.id).state === "working").length;
+
+  const collapsedOwners = new Set();
+  const archivedOpen = new Set();
+
+  const bucket = (session) => {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const today = dayStart.getTime();
+    const week = today - 6 * 24 * 60 * 60 * 1000;
+    const at = session.updated_ms || session.created_ms || 0;
+    return at >= today ? "Today" : at >= week ? "This week" : "Earlier";
+  };
+
+  const appendSession = (parent, session, archived = false) => {
+    parent.append(row(session, { archived }));
+    // Only the conversation on screen can have known children: other rows say
+    // how many agents are working from the host's activity snapshot.
+    if (!archived && session.id === store.current) {
+      for (const agent of store.agents || []) parent.append(agentRow(agent, reveal));
+    }
+  };
+
+  const appendRecency = (parent, sessions) => {
+    const groups = new Map();
+    for (const session of sessions) {
+      const label = bucket(session);
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label).push(session);
+    }
+    for (const [label, grouped] of groups) {
+      parent.append(heading(label, { working: countWorking(grouped) }));
+      for (const session of grouped) appendSession(parent, session);
+    }
+  };
+
+  const appendArchived = (parent, sessions, key) => {
+    const details = el(
+      "details",
+      { class: "session-archived" },
+      el("summary", {}, heading("Archived", { count: sessions.length })),
+      ...sessions.map((session) => row(session, { archived: true }))
+    );
+    details.open = archivedOpen.has(key);
+    details.addEventListener("toggle", () => {
+      if (details.open) archivedOpen.add(key);
+      else archivedOpen.delete(key);
+    });
+    parent.append(details);
+  };
+
   const draw = () => {
     clear(list);
 
     const all = store.sessions || [];
     const active = all.filter((s) => !s.archived && matches(s));
     const archived = all.filter((s) => s.archived && matches(s));
-
-    // Say so when the list is everyone's, because otherwise the only clue is
-    // a lit button in the header.
-    if (store.viewAll) {
-      list.append(
-        el("div", { class: "session-everyone" }, "Everyone's conversations — yours are unlabelled")
-      );
-    }
 
     if (!all.length) {
       list.append(el("div", { class: "session-empty" }, "No conversations yet — start one with the + button."));
@@ -304,59 +344,56 @@ export function mountSessions({ onOpen, onNew, onUnarchive, onRevealAgent }) {
       return;
     }
 
-    // Recency groups. The list already arrives newest-first; the headings just
-    // say where "today" stops.
-    const dayStart = new Date();
-    dayStart.setHours(0, 0, 0, 0);
-    const today = dayStart.getTime();
-    const week = today - 6 * 24 * 60 * 60 * 1000;
-    const bucket = (s) => {
-      const at = s.updated_ms || s.created_ms || 0;
-      return at >= today ? "Today" : at >= week ? "This week" : "Earlier";
-    };
-
-    const groups = new Map();
-    for (const session of active) {
-      const group = bucket(session);
-      if (!groups.has(group)) groups.set(group, []);
-      groups.get(group).push(session);
-    }
-    for (const [label, sessions] of groups) {
-      list.append(heading(label, { working: countWorking(sessions) }));
-      for (const session of sessions) {
-        list.append(row(session));
-        // Only the conversation on screen can have known children: the client
-        // learns of a sub-agent from its frames, and frames only arrive for what
-        // is being watched. Other rows say "2 agents" from the host's count.
-        if (session.id === store.current) {
-          for (const agent of store.agents || []) {
-            list.append(agentRow(agent, reveal));
-          }
-        }
+    // In the installation-wide view, ownership is the primary navigation
+    // boundary. Each user gets a native collapsible field; recency remains a
+    // quieter subdivision inside it.
+    if (store.viewAll) {
+      list.append(el("div", { class: "session-everyone" }, "All conversations, grouped by user"));
+      const owners = new Map();
+      for (const session of [...active, ...archived]) {
+        const id = session.mine ? store.user?.id || "mine" : session.owner || "unknown";
+        const name = session.mine
+          ? store.user?.name || store.user?.id || "You"
+          : session.owner_name || session.owner || "Unknown user";
+        if (!owners.has(id)) owners.set(id, { id, name, mine: Boolean(session.mine), sessions: [] });
+        owners.get(id).sessions.push(session);
       }
-    }
-
-    if (archived.length) {
-      const details = el(
-        "details",
-        { class: "session-archived" },
-        el("summary", {}, heading("Archived", { count: archived.length })),
-        ...archived.map((s) => row(s, { archived: true }))
-      );
-      // Stay open across redraws once the user opened it.
-      details.open = archivedOpen;
-      details.addEventListener("toggle", () => (archivedOpen = details.open));
-      list.append(details);
+      for (const owner of owners.values()) {
+        const visible = owner.sessions.filter(matches);
+        if (!visible.length) continue;
+        const ownerActive = visible.filter((s) => !s.archived);
+        const ownerArchived = visible.filter((s) => s.archived);
+        const details = el(
+          "details",
+          { class: "session-owner-group", dataset: { owner: owner.id } },
+          el(
+            "summary",
+            {},
+            el("span", { class: "session-owner-name", title: owner.id }, owner.name),
+            owner.mine ? el("span", { class: "session-owner-you" }, "you") : null,
+            el("span", { class: "session-count" }, String(visible.length)),
+            countWorking(ownerActive)
+              ? el("span", { class: "session-count is-working" }, `${countWorking(ownerActive)} working`)
+              : null
+          )
+        );
+        details.open = query ? true : !collapsedOwners.has(owner.id);
+        details.addEventListener("toggle", () => {
+          if (details.open) collapsedOwners.delete(owner.id);
+          else collapsedOwners.add(owner.id);
+        });
+        appendRecency(details, ownerActive);
+        if (ownerArchived.length) appendArchived(details, ownerArchived, owner.id);
+        list.append(details);
+      }
+    } else {
+      appendRecency(list, active);
+      if (archived.length) appendArchived(list, archived, "personal");
     }
 
     setTitle(countWorking(all.filter((s) => !s.archived)));
     tick();
   };
-
-  let archivedOpen = false;
-
-  const countWorking = (sessions) =>
-    sessions.filter((s) => activityOf(s.id).state === "working").length;
 
   /* The window title carries how many conversations are working, so a tab in
    * the background says "(2) Thetis" and you know without switching to it. */
