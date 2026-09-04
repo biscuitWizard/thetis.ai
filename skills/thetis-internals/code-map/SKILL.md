@@ -102,7 +102,9 @@ Grouped by concern.
 | `embeddings.rs` | Getting and caching vectors. Nothing here is load-bearing. |
 | `hostfs.rs` | Host file access, confined to the configured roots. |
 | `terminal.rs` | Long-lived shells. A unique marker after each command is what turns an endless stream back into request and response. |
-| `web.rs` | The HTTP and WebSocket transport, and `/admin` in native code. |
+| `web.rs` | The HTTP and WebSocket transport, and the `/admin` recovery page in native code. |
+| `admin.rs` | The operator's controls — trunk reset, worker stop, publishing, sign-out, waits — as plain functions with an `ACTIONS` table. `/admin` and the gateway's `admin` import both call it. |
+| `settings/` | Reading and writing `thetis.toml` and its local overlay through `toml_edit`: `schema.rs` describes every setting (type, help, env override) and every list section's columns; `mod.rs` describes, sets, and edits list entries, validating both files together. |
 | `gateway.rs` | Calls into the gateway component. The renderer keeps a warm instance because it renders one frame for each token. |
 | `main.rs`, `lib.rs`, `roles/` | One binary, two roles: `thetis` is the gateway, `thetis worker` is a conversation's runtime. |
 

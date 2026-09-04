@@ -227,15 +227,26 @@ delete the file and it still runs on built-in defaults — and three layers stac
 2. `thetis.toml`, or whatever `THETIS_CONFIG` points at
 3. environment variables, for per-run overrides and secrets
 
-The file is parsed strictly: a mistyped key fails at startup naming the key,
-rather than becoming a setting that silently does nothing. So does a
-`default_mode` that is not among the configured modes.
+Between the file and the environment sits `thetis.local.toml`, a gitignored
+overlay for accounts and secrets. A key the binary does not know is warned
+about and ignored rather than fatal, so a configuration one step ahead of its
+binary cannot stop the process that would rebuild it; a value that cannot load
+— a `default_mode` that is not among the configured modes, a user naming a
+missing role — still refuses to start, naming the key.
+
+An administrator edits all of this from the **control panel** in the web UI
+(sidebar footer), which describes every setting with its type, help and
+source, edits the `[[models]]`, `[[providers]]`, `[[modes]]`, `[[roles]]` and
+`[[users]]` lists, validates each write against the whole configuration, and
+offers the restart that applies it. The schema behind it is
+`crates/thetis/src/settings/schema.rs`; a setting added to `config.rs` must be
+described there, and a test says so.
 
 The shipped file documents every section. The ones worth knowing:
 
 | Section | Covers |
 |---|---|
-| `[server]` | bind address, which gateway serves the UI, whether `/admin` is on |
+| `[server]` | bind address, which gateway serves the UI, whether `/admin` and the control panel are on |
 | `[paths]` | where the agent, gateways, tools, skills, artifacts and data live, and the naming conventions for gateway and tool directories |
 | `[llm]` | base URL, default model, timeout, retries |
 | `[agent]` | iteration ceiling, default mode, the system prompt (inline or from a file) |

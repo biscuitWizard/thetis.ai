@@ -38,9 +38,18 @@ path, so it works when the gateway guest is broken), the sidebar footer shows
 the account with a **log out** link, and an expired login sends the tab back to
 `/login` rather than leaving it "reconnecting…". An account whose role sets
 `see_all_sessions = true` gets a switch beside **New chat** for everyone's
-conversations; the sidebar is personal until it is pressed. `/admin` lists the
-accounts with their live logins and cumulative spend, and can sign one out
-everywhere.
+conversations; the sidebar is personal until it is pressed. An administrator
+also gets a **control panel** button in the sidebar footer: a tab on the stage
+with trunk's history, every conversation's worker, the accounts (live logins,
+spend, sign out everywhere, and the `[[users]]` / `[[roles]]` entries
+themselves), the model, provider and mode catalogues, and every setting in
+`thetis.toml` with its help text and where its value comes from. Writes are
+validated against the whole configuration before they land; accounts and
+secrets go to `thetis.local.toml`, everything else to `thetis.toml`, and a
+banner offers the restart that applies them. `/admin`, rendered by the
+orchestrator with no WebAssembly in its path, keeps the same trunk, worker,
+account and publishing controls as plain forms for when the UI itself is
+broken.
 
 To check an installation end to end, run the ignored live test against it with
 two accounts (one admin, one plain user):
