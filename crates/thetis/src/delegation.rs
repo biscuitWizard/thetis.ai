@@ -279,28 +279,21 @@ pub async fn spawn(
         .await
         .context("creating the sub-agent's session")?;
 
-    // Before the child can run: its ceiling is the authority the spawning turn
-    // held. Narrowed further by the parent's own ceiling, because a child must
-    // not exceed the conversation it was spawned from even if the speaker's
-    // account is wider than that conversation allows.
-    if let Some(mut ceiling) = ceiling {
+    // Before the child can run, derive the ceiling it inherits from this turn
+    // and from its parent conversation. It is handed to the trusted gateway as
+    // part of registration so a worker never needs permission to set ceilings.
+    let child_ceiling = if let Some(mut ceiling) = ceiling {
         if let Ok(Some(parent_ceiling)) = grip.persist.ceiling_of(parent_id).await {
             ceiling = ceiling.intersect(&parent_ceiling);
         }
-        if let Err(e) = grip.persist.set_ceiling(&child.id, &ceiling).await {
-            // Fail the spawn rather than run a child with no ceiling: an
-            // unstamped child falls back to the root owner's policy, which is
-            // the escalation this parameter exists to prevent.
-            let _ = grip.persist.archive_session(&child.id, true).await;
-            return Err(e).context("stamping the sub-agent's ceiling");
-        }
-    }
+        Some(ceiling)
+    } else {
+        None
+    };
 
-    // Registered before the model is set and before the turn starts, because
-    // registration is what makes this session a child — and therefore what
-    // routes it to this worker, hides it from the sidebar, and stops it
-    // delegating further. Anything that happens before it would happen to a
-    // session that is briefly an ordinary top-level conversation.
+    // Registration and ceiling stamping happen together on the gateway. That
+    // makes the child recognizable for routing before it can run, without any
+    // interval in which an unstamped child could start.
     let row = match grip
         .persist
         .register_subagent(
@@ -312,16 +305,16 @@ pub async fn spawn(
             &model,
             &mode,
             cfg.subagents.max_children,
+            child_ceiling.as_ref(),
         )
         .await
     {
         Ok(row) => row,
         Err(e) => {
-            // The cap or the depth guard refused. Leave nothing behind: an
-            // unregistered session would show up in the user's sidebar as a
-            // conversation they never started.
+            // The cap, depth guard, or ceiling stamp refused. Leave no useful
+            // unregistered session in the sidebar.
             let _ = grip.persist.archive_session(&child.id, true).await;
-            return Err(e);
+            return Err(e).context("registering the sub-agent and stamping its ceiling");
         }
     };
 
