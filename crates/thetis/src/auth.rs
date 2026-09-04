@@ -264,7 +264,11 @@ pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
 /// `store::session_policy`. That is what makes an invitation safe to hand out —
 /// it cannot lend the invitee any of the owner's capabilities.
 pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
-    if p.policy.see_all_sessions {
+    // Administrators have the blanket grant intrinsically. Checking the raw
+    // see-all bit here disagreed with `Principal::may_see_all`: a custom admin
+    // role could list foreign conversations, then be refused when opening or
+    // archiving the exact row it had just been shown.
+    if p.may_see_all() {
         return Ok(());
     }
     let st = g.local_store().context("ownership is gateway-only")?;
