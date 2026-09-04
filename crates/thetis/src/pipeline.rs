@@ -895,6 +895,39 @@ pub(crate) async fn smoke_test(
     Ok(())
 }
 
+/// Where the search for a green build stopped short of one, and why.
+enum ResetBoundary {
+    /// A pull from origin: the trees before it lack what it took in.
+    Pull(String),
+    /// A WIT change: the artifacts before it bind a different contract.
+    Contract(String),
+}
+
+fn short_rev(rev: &str) -> &str {
+    &rev[..12.min(rev.len())]
+}
+
+const RESET_SUBJECT_PREFIX: &str = "watchdog: reset ";
+const RESET_SUBJECT_INFIX: &str = " to green ";
+
+/// The subject of the commit a reset leaves on the branch. Kept to one
+/// shape so the merge can recognise a reset in a branch's history and refuse
+/// to carry a revert it still holds onto trunk.
+pub fn reset_commit_message(aspect: &Aspect, short: &str) -> String {
+    format!("{RESET_SUBJECT_PREFIX}{aspect}{RESET_SUBJECT_INFIX}{short}")
+}
+
+/// The aspect and target a reset commit's subject names, if it is one.
+pub fn parse_reset_commit(subject: &str) -> Option<(Aspect, String)> {
+    let rest = subject.trim().strip_prefix(RESET_SUBJECT_PREFIX)?;
+    let (aspect, short) = rest.rsplit_once(RESET_SUBJECT_INFIX)?;
+    let short = short.trim();
+    if short.is_empty() || !short.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((Aspect::parse(aspect.trim()).ok()?, short.to_string()))
+}
+
 /// Puts an aspect's source back at this branch's most recent green build and
 /// reactivates it — the watchdog's action when a revision keeps failing, and
 /// the boot fallback when the tree no longer builds.
@@ -916,41 +949,86 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     // The build that keeps failing passed its smoke test once, so it is
     // "green" by the cache's lights — the target is the newest green tree
     // that *differs* from what is serving, i.e. the previous known-good.
+    //
+    // The walk back stops at two boundaries, because past either of them an
+    // older tree is not a version of *this* checkout to go back to:
+    //
+    // * a pull from origin. What it took in is another checkout's work, and
+    //   every tree before it lacks that work — reverting onto one quietly
+    //   undoes the pull for this aspect, and the revert then rides to trunk
+    //   under whatever subject the branch merges as, and from there back out
+    //   to origin and every other checkout. That is how the web control
+    //   panel was lost once: reset to the pre-pull tree, squashed, published.
+    // * a change to the WIT contract. Artifacts from before it bind a
+    //   different interface than the source at HEAD needs; loading one only
+    //   "works" while the kernel is equally stale, and reverting the source
+    //   to match discards the contract change itself.
     let serving = grip.loader.get(aspect).map(|loaded| loaded.revision);
+    let head_wit = git.tree_oid("HEAD", "wit").await?.unwrap_or_default();
     let mut target: Option<(String, String)> = None; // (commit, key)
+    let mut boundary: Option<ResetBoundary> = None;
     for commit in git.log("HEAD", 50).await? {
-        let Some(key) = aspect_cache_key(grip, &commit.rev, aspect).await else {
-            continue;
-        };
-        if Some(key_revision(&key)) == serving {
-            continue;
+        if git.tree_oid(&commit.rev, "wit").await?.unwrap_or_default() != head_wit {
+            boundary = Some(ResetBoundary::Contract(commit.rev));
+            break;
         }
-        if grip.buildcache.lookup(&aspect.key(), &key)?.is_some() {
-            target = Some((commit.rev, key));
+        if let Some(key) = aspect_cache_key(grip, &commit.rev, aspect).await {
+            if Some(key_revision(&key)) != serving
+                && grip.buildcache.lookup(&aspect.key(), &key)?.is_some()
+            {
+                target = Some((commit.rev, key));
+                break;
+            }
+        }
+        // The pull's own tree was a candidate just now; nothing before it is.
+        if crate::publish::is_pull_commit(&commit.subject) {
+            boundary = Some(ResetBoundary::Pull(commit.rev));
             break;
         }
     }
-    // Nothing green in this branch's history has two very different causes,
-    // and saying only the first one sent the last diagnosis of this down the
-    // wrong path entirely. A contract mismatch guarantees the search fails —
-    // every artifact this branch can offer binds the old WIT — so the reset is
-    // not the thing that is broken, and reporting it as such buries the cause.
+    // Nothing green in this branch's history has several very different
+    // causes, and saying only the first one sent the last diagnosis of this
+    // down the wrong path entirely. A contract mismatch guarantees the search
+    // fails — every artifact this branch can offer binds the old WIT — so the
+    // reset is not the thing that is broken, and reporting it as such buries
+    // the cause. A boundary is the same: the reset stopped on purpose, and the
+    // operator needs to know what it refused to cross.
     let (commit, key) = match target {
         Some(found) => found,
         None => {
             let contract = checkout_wit_fingerprint(&grip.cfg());
             let kernel = kernel_wit_fingerprint();
-            if contract.as_deref().is_some_and(|fp| fp != kernel) {
-                return Err(anyhow!(
+            let stale_kernel = contract.as_deref().is_some_and(|fp| fp != kernel);
+            let kernel_note = if stale_kernel {
+                format!(
+                    " This kernel binds WIT {kernel}, not the checkout's {}: rebuild and restart \
+                     it, then build {aspect} against it.",
+                    contract.clone().unwrap_or_default()
+                )
+            } else {
+                String::new()
+            };
+            return Err(match boundary {
+                Some(ResetBoundary::Pull(rev)) => anyhow!(
+                    "{aspect} has no green build since the pull from origin at {}. The greens \
+                     before it predate what that pull took in, so resetting onto one would \
+                     revert it; build {aspect} from the pulled source instead.{kernel_note}",
+                    short_rev(&rev)
+                ),
+                Some(ResetBoundary::Contract(rev)) => anyhow!(
+                    "{aspect} has no green build under the checkout's current WIT contract; the \
+                     greens before {} bind an older one, so resetting onto them would revert the \
+                     contract change along with the source.{kernel_note}",
+                    short_rev(&rev)
+                ),
+                None if stale_kernel => anyhow!(
                     "{aspect} has no green build this kernel can load: the checkout's WIT contract \
                      ({}) is not the kernel's ({kernel}), so every artifact in this branch's history \
                      binds the wrong one. Update from trunk rather than resetting.",
                     contract.unwrap_or_default()
-                ));
-            }
-            return Err(anyhow!(
-                "{aspect} has no green build in recent branch history"
-            ));
+                ),
+                None => anyhow!("{aspect} has no green build in recent branch history"),
+            });
         }
     };
 
@@ -958,7 +1036,7 @@ pub async fn reset_aspect_to_green(grip: &Arc<Grip>, aspect: &Aspect) -> Result<
     grip.suppress_watch(aspect, grip.cfg().watchdog.watch_suppression);
     git.sync_paths_to(&commit, &rel).await?;
     let short = &commit[..12.min(commit.len())];
-    grip.commit_worktree(&format!("watchdog: reset {aspect} to green {short}"))
+    grip.commit_worktree(&reset_commit_message(aspect, short))
         .await?;
 
     // Loading goes through the cache: the artifact for this tree is stored,
@@ -1280,5 +1358,35 @@ mod contract_tests {
 
         assert!(matches!(check, ContractCheck::Unknown), "{check:?}");
         assert!(check.is_sound(), "unknown must not blame later failures");
+    }
+}
+
+#[cfg(test)]
+mod reset_subject_tests {
+    use super::*;
+
+    #[test]
+    fn a_reset_subject_round_trips_through_the_parser() {
+        for aspect in [Aspect::Agent, Aspect::gateway("web"), Aspect::tool("moo-server-info")] {
+            let subject = reset_commit_message(&aspect, "7ab6e96c287b");
+            let (parsed, short) = parse_reset_commit(&subject).expect("parses");
+            assert_eq!(parsed, aspect);
+            assert_eq!(short, "7ab6e96c287b");
+        }
+    }
+
+    /// Only the watchdog's own subject shape counts — a conversation that
+    /// mentions a reset in passing must not be held to the revert rule.
+    #[test]
+    fn other_subjects_are_not_resets() {
+        for subject in [
+            "checkpoint: end of turn",
+            "watchdog: reset gateway/web",
+            "watchdog: reset to green abc123",
+            "watchdog: reset gateway/web to green not-a-rev",
+            "Note that the watchdog: reset gateway/web to green 7ab6e96c287b happened",
+        ] {
+            assert!(parse_reset_commit(subject).is_none(), "{subject:?}");
+        }
     }
 }
