@@ -39,8 +39,9 @@ the account with a **log out** link, and an expired login sends the tab back to
 `/login` rather than leaving it "reconnecting…". An account whose role sets
 `see_all_sessions = true` gets a switch beside **New chat** for everyone's
 conversations; the sidebar is personal until it is pressed. An administrator
-also gets a **control panel** button in the sidebar footer: a tab on the stage
-with trunk's history, every conversation's worker, the accounts (live logins,
+also gets a **Control panel** button in the sidebar footer. It takes the place
+of the conversation while it is open (choosing a conversation or pressing Esc
+brings the chat back) and holds trunk's history, every conversation's worker, the accounts (live logins,
 spend, sign out everywhere, and the `[[users]]` / `[[roles]]` entries
 themselves), the model, provider and mode catalogues, and every setting in
 `thetis.toml` with its help text and where its value comes from. Writes are
