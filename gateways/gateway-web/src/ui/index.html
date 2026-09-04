@@ -74,54 +74,35 @@
 
     <nav id="session-list" class="session-list" aria-label="Conversations"></nav>
 
-    <!-- Who is signed in and how the socket is doing, then what they can do
-         about it. Two rows: the identity row is the avatar, the name and the
-         connection state; the action row holds the control panel (for
-         administrators) and log out. Everything is filled from the host's
-         `user` frame — in local mode there is no account and no logout, so the
-         name stays empty and the form stays hidden. The logout form is a real
-         POST rather than a fetch so signing out works with the socket down,
-         which is when it is most wanted. -->
     <footer class="sidebar-foot">
-      <div class="foot-row foot-identity">
-        <!-- Your own face, and the way to change it. The <img> and the drawn
-             mark work the same way as the brand's: exactly one shown, so a bad
-             URL degrades to the mark. app.js wires the click; the file input
-             never appears. -->
-        <button type="button" id="user-avatar-btn" class="user-avatar-btn"
-                title="Your avatar — click to upload a new one" aria-label="Change your avatar">
-          <img id="user-avatar-img" class="user-avatar-img" alt="" decoding="async" hidden>
-          <svg id="user-avatar-mark" class="user-avatar-mark" viewBox="0 0 20 20" aria-hidden="true">
-            <circle cx="10" cy="7.2" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>
-            <path d="M4.4 16.4a5.7 5.7 0 0 1 11.2 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
-        </button>
-        <input type="file" id="user-avatar-input" accept="image/*" hidden>
-        <span id="user-name" class="foot-name" title="Signed in as"></span>
-        <span id="status" class="status is-offline">connecting</span>
-      </div>
-      <div class="foot-row foot-actions">
-        <!-- The control panel, for administrators: every operator control and
-             every setting, taking over the stage while it is open. The
-             host-rendered /admin page is linked from inside it, for when this
-             UI is the thing that is broken. -->
-        <button type="button" id="admin-link" class="quiet-link foot-action" hidden
-                title="Open the control panel: settings, accounts, models, trunk and workers">
-          <svg viewBox="0 0 20 20" aria-hidden="true">
-            <circle cx="10" cy="10" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
-            <path d="M10 2.8v2.2M10 15v2.2M2.8 10H5M15 10h2.2M4.9 4.9l1.6 1.6M13.5 13.5l1.6 1.6M4.9 15.1l1.6-1.6M13.5 6.5l1.6-1.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-          </svg>
-          <span>Control panel</span>
-        </button>
+      <span id="status" class="status is-offline">connecting</span>
+      <!-- Who is signed in, and the way out. Both filled from the host's
+           `user` frame: in local mode there is no account and no logout, so
+           the name stays empty and the form stays hidden. The form is a real
+           POST rather than a fetch so signing out works with the socket
+           down — which is when it is most wanted. -->
+      <span class="foot-user">
+        <span id="user-name" class="quiet" title="Signed in as"></span>
         <form id="logout" method="post" action="/logout" hidden>
-          <button type="submit" class="quiet-link foot-action" title="Sign out of this account on this browser">
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <path d="M8 4H4.5v12H8M12 6.5 15.5 10 12 13.5M15 10H7.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <span>Log out</span>
-          </button>
+          <button type="submit" class="quiet-link" title="Sign out of this account on this browser">log out</button>
         </form>
-      </div>
+      </span>
+      <a id="admin-link" href="/admin" target="_blank" rel="noopener" class="quiet-link" hidden>admin</a>
+      <!-- Your own face, and the way to change it. Sits beside `admin` because
+           this is the footer's "who and what am I" corner, and because an
+           avatar is settings rather than navigation — it must not be a row in
+           the conversation list. The <img> and the drawn mark work the same way
+           as the brand's: exactly one shown, so a bad URL degrades to the mark.
+           app.js wires the click; the file input never appears. -->
+      <button type="button" id="user-avatar-btn" class="user-avatar-btn"
+              title="Your avatar — click to upload a new one" aria-label="Change your avatar">
+        <img id="user-avatar-img" class="user-avatar-img" alt="" decoding="async" hidden>
+        <svg id="user-avatar-mark" class="user-avatar-mark" viewBox="0 0 20 20" aria-hidden="true">
+          <circle cx="10" cy="7.2" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M4.4 16.4a5.7 5.7 0 0 1 11.2 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <input type="file" id="user-avatar-input" accept="image/*" hidden>
     </footer>
   </aside>
 
@@ -257,11 +238,6 @@
 
     <div id="drop-veil" class="drop-veil" hidden><span>Drop images to attach</span></div>
   </main>
-
-  <!-- The control panel. Not a tab: while it is open it takes the place of
-       the stage and the rail, and the sidebar stays as the way back. Filled
-       and shown by views/admin.js; hidden until an administrator opens it. -->
-  <section id="admin-panel" class="admin-panel" aria-label="Control panel" hidden></section>
 
   <aside class="rail" aria-label="Inspectors">
     <nav id="rail-tabs" class="rail-tabs" aria-label="Inspector tabs"></nav>

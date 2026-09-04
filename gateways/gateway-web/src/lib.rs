@@ -8,7 +8,6 @@
 //! The pieces:
 //!   `assets`   the embedded app, one table entry per file
 //!   `handlers` one function per client action
-//!   `admin`    the control panel's ops, over the host's `admin` interface
 //!   `render`   session events to wire frames
 
 wit_bindgen::generate!({
@@ -18,7 +17,6 @@ wit_bindgen::generate!({
     additional_derives: [serde::Serialize],
 });
 
-mod admin;
 mod assets;
 mod handlers;
 mod render;

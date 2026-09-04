@@ -30,7 +30,6 @@ import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
 import * as transcript from "./views/transcript.js";
 import * as avatars from "./views/avatars.js";
-import * as admin from "./views/admin.js";
 import { mountTerminals } from "./views/terminal.js";
 
 // --- status -----------------------------------------------------------------
@@ -230,7 +229,6 @@ connection
       name.title = frame.local ? "" : `Signed in as ${frame.id}${frame.role ? ` (${frame.role})` : ""}`;
     }
     setHidden($("admin-link"), !frame.admin);
-    admin.onUser(frame);
     setHidden($("logout"), Boolean(frame.local));
     setHidden($("see-all"), !frame.see_all);
     // Admins land on the all-conversations view. For other roles with the
@@ -427,14 +425,6 @@ connection
   // The user's stored picture, on `hello` and after any tab changes it.
   .on("user-avatar", avatars.onFrame)
 
-  // The control panel's frames. All five land in one place, which owns the
-  // panel's state; nothing else on the page reads them.
-  .on("admin-overview", admin.onFrame)
-  .on("admin-waits", admin.onFrame)
-  .on("admin-fields", admin.onFrame)
-  .on("admin-entries", admin.onFrame)
-  .on("admin-result", admin.onFrame)
-
   .on("skills", (frame) => {
     if (frame.session !== store.current) return;
     store.set({
@@ -568,10 +558,7 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan|todo|admin)/.test(frame.message || "")) {
-      if (/: admin$/.test(frame.message || "")) admin.onUnsupported();
-      return;
-    }
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan|todo)/.test(frame.message || "")) return;
     // A refusal from Execute belongs on the plan tab, beside the button that
     // caused it, rather than in a toast that outlives the view it refers to.
     if (frame.replying_to === "plan-execute" && stage.onPlanError(frame.message || "That was refused.")) {
@@ -1497,7 +1484,6 @@ $("archive-chat").addEventListener("click", (event) => {
     confirmLabel: "Archive",
     onConfirm: () => {
       connection.send({ type: "archive", id });
-      admin.close();
       store.set({ current: null, title: "", branch: null, branchGraph: null });
       terminals.setSession(null);
       setHeader();
@@ -1512,9 +1498,6 @@ $("archive-chat").addEventListener("click", (event) => {
 // --- actions ----------------------------------------------------------------
 
 function openSession(id) {
-  // The panel takes the place of the stage; choosing a conversation is the
-  // way back to it.
-  admin.close();
   if (id === store.current) return;
   connection.send({ type: "open", id, previous: store.current || undefined });
 }
@@ -1597,8 +1580,6 @@ const composer = mountComposer({
 // connect, which also covers a reconnect after the orchestrator restarts —
 // exactly when the trunk revision and the served UI build have changed.
 const status = statusbar.mountStatusbar((frame) => connection.send(frame));
-admin.mountAdmin((frame) => connection.send(frame));
-$("admin-link")?.addEventListener("click", () => admin.toggle());
 connection.onOpen(() => status.refresh());
 
 connection.connect();
