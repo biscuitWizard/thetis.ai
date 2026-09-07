@@ -193,6 +193,10 @@ label = "GPT-4o"
 id = "google/gemini-2.5-pro"
 label = "Gemini 2.5 Pro"
 
+[[models]]
+id = "z-ai/glm-5.3"
+label = "GLM 5.3"
+
 # The local llama.cpp server, offered in the picker beside the hosted models.
 [[models]]
 id = "local/deepseek-v4-flash"
