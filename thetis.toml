@@ -557,7 +557,17 @@ enabled = true
 # agents that could already write to it — and unreachable entirely in a
 # read-only mode, where the terminal is withheld. Reaching it grants no
 # authority that the preopen had not already handed out.
-roots = []
+#
+# "." is the project root, spelled explicitly because listing any root at all
+# replaces the default instead of adding to it. It must stay FIRST: relative
+# paths resolve against roots[0], so moving it breaks every relative path.
+#
+# The second entry is the real target of /workspace/"thirteen games", which is a
+# symlink out to /tank. The root check canonicalises before comparing — by
+# design, so a link cannot be used to escape — which means a symlink out of the
+# workspace is only followable if its target is a root in its own right.
+# Anything else symlinked into /workspace needs its target added here too.
+roots = [".", "/tank/data/Dev/games/thirteen games"]
 max_read_bytes = 1048576
 # Names that may not be written or deleted anywhere under a root. This keeps the
 # system from destroying its own state by accident; it is not a security
