@@ -1,5 +1,44 @@
 [
   {
+    "when": "(?is)player:\\s*follow the lantern trail",
+    "reply": {
+      "text": "Rain taps against the windows of the Lantern Inn. Below the floorboards, something stirs.",
+      "tool_calls": [
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "sealed-observatory",
+            "present": ["person2"],
+            "beats": [],
+            "narration": "The lantern trail ends at an abandoned observatory. A quiet stranger waits beside the door.",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "narrative",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
     "when": "(?is)revisit.*plot",
     "reply": {
       "text": "The stair remains the central mystery; Mara can reveal the next clue. Planning is complete.",
@@ -69,9 +108,9 @@
     }
   },
   {
-    "when": "(?i)build this .* tabletop campaign",
+    "when": "(?i)build this cyberpunk-red tabletop campaign",
     "reply": {
-      "text": "A stair opens beneath the quiet town.",
+      "text": "SECRET_CLOCKMAKER_BETRAYAL private architect summary must never reach the player.",
       "tool_calls": [
         {
           "name": "rpg-world-create",
@@ -79,7 +118,55 @@
             "kind": "location",
             "id": "lantern-stair",
             "name": "The Lantern Stair",
-            "details": "Rain-dark stone descends beneath the Lantern Inn. A blue flame waits at the foot of the steps."
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
+            "public_description": "A weathered place holding traces of earlier visitors.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "location",
+            "id": "sealed-observatory",
+            "name": "Sealed Observatory",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
+            "public_description": "A weathered place holding traces of earlier visitors.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "location",
+            "id": "hidden-vault",
+            "name": "The Buried Vault",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
+            "public_description": "A weathered place holding traces of earlier visitors.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "faction",
+            "id": "faction0",
+            "name": "Order 0",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
+            "goals": ["Control the old route"],
+            "public_description": "A local society.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "faction",
+            "id": "faction1",
+            "name": "Order 1",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
+            "goals": ["Control the old route"],
+            "public_description": "A local society.",
+            "known_to_player": false
           }
         },
         {
@@ -88,16 +175,567 @@
             "kind": "npc",
             "id": "mara",
             "name": "Mara",
-            "details": "The innkeeper knows the stair."
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": true
           }
         },
         {
-          "name": "rpg-world-update",
+          "name": "rpg-world-create",
           "arguments": {
+            "kind": "npc",
+            "id": "person1",
+            "name": "Ivo",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": true
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person2",
+            "name": "Hidden Architect",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person3",
+            "name": "Stranger 3",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person4",
+            "name": "Stranger 4",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person5",
+            "name": "Stranger 5",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person6",
+            "name": "Stranger 6",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person7",
+            "name": "Stranger 7",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "street-goon",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "beat",
+            "id": "plot0",
+            "name": "SECRET_CLOCKMAKER_BETRAYAL 0",
+            "scale": "major",
+            "details": "A hidden conflict develops around the sealed route.",
+            "key_events": [
+              "An ally may reveal a route",
+              "A rival offers a bargain"
+            ],
+            "conclusions": ["The player can expose or bargain with the rival"],
+            "state": "dormant"
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "beat",
+            "id": "plot1",
+            "name": "SECRET_CLOCKMAKER_BETRAYAL 1",
+            "scale": "minor",
+            "details": "A hidden conflict develops around the sealed route.",
+            "key_events": [
+              "An ally may reveal a route",
+              "A rival offers a bargain"
+            ],
+            "conclusions": ["The player can expose or bargain with the rival"],
+            "state": "dormant"
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "beat",
+            "id": "plot2",
+            "name": "SECRET_CLOCKMAKER_BETRAYAL 2",
+            "scale": "minor",
+            "details": "A hidden conflict develops around the sealed route.",
+            "key_events": [
+              "An ally may reveal a route",
+              "A rival offers a bargain"
+            ],
+            "conclusions": ["The player can expose or bargain with the rival"],
+            "state": "dormant"
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "mara",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person1",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person2",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person3",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person4",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person5",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-journal-add",
+          "arguments": {
+            "title": "Opening hook",
+            "player": "You arrive at the Lantern Inn, where an old stair has begun to glow.",
+            "gm": "SECRET_CLOCKMAKER_BETRAYAL: the hidden architect controls the clock and can be confronted or persuaded."
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?i)build this .* tabletop campaign",
+    "reply": {
+      "text": "SECRET_CLOCKMAKER_BETRAYAL private architect summary must never reach the player.",
+      "tool_calls": [
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "location",
+            "id": "lantern-stair",
+            "name": "The Lantern Stair",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
+            "public_description": "A weathered place holding traces of earlier visitors.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "location",
+            "id": "sealed-observatory",
+            "name": "Sealed Observatory",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
+            "public_description": "A weathered place holding traces of earlier visitors.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "location",
+            "id": "hidden-vault",
+            "name": "The Buried Vault",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
+            "public_description": "A weathered place holding traces of earlier visitors.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "faction",
+            "id": "faction0",
+            "name": "Order 0",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
+            "goals": ["Control the old route"],
+            "public_description": "A local society.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "faction",
+            "id": "faction1",
+            "name": "Order 1",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
+            "goals": ["Control the old route"],
+            "public_description": "A local society.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
             "id": "mara",
-            "patch": {
-              "known_to_player": true
-            }
+            "name": "Mara",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": true
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person1",
+            "name": "Ivo",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": true
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person2",
+            "name": "Hidden Architect",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person3",
+            "name": "Stranger 3",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person4",
+            "name": "Stranger 4",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person5",
+            "name": "Stranger 5",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person6",
+            "name": "Stranger 6",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "npc",
+            "id": "person7",
+            "name": "Stranger 7",
+            "background": "Raised around the old inn and its hidden passages.",
+            "personality": "Patient and observant.",
+            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
+            "flaws": ["Keeps dangerous promises"],
+            "quirks": ["Counts passing bells"],
+            "statblock_id": "bandit",
+            "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
+            "public_description": "A familiar face near the inn.",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "beat",
+            "id": "plot0",
+            "name": "SECRET_CLOCKMAKER_BETRAYAL 0",
+            "scale": "major",
+            "details": "A hidden conflict develops around the sealed route.",
+            "key_events": [
+              "An ally may reveal a route",
+              "A rival offers a bargain"
+            ],
+            "conclusions": ["The player can expose or bargain with the rival"],
+            "state": "dormant"
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "beat",
+            "id": "plot1",
+            "name": "SECRET_CLOCKMAKER_BETRAYAL 1",
+            "scale": "minor",
+            "details": "A hidden conflict develops around the sealed route.",
+            "key_events": [
+              "An ally may reveal a route",
+              "A rival offers a bargain"
+            ],
+            "conclusions": ["The player can expose or bargain with the rival"],
+            "state": "dormant"
+          }
+        },
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "beat",
+            "id": "plot2",
+            "name": "SECRET_CLOCKMAKER_BETRAYAL 2",
+            "scale": "minor",
+            "details": "A hidden conflict develops around the sealed route.",
+            "key_events": [
+              "An ally may reveal a route",
+              "A rival offers a bargain"
+            ],
+            "conclusions": ["The player can expose or bargain with the rival"],
+            "state": "dormant"
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "mara",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person1",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person2",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person3",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person4",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "person5",
+            "to": "lantern-stair",
+            "kind": "visits",
+            "details": "SECRET_CLOCKMAKER_BETRAYAL",
+            "known_to_player": false
+          }
+        },
+        {
+          "name": "rpg-journal-add",
+          "arguments": {
+            "title": "Opening hook",
+            "player": "You arrive at the Lantern Inn, where an old stair has begun to glow.",
+            "gm": "SECRET_CLOCKMAKER_BETRAYAL: the hidden architect controls the clock and can be confronted or persuaded."
           }
         }
       ]

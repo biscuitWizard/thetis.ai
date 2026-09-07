@@ -20,6 +20,7 @@ mkdir -p "$scratch"/{data,artifacts,worktrees,workspace}
 # are only cacheable for a clean tree; the developer checkout may contain this
 # harness edit or unrelated work from another agent.
 if [[ -d "$scratch/source/.git" ]]; then
+  git -C "$scratch/source" fetch --quiet origin
   git -C "$scratch/source" add -A -- . ":!target*"
   git -C "$scratch/source" reset --hard "$(git -C "$root" rev-parse HEAD)" >/dev/null
 else
@@ -106,7 +107,7 @@ case "$mode" in
     THETIS_CAMPAIGN_URL=http://127.0.0.1:7797/play/ \
     THETIS_WALKTHROUGH_ARTIFACTS="$artifacts" \
       npm --prefix "$root/services/playwright-sidecar" run walkthrough:campaign
-    for role in plotting scene referee shop; do
+    for role in architect plotting scene referee shop; do
       rg -q "mock request model=mock/$role" "$scratch/mock-llm.log" || {
         echo "campaign task never used its selected $role model" >&2; exit 1;
       }

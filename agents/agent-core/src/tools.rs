@@ -629,6 +629,16 @@ fn configuration_tools() -> Vec<ToolDef> {
     ]
 }
 
+/// Campaign narrators manipulate campaign documents, not the host project.
+/// Keep this gate identical in advertising and dispatch: remembered tool names
+/// and dynamic group admission must not widen a campaign mode's surface.
+fn campaign_tool_allowed(mode: &str, name: &str) -> bool {
+    if !matches!(mode, "rpg-architect" | "rpg-planner" | "rpg-gm" | "rpg-referee") {
+        return true;
+    }
+    name.starts_with("rpg-") || matches!(name, "skill_search" | "skill_fetch" | "model_info")
+}
+
 /// Every tool the agent can call in this mode.
 pub fn available(mode: &str) -> Vec<ToolDef> {
     let mut tools = vec![
@@ -946,7 +956,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
 
     // Soft, per-account tool-name denial. See `policy_denies` for why this is
     // never the hard boundary.
-    tools.retain(|t| !policy_denies(t.name));
+    tools.retain(|t| campaign_tool_allowed(mode, t.name) && !policy_denies(t.name));
 
     tools
 }
@@ -1743,7 +1753,7 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
             continue;
         }
-        if policy_denies(&manifest.name) {
+        if !campaign_tool_allowed(mode, &manifest.name) || policy_denies(&manifest.name) {
             continue;
         }
         manifest.capabilities.push("component".to_string());
@@ -1791,7 +1801,7 @@ pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
         if ro && !manifest.capabilities.iter().any(|c| c == READ_ONLY_CAP) {
             continue;
         }
-        if policy_denies(&manifest.name) {
+        if !campaign_tool_allowed(mode, &manifest.name) || policy_denies(&manifest.name) {
             continue;
         }
         let group = groups::component_group(&manifest.name, &manifest.capabilities);
@@ -1828,6 +1838,9 @@ pub fn builtin_names() -> Vec<String> {
 // --- dispatch ---------------------------------------------------------------
 
 pub fn invoke(session_id: &str, mode: &str, name: &str, args_json: &str) -> Result<String, String> {
+    if !campaign_tool_allowed(mode, name) {
+        return Err(format!("'{name}' is unavailable in {mode}. Use campaign tools and the rules knowledge base to continue the game."));
+    }
     // Withholding a tool from the definitions is not enough on its own: a model
     // can still name one it saw earlier in the conversation. The mode is
     // enforced here, where the call would actually happen.
@@ -4639,5 +4652,37 @@ mod ask_user_tests {
             }))
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod campaign_surface_tests {
+    use super::{campaign_tool_allowed, invoke};
+    const MODES: &[&str] = &["rpg-architect", "rpg-planner", "rpg-gm", "rpg-referee"];
+    #[test]
+    fn campaign_modes_keep_world_mutation_and_knowledge_tools() {
+        for mode in MODES {
+            for name in ["rpg-world-create", "rpg-world-link", "rpg-scene-present", "rpg-combat-act", "rpg-journal-add", "skill_search", "skill_fetch", "model_info"] {
+                assert!(campaign_tool_allowed(mode, name), "{mode} should retain {name}");
+            }
+        }
+    }
+    #[test]
+    fn campaign_invocation_rejects_admin_and_discovery_before_host_calls() {
+        for mode in MODES {
+            for name in ["patch_code", "tool_search", "selfmod", "write_file", "read_file", "exec", "read_config", "spawn_agent", "load_tool", "skill_write"] {
+                assert!(!campaign_tool_allowed(mode, name));
+                let error=invoke("campaign",mode,name,"{}").unwrap_err();
+                assert!(error.contains("unavailable"), "{error}");
+            }
+        }
+    }
+    #[test]
+    fn unrelated_modes_retain_their_existing_surface() {
+        for mode in ["", "agent", "plan", "custom", "rpg-other", "rpg-gm-custom"] {
+            for name in ["patch_code", "tool_search", "spawn_agent", "read_config", "rpg-world-create"] {
+                assert!(campaign_tool_allowed(mode,name));
+            }
+        }
     }
 }

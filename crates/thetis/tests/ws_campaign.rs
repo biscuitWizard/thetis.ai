@@ -42,7 +42,7 @@ async fn campaign_protocol_walkthrough() {
         &mut socket,
         json!({
             "type":"play-setup-submit","campaign":campaign,"title":"Protocol Lanterns",
-            "system":"d20","premise":"A lantern-lit ruin beneath a quiet town."
+            "system":"d20","themes":["mystery","exploration"],"tone":"Noir"
         }),
     )
     .await;
@@ -52,11 +52,9 @@ async fn campaign_protocol_walkthrough() {
     })
     .await;
 
-    // Build completion is explicitly accepted here. The mock creates the location
-    // needed by the scene; exhaustive architect quality belongs to rules tests.
     send(
         &mut socket,
-        json!({"type":"play-build-continue","campaign":campaign,"complete":true}),
+        json!({"type":"play-state","campaign":campaign}),
     )
     .await;
     wait_state(&mut socket, &campaign, "chargen").await;
