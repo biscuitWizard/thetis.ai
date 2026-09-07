@@ -562,6 +562,32 @@ impl GitCtl {
     }
 
     /// Paths with unmerged index entries — the conflict list.
+    /// Tracked files that carry a conflict's signature, wherever the index
+    /// thinks they stand.
+    ///
+    /// Both halves are required — a line opening `<<<<<<< ` *and* one opening
+    /// `>>>>>>> `. A lone `=======` is a markdown heading rule as often as it
+    /// is a conflict, and refusing to commit over one would be its own kind of
+    /// stuck.
+    async fn conflict_marked_files(&self) -> Result<Vec<String>> {
+        let out = self
+            .run_ok(&["grep", "--name-only", "-z", "-I", "-e", "^<<<<<<< "])
+            .await?;
+        let mut found = Vec::new();
+        for path in String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+        {
+            let Ok(text) = tokio::fs::read_to_string(self.dir.join(path)).await else {
+                continue;
+            };
+            if text.lines().any(|l| l.starts_with(">>>>>>> ")) {
+                found.push(path.to_string());
+            }
+        }
+        Ok(found)
+    }
+
     pub async fn unmerged_paths(&self) -> Result<Vec<String>> {
         let out = self.run(&["ls-files", "-u", "-z"]).await?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -693,23 +719,38 @@ impl GitCtl {
     /// conflict markers in the files themselves. Checked before staging,
     /// because `add -A` erases the unmerged entries that say where to look.
     pub async fn commit_merge(&self, message: &str) -> Result<String> {
-        let unresolved: Vec<String> = {
-            let mut found = Vec::new();
-            for path in self.unmerged_paths().await? {
-                let file = self.dir.join(&path);
-                // A missing file is a resolution too: deleted on purpose.
-                let Ok(text) = tokio::fs::read_to_string(&file).await else {
-                    continue;
-                };
-                if text.lines().any(|l| {
-                    l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "======="
-                }) {
-                    found.push(path);
-                }
+        let mut unresolved: Vec<String> = Vec::new();
+        for path in self.unmerged_paths().await? {
+            let file = self.dir.join(&path);
+            // A missing file is a resolution too: deleted on purpose.
+            let Ok(text) = tokio::fs::read_to_string(&file).await else {
+                continue;
+            };
+            if text
+                .lines()
+                .any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "=======")
+            {
+                unresolved.push(path);
             }
-            found
-        };
+        }
+
+        // And then every tracked file, not only the ones git still calls
+        // unmerged. That list is `ls-files -u`, and `git add` collapses a
+        // conflicted path to stage 0 — so a turn-end checkpoint running
+        // `add -A` while a merge sat open took the conflicted file off the
+        // list entirely, this guard was left with nothing to inspect, and the
+        // markers went into a commit. One conversation's kernel spent a day
+        // refusing to compile on `error: encountered diff marker`, which is a
+        // strange way to learn that the check meant to prevent exactly this
+        // had been looking at an empty list.
+        for path in self.conflict_marked_files().await? {
+            if !unresolved.contains(&path) {
+                unresolved.push(path);
+            }
+        }
+
         if !unresolved.is_empty() {
+            unresolved.sort();
             bail!(
                 "cannot commit merge: conflict markers remain in {}",
                 unresolved.join(", ")
@@ -1099,6 +1140,24 @@ mod tests {
         // Committing with conflicts still unresolved is refused.
         assert!(wt.commit_merge("update from trunk").await.is_err());
 
+        // And still refused once the conflicted file has been staged. This is
+        // the case that got through: `git add` takes a path off `ls-files -u`,
+        // so a checkpoint running `add -A` during an open merge emptied the
+        // list this guard reads and the markers were committed. A conversation
+        // then could not build its own kernel until somebody removed them by
+        // hand.
+        wt.run(&["add", "-A"]).await.unwrap();
+        assert!(
+            wt.unmerged_paths().await.unwrap().is_empty(),
+            "staging is what hides the conflict from the index"
+        );
+        let err = wt
+            .commit_merge("update from trunk")
+            .await
+            .expect_err("a staged conflict is still a conflict")
+            .to_string();
+        assert!(err.contains("base.txt"), "the message has to name it: {err}");
+
         fs::write(wt_path.join("base.txt"), "resolved\n").unwrap();
         wt.commit_merge("update from trunk").await.unwrap();
         assert!(!wt.merge_in_progress().await.unwrap());
@@ -1109,6 +1168,36 @@ mod tests {
         assert_eq!(
             fs::read_to_string(tmp.path().join("base.txt")).unwrap(),
             "resolved\n"
+        );
+    }
+
+    // The guard must not fire on prose. A markdown heading rule is exactly
+    // seven or more `=` on its own line, and a merge refused over one would be
+    // its own kind of stuck.
+    #[tokio::test]
+    async fn a_document_that_looks_a_bit_like_a_conflict_is_not_one() {
+        let (tmp, git) = repo().await;
+        git.branch_create("conv/w", "main").await.unwrap();
+        let wt_path = tmp.path().join("worktrees").join("w");
+        let wt = git.worktree_add(&wt_path, "conv/w").await.unwrap();
+
+        fs::write(
+            wt_path.join("README.md"),
+            "Heading\n=======\n\nSome prose about <<<<<<< markers.\n",
+        )
+        .unwrap();
+        wt.add_all_and_commit("docs").await.unwrap().unwrap();
+        fs::write(tmp.path().join("base.txt"), "trunk\n").unwrap();
+        git.add_all_and_commit("trunk edit").await.unwrap().unwrap();
+
+        let outcome = wt.merge("main", "update from trunk").await.unwrap();
+        assert!(
+            matches!(outcome, MergeOutcome::Clean { .. }),
+            "disjoint files merge cleanly"
+        );
+        assert!(
+            wt.conflict_marked_files().await.unwrap().is_empty(),
+            "an underline and a mention are not a conflict"
         );
     }
 
