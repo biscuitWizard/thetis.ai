@@ -61,6 +61,41 @@ Restarting to pick up your own kernel is normal and expected. It costs your
 turn nothing: an interruption the system asked for is not counted against the
 turn, and your turn is picked up where it left off.
 
+## Merging: what the green-build gate actually checks
+
+A merge to trunk is refused with `"{aspect} was changed on this branch but its
+latest state has no green build"` unless, for every aspect whose source tree
+differs from trunk's, the build cache holds an entry where **`aspect_tree` and
+`wit_tree` equal the branch's trees** and `smoke == Pass`.
+
+The match is by **tree identity, not cache key**. That is deliberate: the key
+carries a fingerprint of the kernel that issued the verdict, and a branch which
+changed the contract earns its greens under its own kernel — still evidence the
+source builds and runs.
+
+Two consequences worth knowing before you debug this:
+
+- A commit that moves an aspect's tree without producing a cache entry is
+  indistinguishable, to the gate, from one that was never built.
+- `BuildCache::store` is **write-once**. An entry already filed under a key with
+  an empty or stale `aspect_tree` can never be corrected by rebuilding.
+
+To check directly whether a tree has a recorded green:
+
+```
+git rev-parse HEAD:agents/agent-core
+grep -l '"aspect_tree": "<that oid>"' /opt/thetis/artifacts/cache/agent/*/meta.json
+```
+
+No hit means no green for that tree, and the gate is telling the truth.
+
+If you find advice saying to clear this by making a trivial edit and rebuilding
+to "attach a build to the tip", it predates the fix and is unreliable: it only
+worked when the edit happened to change the compiled output. The pipeline's
+"identical to what is serving" exit used to commit without caching, so a
+byte-identical rebuild took the same exit and recorded nothing. Both green exits
+now go through `cache_green`.
+
 ## Seeing your own interface
 
 Editing a gateway changes only your copy. The interface every browser loads is

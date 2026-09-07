@@ -38,6 +38,20 @@ fn est_tokens(value: &Value) -> u32 {
     ((char_count(value) + 3) / 4) as u32
 }
 
+/// The estimated size of a stretch of the message list.
+///
+/// The trigger prefers the provider's own count, but there are two moments in a
+/// turn where no such count exists: messages appended since the last completion
+/// — tool results, which are where a turn's context growth actually comes from —
+/// and the list immediately after a compaction, when the newest figure in the
+/// log still describes the conversation as it was *before* the summary. This is
+/// what fills both gaps.
+pub fn estimate(messages: &[Value]) -> u32 {
+    messages
+        .iter()
+        .fold(0u32, |acc, m| acc.saturating_add(est_tokens(m)))
+}
+
 /// Every character reachable in a message, including nested tool calls.
 fn char_count(value: &Value) -> usize {
     match value {
@@ -333,7 +347,7 @@ fn report(
     );
 }
 
-/// Whether the user has pressed stop.
+/// Whether the user has pressed stop while compaction is running.
 ///
 /// Compaction is not part of the conversation, so anything it finds in the
 /// inbox has to be put back for the turn loop to act on: a nudge consumed here
@@ -530,6 +544,25 @@ pub fn plan(
             policy.target_tokens()
         ),
     );
+
+    // Sequence 0 means "no source in the log": the system prompt, and nudge
+    // text folded into a turn already running. Recording a span that starts
+    // there would cover the log from its very beginning, silently summarizing
+    // away the whole conversation. It should be impossible: a seq-0 push is
+    // always a `user` message and `rounds` never puts one in a span. The check
+    // stays because the cost of being wrong is the entire history, and mid-turn
+    // compaction now runs at points where those pushes have happened.
+    if spans
+        .iter()
+        .any(|s| origins[s.start] == 0 || origins[s.end] == 0)
+    {
+        sys::log(
+            LogLevel::Error,
+            "compaction: a span has no log sequence; skipping rather than \
+             recording one that would cover the whole log",
+        );
+        return None;
+    }
 
     let jobs: Vec<SpanJob> = spans
         .into_iter()
@@ -732,6 +765,58 @@ mod tests {
         };
         assert_eq!(plan.messages(), 14);
         assert_eq!(plan.jobs.len(), 2, "two spans, fourteen messages");
+    }
+
+    /// The mid-turn trigger rests on this: growth that no completion has been
+    /// charged for yet still has to show up as growth.
+    #[test]
+    fn estimating_a_list_grows_as_the_list_grows() {
+        let small = vec![assistant("ok")];
+        let big = vec![assistant("ok"), tool(&"x".repeat(4000))];
+        let (a, b) = (estimate(&small), estimate(&big));
+        assert!(b > a, "adding a large tool result must raise the estimate");
+        // Four characters to the token, so a 4000-char result is ~1000.
+        assert!(
+            (900..=1100).contains(&(b - a)),
+            "a 4000-character result should estimate near 1000 tokens, got {}",
+            b - a
+        );
+    }
+
+    #[test]
+    fn estimating_an_empty_list_is_zero() {
+        // `context_estimate` slices from the billed boundary, which is the whole
+        // list when a completion has just landed. That slice must contribute
+        // nothing rather than panicking or inventing a figure.
+        assert_eq!(estimate(&[]), 0);
+    }
+
+    /// A turn whose context has grown past the trigger since the last completion
+    /// must compact, even though the provider's own figure has not moved. This is
+    /// the bug: the count alone was checked once per turn and never budged, so a
+    /// runaway agentic turn sailed past the window.
+    #[test]
+    fn unbilled_growth_can_cross_the_trigger_on_its_own() {
+        let policy = Policy {
+            enabled: true,
+            window: 1000,
+            threshold: 0.6,
+            target: 0.25,
+            summary_model: String::new(),
+            keep_head: 4,
+            keep_tail: 30,
+        };
+        // What the last request was charged: comfortably under the 600 trigger.
+        let billed = 500u32;
+        assert!(!policy.should_compact(billed), "not yet worth compacting");
+
+        // Two big tool results land mid-turn. Nothing re-prices the request.
+        let unbilled = vec![tool(&"x".repeat(2000)), tool(&"y".repeat(2000))];
+        let combined = billed + estimate(&unbilled);
+        assert!(
+            policy.should_compact(combined),
+            "≈{combined} tokens is over the trigger and must compact mid-turn"
+        );
     }
 
     #[test]
