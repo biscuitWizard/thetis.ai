@@ -1,12 +1,20 @@
 <!doctype html>
-<html lang="en">
+<!-- The agent's name is carried on <html> so any view can read it without
+     reaching into the sidebar's markup, which is presentation and may move.
+     Scripts are modules and so run after parsing, so it is always set. -->
+<html lang="en" data-agent-name="{agent_name}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Thetis</title>
+<!-- The agent names the window, like the brand in the sidebar. Substituted at
+     serve time by fill_identity in lib.rs. -->
+<title>{agent_name}</title>
 <link rel="stylesheet" href="/theme.css">
 <link rel="stylesheet" href="/app.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='9' fill='none' stroke='%237c9cff' stroke-width='2.5'/><circle cx='16' cy='16' r='3' fill='%237c9cff'/></svg>">
+<!-- The configured avatar when there is one, otherwise the built-in mark drawn
+     inline. Whole value substituted rather than just the URL, because an empty
+     href resolves to the page itself and shows a broken icon. -->
+<link rel="icon" href="{agent_favicon}">
 </head>
 <body>
 <div id="app">
@@ -28,10 +36,13 @@
           <circle cx="16" cy="16" r="9" fill="none" stroke="currentColor" stroke-width="2.5"/>
           <circle cx="16" cy="16" r="3" fill="currentColor"/>
         </svg>
-        <!-- Substituted at serve time with the configured agent name; see
-             serve_asset in lib.rs. The harness is Thetis, the agent is
+        <!-- Substituted at serve time with the configured agent name, as is the
+             window title, so the tab and the brand always agree. See
+             fill_identity in lib.rs. The harness is Thetis; the agent is
              whatever agent.name says. -->
-        <span>{agent_name}</span>
+        <!-- title so a name too long for the header is still readable on hover,
+             since the CSS clips it to an ellipsis (see .brand-name). -->
+        <span class="brand-name" title="{agent_name}">{agent_name}</span>
       </div>
       <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat">
         <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -83,8 +94,10 @@
       <form id="composer" class="composer" autocomplete="off">
         <div id="attachments" class="attachments" hidden></div>
 
+        <!-- Substituted at serve time so the first paint already carries the
+             agent's name; drawLock in composer.js keeps it in step after that. -->
         <textarea id="input" class="composer-input" rows="1"
-                  placeholder="Message Thetis…"
+                  placeholder="Message {agent_name}…"
                   aria-label="Message"></textarea>
 
         <div class="composer-bar">

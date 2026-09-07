@@ -13,7 +13,7 @@
  * log as text, exactly as if they had been typed.
  */
 
-import { el, clear } from "../lib/dom.js";
+import { AGENT_NAME, el, clear } from "../lib/dom.js";
 
 /** What a question's free-text option is labelled, on every surface. */
 const OTHER_LABEL = "Something else…";
@@ -317,7 +317,7 @@ export function askCard(ask, { onAnswer, answered = false } = {}) {
       el(
         "div",
         {},
-        el("div", { class: "ask-title" }, "Thetis is asking"),
+        el("div", { class: "ask-title" }, `${AGENT_NAME} is asking`),
         ask.intro ? el("div", { class: "ask-intro" }, ask.intro) : null
       )
     ),

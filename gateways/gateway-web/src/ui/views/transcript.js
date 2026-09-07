@@ -9,7 +9,7 @@
  * events flowing through here are the only place those numbers appear.
  */
 
-import { $, clear, el } from "../lib/dom.js";
+import { $, AGENT_NAME, clear, el } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { renderMarkdown } from "../lib/markdown.js";
 import { askCard, parseAsk } from "./askuser.js";
@@ -349,7 +349,7 @@ const RENDERERS = {
 
   delta(ev) {
     if (!live) {
-      const node = row("assistant", "thetis", el("div", { class: "bubble-text is-streaming" }));
+      const node = row("assistant", AGENT_NAME, el("div", { class: "bubble-text is-streaming" }));
       live = node.querySelector(".bubble-text");
     }
     live.textContent += ev.text;
@@ -364,7 +364,7 @@ const RENDERERS = {
       live.replaceChildren(...renderMarkdown(ev.text));
       live = null;
     } else if (ev.text?.trim()) {
-      row("assistant", "thetis", el("div", { class: "bubble-text md" }, renderMarkdown(ev.text)));
+      row("assistant", AGENT_NAME, el("div", { class: "bubble-text md" }, renderMarkdown(ev.text)));
     }
 
     // Each step reports its own usage, so the turn's cost can be watched as it

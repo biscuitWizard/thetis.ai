@@ -70,6 +70,9 @@ body { display: flex; flex-direction: column; }
   justify-content: space-between;
   padding: var(--gap-4) var(--gap-3) var(--gap-3);
 }
+/* The button keeps its size and the name gives way instead; a fixed width is
+ * still shrinkable in a flex row without this. */
+.sidebar-head > .icon-btn { flex: none; }
 
 .brand {
   display: flex;
@@ -77,8 +80,20 @@ body { display: flex; flex-direction: column; }
   gap: var(--gap-2);
   font-weight: 600;
   letter-spacing: -.01em;
+  /* A flex item will not shrink below its content unless told to, so without
+   * this a long agent name pushes the new-chat button out of the header. The
+   * name itself is what gives way, hence min-width on the whole brand. */
+  min-width: 0;
 }
 .brand-mark { width: 20px; height: 20px; color: var(--accent); }
+/* A long configured name clips with an ellipsis rather than wrapping, which
+ * keeps the brand one line tall whatever agent.name says. */
+.brand-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* The avatar occupies the same 20px slot as the mark it replaces, so the brand
  * does not shift when one is configured. `cover` because a supplied image is
  * rarely square, and a hairline keeps a pale or white-edged image from bleeding
