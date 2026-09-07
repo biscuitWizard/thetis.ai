@@ -971,6 +971,143 @@ interface skills-view {
   lint: func() -> list<skill-diagnostic>;
 }
 
+// The operator's controls, for the chat surface's control panel.
+//
+// Gateway-only, like `skills-view`, and refused for anyone who is not an
+// administrator: every function here answers `err` for a caller without that
+// standing, and `available` says so up front so a surface can hide what it
+// cannot offer. The host decides, from the principal it instantiated the
+// guest for; the guest has no identity import and needs none.
+//
+// The same functions draw the host-rendered `/admin` page, which is what keeps
+// working when this guest is broken.
+interface admin {
+  record commit-row {
+    rev: string,
+    subject: string,
+    author: string,
+    head: bool,
+  }
+  record branch-row {
+    session-id: string,
+    title: string,
+    branch-ref: string,
+    live: bool,
+    ahead: u32,
+    behind: u32,
+    state: string,
+    /// The kernel commit the conversation runs on, or "trunk".
+    kernel: string,
+  }
+  record account-row {
+    id: string,
+    name: string,
+    role: string,
+    admin: bool,
+    read-only: bool,
+    sees-all: bool,
+    conversations: u32,
+    logins: u32,
+    spend-usd: f64,
+  }
+  /// A manual override, described for whoever draws the button.
+  record action-info {
+    id: string,
+    label: string,
+    description: string,
+    /// What to ask before running it, when `destructive`.
+    confirm: string,
+    needs-target: bool,
+    destructive: bool,
+  }
+  record admin-overview {
+    trunk-name: string,
+    trunk-head: string,
+    commits: list<commit-row>,
+    branches: list<branch-row>,
+    accounts: list<account-row>,
+    private-dirs: list<string>,
+    sessions: u64,
+    /// Local mode: one implicit administrator, no accounts.
+    local-mode: bool,
+    admin-enabled: bool,
+    restart-available: bool,
+    config-path: string,
+    overlay-path: string,
+  }
+  /// One configuration setting with what a form needs to edit it.
+  record field {
+    key: string,
+    /// "***" for a secret that is set.
+    value: string,
+    default-value: string,
+    /// bool, int, float, text, longtext, list, secret, path, url, model,
+    /// mode, role, provider, map.
+    kind: string,
+    section: string,
+    help: string,
+    /// Where the value comes from: default, file, local or env.
+    source: string,
+    env: option<string>,
+    secret: bool,
+    editable: bool,
+    restart-required: bool,
+    /// The options for a chosen kind; empty for a typed one.
+    choices: list<string>,
+  }
+  /// One column of a list section.
+  record column {
+    key: string,
+    kind: string,
+    help: string,
+    required: bool,
+    choices: list<string>,
+  }
+  /// One entry of a list section. Fields travel as JSON because each section
+  /// has its own shape and the host validates the whole file anyway.
+  record entry {
+    section: string,
+    id: string,
+    /// Which file holds the list: file or local.
+    source: string,
+    fields-json: string,
+  }
+  /// A section made of entries, with its columns.
+  record table-info {
+    id: string,
+    label: string,
+    help: string,
+    columns: list<column>,
+  }
+  /// A section made of settings.
+  record section-info {
+    id: string,
+    label: string,
+    help: string,
+  }
+
+  /// Whether the caller may use the rest of this interface.
+  available: func() -> bool;
+  overview: func() -> result<admin-overview, string>;
+  /// What the system is waiting on, as JSON. The same body as `/admin/waits`.
+  waits: func() -> result<string, string>;
+  actions: func() -> list<action-info>;
+  act: func(action: string, target: string) -> result<string, string>;
+  /// Ends every login an account holds. Returns how many.
+  sign-out-everywhere: func(account: string) -> result<u32, string>;
+
+  sections: func() -> list<section-info>;
+  fields: func(prefix: option<string>) -> result<list<field>, string>;
+  set-field: func(key: string, value: string) -> result<string, string>;
+  tables: func() -> list<table-info>;
+  entries: func(section: string) -> result<list<entry>, string>;
+  save-entry: func(section: string, id: string, fields-json: string) -> result<string, string>;
+  remove-entry: func(section: string, id: string) -> result<string, string>;
+
+  /// Restarts the orchestrator, to apply configuration.
+  restart: func(reason: string) -> result<string, string>;
+}
+
 interface llm {
   use types.{stream-chunk, llm-error};
 
@@ -1265,7 +1402,10 @@ world gateway {
 // Nothing exports from here and no guest builds it. Entries are temporary: an
 // interface graduates to the world that needs it.
 world host-staging {
-  // Empty. `delegation` and `transcripts` both graduated to `world agent` once
+  // `admin` is staged: the host answers it before the gateway world imports
+  // it, so a running kernel is never asked for an import it lacks.
+  import admin;
+  // `delegation` and `transcripts` both graduated to `world agent` once
   // the host was live. Leave the world here: the next contract addition needs
   // the same staging step, and rediscovering why is more expensive than
   // keeping four lines.

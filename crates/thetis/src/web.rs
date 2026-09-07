@@ -509,6 +509,11 @@ async fn workspace_upload(
 }
 
 // --- admin (host-owned; never routed through a guest) -----------------------
+//
+// The controls themselves live in `admin.rs`, shared with the `admin` import
+// the gateway guest uses for the control panel. This page is the recovery
+// rendering of them: plain HTML forms that work with no JavaScript, no
+// websocket, and no guest code involved.
 
 #[derive(serde::Deserialize)]
 struct BranchForm {
@@ -531,18 +536,12 @@ controls below.</p>"#,
     )
 }
 
-/// The manual overrides. Deliberately plain HTML forms so they work with no
-/// JavaScript, no websocket, and no guest code involved.
 async fn admin_branch(
     State(grip): State<Arc<Grip>>,
     axum::Form(form): axum::Form<BranchForm>,
 ) -> Html<String> {
-    let result = admin_branch_action(&grip, &form.action, &form.target).await;
-    let banner = match result {
-        Ok(message) => {
-            tracing::warn!(action = %form.action, "admin: {message}");
-            format!(r#"<p class="banner ok">{}</p>"#, html_escape(&message))
-        }
+    let banner = match crate::admin::act(&grip, &form.action, &form.target).await {
+        Ok(message) => format!(r#"<p class="banner ok">{}</p>"#, html_escape(&message)),
         Err(e) => format!(
             r#"<p class="banner bad">{} failed: {}</p>"#,
             html_escape(&form.action),
@@ -550,168 +549,6 @@ async fn admin_branch(
         ),
     };
     Html(render_admin(&grip, &banner).await)
-}
-
-async fn admin_branch_action(
-    grip: &Arc<Grip>,
-    action: &str,
-    target: &str,
-) -> anyhow::Result<String> {
-    let crate::grip::Role::Gateway(router) = &grip.role else {
-        anyhow::bail!("admin actions run on the gateway");
-    };
-    let store = grip.local_store().context("gateway has no local store")?;
-    let branches = crate::branches::Branches::new(grip.cfg.clone(), store.clone());
-
-    match action {
-        // Break glass: put trunk's checkout at an earlier commit. Forward
-        // history is preserved in the conversation branches that made it;
-        // this moves the shared starting point everyone inherits.
-        "trunk-reset" => {
-            let root = branches.root_git();
-            let rev = root
-                .rev_parse(target)
-                .await?
-                .with_context(|| format!("'{target}' does not name a commit"))?;
-            router.stop_all().await;
-            root.hard_reset_clean(&rev).await?;
-            crate::roles::gateway::load_ui_gateway(grip).await;
-            Ok(format!(
-                "trunk was reset to {}; stopped workers restart on their next message",
-                &rev[..12]
-            ))
-        }
-        "stop-worker" => {
-            let peer = router
-                .live_peer(target)
-                .await
-                .with_context(|| format!("no live worker for {target}"))?;
-            router.mark_stopping(target).await;
-            let _ = peer.call("shutdown", serde_json::Value::Null).await;
-            Ok(format!("asked the worker for {target} to stop"))
-        }
-        "abort-merge" => {
-            let state: crate::bindings::branch::BranchState = serde_json::from_value(
-                crate::workers::call_session(
-                    grip,
-                    router,
-                    target,
-                    "branch.abort",
-                    serde_json::json!({ "session": target }),
-                )
-                .await?,
-            )?;
-            Ok(format!(
-                "merge aborted; the branch is {} again",
-                state.state
-            ))
-        }
-        "release-worktree" => {
-            if router.live_peer(target).await.is_some() {
-                anyhow::bail!("stop the worker first; its checkout is in use");
-            }
-            branches.release_worktree(target).await?;
-            Ok(format!(
-                "released the checkout for {target}; its branch and commits remain"
-            ))
-        }
-        // Publishing: derive the filtered history, then (separately)
-        // push it. Two explicit human actions, never automatic.
-        "export-public" => {
-            let root = branches.root_git();
-            let export = crate::publish::export_public(root).await?;
-            Ok(match export.public_head {
-                Some(head) => format!(
-                    "exported {} commit(s); public is at {}",
-                    export.commits,
-                    &head[..12.min(head.len())]
-                ),
-                None => "nothing to export yet".to_string(),
-            })
-        }
-        // The other direction: take in what another checkout published, so
-        // that publishing from here adds to it rather than replacing it.
-        "pull-public" => {
-            let root = branches.root_git();
-            let before = root.head().await?;
-            match crate::publish::plan_pull(root).await? {
-                crate::publish::Pull::NothingPublished => Ok(format!(
-                    "nothing has been published to origin/{} yet, so there is nothing to pull",
-                    crate::publish::REMOTE_BRANCH
-                )),
-                crate::publish::Pull::UpToDate => Ok(format!(
-                    "already up to date with origin/{}",
-                    crate::publish::REMOTE_BRANCH
-                )),
-                crate::publish::Pull::Ready(plan) => {
-                    let count = plan.subjects.len();
-                    let pulled = crate::publish::apply_pull(root, plan).await?;
-                    let Some(commit) = pulled.trunk_commit else {
-                        return Ok(format!(
-                            "origin/{} held nothing this checkout was missing; its history is \
-                             now part of ours, so publishing from here no longer replaces it",
-                            crate::publish::REMOTE_BRANCH
-                        ));
-                    };
-                    // Everyone's page is served from trunk's build, and trunk
-                    // just moved.
-                    crate::roles::gateway::load_ui_gateway(grip).await;
-                    let mut msg = format!(
-                        "pulled {count} commit(s) from origin/{}; trunk is at {}",
-                        crate::publish::REMOTE_BRANCH,
-                        &commit[..12.min(commit.len())]
-                    );
-                    // The guest aspects hot-swap; the kernel does not, and
-                    // nothing here rebuilds it — say so rather than leave the
-                    // operator running a binary older than trunk unawares.
-                    if crate::control::kernel_source_moved(root, &before, "HEAD").await {
-                        msg.push_str(
-                            ". This moved the orchestrator's own source, so trunk's binary is \
-                             now older than trunk — rebuild and restart to run it",
-                        );
-                    }
-                    Ok(msg)
-                }
-            }
-        }
-        // A claim about the past only the operator can make: what is published
-        // now is where this checkout and the remote last agreed.
-        "adopt-remote" => {
-            let root = branches.root_git();
-            let remote = crate::publish::adopt_remote(root).await?;
-            Ok(format!(
-                "adopted origin/{} at {} as the base this checkout last agreed with; pull now \
-                 to join the two histories",
-                crate::publish::REMOTE_BRANCH,
-                &remote[..12.min(remote.len())]
-            ))
-        }
-        "push-public" => {
-            let root = branches.root_git();
-            // Export first. Pushing meant "publish where trunk is now", but the
-            // button only pushed whatever `public` already pointed at — and on
-            // a checkout that had never exported there was no such ref at all,
-            // so it failed with git's `src refspec public does not match any`,
-            // which says nothing about what to do. Exporting is idempotent, so
-            // doing it here costs nothing when the branch is already current.
-            let export = crate::publish::export_public(root).await?;
-            let Some(head) = export.public_head else {
-                anyhow::bail!(
-                    "there is nothing to publish yet: trunk has no commits that survive \
-                     the private-path filter, so nothing was exported."
-                );
-            };
-
-            crate::publish::push_public(root).await?;
-            Ok(format!(
-                "exported {} commit(s) and published {} as '{}' on origin",
-                export.commits,
-                &head[..12.min(head.len())],
-                crate::publish::REMOTE_BRANCH
-            ))
-        }
-        other => anyhow::bail!("unknown action '{other}'"),
-    }
 }
 
 async fn admin_page(State(grip): State<Arc<Grip>>) -> Html<String> {
@@ -727,149 +564,91 @@ async fn admin_user_logout(
     State(grip): State<Arc<Grip>>,
     Form(form): Form<AdminUserLogout>,
 ) -> Response {
-    if grip.cfg.auth.user(&form.user).is_none() {
-        return (StatusCode::BAD_REQUEST, "unknown user").into_response();
+    match crate::admin::sign_out_everywhere(&grip, &form.user) {
+        Ok(removed) => Redirect::to(&format!("/admin?signed_out={removed}")).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
-    let removed = grip
-        .local_store()
-        .and_then(|store| store.remove_logins_for(&form.user).ok())
-        .unwrap_or(0);
-    Redirect::to(&format!("/admin?signed_out={removed}")).into_response()
+}
+
+/// One form button for an admin action, confirming first when the table says to.
+fn action_form(action: &str, target: &str) -> String {
+    let info = crate::admin::action(action);
+    let label = info.map(|a| a.label).unwrap_or(action);
+    let confirm = info
+        .filter(|a| a.destructive)
+        .map(|a| {
+            format!(
+                r#" onsubmit="return confirm('{}')""#,
+                a.confirm.replace('\\', "\\\\").replace('\'', "\\'")
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<form method=post action="/admin/branch"{confirm}>
+           <input type=hidden name=action value="{action}">
+           <input type=hidden name=target value="{}">
+           <button>{}</button></form>"#,
+        html_escape(target),
+        html_escape(label)
+    )
 }
 
 async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
-    let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
-    let trunk_name = root
-        .current_branch()
-        .await
-        .unwrap_or_else(|_| "trunk".to_string());
+    let view = crate::admin::overview(grip).await;
 
-    // --- trunk -------------------------------------------------------------
-    let trunk_head = root.head().await.unwrap_or_default();
-    let trunk_rows = root
-        .log("HEAD", 15)
-        .await
-        .unwrap_or_default()
+    let trunk_rows = view
+        .commits
         .iter()
         .map(|c| {
-            let is_head = c.rev == trunk_head;
             format!(
                 "<tr><td class=mono>{}{}</td><td>{}</td><td class=note>{}</td><td>{}</td></tr>",
                 &c.rev[..12.min(c.rev.len())],
-                if is_head { " &larr; head" } else { "" },
+                if c.head { " &larr; head" } else { "" },
                 html_escape(&c.subject),
                 html_escape(&c.author),
-                if is_head {
+                if c.head {
                     String::new()
                 } else {
-                    format!(
-                        r#"<form method=post action="/admin/branch"
-                           onsubmit="return confirm('Reset trunk? All workers stop first.')">
-                           <input type=hidden name=action value="trunk-reset">
-                           <input type=hidden name=target value="{}">
-                           <button>reset trunk here</button></form>"#,
-                        c.rev
-                    )
+                    action_form("trunk-reset", &c.rev)
                 }
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    // --- conversations -------------------------------------------------------
-    let store = grip.local_store();
-    let mut branch_rows = String::new();
-    if let (Some(store), crate::grip::Role::Gateway(router)) = (store, &grip.role) {
-        let titles: std::collections::HashMap<String, String> = store
-            .list_sessions(true)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| (s.id, s.title))
-            .collect();
-        let live: std::collections::HashSet<String> =
-            router.live_sessions().await.into_iter().collect();
-
-        for row in store.list_branches().unwrap_or_default() {
-            let (ahead, behind) = root
-                .ahead_behind(&row.branch_ref, &trunk_name)
-                .await
-                .unwrap_or((0, 0));
-            let is_live = live.contains(&row.session_id);
-            let title = titles
-                .get(&row.session_id)
-                .cloned()
-                .unwrap_or_else(|| row.session_id.clone());
-
-            let mut actions = String::new();
-            if is_live {
-                actions.push_str(&format!(
-                    r#"<form method=post action="/admin/branch">
-                       <input type=hidden name=action value="stop-worker">
-                       <input type=hidden name=target value="{id}">
-                       <button>stop worker</button></form>
-                       <form method=post action="/admin/branch">
-                       <input type=hidden name=action value="abort-merge">
-                       <input type=hidden name=target value="{id}">
-                       <button>abort merge</button></form>"#,
-                    id = row.session_id
-                ));
+    let branch_rows = view
+        .branches
+        .iter()
+        .map(|row| {
+            let actions = if row.live {
+                action_form("stop-worker", &row.session_id)
+                    + &action_form("abort-merge", &row.session_id)
             } else {
-                actions.push_str(&format!(
-                    r#"<form method=post action="/admin/branch">
-                       <input type=hidden name=action value="release-worktree">
-                       <input type=hidden name=target value="{id}">
-                       <button>release checkout</button></form>"#,
-                    id = row.session_id
-                ));
-            }
-
-            let kernel = if row.kernel_commit.is_empty() {
-                "trunk".to_string()
-            } else {
-                row.kernel_commit[..12.min(row.kernel_commit.len())].to_string()
+                action_form("release-worktree", &row.session_id)
             };
-            branch_rows.push_str(&format!(
+            format!(
                 "<tr><td>{}</td><td class=mono>{}</td><td>{}</td><td class=mono>&uarr;{} &darr;{}</td>\
                  <td>{}</td><td class=mono>{}</td><td class=actions>{}</td></tr>\n",
-                html_escape(&title),
+                html_escape(&row.title),
                 html_escape(&row.branch_ref),
-                if is_live { "<span class=active>live</span>" } else { "stopped" },
-                ahead,
-                behind,
-                format!("{:?}", row.state).to_lowercase(),
-                kernel,
+                if row.live { "<span class=active>live</span>" } else { "stopped" },
+                row.ahead,
+                row.behind,
+                row.state,
+                row.kernel,
                 actions
-            ));
-        }
-    }
+            )
+        })
+        .collect::<String>();
 
-    let sessions = grip
-        .persist
-        .list_sessions(true)
-        .await
-        .map(|s| s.len())
-        .unwrap_or(0);
-    let logins = grip
-        .local_store()
-        .and_then(|store| store.active_logins_by_user(crate::store::now_ms()).ok())
-        .unwrap_or_default();
-    let owned = grip.local_store().and_then(|store| store.owners_map().ok()).unwrap_or_default();
-    let user_rows = grip
-        .cfg
-        .auth
-        .users
+    let user_rows = view
+        .accounts
         .iter()
         .map(|user| {
-            let spend = grip
-                .local_store()
-                .and_then(|store| store.get_user_spend(&user.id).ok())
-                .unwrap_or(0.0);
-            let live = logins.get(&user.id).copied().unwrap_or(0);
-            let conversations = owned.values().filter(|o| *o == &user.id).count();
             let flags = [
-                user.policy.admin.then_some("admin"),
-                user.policy.read_only.then_some("read-only"),
-                user.policy.see_all_sessions.then_some("sees all"),
+                user.admin.then_some("admin"),
+                user.read_only.then_some("read-only"),
+                user.sees_all.then_some("sees all"),
             ]
             .into_iter()
             .flatten()
@@ -881,23 +660,20 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
                 html_escape(&user.name),
                 html_escape(&user.role),
                 html_escape(&flags),
-                conversations,
-                live,
-                spend,
+                user.conversations,
+                user.logins,
+                user.spend_usd,
                 html_escape(&user.id),
-                if live == 0 { " disabled" } else { "" },
+                if user.logins == 0 { " disabled" } else { "" },
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    let private = crate::publish::private_dirs(&root, "HEAD")
-        .await
-        .unwrap_or_default();
-    let private_list = if private.is_empty() {
+    let private_list = if view.private_dirs.is_empty() {
         "<em>nothing</em>".to_string()
     } else {
-        private
+        view.private_dirs
             .iter()
             .map(|p| format!("<code>{}</code>", html_escape(p)))
             .collect::<Vec<_>>()
@@ -925,7 +701,8 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
 </style>
 <h1>Thetis admin</h1>
 <p class=note>Served directly by the orchestrator — no WebAssembly in this page's path.
-It keeps working when every guest and every worker is broken.</p>
+It keeps working when every guest and every worker is broken. The control panel in the
+chat UI offers the same controls, and the configuration, when the guests are healthy.</p>
 {banner}
 <h2>Trunk (<code>{trunk_name}</code>)</h2>
 <p class=note>What every new conversation starts from, and what everyone's page is served
@@ -949,27 +726,17 @@ account holds, on every device. Spend is cumulative across all of the account's 
 <p class=note>Directories holding a <code>.thetis-private</code> marker never leave this
 machine: a filtered <code>public</code> branch mirrors trunk without them, and a pre-push
 hook refuses everything else. Currently private: {private_list}.</p>
-<form method=post action="/admin/branch">
-  <input type=hidden name=action value="export-public">
-  <button>export public history</button></form>
-<form method=post action="/admin/branch"
-      onsubmit="return confirm('Publish to origin/main? This replaces the remote\'s main with the filtered export of trunk.')">
-  <input type=hidden name=action value="push-public">
-  <button>publish to origin/main</button></form>
+{export_form}
+{push_form}
 <p class=note>When another checkout publishes too, pull before publishing: it merges what
 they published into trunk here, so the next publish carries both instead of being refused
 for replacing their work. Only paths that leave this machine are touched.</p>
-<form method=post action="/admin/branch">
-  <input type=hidden name=action value="pull-public">
-  <button>pull from origin/main</button></form>
-<form method=post action="/admin/branch"
-      onsubmit="return confirm('Adopt origin/main as the base? Only if what is published there is work this checkout already has — anything on it that is new here would be treated as already-had and dropped from the next publish.')">
-  <input type=hidden name=action value="adopt-remote">
-  <button>adopt origin/main as base</button></form>
+{pull_form}
+{adopt_form}
 <p class=note>{sessions} session(s) on record.</p>
 <p><a href="/">&larr; back to chat</a></p>"#,
         banner = banner,
-        trunk_name = html_escape(&trunk_name),
+        trunk_name = html_escape(&view.trunk_name),
         trunk_rows = if trunk_rows.is_empty() {
             "<tr><td colspan=4><em>no commits</em></td></tr>".to_string()
         } else {
@@ -981,12 +748,16 @@ for replacing their work. Only paths that leave this machine are touched.</p>
         } else {
             branch_rows
         },
-        sessions = sessions,
+        sessions = view.sessions,
         user_rows = if user_rows.is_empty() {
             "<tr><td colspan=8><em>local mode — one implicit administrator, no accounts</em></td></tr>".to_string()
         } else {
             user_rows
         },
+        export_form = action_form("export-public", ""),
+        push_form = action_form("push-public", ""),
+        pull_form = action_form("pull-public", ""),
+        adopt_form = action_form("adopt-remote", ""),
     )
 }
 
@@ -998,67 +769,11 @@ fn html_escape(s: &str) -> String {
 
 // --- websocket -------------------------------------------------------------
 
-/// What the system is waiting on, as JSON.
-///
-/// The first thing to open when something looks frozen: it names the sessions
-/// whose worker is still materializing, every outstanding RPC with its age,
-/// and who holds the fleet build lock — so "the UI is stuck" becomes a page
-/// load rather than an investigation with `gdb`.
+/// What the system is waiting on, as JSON. See `admin::waits`.
 async fn admin_waits(State(grip): State<Arc<Grip>>) -> Response {
-    let workers = match &grip.role {
-        crate::grip::Role::Gateway(router) => router.waits().await,
-        crate::grip::Role::Worker(peer) => serde_json::json!({
-            "pending_to_gateway": peer
-                .in_flight()
-                .into_iter()
-                .map(|(id, method, age)| serde_json::json!({
-                    "id": id, "method": method, "age_s": age
-                }))
-                .collect::<Vec<_>>(),
-        }),
-    };
-
-    // The build lock file carries its holder's pid (written when taken), so a
-    // build that is queueing the fleet can be identified from here. The pid
-    // alone is not evidence that anyone holds it: the file keeps the name of
-    // whoever wrote it last, and a holder that was killed leaves it behind. Ask
-    // the kernel whether the lock is actually taken, and only name a pid when
-    // it is — reporting a stale one as live sent more than one investigation
-    // after a process that had exited hours before.
-    let lock = grip.cfg.build_lock_path();
-    let build_lock_held = crate::builder::lock_is_held(&lock);
-    let build_lock = std::fs::read_to_string(&lock)
-        .ok()
-        .map(|pid| pid.trim().to_string())
-        .filter(|pid| !pid.is_empty() && build_lock_held);
-
-    // Turns run in workers, so this process's own counter is zero on the
-    // gateway and the fleet's total is what the question means. Both are
-    // reported: `turns_running` is the honest answer to "is anything running",
-    // and `turns_running_here` keeps the old, narrower number available.
-    let turns_here = grip.turns_in_flight();
-    let turns_in_workers: u64 = workers
-        .get("workers")
-        .and_then(|w| w.as_array())
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r.get("turns_running").and_then(|t| t.as_u64()))
-                .sum()
-        })
-        .unwrap_or(0);
-
-    let body = serde_json::json!({
-        "uptime_s": crate::control::uptime().as_secs(),
-        "workers": workers,
-        "build_lock_held": build_lock_held,
-        "build_lock_holder_pid": build_lock,
-        "building": grip.building_aspects(),
-        "turns_running": turns_here as u64 + turns_in_workers,
-        "turns_running_here": turns_here,
-    });
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string_pretty(&body).unwrap_or_default(),
+        serde_json::to_string_pretty(&crate::admin::waits(&grip).await).unwrap_or_default(),
     )
         .into_response()
 }

@@ -1117,11 +1117,11 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 mod spec {
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     // No `Debug` on this or on `Llm`: both hold the raw API key, and a derived
     // Debug anywhere above them would be enough to print it.
-    #[derive(Default, Deserialize)]
+    #[derive(Default, Deserialize, Serialize)]
     #[serde(default)]
     pub struct File {
         pub server: Server,
@@ -1156,7 +1156,7 @@ mod spec {
         pub tools: std::collections::BTreeMap<String, toml::Value>,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Auth {
         pub mode: String,
@@ -1178,7 +1178,7 @@ mod spec {
             }
         }
     }
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     pub struct Role {
         pub id: String,
         #[serde(default)]
@@ -1186,7 +1186,7 @@ mod spec {
         #[serde(flatten)]
         pub policy: crate::policy::PolicyLayer,
     }
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     pub struct User {
         pub id: String,
         #[serde(default)]
@@ -1202,7 +1202,7 @@ mod spec {
         pub overrides: crate::policy::PolicyLayer,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Server {
         pub bind: String,
@@ -1221,7 +1221,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Paths {
         pub data: String,
@@ -1254,7 +1254,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Skills {
         pub retrieval_enabled: bool,
@@ -1280,7 +1280,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct ToolGroups {
         pub grouping_enabled: bool,
@@ -1300,7 +1300,7 @@ mod spec {
         }
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(default)]
     pub struct Llm {
         pub base_url: String,
@@ -1326,7 +1326,7 @@ mod spec {
     }
 
     /// One OpenAI-compatible endpoint. No `Debug`: it holds an API key.
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     pub struct Provider {
         pub id: String,
         #[serde(default)]
@@ -1349,7 +1349,7 @@ mod spec {
         pub headers: std::collections::BTreeMap<String, String>,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Agent {
         pub max_iterations: u32,
@@ -1377,7 +1377,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
 
     pub struct Model {
         pub id: String,
@@ -1391,7 +1391,7 @@ mod spec {
         pub wire_model: String,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
 
     pub struct Mode {
         pub id: String,
@@ -1405,7 +1405,7 @@ mod spec {
         pub prompt: String,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Subagents {
         pub enabled: bool,
@@ -1429,7 +1429,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     pub struct AgentProfile {
         pub id: String,
         #[serde(default)]
@@ -1444,7 +1444,7 @@ mod spec {
         pub prompt: String,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Budgets {
         pub wasm_slice_secs: u64,
@@ -1461,7 +1461,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Limits {
         pub agent_memory_mb: usize,
@@ -1486,7 +1486,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Context {
         pub enabled: bool,
@@ -1514,7 +1514,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Cache {
         pub enabled: bool,
@@ -1536,7 +1536,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Build {
         pub command: String,
@@ -1565,7 +1565,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Wasi {
         pub network: bool,
@@ -1590,7 +1590,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Watchdog {
         pub failure_window_secs: u64,
@@ -1611,7 +1611,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Devkit {
         pub enabled: bool,
@@ -1631,13 +1631,13 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Default, Deserialize)]
+    #[derive(Debug, Default, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Sandbox {
         pub enabled: bool,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Filesystem {
         pub enabled: bool,
@@ -1659,7 +1659,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Terminal {
         pub enabled: bool,
@@ -1701,7 +1701,7 @@ mod spec {
     }
 
     /// The headless browser sidecar. See [`super::BrowserSettings`].
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Browser {
         pub enabled: bool,
@@ -1748,7 +1748,7 @@ mod spec {
         }
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     #[serde(default)]
     pub struct Control {
         pub allow_restart: bool,
@@ -1765,7 +1765,7 @@ mod spec {
         }
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(default)]
     pub struct Discord {
         pub enabled: bool,
@@ -2090,6 +2090,36 @@ impl Config {
             Env::None,
         )?;
         Ok(())
+    }
+
+    /// Checks that a config file and its local overlay would load together.
+    ///
+    /// The overlay is where accounts and secrets live, so a candidate for one
+    /// file can only be judged against the other: `thetis.toml` alone has no
+    /// users, and a users-mode overlay alone has no models.
+    pub fn validate_layers(file_text: &str, overlay_text: &str, root: &Path) -> Result<()> {
+        let mut merged: toml::Value =
+            toml::from_str(file_text).context("the file is not valid TOML")?;
+        let overlay: toml::Value =
+            toml::from_str(overlay_text).context("the local overlay is not valid TOML")?;
+        merge_toml(&mut merged, overlay);
+        let (file, _unknown) = parse_file(merged)?;
+        Self::assemble(
+            root.to_path_buf(),
+            root.join("thetis.toml"),
+            file,
+            Env::None,
+        )?;
+        Ok(())
+    }
+
+    /// Every setting at its built-in default, as TOML.
+    ///
+    /// This is the schema's source of truth for defaults and types: the
+    /// settings layer reads it rather than restating each value, so a default
+    /// changed in `spec` is changed everywhere at once.
+    pub fn default_file_toml() -> String {
+        toml::to_string(&spec::File::default()).unwrap_or_default()
     }
 
     fn assemble(root: PathBuf, config_path: PathBuf, file: spec::File, env: Env) -> Result<Self> {
