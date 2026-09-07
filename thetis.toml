@@ -142,15 +142,6 @@ base_url = "http://127.0.0.1:8080/v1"
 # api_key = "env:LLAMA_API_KEY"   # only if you started it with --api-key
 # headers = { "X-Org" = "acme" }  # sent on every request to this provider
 
-# A second llama-server, pinned to the A100, for the per-turn narrator. Model
-# ids are prefixed by provider id, so `local-qwen/qwen3.8-27b` reaches this one
-# and `local/deepseek-v4-flash` the first. Started by the llama-qwen systemd
-# unit (scripts/local-models/).
-[[providers]]
-id = "local-qwen"
-label = "llama.cpp (A100)"
-base_url = "http://127.0.0.1:8081/v1"
-
 # [[providers]]
 # id = "vllm"
 # label = "vLLM (GPU box)"
@@ -249,12 +240,6 @@ id = "local/deepseek-v4-flash"
 label = "DeepSeek V4 Flash (local)"
 provider = "local"
 wire_model = "deepseek-v4-flash"
-
-[[models]]
-id = "local-qwen/qwen3.8-27b"
-label = "Qwen3.8 27B (local, A100)"
-provider = "local-qwen"
-wire_model = "qwen3.8-27b"
 
 # Ways of working, offered per conversation. `read_only` is carried through to
 # the agent, which withholds every tool that changes something — so adding a
