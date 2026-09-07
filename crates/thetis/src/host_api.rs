@@ -387,6 +387,19 @@ impl sys::Host for HostState {
             "tool_accounting_enabled" => Some(cfg.tool_groups.accounting_enabled.to_string()),
             "tool_groups_always_on" => Some(cfg.tool_groups.always_on.join(",")),
             "tool_route_threshold" => Some(cfg.tool_groups.route_threshold.to_string()),
+            // Where the campaign knowledge sidecar listens and the boot-time
+            // token it expects, for the campaign gateway's Rules and World
+            // searches. The token guards a loopback port and nothing else; it
+            // is the same value the `rpg-kb-*` tools receive in their config.
+            // `None` when the sidecar is off, so a caller can tell "not
+            // running" from "unreachable".
+            "sidecar:rpg-kb" => cfg.rpg_kb.enabled.then(|| {
+                serde_json::json!({
+                    "endpoint": cfg.rpg_kb.base_url(),
+                    "token": crate::kb_sidecar::token(cfg),
+                })
+                .to_string()
+            }),
             _ => None,
         })
     }
