@@ -46,6 +46,10 @@ on:
         description: 'Force the BM25 fallback instead of dense ranking'
         type: boolean
         default: false
+      full_ablation:
+        description: 'Also ablate the 9.5k-doc ToolRet corpus (downloads it; embedding a cold cache costs ~$0.20-0.90)'
+        type: boolean
+        default: false
 
 concurrency:
   # Serialise pushes to the results branch: two runs appending at once would
@@ -86,15 +90,53 @@ jobs:
         uses: actions/cache@v4
         with:
           path: bench-work/cache
-          key: retrieval-bench-vectors-${{ hashFiles('skills/**/SKILL.md', 'skills/*.md') }}
+          # Keyed on the pinned fixture, because that is what gets embedded.
+          # Keying it on the live skills/ tree would miss the cache on every
+          # unrelated brief edit and re-embed 61 cards for nothing.
+          key: retrieval-bench-vectors-${{ hashFiles('scripts/retrieval-bench/corpus/**') }}
           restore-keys: |
             retrieval-bench-vectors-
+
+      - name: Check the pinned corpus for drift
+        # Advisory, never fatal. Drift means someone edited a brief without
+        # re-pinning, which is fine and often deliberate -- but the run is then
+        # measuring a corpus older than the tree, and that belongs in the log
+        # rather than being discovered later from a puzzling flat line.
+        continue-on-error: true
+        run: |
+          cd scripts/retrieval-bench
+          if python3 pin-corpus.py --from ../../skills --out corpus/v1 \
+               --exclude torchship --check
+          then
+            echo "pinned corpus matches skills/"
+          else
+            {
+              echo "### Pinned corpus is behind \`skills/\`"
+              echo
+              echo "Scores here reflect \`corpus/v1\`, not the current tree."
+              echo "To re-pin, in its own commit:"
+              echo
+              echo '```sh'
+              echo 'cd scripts/retrieval-bench'
+              echo './pin-corpus.py --from ../../skills --out corpus/v1 --exclude torchship'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Fetch the results branch
         run: |
           git fetch origin bench-results:bench-results 2>/dev/null \
             && echo "results branch found" \
             || echo "no results branch yet; it will be created"
+
+      - name: Check the harness itself
+        # The harness must build both with and without the toolret feature: a
+        # revision predating the group table has no table to lift. This was
+        # broken once, and the symptom was 72 of 104 commits reporting as
+        # "could not be measured" rather than as a bug here.
+        env:
+          RETRIEVAL_BENCH_WORK: ${{ github.workspace }}/bench-work
+        run: ./scripts/retrieval-bench/selftest.sh
 
       - name: Run the benchmark
         env:
@@ -131,6 +173,37 @@ jobs:
           ./scripts/retrieval-bench/run.sh \
             --out bench-work/results.jsonl \
             ${ARGS[@]+"${ARGS[@]}"} 2>&1 | tee bench-work/run.log
+
+      # The headline measurement: what is each mechanism worth, with a
+      # significance test on every delta. Runs on the small pinned corpus by
+      # default because that needs no download and no API spend; the 9.5k-doc
+      # external corpus is opt-in via the `full_ablation` input, since embedding
+      # it costs real money on a cold cache.
+      - name: Ablate the retrieval mechanisms
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          THETIS_EMBED_BASE: ${{ vars.THETIS_EMBED_BASE }}
+          RETRIEVAL_BENCH_WORK: ${{ github.workspace }}/bench-work
+          ABLATE_OUT: ${{ github.workspace }}/bench-work
+        run: |
+          set -euo pipefail
+          ABL=(--skills-only)
+          if [[ "${{ inputs.full_ablation }}" == "true" ]]; then ABL=(); fi
+
+          ./scripts/retrieval-bench/ablate.sh "${ABL[@]+"${ABL[@]}"}" \
+            2>&1 | tee bench-work/ablate.log
+
+          {
+            echo "## Ablation — what each mechanism is worth"
+            echo
+            echo 'Every delta carries a paired-bootstrap 95% CI. `ns` means the'
+            echo 'interval includes zero: no effect detected at this sample size.'
+            echo
+            echo '```'
+            sed -n '/^arm /,/^$/p' bench-work/ablate.log | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Chart and summarise
         run: |

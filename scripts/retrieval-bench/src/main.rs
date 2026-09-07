@@ -22,9 +22,17 @@
 //! To measure past revisions, use ./run.sh --rev <sha> instead: this binary only
 //! ever measures the tree it was compiled against.
 
+mod ablate;
+mod corpus;
 mod embed;
 mod metrics;
 mod skillret;
+// Gated with the same feature as `lifted::table`, which it imports. Declaring it
+// unconditionally made every pre-routing revision fail to build with
+// `unresolved import crate::lifted::table` -- 72 of 104 commits on main, all of
+// them reported as "could not be measured" when they are in fact perfectly
+// measurable for SkillRet.
+#[cfg(feature = "toolret")]
 mod toolret;
 
 mod lifted;
@@ -53,7 +61,14 @@ struct Datapoint {
     /// test. Points with this set are comparable to each other and to HEAD, but
     /// they were not produced by the tree as it stood.
     backfilled: bool,
+    /// Which corpus produced the SkillRet numbers: "pinned corpus/v1", or
+    /// "live" when `--skills` pointed at a real tree. Recorded because the two
+    /// are not comparable -- a live corpus differs between checkouts and grows
+    /// over time -- so a chart must split the series here rather than draw one
+    /// misleading line through both.
+    corpus: String,
     skillret: skillret::SkillRet,
+    #[cfg(feature = "toolret")]
     #[serde(skip_serializing_if = "Option::is_none")]
     toolret: Option<toolret::ToolRet>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -67,17 +82,218 @@ fn main() {
     }
 }
 
+/// The ablation sweep over a large external corpus.
+///
+/// Reported as one row per arm with a delta against the baseline, plus the
+/// vector count each arm needed — quality and cost side by side, because the
+/// question being answered is whether a mechanism earns what it costs.
+fn run_ablation(args: &[String]) -> Result<()> {
+    let corpus_path = flag(args, "--corpus")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/toolret.json")
+        });
+    let cache_dir = flag(args, "--cache")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/opt/thetis/workspace/zero-retrieval-bench/cache"));
+    let limit: usize = flag(args, "--limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let group_tree = args.iter().any(|a| a == "--group-tree");
+    let lexical_only = args.iter().any(|a| a == "--lexical");
+    let json_out = flag(args, "--json").map(PathBuf::from);
+    // A cap for a quick look; the committed default is the whole corpus so the
+    // published number is not a subsample somebody has to caveat.
+    let max_cases: Option<usize> = flag(args, "--cases").and_then(|v| v.parse().ok());
+
+    // `--skills DIR` runs the sweep over a real Thetis skills tree plus the
+    // hand-written SkillRet gold set, instead of the external ToolRet corpus.
+    //
+    // Both surfaces matter and they answer different questions. ToolRet gives
+    // statistical power (thousands of queries) on documents that are not ours;
+    // the skills tree is the corpus the ranker actually serves, but it is small.
+    // A mechanism worth shipping should win on both, and a claim made about one
+    // should not be assumed to hold on the other.
+    let skills_dir = flag(args, "--skills").map(PathBuf::from);
+
+    let (file, tree, mut cases) = match &skills_dir {
+        Some(dir) => {
+            let gold_path = flag(args, "--gold").map(PathBuf::from).unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gold/skillret.json")
+            });
+            corpus::load_skills(dir, &gold_path)?
+        }
+        None => {
+            if !corpus_path.exists() {
+                anyhow::bail!(
+                    "no corpus at {}\n\nBuild it first:\n  ./fetch-toolret.py --out {}\n\nOr sweep the real skills tree instead:\n  --skills ../../skills",
+                    corpus_path.display(),
+                    corpus_path.display()
+                );
+            }
+            corpus::load(&corpus_path, group_tree)?
+        }
+    };
+    if let Some(n) = max_cases {
+        cases.truncate(n);
+    }
+
+    let skills: Vec<crate::lifted::skills::Skill> = {
+        let mut v: Vec<_> = tree.skills.values().cloned().collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id)); // determinism: HashMap order is not stable
+        v
+    };
+
+    println!(
+        "corpus  {}",
+        match &skills_dir {
+            Some(d) => d.display().to_string(),
+            None => corpus_path.display().to_string(),
+        }
+    );
+    println!("source  {}", file.source);
+    println!(
+        "docs    {}  ({} groups, tree={})",
+        skills.len(),
+        file.groups.len(),
+        if group_tree { "nested" } else { "flat" }
+    );
+    println!("queries {}", cases.len());
+    println!("limit   {limit}");
+
+    let bad = corpus::unresolvable(&tree, &cases);
+    if !bad.is_empty() {
+        println!(
+            "WARNING {} gold ids missing from the corpus (cases affected score 0)",
+            bad.len()
+        );
+        for id in bad.iter().take(5) {
+            println!("          {id}");
+        }
+    }
+
+    // The ranker returns the whole corpus unranked when limit >= corpus size,
+    // scoring a perfect 1.0 while measuring nothing at all.
+    if skills.len() <= limit {
+        anyhow::bail!(
+            "corpus of {} is not larger than limit {}: rank() short-circuits and \
+             returns everything, measuring nothing",
+            skills.len(),
+            limit
+        );
+    }
+
+    let mut embedder = if lexical_only {
+        None
+    } else {
+        embed::Embedder::new(&cache_dir, "openai/text-embedding-3-small", 1536)
+    };
+    if embedder.is_none() && !lexical_only {
+        println!(
+            "\nnote: no embeddings key (OPENROUTER_API_KEY / OPENAI_API_KEY);\n      \
+             running the lexical arms only, so dense and fusion are absent."
+        );
+    }
+
+    let (doc_vecs, query_vecs, mode) =
+        ablate::embed_corpus(embedder.as_mut(), &skills, &cases)?;
+    let dense_ok = !doc_vecs.is_empty() && !query_vecs.is_empty();
+    println!("mode    {}", mode.label());
+
+    let plan = ablate::Plan::default_sweep(limit, dense_ok);
+    println!("\nrunning {} arms...\n", plan.arms.len());
+
+    let results = ablate::run_plan(&plan, &tree, &skills, &doc_vecs, &cases, &query_vecs);
+
+    println!(
+        "{:<28} {:>7} {:>7} {:>7} {:>9} {:>18} {:>8}",
+        "arm", "nDCG", "hit@1", "MRR", "vs base", "95% CI (p)", "vectors"
+    );
+    println!("{}", "-".repeat(88));
+    for r in &results {
+        let (delta, stat) = if r.arm == plan.baseline {
+            ("  baseline".to_string(), String::new())
+        } else {
+            let d = r.vs_baseline.unwrap_or(0.0);
+            let s = match (r.ci95, r.p_value) {
+                (Some((lo, hi)), Some(p)) => {
+                    // A CI straddling zero is the finding, so mark it: it means
+                    // "no detectable difference", not "a small difference".
+                    let flag = if lo <= 0.0 && hi >= 0.0 { " ns" } else { "" };
+                    format!("[{lo:+.3},{hi:+.3}] p={p:.3}{flag}")
+                }
+                _ => String::new(),
+            };
+            (format!("{d:+.4}"), s)
+        };
+        println!(
+            "{:<28} {:>7.4} {:>7.4} {:>7.4} {:>9} {:>18} {:>8}",
+            r.arm, r.ndcg_at_k, r.hit_at_1, r.mrr, delta, stat, r.vectors_used
+        );
+    }
+    println!(
+        "\n  ns = 95% CI includes zero: no difference detected at this sample size."
+    );
+
+    if let Some(path) = json_out {
+        let payload = serde_json::json!({
+            "schema": 1,
+            "kind": "ablation",
+            "corpus": corpus_path.display().to_string(),
+            "source": file.source,
+            "caveat": file.note,
+            "docs": skills.len(),
+            "queries": cases.len(),
+            "groups": file.groups.len(),
+            "tree": if group_tree { "nested" } else { "flat" },
+            "limit": limit,
+            "mode": mode.label(),
+            "commit": git_facts(std::path::Path::new(".")).0,
+            "measured_at": now(),
+            "baseline": plan.baseline,
+            "arms": results,
+        });
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
+        println!("\nwrote {}", path.display());
+    }
+
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `ablate` is the primary measurement and takes over the process. It answers
+    // "what does each mechanism buy", which the per-commit datapoint below
+    // cannot: the ranker has exactly one distinct version in the whole history,
+    // so a time series over it is flat by construction.
+    if args.first().map(|a| a.as_str()) == Some("ablate") {
+        return run_ablation(&args[1..]);
+    }
+
     let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
     let json_out = flag(&args, "--json").map(PathBuf::from);
 
     let root = flag(&args, "--root")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let skills_dir = flag(&args, "--skills")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("skills"));
+    // The pinned corpus is the default, not the live `skills/` tree. Thetis
+    // pushes selectively, so checkouts legitimately carry different corpora:
+    // the same commit scored corpus=127/hit@1 0.750 here and corpus=61/0.583 in
+    // CI. Grading every revision against a committed fixture means a movement
+    // in the number has one cause, the code. `--skills <dir>` opts back into a
+    // live tree for a one-off look at the real product.
+    let pinned = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/v1");
+    let (skills_dir, corpus_label) = match flag(&args, "--skills") {
+        Some(d) => (PathBuf::from(d), "live".to_string()),
+        None if pinned.is_dir() => (pinned, "pinned corpus/v1".to_string()),
+        // Before the fixture existed, or if it is deleted: fall back rather
+        // than refuse, and say so in the datapoint.
+        None => (root.join("skills"), "live (no pinned fixture)".to_string()),
+    };
     let gold_dir = flag(&args, "--gold")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gold"));
@@ -128,12 +344,7 @@ fn run() -> Result<()> {
         verbose,
     )?);
     #[cfg(not(feature = "toolret"))]
-    let toolret = {
-        notes.push(
-            "ToolRet skipped: no tool-group table could be lifted from this revision".into(),
-        );
-        None
-    };
+    notes.push("ToolRet skipped: no tool-group table could be lifted from this revision".into());
 
     let (commit, commit_date, subject) = git_facts(&root);
 
@@ -149,7 +360,9 @@ fn run() -> Result<()> {
         backfilled: std::env::var("RETRIEVAL_BENCH_BACKFILL")
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false),
+        corpus: corpus_label,
         skillret,
+        #[cfg(feature = "toolret")]
         toolret,
         notes,
     };
@@ -175,8 +388,8 @@ fn report(p: &Datapoint, verbose: bool) {
     }
     println!();
     println!(
-        "SkillRet   mode={}  corpus={}  limit={}  cases={}",
-        s.mode, s.corpus_size, s.limit, s.cases
+        "SkillRet   mode={}  corpus={} [{}]  limit={}  cases={}",
+        s.mode, s.corpus_size, p.corpus, s.limit, s.cases
     );
     println!("  nDCG@{:<3}      {:.3}", s.limit, s.ndcg_at_k);
     println!("  recall@{:<3}    {:.3}", s.limit, s.recall_at_k);
@@ -190,6 +403,7 @@ fn report(p: &Datapoint, verbose: bool) {
         );
     }
 
+    #[cfg(feature = "toolret")]
     if let Some(t) = &p.toolret {
         println!();
         println!(
@@ -231,6 +445,7 @@ fn report(p: &Datapoint, verbose: bool) {
         }
     }
 
+    #[cfg(feature = "toolret")]
     if let Some(t) = &p.toolret {
         if let Some(cases) = &t.per_case {
             println!("\n--- ToolRet, worst first ---");

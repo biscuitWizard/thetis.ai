@@ -192,7 +192,8 @@
     },
     {
       "query": "The freight orders are partitioned by day and the totals look wrong for last Tuesday.",
-      "skills": ["torchship/world-simulation/cargo-economy", "torchship"],
+      "comment": "An in-world domain query. 'partitioned' is a bigquery tag and must not fire on it. Retrieved skills are deliberately empty: this case tests the query text alone, so it stays measurable on any checkout.",
+      "skills": [],
       "want": [],
       "unwanted": ["bigquery", "notion", "ssh", "browser"]
     },
