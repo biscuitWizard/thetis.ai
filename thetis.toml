@@ -35,6 +35,13 @@ tool_prefix = ""
 [llm]
 base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-opus-5"
+# How long to wait on a silent server. For a streaming completion — which is
+# what a turn uses — this is a *read* timeout: it resets every time bytes
+# arrive, so a slow local model may generate for as long as it likes provided
+# it keeps trickling, and only a genuine stall trips it. For a non-streaming
+# call it is the total deadline for the whole request. It is deliberately not a
+# cap on total generation time: as one, it severed long answers mid-body and
+# surfaced as "transport error: error decoding response body".
 request_timeout_secs = 180
 max_retries = 3
 # Your OpenRouter key. OPENROUTER_API_KEY overrides this when set, so you can
