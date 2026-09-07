@@ -45,6 +45,7 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/views/branch.js", mime: JS, body: include_str!("ui/views/branch.js") },
     Asset { path: "/views/workspace.js", mime: JS, body: include_str!("ui/views/workspace.js") },
     Asset { path: "/views/rail.js", mime: JS, body: include_str!("ui/views/rail.js") },
+    Asset { path: "/views/todo.js", mime: JS, body: include_str!("ui/views/todo.js") },
     // The centre stage's tab strip: the conversation first and always, then a
     // tab per sub-agent and per open file. Owns which pane is showing, the
     // conversation's title and rename, and the file editors.

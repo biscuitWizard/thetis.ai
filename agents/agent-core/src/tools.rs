@@ -15,6 +15,7 @@ use crate::thetis::grip::{
 };
 use crate::groups;
 use crate::plan;
+use crate::todos;
 use serde_json::{json, Value};
 
 /// The mode assumed when a session has not chosen one.
@@ -667,6 +668,9 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     // and ticked off — so gating these on the mode would mean the executing
     // session could not record that a step was done.
     tools.extend(plan_tools());
+    // A todo list is the same kind of conversation-local artefact as a plan,
+    // and must remain readable and writable in every mode.
+    tools.extend(todo_tools());
 
     if sandbox_available() {
         tools.extend(sandbox_tools());
@@ -776,6 +780,64 @@ fn plan_tools() -> Vec<ToolDef> {
             description:
                 "Read this conversation's plan back, with its revision number. Do this before \
                  editing: another turn may have revised it, and `plan_edit` matches exact text.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
+        },
+    ]
+}
+
+/// A concise, durable progress list for this conversation.
+///
+/// These tools are deliberately not mutating: like the plan document, they
+/// change only conversation state and must remain available in read-only modes.
+fn todo_tools() -> Vec<ToolDef> {
+    let item = json!({
+        "type": "object",
+        "properties": {
+            "content": string_prop("Short imperative description of the work."),
+            "active_form": string_prop("Present-continuous label shown while in progress, e.g. 'Testing login'."),
+            "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
+        },
+        "required": ["content"],
+        "additionalProperties": false,
+    });
+    vec![
+        ToolDef {
+            name: "todo_write",
+            description: "Write this conversation's todo list, replacing whatever is there. Use it once when work has three or more distinct steps or the user gives you a list. Prefer todo_update afterwards: restating the whole list to change one status is how a row quietly disappears.",
+            mutating: false,
+            parameters: obj(json!({ "todos": { "type": "array", "items": item.clone(), "description": "The complete replacement list." } }), &["todos"]),
+        },
+        ToolDef {
+            name: "todo_add",
+            description: "Add items without restating the list. Use this when work turns out to be larger than expected or a blocker becomes concrete.",
+            mutating: false,
+            parameters: obj(json!({ "todos": { "type": "array", "items": item, "description": "Items to append." } }), &["todos"]),
+        },
+        ToolDef {
+            name: "todo_update",
+            description: "Change items in place. Mark exactly one item in_progress before starting it and completed when it is actually done. Use cancelled for work deliberately abandoned and say why in your reply.",
+            mutating: false,
+            parameters: obj(json!({
+                "updates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": string_prop("Stable todo id, e.g. t3. Give this or index, not both."),
+                            "index": { "type": "integer", "description": "One-based item position. Give this or id, not both." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
+                            "content": string_prop("Replacement description."),
+                            "active_form": string_prop("Replacement present-continuous label."),
+                        },
+                        "additionalProperties": false,
+                    },
+                }
+            }), &["updates"]),
+        },
+        ToolDef {
+            name: "todo_read",
+            description: "Read the authoritative todo list. Use this after a long stretch of tool work or context compaction if you have lost track of it.",
             mutating: false,
             parameters: obj(json!({}), &[]),
         },
@@ -1650,6 +1712,24 @@ pub fn invoke(
             } else {
                 Ok(plan::describe(&p))
             }
+        }
+
+        "todo_write" => {
+            let values = args.get("todos").and_then(Value::as_array).ok_or_else(|| "todos must be an array".to_string())?;
+            todos::write(session_id, values).map(|list| todos::render(&list))
+        }
+        "todo_add" => {
+            let values = args.get("todos").and_then(Value::as_array).ok_or_else(|| "todos must be an array".to_string())?;
+            todos::add(session_id, values).map(|list| todos::render(&list))
+        }
+        "todo_update" => {
+            let values = args.get("updates").and_then(Value::as_array).ok_or_else(|| "updates must be an array".to_string())?;
+            todos::update(session_id, values).map(|update| format!("updated {} item(s).\n{}", update.changed, todos::render(&update.list)))
+        }
+        "todo_read" => {
+            let list = todos::load(session_id);
+            if list.items.is_empty() { Ok("no todo list yet. Write one with todo_write.".to_string()) }
+            else { Ok(todos::render(&list)) }
         }
 
         // `wait` is not in this arm: it is a core tool, reachable by a

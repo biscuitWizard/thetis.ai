@@ -23,6 +23,7 @@ import { mountSessions } from "./views/sessions.js";
 import * as workspace from "./views/workspace.js";
 import * as panel from "./views/panel.js";
 import * as rail from "./views/rail.js";
+import * as todoView from "./views/todo.js";
 import * as stage from "./views/stage.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
@@ -205,6 +206,7 @@ connection
       branchLog: [],
       baseRevision: "",
       branchView: "graph",
+      todos: null,
       hasMessages: events.some((e) => e.kind === "user"),
     });
     setHeader();
@@ -232,6 +234,7 @@ connection
     // only when a tab is showing, because the plan's tab existing *is* how the
     // user finds out there is one.
     connection.send({ type: "plan", id: frame.session });
+    connection.send({ type: "todo", id: frame.session });
   })
 
   .on("settings", (frame) => {
@@ -244,6 +247,10 @@ connection
   // this frame — so a conversation with a plan shows it on reload, and one
   // without never carries the previous conversation's tab over.
   .on("plan", stage.onPlan)
+  .on("todo", (frame) => {
+    if (frame.session !== store.current) return;
+    todoView.onFrame(frame);
+  })
 
   .on("opened", (frame) => store.set({ current: frame.session }))
 
@@ -289,6 +296,9 @@ connection
     // watching it.
     if (frame.kind === "tool-result" && PLAN_TOOLS.includes(frame.name)) {
       connection.send({ type: "plan", id: store.current });
+    }
+    if (frame.kind === "tool-result" && TODO_TOOLS.includes(frame.name)) {
+      connection.send({ type: "todo", id: store.current });
     }
     transcript.applyEvent(frame);
     invalidate(frame.kind);
@@ -432,7 +442,7 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan)/.test(frame.message || "")) return;
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar|plan|todo)/.test(frame.message || "")) return;
     // A refusal from Execute belongs on the plan tab, beside the button that
     // caused it, rather than in a toast that outlives the view it refers to.
     if (frame.replying_to === "plan-execute" && stage.onPlanError(frame.message || "That was refused.")) {
@@ -578,11 +588,13 @@ const INVALIDATED_BY = {
   context: ["assistant", "turn-finished"],
   tools: ["modification", "turn-finished"],
   skills: ["modification", "turn-finished"],
+  todo: ["tool-result", "turn-finished"],
 };
 
 /** Tools whose result means the plan document has changed. Kept in step with
  *  the `plan_*` family in `agents/agent-core/src/tools.rs`. */
 const PLAN_TOOLS = ["plan_write", "plan_edit", "plan_append"];
+const TODO_TOOLS = ["todo_write", "todo_add", "todo_update"];
 
 /** Event kinds after which the composer's @-mention index cannot be trusted. */
 const MENTION_STALED_BY = ["tool-result", "modification", "turn-finished"];
@@ -615,6 +627,9 @@ function invalidate(kind) {
         break;
       case "skills":
         if (store.current) connection.send({ type: "skills", id: store.current });
+        break;
+      case "todo":
+        if (store.current) connection.send({ type: "todo", id: store.current });
         break;
     }
   }, INVALIDATE_COALESCE_MS);
@@ -1193,6 +1208,7 @@ const branchGraph = mountBranch({
 
 rail.mountRail([
   { id: "branch", label: "Branch", hint: "Branch — this conversation's sandbox: graph, merge, history", icon: rail.ICONS.branch, activate: showBranchTab },
+  { id: "todo", label: "Todo", hint: "Todo — what this conversation is working through", icon: rail.ICONS.todo, activate: todoView.openTab },
   { id: "workspace", label: "Files", hint: "Files — the shared workspace every agent reads and writes", icon: rail.ICONS.files, wide: true, activate: () => workspaceView.open() },
   { id: "context", label: "Context", hint: "Context — the exact request the model receives", icon: rail.ICONS.context, wide: true, activate: () => context.openTab() },
   { id: "skills", label: "Skills", hint: "Skills — what reached this conversation's prompt, and why", icon: rail.ICONS.skills, activate: openSkills },
@@ -1207,6 +1223,10 @@ function refreshOpenTab() {
   switch (rail.activeTab()) {
     case "branch":
       showBranchTab();
+      break;
+    case "todo":
+      todoView.openTab();
+      if (store.current) connection.send({ type: "todo", id: store.current });
       break;
     case "context":
       context.openTab();
@@ -1236,6 +1256,14 @@ function setHeader() {
       el("span", { class: "picker-dot" }),
       el("span", { class: "picker-label" }, store.modelLabel())
     );
+  }
+
+  const todo = $("chip-todo");
+  const list = store.todos;
+  todo.hidden = !list?.has_todos;
+  if (list?.has_todos) {
+    todo.textContent = `todo ${list.done}/${list.total}`;
+    todo.classList.toggle("is-done", list.total > 0 && list.done === list.total);
   }
 
   const branch = $("chip-branch");
@@ -1271,11 +1299,13 @@ store.watch("branch", setHeader);
 store.watch("current", setHeader);
 store.watch("spendSession", setHeader);
 store.watch("liveTurn", setHeader);
+store.watch("todos", setHeader);
 store.watch("turnStats", () => context.onUsageChanged());
 store.watch("liveTurn", () => context.onUsageChanged());
 
 $("chip-model").addEventListener("click", openModels);
 $("chip-branch").addEventListener("click", showBranchTab);
+$("chip-todo").addEventListener("click", todoView.openTab);
 $("chip-spend").addEventListener("click", () => context.openTab("usage"));
 
 // Renaming moved onto the conversation's own tab: click the active chat tab a

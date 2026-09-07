@@ -34,6 +34,8 @@ export const store = {
   creating: false,
   skills: [],
   tools: [],
+  /** Authoritative todo frame for the current conversation. */
+  todos: null,
 
   /* Sub-agents of the conversation on screen, in spawn order.
    *

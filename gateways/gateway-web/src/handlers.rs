@@ -134,6 +134,10 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
             Some(session) => execute_plan(session, frame),
             None => vec![error("plan-execute requires an id")],
         },
+        "todo" => match id {
+            Some(session) => vec![todos(session)],
+            None => vec![error("todo requires an id")],
+        },
 
         "model-save" => save_model(frame, id),
         "model-remove" => remove_model(frame, id),
@@ -931,6 +935,30 @@ fn plan(session_id: &str) -> GatewayAction {
         "modes": executable_modes(),
         "models": model_options(),
         "has_plan": !body.trim().is_empty(),
+    }))
+}
+
+// --- the todo list -----------------------------------------------------------
+// Mirrored from agents/agent-core/src/todos.rs: separate components cannot
+// share a constant, so grep for this literal when changing the storage format.
+const TODO_KEY: &str = "__todos";
+
+fn todos(session_id: &str) -> GatewayAction {
+    let stored = sys::kv_get(session_id, TODO_KEY)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let items = stored.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+    let done = items.iter().filter(|item| item.get("status").and_then(Value::as_str) == Some("completed")).count();
+    let total = items.len();
+    reply(json!({
+        "type": "todo",
+        "session": session_id,
+        "items": items,
+        "revision": stored.get("revision").and_then(Value::as_u64).unwrap_or(0),
+        "updated_ms": stored.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
+        "done": done,
+        "total": total,
+        "has_todos": total > 0,
     }))
 }
 
