@@ -194,7 +194,7 @@ fn verify(db_path: &Path, cache_root: &Path) -> Result<(usize, usize)> {
 ///
 /// Only sensible immediately after the branches themselves have been rebased
 /// onto that commit.
-fn repoint_branches(db_path: &Path, base: &str, apply: bool) -> Result<usize> {
+fn repoint_branches(db_path: &Path, base: &str, root: &Path, apply: bool) -> Result<usize> {
     if !db_path.is_file() {
         return Ok(0);
     }
@@ -214,13 +214,31 @@ fn repoint_branches(db_path: &Path, base: &str, apply: bool) -> Result<usize> {
             let Some(object) = parsed.as_object_mut() else {
                 continue;
             };
+            // The checkout path is absolute and stored, so moving the tree
+            // leaves it naming a directory that is gone. The worker then finds
+            // no checkout there and tries to create one — which fails, because
+            // the branch is already checked out at the *new* path, and the
+            // conversation cannot be opened at all.
+            let wanted_worktree = object
+                .get("worktree")
+                .and_then(Value::as_str)
+                .and_then(|w| w.rsplit('/').next())
+                .map(|name| root.join("worktrees").join(name))
+                .map(|p| p.to_string_lossy().into_owned());
+            let stale_worktree = match (&wanted_worktree, object.get("worktree").and_then(Value::as_str)) {
+                (Some(wanted), Some(current)) => wanted != current,
+                _ => false,
+            };
             let stale_base = object.get("base_commit").and_then(Value::as_str) != Some(base);
             let has_kernel = object
                 .get("kernel_commit")
                 .and_then(Value::as_str)
                 .is_some_and(|k| !k.is_empty());
-            if !stale_base && !has_kernel {
+            if !stale_base && !has_kernel && !stale_worktree {
                 continue;
+            }
+            if let Some(wanted) = wanted_worktree {
+                object.insert("worktree".into(), Value::String(wanted));
             }
             object.insert("base_commit".into(), Value::String(base.to_string()));
             object.insert("kernel_commit".into(), Value::String(String::new()));
@@ -286,7 +304,18 @@ fn main() -> Result<()> {
     let cache = migrate_build_cache(&artifacts.join("cache"), apply)?;
 
     if let Some(base) = &repoint {
-        let n = repoint_branches(&db_path, base, apply)?;
+        // Canonicalised, because the checkout path written into each row is
+        // used verbatim as a worker's root. Deriving it from a relative
+        // argument silently stores a relative path, and the worker then
+        // resolves it against its own working directory — which is the
+        // worktree itself, so every lookup lands somewhere that does not
+        // exist and the conversation cannot start.
+        let root = std::fs::canonicalize(data)
+            .with_context(|| format!("resolving {}", data.display()))?
+            .parent()
+            .map(Path::to_path_buf)
+            .context("the data directory has no parent")?;
+        let n = repoint_branches(&db_path, base, &root, apply)?;
         let verb = if apply { "re-pointed" } else { "would re-point" };
         println!("{verb} {n} conversation branches at {base}");
     }
