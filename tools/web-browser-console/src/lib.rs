@@ -30,6 +30,10 @@ impl Guest for Component {
                         "type": "string",
                         "enum": ["debug", "log", "info", "warning", "error", "pageerror"],
                         "description": "Only messages at this level or more severe. 'error' is the usual choice."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many messages to return, most recent last. Defaults to 100 of the 500 kept; each message is itself cut at 2000 chars."
                     }
                 },
                 "additionalProperties": false

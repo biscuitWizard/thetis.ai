@@ -903,8 +903,8 @@ impl Grip {
         .await;
 
         match result {
-            Ok(Ok(output)) => Ok(self.truncate(output)),
-            Ok(Err(message)) => Err(self.truncate(message)),
+            Ok(Ok(output)) => Ok(self.cap_output(name, output)),
+            Ok(Err(message)) => Err(self.cap_output(name, message)),
             Err(trap) => {
                 // A trapping tool is a faulty revision; let the breaker see it.
                 let detail = format!("{trap:#}");
@@ -920,21 +920,17 @@ impl Grip {
     }
 
     /// Caps anything headed for the model's context window.
+    ///
+    /// Oversized text is spilled to a file in the workspace rather than clipped,
+    /// so the model is handed a way to read the rest instead of a dead end. See
+    /// `crate::spill` for why the tail is kept as well as the head.
     pub fn truncate(&self, text: String) -> String {
-        let limit = self.cfg.max_tool_output_bytes;
-        if text.len() <= limit {
-            return text;
-        }
-        let mut cut = limit;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!(
-            "{}\n\n[truncated: {} of {} bytes shown]",
-            &text[..cut],
-            cut,
-            text.len()
-        )
+        self.cap_output("tool-output", text)
+    }
+
+    /// As `truncate`, but names the source so a spilled file is identifiable.
+    pub fn cap_output(&self, label: &str, text: String) -> String {
+        crate::spill::cap(&self.cfg, label, text).text
     }
 
     // --- watcher suppression ------------------------------------------------

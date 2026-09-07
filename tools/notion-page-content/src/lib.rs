@@ -221,7 +221,7 @@ impl Guest for Component {
 
         let mut out = format!("Page {page_id}: {summary}.\n");
         out.push_str("\n--- page content now (markdown) ---\n");
-        out.push_str(&notion::markdown_body(&response));
+        out.push_str(&notion::markdown_body_preview(&response));
         out.push('\n');
         Ok(out)
     }

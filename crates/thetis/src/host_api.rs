@@ -167,6 +167,32 @@ fn stopped_message(what: &str) -> String {
     format!("{what} was interrupted: you stopped this turn")
 }
 
+/// Drops the cached skill tree when a filesystem write landed inside it.
+///
+/// `skill_write` invalidates the cache itself, but the file tools are a second
+/// way to the same files and a skill is an ordinary Markdown file — editing one
+/// with `edit_path` is both legal and, for a nested skill under a parent, often
+/// easier. Without this, such an edit is invisible to `skill_fetch` and
+/// `skill_lint` until the next restart, which reads as the linter being wrong
+/// about a file you just fixed.
+fn invalidate_skills_if_inside(grip: &crate::grip::Grip, path: &str) {
+    if is_inside_skills(&grip.cfg, path) {
+        grip.skills.invalidate();
+    }
+}
+
+/// Whether a guest-supplied path names something in the skills directory.
+///
+/// Split out from the invalidation so it can be tested without building a
+/// `Grip`. Both sides are canonicalised, so a relative or symlinked spelling of
+/// the same file still matches.
+fn is_inside_skills(cfg: &crate::config::Config, path: &str) -> bool {
+    let Ok(written) = crate::hostfs::resolve(cfg, path) else {
+        return false;
+    };
+    crate::hostfs::canonical(&written).starts_with(crate::hostfs::canonical(&cfg.paths.skills))
+}
+
 // --- sys -------------------------------------------------------------------
 
 impl sys::Host for HostState {
@@ -1703,10 +1729,12 @@ impl hostfs::Host for HostState {
         self.budget.entered_host("write_file");
         self.require(crate::policy::Cap::FilesystemWrite)?;
         let grip = self.grip.clone();
-        Ok(
-            crate::offload::blocking(|| crate::hostfs::write_file(&grip.cfg, &path, &contents))
-                .map_err(|e| format!("{e:#}")),
-        )
+        let result =
+            crate::offload::blocking(|| crate::hostfs::write_file(&grip.cfg, &path, &contents));
+        if result.is_ok() {
+            invalidate_skills_if_inside(&grip, &path);
+        }
+        Ok(result.map_err(|e| format!("{e:#}")))
     }
 
     async fn list_dir(
@@ -1735,6 +1763,9 @@ impl hostfs::Host for HostState {
         if let Ok(message) = &result {
             // Deletions are worth a line in the log whoever asked for them.
             tracing::warn!(%path, "agent deleted a path: {message}");
+            // A deleted skill has to leave the cached tree too. The path is
+            // gone by now, so this matches on the spelling rather than on disk.
+            invalidate_skills_if_inside(&grip, &path);
         }
         Ok(result.map_err(|e| format!("{e:#}")))
     }
@@ -1765,10 +1796,13 @@ impl hostfs::Host for HostState {
         self.budget.entered_host("edit_file");
         self.require(crate::policy::Cap::FilesystemWrite)?;
         let grip = self.grip.clone();
-        Ok(crate::offload::blocking(|| {
+        let result = crate::offload::blocking(|| {
             crate::hostfs::edit_file(&grip.cfg, &path, &old_text, &new_text, replace_all)
-        })
-        .map_err(|e| format!("{e:#}")))
+        });
+        if result.is_ok() {
+            invalidate_skills_if_inside(&grip, &path);
+        }
+        Ok(result.map_err(|e| format!("{e:#}")))
     }
 
     async fn search_files(
@@ -1932,7 +1966,22 @@ impl terminal::Host for HostState {
         // spinning, so the budget's spin timer restarts here.
         self.yielded();
         Ok(match result {
-            Ok(inner) => inner.map_err(|e| format!("{e:#}")),
+            // `signal`, `send` and `read` all cap what they hand back, but this
+            // is the call that returns a whole build log, and it was the one
+            // path that did not. `terminal::clip` has already kept the last
+            // 64 KiB — twice what a tool result is allowed — so without this a
+            // single noisy command still cost double the budget and spilled
+            // nothing. Capping the field rather than the record keeps
+            // `exit-code` and `timed-out` readable no matter how loud the
+            // command was.
+            Ok(inner) => inner
+                .map(|mut out| {
+                    let was = out.output.len();
+                    out.output = grip.cap_output("terminal-run", out.output);
+                    out.truncated = out.truncated || out.output.len() < was;
+                    out
+                })
+                .map_err(|e| format!("{e:#}")),
             Err(stopped) => Err(stopped),
         })
     }
@@ -2383,6 +2432,83 @@ impl skills_view::Host for HostState {
 
 #[cfg(test)]
 mod tests {
+    /// A skill edited through the file tools has to leave the cached tree.
+    ///
+    /// The bug: `skill_write` invalidates the cache, but `edit_path` is a second
+    /// route to the same Markdown files and did not, so `skill_lint` kept
+    /// reporting a fault against a file already fixed on disk — with no way to
+    /// clear it short of a restart.
+    #[test]
+    fn a_write_inside_the_skills_directory_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::hostfs::canonical(dir.path());
+        let skills = root.join("skills");
+        std::fs::create_dir_all(skills.join("parent")).unwrap();
+
+        let mut cfg = crate::config::Config::load().unwrap();
+        cfg.filesystem.roots = vec![root.clone()];
+        cfg.paths.skills = skills.clone();
+
+        let inside = [
+            skills.join("parent/SKILL.md").to_string_lossy().to_string(),
+            // Relative, resolved against the first root.
+            "skills/parent/SKILL.md".to_string(),
+            // A path that does not exist yet: creating a new skill.
+            skills.join("fresh/SKILL.md").to_string_lossy().to_string(),
+        ];
+        for path in inside {
+            assert!(
+                super::is_inside_skills(&cfg, &path),
+                "{path} is in the skills directory but was not recognised"
+            );
+        }
+
+        let outside = [
+            root.join("notes.md").to_string_lossy().to_string(),
+            // A sibling whose name merely starts the same way, which a plain
+            // string prefix check would wrongly accept.
+            root.join("skills-backup/SKILL.md")
+                .to_string_lossy()
+                .to_string(),
+        ];
+        for path in outside {
+            assert!(
+                !super::is_inside_skills(&cfg, &path),
+                "{path} is outside the skills directory but was recognised"
+            );
+        }
+    }
+
+    /// Every filesystem host function that can change a file must invalidate the
+    /// skill cache, because any of them can be pointed at a skill.
+    ///
+    /// A source check for the same reason the `scope_ok` test below is one: the
+    /// bug is a write path added without the call.
+    #[test]
+    fn every_filesystem_write_path_invalidates_the_skill_cache() {
+        let src = include_str!("host_api.rs");
+        // Scoped to the hostfs impl: `write_file` is also a devkit and a
+        // gateway method, and those are confined to aspect source trees, which
+        // never contain skills.
+        let hostfs = src
+            .split("impl hostfs::Host for HostState {")
+            .nth(1)
+            .expect("the hostfs impl block moved");
+        for name in ["write_file", "edit_file", "delete_path"] {
+            let body = hostfs
+                .split(&format!("async fn {name}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} moved"))
+                .split("\n    async fn ")
+                .next()
+                .unwrap_or_default();
+            assert!(
+                body.contains("invalidate_skills_if_inside"),
+                "{name} can change a skill file but does not invalidate the skill cache"
+            );
+        }
+    }
+
     #[test]
     fn delegation_wait_propagates_a_web_stop_into_the_agent_budget() {
         // `wait` is the one tool path that intentionally bypasses

@@ -194,6 +194,26 @@ function trimSnapshot(text, budget = SNAPSHOT_BUDGET) {
   };
 }
 
+// Bounds a value that came back from page script or from a log.
+//
+// `evaluate` is the widest hole in the browser tools: the caller chooses what to
+// return, and `() => document.body.innerHTML` is megabytes. Cutting it here,
+// where the size is known, lets us say what to do about it instead of leaving
+// the host to clip the string blind. Console text gets the same treatment per
+// message, so one enormous log line cannot crowd out the other 499.
+const VALUE_BUDGET = Number(process.env.THETIS_PW_VALUE_CHARS || 8000);
+
+function trimValue(text, budget = VALUE_BUDGET, what = 'value') {
+  const s = String(text ?? '');
+  if (s.length <= budget) return { text: s };
+  return {
+    text: s.slice(0, budget),
+    note: `[the ${what} was ${s.length} chars and is cut to ${budget} here. `
+      + 'Return less from the page — a length, a slice, a mapped subset, or a '
+      + '`document.querySelectorAll` count — rather than the whole thing.]',
+  };
+}
+
 // A ref is only valid for the snapshot that produced it, and Playwright
 // reassigns them when the DOM changes. Accepting a selector too means a caller
 // who knows the page does not have to snapshot first.
@@ -363,7 +383,11 @@ const ops = {
     let rendered;
     try { rendered = JSON.stringify(result, null, 2); } catch { rendered = String(result); }
     if (rendered === undefined) rendered = 'undefined';
-    return pageState(page, s, { result: rendered });
+    const trimmed = trimValue(rendered, VALUE_BUDGET, 'returned value');
+    return pageState(page, s, {
+      result: trimmed.text,
+      ...(trimmed.note ? { resultNote: trimmed.note } : {}),
+    });
   },
 
   async screenshot(s, a) {
@@ -418,11 +442,20 @@ const ops = {
     const page = await activePage(s);
     const order = { debug: 0, log: 1, info: 1, warning: 2, warn: 2, error: 3, pageerror: 3 };
     const min = order[a.level || 'info'] ?? 1;
-    const items = s.consoles.filter((m) => (order[m.type] ?? 1) >= min);
+    const matching = s.consoles.filter((m) => (order[m.type] ?? 1) >= min);
+    // Newest last, but when there are more than fit, keep the most recent: a
+    // page's latest errors are what a caller is chasing. A stack trace in a
+    // single message can be thousands of chars, so bound each one too.
+    const cap = Number.isFinite(a.limit) ? Math.max(1, a.limit) : 100;
+    const items = matching.slice(-cap);
+    const dropped = matching.length - items.length;
     return pageState(page, s, {
       total: s.consoles.length,
       shown: items.length,
-      messages: items.map((m) => `[${m.type}] ${m.text}`),
+      ...(dropped > 0
+        ? { note: `${dropped} older matching message(s) not shown; raise \`limit\` or filter by \`level\`.` }
+        : {}),
+      messages: items.map((m) => `[${m.type}] ${trimValue(m.text, 2000, 'message').text}`),
     });
   },
 
@@ -483,7 +516,15 @@ const ops = {
       if (action === 'list' || action === 'get') {
         const all = await s.ctx.cookies();
         const items = a.name ? all.filter((c) => c.name === a.name) : all;
-        return pageState(page, s, { cookies: items });
+        // A session cookie is often a JWT of a few kB, and a site can set
+        // dozens. The name, domain and expiry are what a caller is reading the
+        // jar for; the full secret is rarely it, and never worth the context.
+        const shown = items.map((c) => (
+          typeof c.value === 'string' && c.value.length > 200
+            ? { ...c, value: `${c.value.slice(0, 200)}… [${c.value.length} chars]` }
+            : c
+        ));
+        return pageState(page, s, { cookies: shown });
       }
       if (action === 'set') {
         if (!a.name) throw new Error('setting a cookie needs a `name`');
@@ -513,16 +554,29 @@ const ops = {
       const store = kind;
       const run = (fn, arg) => page.evaluate(fn, { store, arg });
       if (action === 'list') {
+        // Apps keep serialised state here — a Redux tree, a cache — so listing
+        // raw values can be megabytes. Values are summarised by length and the
+        // caller fetches the one it wants with `get`, which is the retrieval
+        // path rather than a dead end.
         const items = await run(({ store: st }) => {
           const s2 = window[st]; const o = {};
-          for (let i = 0; i < s2.length; i++) { const k = s2.key(i); o[k] = s2.getItem(k); }
+          for (let i = 0; i < s2.length; i++) {
+            const k = s2.key(i);
+            const v = s2.getItem(k) ?? '';
+            o[k] = v.length > 300 ? `${v.slice(0, 300)}… [${v.length} chars; use action 'get' with this key]` : v;
+          }
           return o;
         });
         return pageState(page, s, { [store]: items });
       }
       if (action === 'get') {
         const v = await run(({ store: st, arg }) => window[st].getItem(arg), a.name);
-        return pageState(page, s, { key: a.name, value: v });
+        const trimmed = trimValue(v, VALUE_BUDGET, `${store} value`);
+        return pageState(page, s, {
+          key: a.name,
+          value: trimmed.text,
+          ...(trimmed.note ? { valueNote: trimmed.note } : {}),
+        });
       }
       if (action === 'set') {
         await page.evaluate(({ store: st, k, v }) => window[st].setItem(k, v),

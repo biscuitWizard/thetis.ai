@@ -47,6 +47,7 @@ pub mod skill_index;
 pub mod skill_lint;
 pub mod skill_manager;
 pub mod skills;
+pub mod spill;
 pub mod sshhosts;
 pub mod store;
 pub mod subagents;

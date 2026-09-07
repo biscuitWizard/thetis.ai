@@ -87,6 +87,8 @@ the change is wrong.
   sub-agents.
 - [working-alongside-others](skill:thetis-internals/working-alongside-others)
   — sharing a checkout or a workspace with other agents.
+- [multi-user](skill:thetis-internals/multi-user) — accounts, sessions and what
+  each user may see when more than one person uses this Thetis.
 
 Also useful, not skills:
 

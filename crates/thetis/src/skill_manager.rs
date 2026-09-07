@@ -145,8 +145,13 @@ impl SkillManager {
         fresh
     }
 
-    /// Drops the cached tree. Called after any write, and by the watcher when
-    /// the skills directory changes underneath us.
+    /// Drops the cached tree.
+    ///
+    /// Called after any write through this manager, and by the filesystem host
+    /// functions when a write, edit or deletion lands inside the skills
+    /// directory. Note that nothing watches that directory: a change made by a
+    /// human with an editor, or by another process, is not noticed until
+    /// something calls this or the worker restarts.
     pub fn invalidate(&self) {
         if let Ok(mut g) = self.tree.write() {
             *g = None;
