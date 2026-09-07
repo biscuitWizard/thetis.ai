@@ -223,6 +223,105 @@ exit 0
     Ok(())
 }
 
+/// Publishes the exported `public` branch as `main` on the remote.
+///
+/// The remote's `main` *is* the published version, so that is where the
+/// filtered history goes. It is not a fast-forward of anything local — the
+/// filtered chain is derived, and rewriting trunk's history rewrites it too —
+/// so publishing necessarily replaces what is there. The lease is what keeps
+/// that honest: it refuses if the remote has moved since we last saw it, so
+/// this can overwrite our own previous publish and never somebody else's.
+pub async fn push_public(git: &GitCtl) -> Result<()> {
+    // The lease is measured against `refs/remotes/<remote>/<branch>`, not
+    // against the remote itself, so it is only as trustworthy as our last
+    // successful fetch. A fetch that fails leaves that ref pointing at
+    // whatever it happened to hold, and the push is then refused for "stale
+    // info" — a message about the lease, blaming the wrong thing entirely.
+    // This used to be fire-and-forget, which meant the real error (git could
+    // not write the tracking ref) was discarded and only its consequence was
+    // ever shown.
+    let fetch = git
+        .run_hooked_status(&["fetch", "origin", REMOTE_BRANCH], &[])
+        .await?;
+    if !fetch.status.success() {
+        let err = String::from_utf8_lossy(&fetch.stderr);
+        let err = err.trim();
+        // A remote nobody has published to yet has no such branch. There is
+        // then nothing to lease against, and the push below is a create
+        // rather than a replace, which git allows under a lease.
+        if !missing_remote_branch(err) {
+            anyhow::bail!("{}", fetch_failure(err));
+        }
+    }
+
+    let refspec = format!("public:{REMOTE_BRANCH}");
+    let lease = format!("--force-with-lease={REMOTE_BRANCH}");
+    let push = git
+        .run_hooked_status(&["push", &lease, "origin", &refspec], &[])
+        .await?;
+    if !push.status.success() {
+        let err = String::from_utf8_lossy(&push.stderr);
+        anyhow::bail!("{}", push_failure(err.trim()));
+    }
+    Ok(())
+}
+
+/// Whether a failed fetch means only that the remote has no such branch.
+fn missing_remote_branch(stderr: &str) -> bool {
+    stderr.contains("couldn't find remote ref")
+}
+
+/// Whether a failed git command was blocked by a leftover `.lock` file.
+///
+/// Git writes a lock beside a ref while updating it and renames it into place
+/// when done; a process killed in between leaves the lock behind, and every
+/// later update of that ref fails until somebody deletes it. Git's advice for
+/// this case leads with "Another git process seems to be running", which sends
+/// the reader looking for a process that exited hours ago.
+fn stale_lock(stderr: &str) -> bool {
+    stderr.contains("cannot lock ref") && stderr.contains("File exists")
+}
+
+fn fetch_failure(stderr: &str) -> String {
+    let mut msg = format!(
+        "could not refresh origin/{REMOTE_BRANCH} before publishing, so the check that keeps \
+         this from overwriting someone else's work has nothing current to measure against. \
+         Nothing was pushed. git said: {stderr}"
+    );
+    if stale_lock(stderr) {
+        msg.push_str(
+            "\n\nThat is a leftover lock file rather than a live git: a fetch was killed \
+             partway and never cleaned up after itself. Check that no git process is running \
+             in this repository, then delete the .lock file git named above and publish again.",
+        );
+    }
+    msg
+}
+
+fn push_failure(stderr: &str) -> String {
+    // Git's own wording for a refused lease is "(stale info)", which describes
+    // the mechanism and not the cause. Having just fetched successfully, the
+    // cause is no longer ambiguous: the remote moved between that fetch and
+    // this push.
+    if stderr.contains("stale info") {
+        return format!(
+            "publishing was refused: origin/{REMOTE_BRANCH} moved between the fetch a moment \
+             ago and the push, so something else published in the meantime. Nothing was \
+             pushed and those commits are intact. Check what is on the remote before \
+             publishing again — this push replaces {REMOTE_BRANCH} outright. git said: {stderr}"
+        );
+    }
+    if stale_lock(stderr) {
+        return format!(
+            "publishing failed on a leftover lock file, not on anything about the commits: a \
+             git process was killed partway and never cleaned up after itself. Check that no \
+             git process is running in this repository, then delete the .lock file git named \
+             below and publish again. git said: {stderr}"
+        );
+    }
+    format!("publishing failed and nothing was pushed. git said: {stderr}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +338,135 @@ mod tests {
         std::fs::write(tmp.path().join("open.txt"), "public\n").unwrap();
         git.add_all_and_commit("base").await.unwrap();
         (tmp, git)
+    }
+
+    /// A repo with an `origin` it can actually push to, and a second clone
+    /// standing in for whoever else publishes.
+    async fn repo_with_remote() -> (TempDir, GitCtl, GitCtl) {
+        let (tmp, git) = repo().await;
+        let remote = tmp.path().join("remote.git");
+        let bare = GitCtl::new(&remote);
+        std::fs::create_dir_all(&remote).unwrap();
+        bare.run_raw(&["init", "--bare", "-b", REMOTE_BRANCH])
+            .await
+            .unwrap();
+        git.run_raw(&["remote", "add", "origin", remote.to_str().unwrap()])
+            .await
+            .unwrap();
+        (tmp, git, bare)
+    }
+
+    /// Another clone publishes to the same remote, moving it out from under
+    /// us — the state both the lease and a stale tracking ref have to cope
+    /// with.
+    async fn somebody_else_publishes(tmp: &TempDir, bare: &GitCtl) {
+        let dir = tmp.path().join("other");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = GitCtl::new(&dir);
+        other
+            .run_raw(&["clone", bare.dir().to_str().unwrap(), "."])
+            .await
+            .unwrap();
+        other.run_raw(&["config", "user.name", "other"]).await.unwrap();
+        other
+            .run_raw(&["config", "user.email", "o@example.com"])
+            .await
+            .unwrap();
+        std::fs::write(dir.join("theirs.txt"), "theirs\n").unwrap();
+        other
+            .add_all_and_commit("someone else's publish")
+            .await
+            .unwrap();
+        other
+            .run_hooked(&["push", "origin", REMOTE_BRANCH], &[])
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_first_publish_succeeds_though_the_remote_has_no_branch_yet() {
+        // Nothing to lease against is not a conflict: the push creates the
+        // branch. The fetch fails here ("couldn't find remote ref"), and
+        // treating every failed fetch as fatal would block the first publish.
+        let (_tmp, git, bare) = repo_with_remote().await;
+        export_public(&git).await.unwrap();
+
+        push_public(&git).await.unwrap();
+        assert_eq!(
+            bare.log(REMOTE_BRANCH, 10).await.unwrap()[0].subject,
+            "base"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leftover_lock_file_is_named_as_such_and_nothing_is_pushed() {
+        // The regression this whole path exists for: a git killed mid-fetch
+        // leaves a `.lock` beside the tracking ref, every later fetch fails to
+        // update it, and the lease — measured against that stale ref — refuses
+        // the push with "stale info". The fetch error used to be discarded, so
+        // the operator saw only the lease complaint and went looking for a
+        // conflicting publish that had never happened.
+        let (tmp, git, bare) = repo_with_remote().await;
+        export_public(&git).await.unwrap();
+        push_public(&git).await.unwrap();
+
+        // The remote moves on, so the tracking ref genuinely needs updating —
+        // a lock only bites when there is a write for it to block.
+        somebody_else_publishes(&tmp, &bare).await;
+        std::fs::write(tmp.path().join("open.txt"), "more public\n").unwrap();
+        git.add_all_and_commit("second").await.unwrap();
+        export_public(&git).await.unwrap();
+        let lock = tmp
+            .path()
+            .join(format!(".git/refs/remotes/origin/{REMOTE_BRANCH}.lock"));
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, "").unwrap();
+
+        let err = push_public(&git).await.unwrap_err().to_string();
+        assert!(
+            err.contains("leftover lock file"),
+            "the lock must be named as the cause: {err}"
+        );
+        assert!(
+            err.contains("Nothing was pushed"),
+            "the operator must be told the remote is untouched: {err}"
+        );
+        assert!(
+            !err.contains("stale info"),
+            "the lease is not the cause and must not be blamed: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_that_moved_underneath_us_is_reported_as_someone_else_publishing() {
+        let (tmp, git, bare) = repo_with_remote().await;
+        export_public(&git).await.unwrap();
+        push_public(&git).await.unwrap();
+
+        // Somebody else publishes. Their commit must survive our attempt.
+        somebody_else_publishes(&tmp, &bare).await;
+
+        // Our tracking ref is now stale, and the lease is what catches it.
+        // Freeze it there: the fetch inside `push_public` would otherwise
+        // refresh it and the push would simply overwrite their work.
+        std::fs::write(tmp.path().join("open.txt"), "ours\n").unwrap();
+        git.add_all_and_commit("ours").await.unwrap();
+        export_public(&git).await.unwrap();
+        git.run_raw(&["config", "remote.origin.fetch", "+refs/heads/nothing:refs/remotes/origin/nothing"])
+            .await
+            .unwrap();
+
+        let err = push_public(&git).await.unwrap_err().to_string();
+        assert!(
+            err.contains("published in the meantime"),
+            "a real conflict must read as one: {err}"
+        );
+        let remote_log = bare.log(REMOTE_BRANCH, 10).await.unwrap();
+        assert_eq!(
+            remote_log[0].subject, "someone else's publish",
+            "their publish must be intact: {remote_log:?}"
+        );
     }
 
     #[tokio::test]
