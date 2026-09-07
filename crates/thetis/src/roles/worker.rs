@@ -276,11 +276,29 @@ pub async fn run(
     let runtime = Runtime::new(cfg.clone())?;
     let grip = Grip::worker(cfg.clone(), runtime, peer.clone())?;
 
+    // Before a single aspect is built: does this checkout's WIT agree with the
+    // kernel that has to load what it produces? A branch that has not merged a
+    // trunk WIT change builds guests wasmtime will refuse, and no later gate
+    // can recover from it — the smoke test rejects the artifact and the green
+    // fallback searches the same stale branch. Settling it here, by merging
+    // trunk, is what keeps that from becoming an unloadable worker.
+    let contract = pipeline::reconcile_wit_contract(&grip).await;
+    contract.report();
+
     // Bring every aspect up. An aspect that will not start leaves the rest
     // running; the gateway's /admin stays available for a manual rollback.
     for aspect in pipeline::discover_aspects(&grip.cfg) {
         if let Err(e) = bring_up(&grip, &aspect).await {
-            tracing::error!(%aspect, error = %e, "aspect failed to start");
+            match contract.is_sound() {
+                true => tracing::error!(%aspect, error = %e, "aspect failed to start"),
+                // Not a fault in this aspect's source: nothing built in this
+                // checkout can load until the contract is settled.
+                false => tracing::error!(
+                    %aspect, error = %e,
+                    "aspect failed to start, and this checkout's WIT contract does not match \
+                     the kernel — that is the cause, not this aspect's source"
+                ),
+            }
         }
     }
 
