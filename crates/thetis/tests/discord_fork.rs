@@ -80,7 +80,7 @@ fn session_for(store: &Store, key: &str) -> String {
         }
     }
     let meta = store
-        .create_session(Some(format!("Discord {key}")), "chat", "discord:test")
+        .create_session(Some(format!("Discord {key}")), "chat", "discord:test", None)
         .unwrap();
     store.set_ceiling(&meta.id, &discord_ceiling()).unwrap();
     store
@@ -98,6 +98,7 @@ fn fork_session_for(store: &Store, key: &str, account: &str, ceiling: &Effective
             Some(format!("Fork for {account} (Discord)")),
             &ceiling.default_mode,
             account,
+            None,
         )
         .unwrap();
     store.set_ceiling(&meta.id, ceiling).unwrap();
@@ -382,7 +383,7 @@ fn a_conversation_that_lost_its_ceiling_is_repaired_before_it_is_reused() {
     let key = "discord:channel:c1";
 
     let legacy = store
-        .create_session(Some("Discord (old)".into()), "chat", "discord:test")
+        .create_session(Some("Discord (old)".into()), "chat", "discord:test", None)
         .unwrap();
     store
         .kv_put(SCOPE, &session_map_key(key), &legacy.id)
@@ -426,7 +427,12 @@ fn a_fork_that_lost_its_ceiling_is_refused_rather_than_rebuilt() {
     // reach it is corruption or a hand-edited row. That is precisely why the
     // reader must not assume it away.
     let unbounded = store
-        .create_session(Some("Fork for writer (Discord)".into()), "agent", "writer")
+        .create_session(
+            Some("Fork for writer (Discord)".into()),
+            "agent",
+            "writer",
+            None,
+        )
         .unwrap();
     store.kv_put(SCOPE, &fork_key(key), &unbounded.id).unwrap();
 

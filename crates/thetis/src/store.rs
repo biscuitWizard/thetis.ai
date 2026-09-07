@@ -124,6 +124,50 @@ const CEILINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("session_cei
 const PARTICIPANTS: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("session_participants");
 
+/// One surface's claim on the session store.
+///
+/// Thetis serves more than one surface over a single store — the chat UI, the
+/// campaign gateway at `/play`, whatever is mounted next — and every campaign
+/// is a session. Without this, one surface's sessions fill another's list with
+/// rows nobody started there.
+///
+/// So a session belongs to whichever surface created it, recorded on the
+/// record itself, and each surface lists its own. That is the same shape as
+/// the rest of the mounts design (one `gateway.toml`, one `Renderer`, one
+/// `gateway` tag per frame) rather than a rule about any particular gateway's
+/// name or the keys it happens to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceScope {
+    /// The gateway aspect's name: "web", "campaign", ...
+    pub name: String,
+    /// Whether sessions with no surface recorded belong to this one.
+    ///
+    /// Every session in an existing database predates the field, and they are
+    /// all chat conversations, so exactly one surface may claim them: the
+    /// primary gateway. Anything else and either the operator's real history
+    /// disappears from the chat sidebar, or it shows up in every surface at
+    /// once — and the first of those is the unacceptable one.
+    pub inherits_unrecorded: bool,
+}
+
+impl SurfaceScope {
+    /// The scope for a gateway aspect, given the configured primary gateway.
+    pub fn for_gateway(name: &str, primary: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            inherits_unrecorded: name == primary,
+        }
+    }
+
+    /// Whether a session recorded with `surface` belongs to this scope.
+    pub fn claims(&self, surface: Option<&str>) -> bool {
+        match surface {
+            Some(recorded) => recorded == self.name,
+            None => self.inherits_unrecorded,
+        }
+    }
+}
+
 /// The title a conversation starts with, and the only one auto-titling will
 /// overwrite.
 pub const DEFAULT_TITLE: &str = "New chat";
@@ -273,11 +317,16 @@ impl Store {
 
     // --- sessions ----------------------------------------------------------
 
+    /// `surface` is the gateway aspect whose guest asked for this session, and
+    /// it is what [`Self::list_sessions_owned`] later filters on. `None` for a
+    /// session nobody's surface asked for — a sub-agent, a local probe — which
+    /// reads back the same as a row written before the field existed.
     pub fn create_session(
         &self,
         title: Option<String>,
         mode: &str,
         owner: &str,
+        surface: Option<&str>,
     ) -> Result<SessionMeta> {
         let now = now_ms();
         let meta = SessionMeta {
@@ -290,6 +339,7 @@ impl Store {
             preview: String::new(),
             mode: mode.to_string(),
             model: String::new(),
+            surface: surface.map(str::to_string),
         };
         let txn = self.db.begin_write()?;
         {
@@ -500,9 +550,15 @@ impl Store {
     ///
     /// `None` means every conversation, for a principal with
     /// `see_all_sessions`.
+    ///
+    /// `surface` narrows the listing on a second, independent axis: which
+    /// *surface* the conversations belong to. `None` means every surface,
+    /// which is what a caller that is not a surface at all (an agent turn, a
+    /// local probe) gets, and what `/admin` wants.
     pub fn list_sessions_owned(
         &self,
         owner: Option<&str>,
+        surface: Option<&SurfaceScope>,
         include_archived: bool,
     ) -> Result<Vec<SessionMeta>> {
         let tx = self.db.begin_read()?;
@@ -523,6 +579,11 @@ impl Store {
                 }
             }
             let meta: SessionMeta = serde_json::from_slice(v.value())?;
+            if let Some(scope) = surface {
+                if !scope.claims(meta.surface.as_deref()) {
+                    continue;
+                }
+            }
             if include_archived || !meta.archived {
                 out.push(meta);
             }
@@ -1478,7 +1539,7 @@ mod tests {
     #[test]
     fn an_event_row_in_the_old_shape_still_reads_back() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent", "local").unwrap();
+        let s = store.create_session(None, "agent", "local", None).unwrap();
 
         // Exactly what a pre-authorship user message looks like on disk. The
         // variant is spelled the way serde derives it from the Rust enum, not
@@ -1528,7 +1589,7 @@ mod tests {
     #[test]
     fn an_author_survives_a_round_trip_through_the_store() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent", "local").unwrap();
+        let s = store.create_session(None, "agent", "local", None).unwrap();
         store
             .append_event(
                 &s.id,
@@ -1561,7 +1622,7 @@ mod tests {
     #[test]
     fn a_fresh_database_answers_reads_before_anything_is_written() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, "agent", "local").unwrap();
+        let s = store.create_session(None, "agent", "local", None).unwrap();
 
         assert!(store.ceiling_of(&s.id).unwrap().is_none());
         assert!(store.participants(&s.id).unwrap().is_empty());
@@ -1577,8 +1638,8 @@ mod tests {
     #[test]
     fn switching_to_users_adopts_the_conversations_local_mode_claimed() {
         let (store, _d) = temp_store();
-        let a = store.create_session(None, "agent", "").unwrap();
-        let b = store.create_session(None, "agent", "").unwrap();
+        let a = store.create_session(None, "agent", "", None).unwrap();
+        let b = store.create_session(None, "agent", "", None).unwrap();
 
         // A local-mode boot: everything unowned becomes `local`.
         let first = store.sessions_needing_an_owner(None).unwrap();
@@ -1599,7 +1660,9 @@ mod tests {
             store.set_owner(id, "alice").unwrap();
         }
 
-        let hers = store.list_sessions_owned(Some("alice"), false).unwrap();
+        let hers = store
+            .list_sessions_owned(Some("alice"), None, false)
+            .unwrap();
         assert_eq!(hers.len(), 2, "she can see what she had");
         assert_eq!(store.owner_of(&a.id).unwrap().as_deref(), Some("alice"));
         assert_eq!(store.owner_of(&b.id).unwrap().as_deref(), Some("alice"));
@@ -1610,8 +1673,8 @@ mod tests {
     #[test]
     fn a_conversation_owned_by_a_real_user_is_never_reclaimed() {
         let (store, _d) = temp_store();
-        store.create_session(None, "agent", "bob").unwrap();
-        store.create_session(None, "agent", "").unwrap();
+        store.create_session(None, "agent", "bob", None).unwrap();
+        store.create_session(None, "agent", "", None).unwrap();
 
         let claimable = store
             .sessions_needing_an_owner(Some(crate::auth::LOCAL_OWNER))
@@ -1626,8 +1689,8 @@ mod tests {
     #[test]
     fn sub_agents_are_not_claimed_in_their_own_right() {
         let (store, _d) = temp_store();
-        let parent = store.create_session(None, "agent", "").unwrap();
-        let child = store.create_session(None, "agent", "").unwrap();
+        let parent = store.create_session(None, "agent", "", None).unwrap();
+        let child = store.create_session(None, "agent", "", None).unwrap();
         let subs = crate::subagents::Subagents::new(&store);
         subs.register(&parent.id, &child.id, "c", "t", "", "", "agent", 8)
             .unwrap();
@@ -1643,20 +1706,20 @@ mod tests {
     fn a_conversation_you_were_invited_into_is_listed_for_you() {
         let (store, _d) = temp_store();
         let hers = store
-            .create_session(Some("Alice's".into()), "agent", "alice")
+            .create_session(Some("Alice's".into()), "agent", "alice", None)
             .unwrap();
         let his = store
-            .create_session(Some("Bob's".into()), "agent", "bob")
+            .create_session(Some("Bob's".into()), "agent", "bob", None)
             .unwrap();
 
         // Before the invitation, Bob sees only his own.
-        let seen = store.list_sessions_owned(Some("bob"), false).unwrap();
+        let seen = store.list_sessions_owned(Some("bob"), None, false).unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].id, his.id);
 
         store.add_participant(&hers.id, "bob", "alice").unwrap();
 
-        let seen = store.list_sessions_owned(Some("bob"), false).unwrap();
+        let seen = store.list_sessions_owned(Some("bob"), None, false).unwrap();
         let ids: Vec<&str> = seen.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&hers.id.as_str()), "the invitation is listed");
         assert!(ids.contains(&his.id.as_str()), "and so is his own");
@@ -1666,7 +1729,7 @@ mod tests {
         // conversations to yours.
         assert_eq!(
             store
-                .list_sessions_owned(Some("alice"), false)
+                .list_sessions_owned(Some("alice"), None, false)
                 .unwrap()
                 .len(),
             1
@@ -1675,7 +1738,10 @@ mod tests {
         // And it goes away again when the invitation does.
         assert!(store.remove_participant(&hers.id, "bob").unwrap());
         assert_eq!(
-            store.list_sessions_owned(Some("bob"), false).unwrap().len(),
+            store
+                .list_sessions_owned(Some("bob"), None, false)
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -1684,21 +1750,21 @@ mod tests {
     fn ownership_logins_and_user_spend_round_trip() {
         let (store, _d) = temp_store();
         let alice = store
-            .create_session(Some("Alice".into()), "agent", "alice")
+            .create_session(Some("Alice".into()), "agent", "alice", None)
             .unwrap();
         let bob = store
-            .create_session(Some("Bob".into()), "agent", "bob")
+            .create_session(Some("Bob".into()), "agent", "bob", None)
             .unwrap();
         assert_eq!(store.owner_of(&alice.id).unwrap().as_deref(), Some("alice"));
         assert_eq!(
             store
-                .list_sessions_owned(Some("alice"), false)
+                .list_sessions_owned(Some("alice"), None, false)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            store.list_sessions_owned(Some("bob"), false).unwrap()[0].id,
+            store.list_sessions_owned(Some("bob"), None, false).unwrap()[0].id,
             bob.id
         );
 
@@ -1767,7 +1833,7 @@ mod tests {
         // chat surface carry on in an archived conversation. Anything reusing a
         // session id has to read `archived`.
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"chat", "local").unwrap();
+        let s = store.create_session(None, &"chat", "local", None).unwrap();
         assert!(!s.archived);
 
         store.archive_session(&s.id, true).unwrap();
@@ -1795,7 +1861,7 @@ mod tests {
     #[test]
     fn events_are_sequential_and_readable_from_offset() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
 
         for i in 0..5 {
             let rec = store
@@ -1817,10 +1883,10 @@ mod tests {
     fn events_are_isolated_per_session() {
         let (store, _d) = temp_store();
         let a = store
-            .create_session(Some("a".into()), &"agent", "local")
+            .create_session(Some("a".into()), &"agent", "local", None)
             .unwrap();
         let b = store
-            .create_session(Some("b".into()), &"agent", "local")
+            .create_session(Some("b".into()), &"agent", "local", None)
             .unwrap();
 
         store.append_event(&a.id, user("in a")).unwrap();
@@ -1833,7 +1899,7 @@ mod tests {
     #[test]
     fn preview_tracks_conversation_not_bookkeeping() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
 
         store.append_event(&s.id, user("hello there")).unwrap();
         store
@@ -1862,7 +1928,7 @@ mod tests {
     #[test]
     fn first_message_names_the_conversation() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
         assert_eq!(s.title, DEFAULT_TITLE);
 
         store
@@ -1882,7 +1948,7 @@ mod tests {
     #[test]
     fn auto_titles_are_shortened_on_a_word_boundary() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
 
         store
             .append_event(
@@ -1909,7 +1975,7 @@ mod tests {
     fn a_renamed_conversation_is_never_auto_titled() {
         let (store, _d) = temp_store();
         let s = store
-            .create_session(Some("Budget review".into()), &"agent", "local")
+            .create_session(Some("Budget review".into()), &"agent", "local", None)
             .unwrap();
 
         store.append_event(&s.id, user("hello there")).unwrap();
@@ -1923,7 +1989,7 @@ mod tests {
     #[test]
     fn image_only_conversations_are_named_after_the_file() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
 
         store
             .append_event(
@@ -1949,7 +2015,7 @@ mod tests {
     #[test]
     fn session_mode_and_model_round_trip() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
         assert_eq!(s.mode, "agent");
         assert_eq!(s.model, "", "no override until one is chosen");
 
@@ -1968,7 +2034,7 @@ mod tests {
     #[test]
     fn image_only_messages_get_a_readable_preview() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
 
         let image = Attachment {
             name: "chart.png".into(),
@@ -2010,7 +2076,7 @@ mod tests {
     /// never got its result.
     fn mid_turn(store: &Store, title: &str, pending_call: Option<&str>) -> String {
         let s = store
-            .create_session(Some(title.into()), &"agent", "local")
+            .create_session(Some(title.into()), &"agent", "local", None)
             .unwrap();
         store.append_event(&s.id, user("do the thing")).unwrap();
         store
@@ -2399,7 +2465,7 @@ mod tests {
     #[test]
     fn spend_accumulates() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
         assert_eq!(store.get_spend(&s.id).unwrap(), 0.0);
         store.add_spend(&s.id, 0.25).unwrap();
         let total = store.add_spend(&s.id, 0.5).unwrap();
@@ -2412,7 +2478,7 @@ mod tests {
     #[test]
     fn progress_is_readable_before_a_session_has_finished_anything() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
 
         let fresh = store.session_progress(&s.id).unwrap();
         assert_eq!(fresh.cost_usd, 0.0);
@@ -2540,10 +2606,10 @@ mod tests {
     fn archived_sessions_are_filtered() {
         let (store, _d) = temp_store();
         let s = store
-            .create_session(Some("keep".into()), &"agent", "local")
+            .create_session(Some("keep".into()), &"agent", "local", None)
             .unwrap();
         let g = store
-            .create_session(Some("gone".into()), &"agent", "local")
+            .create_session(Some("gone".into()), &"agent", "local", None)
             .unwrap();
         store.archive_session(&g.id, true).unwrap();
 
@@ -2551,5 +2617,175 @@ mod tests {
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, s.id);
         assert_eq!(store.list_sessions(true).unwrap().len(), 2);
+    }
+
+    // --- surfaces ----------------------------------------------------------
+
+    /// "web" here and below is the primary gateway, as it is in `thetis.toml`.
+    fn chat() -> SurfaceScope {
+        SurfaceScope::for_gateway("web", "web")
+    }
+    fn play() -> SurfaceScope {
+        SurfaceScope::for_gateway("campaign", "web")
+    }
+
+    /// The whole point: a campaign is a session, and the game mode makes many,
+    /// so the chat sidebar must not be where they land.
+    #[test]
+    fn a_session_one_surface_made_is_not_listed_by_another() {
+        let (store, _d) = temp_store();
+        let convo = store
+            .create_session(Some("a chat".into()), "agent", "local", Some("web"))
+            .unwrap();
+        let campaign = store
+            .create_session(
+                Some("a campaign".into()),
+                "agent",
+                "local",
+                Some("campaign"),
+            )
+            .unwrap();
+
+        let listed = |scope: &SurfaceScope| {
+            store
+                .list_sessions_owned(None, Some(scope), true)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&chat()), vec![convo.id.clone()]);
+        assert_eq!(listed(&play()), vec![campaign.id.clone()]);
+
+        // And no filter still means everything, for callers that are not
+        // surfaces at all.
+        assert_eq!(
+            store.list_sessions_owned(None, None, true).unwrap().len(),
+            2
+        );
+    }
+
+    /// Every session in the operator's database predates the field. They are
+    /// chat conversations, and hiding them would be the one unacceptable
+    /// outcome of this change — so the primary gateway claims them, and only
+    /// the primary gateway does.
+    #[test]
+    fn a_session_with_no_surface_recorded_stays_in_chat() {
+        let (store, _d) = temp_store();
+        let legacy = store
+            .create_session(Some("from before".into()), "agent", "local", None)
+            .unwrap();
+        assert!(legacy.surface.is_none());
+
+        let ids = |scope: &SurfaceScope| {
+            store
+                .list_sessions_owned(None, Some(scope), true)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&chat()), vec![legacy.id.clone()]);
+        assert!(
+            ids(&play()).is_empty(),
+            "an unrecorded surface must be claimed by exactly one surface, or \
+             old conversations appear in every one at once"
+        );
+    }
+
+    /// The field is added to a WIT record that is already on disk in millions
+    /// of rows' worth of databases, and `#[serde(default)]` cannot be put on a
+    /// generated type. `option<string>` is what makes that safe — asserted
+    /// against bytes the current struct did not write, exactly as
+    /// `an_event_row_in_the_old_shape_still_reads_back` does for events.
+    #[test]
+    fn a_session_row_written_before_surfaces_still_reads_back() {
+        let (store, _d) = temp_store();
+        let legacy = br#"{"id":"old-1","title":"Welcome","created_ms":1,"updated_ms":1,
+            "event_count":0,"archived":false,"preview":"","mode":"agent","model":""}"#;
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(SESSIONS).unwrap();
+            t.insert("old-1", legacy.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let meta = store
+            .get_session("old-1")
+            .expect("a row written before `surface` existed must still parse")
+            .expect("the row is there");
+        assert_eq!(meta.title, "Welcome");
+        assert!(meta.surface.is_none());
+        assert_eq!(
+            store
+                .list_sessions_owned(None, Some(&chat()), true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Surface and ownership are separate axes and stay separate.
+    ///
+    /// `see_all_sessions` is modelled as `owner: None`. It widens *whose*
+    /// conversations are listed, never *which surfaces* exist — so an
+    /// administrator looking at the chat sidebar sees everyone's chats and
+    /// still no campaigns. `/admin` is the surface that sees everything, and it
+    /// reads `list_sessions`, which takes no scope at all.
+    #[test]
+    fn seeing_everyones_sessions_does_not_mean_seeing_every_surface() {
+        let (store, _d) = temp_store();
+        let alice_chat = store
+            .create_session(Some("alice chats".into()), "agent", "alice", Some("web"))
+            .unwrap();
+        let bob_chat = store
+            .create_session(Some("bob chats".into()), "agent", "bob", Some("web"))
+            .unwrap();
+        let bob_game = store
+            .create_session(Some("bob plays".into()), "agent", "bob", Some("campaign"))
+            .unwrap();
+
+        let mut admin_sidebar = store
+            .list_sessions_owned(None, Some(&chat()), true)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>();
+        admin_sidebar.sort();
+        let mut both_chats = vec![alice_chat.id.clone(), bob_chat.id.clone()];
+        both_chats.sort();
+        assert_eq!(
+            admin_sidebar, both_chats,
+            "an administrator sees more owners in the chat sidebar, not more surfaces"
+        );
+
+        // `/admin` reads this one, and it is unfiltered on purpose: the
+        // operator's console is where a campaign session must remain
+        // inspectable, or a surface could hide its sessions from oversight
+        // simply by existing.
+        let everything = store.list_sessions(true).unwrap();
+        assert_eq!(everything.len(), 3);
+        assert!(everything.iter().any(|s| s.id == bob_game.id));
+    }
+
+    /// Ownership still applies underneath the surface filter: narrowing by
+    /// surface must not accidentally widen who can see what.
+    #[test]
+    fn a_surface_listing_is_still_scoped_to_its_owner() {
+        let (store, _d) = temp_store();
+        let mine = store
+            .create_session(Some("mine".into()), "agent", "alice", Some("campaign"))
+            .unwrap();
+        store
+            .create_session(Some("theirs".into()), "agent", "bob", Some("campaign"))
+            .unwrap();
+
+        let listed = store
+            .list_sessions_owned(Some("alice"), Some(&play()), true)
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec![mine.id.as_str()]
+        );
     }
 }

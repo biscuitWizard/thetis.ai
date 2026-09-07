@@ -443,10 +443,10 @@ mod tests {
         let store = store();
         let subs = Subagents::new(&store);
         let parent = store
-            .create_session(Some("parent".into()), &"agent", "local")
+            .create_session(Some("parent".into()), &"agent", "local", None)
             .unwrap();
         let child = store
-            .create_session(Some("child".into()), &"agent", "local")
+            .create_session(Some("child".into()), &"agent", "local", None)
             .unwrap();
         subs.register(&parent.id, &child.id, "k", "t", "", "", "agent", 8)
             .unwrap();

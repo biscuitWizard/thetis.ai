@@ -1246,7 +1246,11 @@ pub(crate) async fn new_session_for(
         .owner_for_discord(discord_user_id, &synthetic_owner);
     let meta = grip
         .persist
-        .create_session(Some(title), &grip.cfg().discord.mode, &owner)
+        // No surface: the Discord bridge is not a gateway aspect, and a
+        // conversation it starts is reachable from chat like any other. An
+        // unrecorded surface is claimed by the primary gateway, which is
+        // exactly where these belong.
+        .create_session(Some(title), &grip.cfg().discord.mode, &owner, None)
         .await?;
 
     // Stamped before the channel is mapped to it. A conversation reachable from
@@ -1406,7 +1410,9 @@ async fn fork_session_for(
     let mode = ceiling.default_mode.clone();
     let meta = grip
         .persist
-        .create_session(Some(title), &mode, account)
+        // Unrecorded surface, as in `new_session_for`: a fork is a chat
+        // conversation.
+        .create_session(Some(title), &mode, account, None)
         .await?;
 
     if let Err(e) = grip.persist.set_ceiling(&meta.id, &ceiling).await {

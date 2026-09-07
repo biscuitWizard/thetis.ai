@@ -863,6 +863,9 @@ pub(crate) async fn smoke_test(
     };
     let budget = Budget::probe(format!("{aspect} smoke test"), grip.cfg().probe_budget);
     let mut store = grip.runtime.new_store(grip.clone(), caps, budget, None);
+    if let Aspect::Gateway(name) = aspect {
+        store.data_mut().surface = Some(name.clone());
+    }
     let linker = grip.runtime.linker(caps);
 
     match aspect {

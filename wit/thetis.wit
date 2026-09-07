@@ -241,6 +241,18 @@ interface types {
     mode: string,
     /// Model override for this session; empty means the grip default.
     model: string,
+    /// The surface that created this session: the name of the gateway aspect
+    /// whose guest called `create-session` ("web", "campaign", ...).
+    ///
+    /// Recorded by the host from the calling guest, never passed in by it: a
+    /// guest that named its own surface could name somebody else's and read
+    /// their sessions out of `list-sessions`.
+    ///
+    /// `none` on every session written before this field existed, and on any
+    /// session created outside a surface (a local probe). Those are chat
+    /// conversations, so the *primary* gateway claims them — see
+    /// `list-sessions`.
+    surface: option<string>,
   }
 
   /// A model the user may pick for a session.
@@ -582,6 +594,22 @@ interface session {
   // Drains mid-turn user input (nudges / cancel) so a running turn can steer.
   poll-inbox: func(session-id: string) -> list<inbox-item>;
 
+  /// Conversations this surface created, most recently active first.
+  ///
+  /// A session belongs to the surface that made it. Thetis serves several —
+  /// the chat UI, the campaign gateway, whatever is mounted next — over one
+  /// session store, and a surface listing another's sessions shows rows nobody
+  /// started there. So each gateway sees only its own, and the host decides
+  /// which that is from the aspect the calling guest runs as.
+  ///
+  /// The primary gateway additionally claims every session with no `surface`
+  /// recorded: those predate the field, and they are the operator's real chat
+  /// history.
+  ///
+  /// This is a *belonging* filter, not an access one. Whose conversations are
+  /// visible is still the principal's business (`see-all-sessions` widens it);
+  /// an administrator sees more owners here, not more surfaces. `/admin` is the
+  /// surface that sees everything.
   list-sessions: func(include-archived: bool) -> list<session-meta>;
   get-session: func(session-id: string) -> option<session-meta>;
   create-session: func(title: option<string>) -> string;

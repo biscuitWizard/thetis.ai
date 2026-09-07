@@ -623,10 +623,10 @@ mod tests {
         // asking session did not write.
         let (store, _d) = temp_store();
         let a = store
-            .create_session(Some("first".into()), &"agent", "local")
+            .create_session(Some("first".into()), &"agent", "local", None)
             .unwrap();
         let b = store
-            .create_session(Some("second".into()), &"agent", "local")
+            .create_session(Some("second".into()), &"agent", "local", None)
             .unwrap();
         store
             .append_event(&a.id, user("the redb lock was the problem"))
@@ -650,7 +650,7 @@ mod tests {
         // The asymmetry is deliberate and is the one thing about this surface a
         // reader is likeliest to think is a bug, so it is pinned.
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
         store
             .append_event(&s.id, tool_result("read_path", true, "fn widget() {}"))
             .unwrap();
@@ -680,9 +680,9 @@ mod tests {
     fn a_sub_agents_log_is_searchable_and_attributed() {
         let (store, _d) = temp_store();
         let parent = store
-            .create_session(Some("parent".into()), &"agent", "local")
+            .create_session(Some("parent".into()), &"agent", "local", None)
             .unwrap();
-        let child = store.create_session(None, &"agent", "local").unwrap();
+        let child = store.create_session(None, &"agent", "local", None).unwrap();
         crate::subagents::Subagents::new(&store)
             .register(
                 &parent.id,
@@ -721,8 +721,8 @@ mod tests {
     #[test]
     fn subagents_lists_a_whole_tree_for_any_conversation() {
         let (store, _d) = temp_store();
-        let parent = store.create_session(None, &"agent", "local").unwrap();
-        let child = store.create_session(None, &"agent", "local").unwrap();
+        let parent = store.create_session(None, &"agent", "local", None).unwrap();
+        let child = store.create_session(None, &"agent", "local", None).unwrap();
         crate::subagents::Subagents::new(&store)
             .register(&parent.id, &child.id, "scout", "look", "", "", "plan", 0)
             .unwrap();
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn a_read_pages_by_seq_and_reports_what_it_clipped() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
         store.append_event(&s.id, user("first")).unwrap();
         store.append_event(&s.id, user(&"x".repeat(50))).unwrap();
 
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn the_hit_cap_is_reported_rather_than_hidden() {
         let (store, _d) = temp_store();
-        let s = store.create_session(None, &"agent", "local").unwrap();
+        let s = store.create_session(None, &"agent", "local", None).unwrap();
         for _ in 0..10 {
             store.append_event(&s.id, user("needle")).unwrap();
         }
@@ -873,10 +873,10 @@ mod tests {
     fn conversations_are_newest_first_and_archived_ones_are_opt_in() {
         let (store, _d) = temp_store();
         let kept = store
-            .create_session(Some("kept".into()), &"agent", "local")
+            .create_session(Some("kept".into()), &"agent", "local", None)
             .unwrap();
         let filed = store
-            .create_session(Some("filed".into()), &"agent", "local")
+            .create_session(Some("filed".into()), &"agent", "local", None)
             .unwrap();
         store.append_event(&filed.id, user("a")).unwrap();
         store.append_event(&kept.id, user("b")).unwrap();
@@ -906,7 +906,7 @@ mod tests {
     fn a_limit_of_zero_means_everything() {
         let (store, _d) = temp_store();
         for _ in 0..3 {
-            store.create_session(None, &"agent", "local").unwrap();
+            store.create_session(None, &"agent", "local", None).unwrap();
         }
         let t = Transcripts::new(&store);
         assert_eq!(t.conversations(false, false, 0).unwrap().len(), 3);

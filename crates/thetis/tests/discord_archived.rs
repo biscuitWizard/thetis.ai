@@ -49,7 +49,7 @@ fn session_for(store: &Store, key: &str) -> String {
         }
     }
     let meta = store
-        .create_session(Some(format!("Discord {key}")), "chat", "discord:test")
+        .create_session(Some(format!("Discord {key}")), "chat", "discord:test", None)
         .unwrap();
     store.set_ceiling(&meta.id, &discord_ceiling()).unwrap();
     store.kv_put(SCOPE, &kv_key(key), &meta.id).unwrap();

@@ -273,9 +273,20 @@ pub async fn spawn(
         .owner_of_root(parent_id)
         .await?
         .unwrap_or_else(|| "local".into());
+    // A sub-agent inherits its parent's surface. It is never listed as a
+    // conversation — the sub-agent registry takes it out of every listing — but
+    // recording where it came from keeps the field meaningful for anything that
+    // reads a child's meta, and costs one read that is already warm.
+    let surface = grip
+        .persist
+        .get_session(parent_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|meta| meta.surface);
     let child = grip
         .persist
-        .create_session(Some(label.clone()), &mode, &owner)
+        .create_session(Some(label.clone()), &mode, &owner, surface.as_deref())
         .await
         .context("creating the sub-agent's session")?;
 

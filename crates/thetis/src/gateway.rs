@@ -55,6 +55,13 @@ async fn instance_of(
         grip.runtime
             .new_store(grip.clone(), Caps::Gateway, budget, None)
     };
+    // Which surface is calling, taken from the component the host actually
+    // loaded rather than from anything the guest says about itself. Every
+    // gateway instance is built here — assets, client messages, the warm
+    // renderer, and previews — so this is the one place it has to be set.
+    if let Aspect::Gateway(name) = &loaded.aspect {
+        store.data_mut().surface = Some(name.clone());
+    }
 
     let instance = Gateway::instantiate_async(
         &mut store,

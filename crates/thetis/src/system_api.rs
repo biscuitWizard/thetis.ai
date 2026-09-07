@@ -36,15 +36,26 @@ pub fn handles(frame_type: &str) -> bool {
 }
 
 /// Handles one frame, returning the reply frames to send on this socket.
+/// `surface` is the gateway this socket is connected to, so the session count
+/// is the one that surface's own sidebar shows.
 pub async fn handle(
     grip: &Arc<Grip>,
     principal: &crate::auth::Principal,
+    surface: Option<&str>,
     _frame: &Value,
 ) -> Vec<String> {
-    vec![status(grip, principal).await.to_string()]
+    vec![status(grip, principal, surface).await.to_string()]
 }
 
-async fn status(grip: &Arc<Grip>, principal: &crate::auth::Principal) -> Value {
+async fn status(
+    grip: &Arc<Grip>,
+    principal: &crate::auth::Principal,
+    surface: Option<&str>,
+) -> Value {
+    // Counted with the same surface filter the sidebar lists with, or the
+    // header would say "12 conversations" over a list of three.
+    let scope = surface
+        .map(|name| crate::store::SurfaceScope::for_gateway(name, &grip.cfg().primary_gateway));
     let trunk = trunk_facts(grip).await;
     let ui = ui_facts(grip).await;
     let fleet = fleet_facts(grip).await;
@@ -76,7 +87,7 @@ async fn status(grip: &Arc<Grip>, principal: &crate::auth::Principal) -> Value {
         // is showing everyone's: the count should match the sidebar.
         "sessions": grip
             .persist
-            .list_sessions_owned(principal.list_owner(), false)
+            .list_sessions_owned(principal.list_owner(), scope.as_ref(), false)
             .await
             .map(|s| s.len())
             .unwrap_or(0),

@@ -185,6 +185,13 @@ pub struct HostState {
     /// guest cannot reach into a session it was not invoked for.
     pub session_id: Option<String>,
     pub principal: Option<Arc<crate::auth::Principal>>,
+    /// The surface this call is being made *by*: the name of the gateway
+    /// aspect whose component is instantiated in this store.
+    ///
+    /// Set by the host when it builds the instance, from the aspect it loaded,
+    /// so a guest cannot name a surface it is not. `None` for the agent, for
+    /// tools, and for probes — none of which are surfaces.
+    pub surface: Option<String>,
     pub policy: Arc<crate::policy::EffectivePolicy>,
     pub streams: HashMap<u64, StreamHandle>,
     pub next_stream_id: u64,
@@ -295,6 +302,7 @@ impl Runtime {
             budget,
             session_id,
             principal: None,
+            surface: None,
             policy: self.cfg.auth.local_policy.clone(),
             streams: HashMap::new(),
             next_stream_id: 1,

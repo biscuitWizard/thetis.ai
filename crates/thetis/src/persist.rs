@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
 use crate::ipc::Peer;
-use crate::store::{SessionProgress, Store};
+use crate::store::{SessionProgress, Store, SurfaceScope};
 use crate::subagents::SubagentRow;
 use crate::transcripts::{ConversationSummary, SearchQuery, SearchReport, TranscriptEntry};
 
@@ -63,28 +63,39 @@ impl Persist {
         title: Option<String>,
         mode: &str,
         owner: &str,
+        surface: Option<&str>,
     ) -> Result<SessionMeta> {
         delegate!(
             self,
             "store.create_session",
-            |s| s.create_session(title.clone(), mode, owner),
-            json!({ "title": title, "mode": mode, "owner": owner })
+            |s| s.create_session(title.clone(), mode, owner, surface),
+            json!({ "title": title, "mode": mode, "owner": owner, "surface": surface })
         )
     }
 
     pub async fn list_sessions_owned(
         &self,
         owner: Option<&str>,
+        surface: Option<&SurfaceScope>,
         include_archived: bool,
     ) -> Result<Vec<SessionMeta>> {
         match self {
-            Persist::Local(store) => {
-                crate::offload::blocking(|| store.list_sessions_owned(owner, include_archived))
-            }
+            Persist::Local(store) => crate::offload::blocking(|| {
+                store.list_sessions_owned(owner, surface, include_archived)
+            }),
             Persist::Remote(peer) => {
+                // A worker runs the agent, never a gateway, so `surface` is
+                // `None` on this path today. It is still sent, so that the
+                // wire says what the caller asked for rather than quietly
+                // widening the listing if a surface ever runs in a worker.
                 peer.call_as(
                     "store.list_sessions",
-                    json!({"include_archived": include_archived}),
+                    json!({
+                        "include_archived": include_archived,
+                        "surface": surface.map(|s| &s.name),
+                        "surface_inherits_unrecorded":
+                            surface.is_some_and(|s| s.inherits_unrecorded),
+                    }),
                 )
                 .await
             }
@@ -626,6 +637,22 @@ fn serve_store_call_inner(
     fn to_value<T: serde::Serialize>(value: T) -> Result<Value> {
         Ok(serde_json::to_value(value)?)
     }
+    /// The surface a listing was asked for, as it was sent over the wire.
+    ///
+    /// Absent means "every surface", which is what every caller that is not a
+    /// gateway asks for and what an older peer sends.
+    fn surface_scope(params: &Value) -> Option<crate::store::SurfaceScope> {
+        params
+            .get("surface")
+            .and_then(Value::as_str)
+            .map(|name| crate::store::SurfaceScope {
+                name: name.to_owned(),
+                inherits_unrecorded: params
+                    .get("surface_inherits_unrecorded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+    }
     // The session-private methods: their `session` argument must be the
     // caller's own, or one of the sub-agents the caller spawned. An empty
     // `caller_session` means the call did not come from a session-bound worker
@@ -705,7 +732,8 @@ fn serve_store_call_inner(
                 .and_then(Value::as_str)
                 .unwrap_or("local");
             let owner = caller_owner.as_deref().unwrap_or(requested);
-            to_value(store.create_session(title, get_str(&params, "mode")?, owner)?)
+            let surface = params.get("surface").and_then(Value::as_str);
+            to_value(store.create_session(title, get_str(&params, "mode")?, owner, surface)?)
         }
         "store.get_session" => {
             let id = get_str(&params, "id")?;
@@ -858,14 +886,22 @@ fn serve_store_call_inner(
                     "cannot list another user's sessions"
                 );
             }
-            to_value(store.list_sessions_owned(requested, include)?)
+            to_value(store.list_sessions_owned(
+                requested,
+                surface_scope(&params).as_ref(),
+                include,
+            )?)
         }
         "store.list_sessions" => {
             let include = params
                 .get("include_archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            to_value(store.list_sessions_owned(caller_owner.as_deref(), include)?)
+            to_value(store.list_sessions_owned(
+                caller_owner.as_deref(),
+                surface_scope(&params).as_ref(),
+                include,
+            )?)
         }
         "store.rename_session" => {
             let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
@@ -1182,7 +1218,7 @@ mod tests {
 
         // A conversation owned by the account that *can* change things.
         let convo = store
-            .create_session(Some("writer's chat".into()), "agent", "writer")
+            .create_session(Some("writer's chat".into()), "agent", "writer", None)
             .unwrap();
         // The read-only account is invited in.
         store
@@ -1247,7 +1283,7 @@ mod tests {
         let cfg = two_account_config();
 
         let convo = store
-            .create_session(Some("from discord".into()), "chat", "writer")
+            .create_session(Some("from discord".into()), "chat", "writer", None)
             .unwrap();
 
         // A Discord-flavoured ceiling: read-only, no delegation.
@@ -1288,7 +1324,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
         let cfg = two_account_config();
-        let convo = store.create_session(None, "chat", "writer").unwrap();
+        let convo = store.create_session(None, "chat", "writer", None).unwrap();
 
         let mut narrow = cfg.auth.local_policy.as_ref().clone();
         narrow.read_only = true;
@@ -1325,7 +1361,7 @@ mod tests {
 
         // Delegation stamps the child's ceiling as part of registration. The
         // separate set-ceiling RPC remains forbidden to every worker.
-        let child = store.create_session(None, "plan", "writer").unwrap();
+        let child = store.create_session(None, "plan", "writer", None).unwrap();
         remote
             .register_subagent(
                 &convo.id,
@@ -1342,7 +1378,7 @@ mod tests {
             .unwrap();
         assert!(store.ceiling_of(&child.id).unwrap().unwrap().read_only);
 
-        let unrelated = store.create_session(None, "plan", "writer").unwrap();
+        let unrelated = store.create_session(None, "plan", "writer", None).unwrap();
         assert!(
             remote.set_ceiling(&unrelated.id, &narrow).await.is_err(),
             "a worker cannot use the separate RPC on any conversation"
@@ -1360,7 +1396,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
         let cfg = two_account_config();
-        let convo = store.create_session(None, "agent", "writer").unwrap();
+        let convo = store.create_session(None, "agent", "writer", None).unwrap();
         store
             .add_participant(&convo.id, "reader", "writer")
             .unwrap();
@@ -1420,7 +1456,7 @@ mod tests {
         let cfg = two_account_config();
 
         let convo = store
-            .create_session(Some("chat".into()), "agent", "writer")
+            .create_session(Some("chat".into()), "agent", "writer", None)
             .unwrap();
 
         // `set_mode` is scoped by owner, not by session, so the caller session
@@ -1520,7 +1556,7 @@ mod tests {
 
         // Create through the remote arm, read back through both.
         let meta = remote
-            .create_session(Some("hi".into()), &"build", "local")
+            .create_session(Some("hi".into()), &"build", "local", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1574,10 +1610,10 @@ mod tests {
         let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
 
         let alice = store
-            .create_session(Some("alice's".into()), &"agent", "alice")
+            .create_session(Some("alice's".into()), &"agent", "alice", None)
             .unwrap();
         let bob = store
-            .create_session(Some("bob's".into()), &"agent", "bob")
+            .create_session(Some("bob's".into()), &"agent", "bob", None)
             .unwrap();
         store
             .append_event(&bob.id, SessionEvent::Nudge("the zebra password".into()))
@@ -1606,7 +1642,7 @@ mod tests {
             listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec![alice.id.as_str()]
         );
-        let listed = remote.list_sessions_owned(None, true).await.unwrap();
+        let listed = remote.list_sessions_owned(None, None, true).await.unwrap();
         assert_eq!(
             listed.len(),
             1,
@@ -1615,7 +1651,10 @@ mod tests {
         // A worker cannot name an owner at all: the remote arm drops the
         // argument and the gateway lists for the caller's owner, so asking
         // for bob's gets alice's.
-        let listed = remote.list_sessions_owned(Some("bob"), true).await.unwrap();
+        let listed = remote
+            .list_sessions_owned(Some("bob"), None, true)
+            .await
+            .unwrap();
         assert_eq!(
             listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec![alice.id.as_str()]
@@ -1663,7 +1702,7 @@ mod tests {
         // A session this worker creates (delegation) belongs to its owner,
         // whatever owner the params claim.
         let child = remote
-            .create_session(Some("child".into()), &"agent", "bob")
+            .create_session(Some("child".into()), &"agent", "bob", None)
             .await
             .unwrap();
         assert_eq!(store.owner_of(&child.id).unwrap().as_deref(), Some("alice"));
@@ -1707,9 +1746,9 @@ mod tests {
         let remote = Persist::Remote(wk_peer);
 
         let parent = store
-            .create_session(Some("the parent".into()), &"agent", "local")
+            .create_session(Some("the parent".into()), &"agent", "local", None)
             .unwrap();
-        let child = store.create_session(None, &"agent", "local").unwrap();
+        let child = store.create_session(None, &"agent", "local", None).unwrap();
         crate::subagents::Subagents::new(&store)
             .register(
                 &parent.id,

@@ -162,7 +162,9 @@ pub async fn run() -> Result<()> {
         };
         let first = grip
             .persist
-            .create_session(Some("Welcome".into()), &cfg.default_mode, owner)
+            // The first conversation is a chat conversation; leaving its
+            // surface unrecorded is what puts it in the chat sidebar.
+            .create_session(Some("Welcome".into()), &cfg.default_mode, owner, None)
             .await?;
         tracing::info!(session = %first.id, "created first session");
     }

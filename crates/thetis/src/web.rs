@@ -1178,11 +1178,12 @@ async fn connection(
             let grip = grip.clone();
             let out_tx = out_tx.clone();
             let principal = principal.clone();
+            let surface = gateway.clone();
             tokio::spawn(async move {
                 let replies = if crate::debug_api::handles(&frame_type) {
                     crate::debug_api::handle(&grip, &frame).await
                 } else {
-                    crate::system_api::handle(&grip, &principal, &frame).await
+                    crate::system_api::handle(&grip, &principal, Some(&surface), &frame).await
                 };
                 for reply in replies {
                     if out_tx.send(reply).await.is_err() {

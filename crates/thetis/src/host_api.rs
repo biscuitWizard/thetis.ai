@@ -80,6 +80,24 @@ impl HostState {
     fn may_access(&self, session_id: &str) -> Result<()> {
         self.scope_ok(session_id)
     }
+
+    /// The surface this call is being made by, as a listing filter.
+    ///
+    /// `None` when the caller is not a surface at all — an agent turn, a tool,
+    /// a probe — and then nothing is filtered, which is the behaviour those
+    /// callers already had.
+    ///
+    /// The primary gateway additionally claims sessions with no surface
+    /// recorded. Every session in an existing database predates the field and
+    /// every one of them is a chat conversation, so the alternative to this is
+    /// the operator's own history vanishing from the sidebar.
+    fn surface_scope(&self) -> Option<crate::store::SurfaceScope> {
+        let name = self.surface.as_deref()?;
+        Some(crate::store::SurfaceScope::for_gateway(
+            name,
+            &self.grip().cfg().primary_gateway,
+        ))
+    }
     fn require(&self, cap: crate::policy::Cap) -> Result<()> {
         if self.policy.denies(cap) {
             Err(err(format!("{cap:?} is withheld for this user by policy")))
@@ -418,9 +436,7 @@ impl sys::Host for HostState {
                 cfg.providers
                     .iter()
                     .find(|p| p.id == id && p.api_key.is_none())
-                    .map(|p| {
-                        serde_json::json!({ "base_url": p.base_url() }).to_string()
-                    })
+                    .map(|p| serde_json::json!({ "base_url": p.base_url() }).to_string())
             }
             _ => None,
         })
@@ -558,9 +574,24 @@ impl session::Host for HostState {
         } else {
             None
         };
+        // Which surface's conversations. Sessions belong to the surface that
+        // created them, so each gateway lists its own: Thetis serves the chat
+        // UI and the campaign gateway over one store, and a campaign is a
+        // session — many of them — which would otherwise fill the chat sidebar
+        // with rows nobody started there.
+        //
+        // Deliberately *not* an authority check. `see_all_sessions` widens
+        // whose conversations you see, not which surfaces exist, so an
+        // administrator's sidebar is still the chat surface's sidebar. The
+        // surface that sees everything is `/admin`, which reads the store
+        // directly and is unfiltered.
+        //
+        // A caller that is not a surface — an agent turn, a local probe — gets
+        // no filter, exactly as before.
+        let surface = self.surface_scope();
         self.grip()
             .persist
-            .list_sessions_owned(owned.as_deref(), include_archived)
+            .list_sessions_owned(owned.as_deref(), surface.as_ref(), include_archived)
             .await
             .wt()
     }
@@ -593,9 +624,14 @@ impl session::Host for HostState {
             .as_ref()
             .map(|p| p.user_id.as_str())
             .unwrap_or("local");
+        // The surface is stamped from the aspect the host instantiated, not
+        // from anything the guest passes: a guest that named its own surface
+        // could name another's and read that surface's sessions back out of
+        // `list_sessions`.
+        let surface = self.surface.clone();
         self.grip()
             .persist
-            .create_session(title, &mode, owner)
+            .create_session(title, &mode, owner, surface.as_deref())
             .await
             .map(|s| s.id)
             .wt()
@@ -3620,5 +3656,66 @@ mod tests {
              this way is in no sub-agent registry, so it has no parent, dodges \
              the fan-out cap, and could itself delegate"
         );
+    }
+
+    /// The surface a session belongs to is the host's fact about the caller,
+    /// never the caller's claim about itself.
+    ///
+    /// If a guest could name its own surface it could name another's, and
+    /// `list_sessions` would hand it that surface's conversations — which is
+    /// the whole filter, undone. `create-session` takes no surface argument in
+    /// the WIT for exactly this reason; this pins the host half.
+    #[test]
+    fn the_surface_is_stamped_by_the_host_not_supplied_by_the_guest() {
+        let src = include_str!("host_api.rs");
+        let body = src
+            .split("async fn create_session(")
+            .nth(1)
+            .expect("create_session moved")
+            .split("    async fn ")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            body.contains("self.surface"),
+            "create_session no longer records the calling surface, so every \
+             new session looks unrecorded and lands in the chat sidebar"
+        );
+
+        let listing = src
+            .split("async fn list_sessions(")
+            .nth(1)
+            .expect("list_sessions moved")
+            .split("    async fn ")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            listing.contains("surface_scope()"),
+            "list_sessions no longer scopes to the calling surface: every \
+             campaign is a session, and they would fill the chat sidebar"
+        );
+
+        // The surface itself must come from the loaded component, not from
+        // anything a guest hands over.
+        let gw = include_str!("gateway.rs");
+        assert!(
+            gw.contains("store.data_mut().surface = Some(name.clone())")
+                && gw.contains("loaded.aspect"),
+            "the gateway store no longer takes its surface from the aspect the \
+             host loaded"
+        );
+    }
+
+    /// Only the primary gateway claims sessions with no surface recorded.
+    ///
+    /// Everything in an existing database is unrecorded, and all of it is chat
+    /// history; if a second surface claimed it too, every campaign list would
+    /// open full of the operator's conversations.
+    #[test]
+    fn unrecorded_sessions_belong_to_the_primary_gateway_alone() {
+        use crate::store::SurfaceScope;
+        assert!(SurfaceScope::for_gateway("web", "web").claims(None));
+        assert!(!SurfaceScope::for_gateway("campaign", "web").claims(None));
+        assert!(SurfaceScope::for_gateway("campaign", "web").claims(Some("campaign")));
+        assert!(!SurfaceScope::for_gateway("campaign", "web").claims(Some("web")));
     }
 }
