@@ -25,8 +25,11 @@
 //! records. The originals are simply still there, so the store is unnecessary.
 
 use crate::thetis::grip::llm;
+use crate::thetis::grip::session as host;
 use crate::thetis::grip::sys;
-use crate::thetis::grip::types::{Compaction, LogLevel, SeqSpan};
+use crate::thetis::grip::types::{
+    Compaction, CompactionProgress, InboxItem, LogLevel, SeqSpan,
+};
 use serde_json::{json, Value};
 
 /// Tokens per character, near enough. Only used to rank and total messages
@@ -241,16 +244,33 @@ so rather than resolving it. Here is the span:
 
 ";
 
+/// One span of the conversation, flattened and ready to summarize.
+///
+/// Selection is separated from summarizing deliberately. Choosing what to shed
+/// is pure and instant; summarizing is several model calls that can take tens of
+/// seconds altogether. Handing the caller a list of jobs lets it report
+/// progress between them and check whether the user has pressed stop — neither
+/// of which was possible while the whole thing was one opaque function.
+pub struct SpanJob {
+    /// The span as plain text, with the instructions not yet attached.
+    transcript: String,
+    /// The log sequences this span covers, inclusive.
+    pub first_seq: u64,
+    pub last_seq: u64,
+    /// How many messages it stands for.
+    pub messages: u32,
+}
+
 /// One summary, from a separate and usually cheaper model.
 ///
 /// A failure here returns `None` and the span is left alone: an unsummarized
 /// span costs context, while a wrong summary costs correctness.
-fn summarize(messages: &[Value], span: Round, model: &str) -> Option<String> {
+pub fn summarize(job: &SpanJob, model: &str) -> Option<String> {
     let request = json!({
         "model": model,
         "messages": [{
             "role": "user",
-            "content": format!("{SUMMARY_INSTRUCTIONS}{}", transcript(messages, span)),
+            "content": format!("{SUMMARY_INSTRUCTIONS}{}", job.transcript),
         }],
     });
 
@@ -286,17 +306,181 @@ pub fn note(summary: &str, replaced: u32, first_seq: u64, last_seq: u64) -> Valu
     })
 }
 
-/// Works out what to shed and summarizes it.
+/// The one place a progress frame is built, so every phase reports the same
+/// fields and the surface can rely on them.
+fn report(
+    session_id: &str,
+    policy: &Policy,
+    context_tokens: u32,
+    phase: &str,
+    span: u32,
+    spans: u32,
+    messages: u32,
+    detail: &str,
+) {
+    host::emit_compaction_progress(
+        session_id,
+        &CompactionProgress {
+            phase: phase.to_string(),
+            span,
+            spans,
+            messages,
+            tokens_before: context_tokens,
+            tokens_target: policy.target_tokens(),
+            model: policy.summary_model.clone(),
+            detail: detail.to_string(),
+        },
+    );
+}
+
+/// Whether the user has pressed stop.
+///
+/// Compaction is not part of the conversation, so anything it finds in the
+/// inbox has to be put back for the turn loop to act on: a nudge consumed here
+/// would be silently lost, and a cancel consumed here would leave the loop
+/// thinking the turn is fine. The host re-synthesizes a cancel on every later
+/// poll, so only a nudge needs actually carrying — which the caller does by
+/// draining the inbox itself once compaction is out of the way.
+fn stop_requested(session_id: &str, carried: &mut Vec<String>) -> bool {
+    let mut cancelled = false;
+    for item in host::poll_inbox(session_id) {
+        match item {
+            InboxItem::Cancel => cancelled = true,
+            InboxItem::Nudge(text) => carried.push(text),
+            InboxItem::Control(_) => {}
+        }
+    }
+    cancelled
+}
+
+/// What compaction decided to do, before any summarizing has happened.
+pub struct Plan {
+    pub jobs: Vec<SpanJob>,
+    pub tokens_before: u32,
+}
+
+impl Plan {
+    /// Total messages every span stands for.
+    pub fn messages(&self) -> u32 {
+        self.jobs.iter().map(|j| j.messages).sum()
+    }
+}
+
+/// Summarizes a plan, reporting progress and stopping if the user asks.
+///
+/// Returns the `Compaction` to record, plus any nudge text that arrived while
+/// this was running and must be handed back to the turn loop. `None` means
+/// nothing usable came out — every span failed, or the user stopped it — and in
+/// that case no `ContextCompacted` event should be written at all: a partial
+/// compaction is fine, but an empty one that claims to stand for messages is
+/// not.
+pub fn run(session_id: &str, plan: Plan, policy: &Policy) -> (Option<Compaction>, Vec<String>) {
+    let total = plan.jobs.len() as u32;
+    let tokens_before = plan.tokens_before;
+    let mut carried: Vec<String> = Vec::new();
+
+    let mut summaries = Vec::new();
+    let mut covered = Vec::new();
+    let mut replaced = 0u32;
+
+    for (i, job) in plan.jobs.iter().enumerate() {
+        // Checked before each call rather than only after the batch: a stop
+        // pressed during span one must not be answered by four more summary
+        // calls. The host also fails the call itself now, but a guest that
+        // relied on that alone would still make every request.
+        if stop_requested(session_id, &mut carried) {
+            report(
+                session_id,
+                policy,
+                tokens_before,
+                "cancelled",
+                i as u32,
+                total,
+                replaced,
+                "you stopped this turn; keeping what was summarized so far",
+            );
+            break;
+        }
+
+        report(
+            session_id,
+            policy,
+            tokens_before,
+            "summarizing",
+            i as u32 + 1,
+            total,
+            replaced,
+            &format!(
+                "summarizing span {} of {total} ({} messages, events {}-{})",
+                i + 1,
+                job.messages,
+                job.first_seq,
+                job.last_seq
+            ),
+        );
+
+        let Some(summary) = summarize(job, &policy.summary_model) else {
+            continue;
+        };
+        summaries.push(format!(
+            "### events {}-{}\n\n{summary}",
+            job.first_seq, job.last_seq
+        ));
+        covered.push(SeqSpan {
+            from_seq: job.first_seq,
+            through_seq: job.last_seq,
+        });
+        replaced += job.messages;
+    }
+
+    if covered.is_empty() {
+        report(
+            session_id,
+            policy,
+            tokens_before,
+            "failed",
+            0,
+            total,
+            0,
+            "nothing was summarized; the conversation is unchanged",
+        );
+        return (None, carried);
+    }
+
+    report(
+        session_id,
+        policy,
+        tokens_before,
+        "finished",
+        total,
+        total,
+        replaced,
+        &format!("{replaced} messages now stand summarized"),
+    );
+
+    (
+        Some(Compaction {
+            spans: covered,
+            summary: summaries.join("\n\n"),
+            messages_replaced: replaced,
+            tokens_before,
+        }),
+        carried,
+    )
+}
+
+/// Works out what to shed, without summarizing any of it.
 ///
 /// `origins` maps each message to the log sequence it came from, so the result
 /// can be recorded against the log rather than against this particular
 /// rebuilding of it. Returns `None` when there is nothing worth doing.
 pub fn plan(
+    session_id: &str,
     messages: &[Value],
     origins: &[u64],
     context_tokens: u32,
     policy: &Policy,
-) -> Option<Compaction> {
+) -> Option<Plan> {
     // The two lists are indexed together below. Drifting apart would mean
     // recording a summary against the wrong part of the log, so refuse rather
     // than guess - and a panic here would trap the whole turn.
@@ -307,6 +491,21 @@ pub fn plan(
         );
         return None;
     }
+
+    // Announced before the selection walk, not after it. Selection is fast, but
+    // this frame is also what tells the surface that a compaction is starting at
+    // all — and the surface needs to know that before the first summary call,
+    // which is the part that takes the time.
+    report(
+        session_id,
+        policy,
+        context_tokens,
+        "planning",
+        0,
+        0,
+        0,
+        "choosing what to summarize",
+    );
 
     let (lo, hi) = eligible_middle(messages, policy.keep_head, policy.keep_tail)?;
     let rounds = rounds(messages, lo, hi);
@@ -332,33 +531,18 @@ pub fn plan(
         ),
     );
 
-    let mut summaries = Vec::new();
-    let mut covered = Vec::new();
-    let mut replaced = 0u32;
+    let jobs: Vec<SpanJob> = spans
+        .into_iter()
+        .map(|span| SpanJob {
+            transcript: transcript(messages, span),
+            first_seq: origins[span.start],
+            last_seq: origins[span.end],
+            messages: (span.end - span.start + 1) as u32,
+        })
+        .collect();
 
-    for span in spans {
-        let Some(summary) = summarize(messages, span, &policy.summary_model) else {
-            continue;
-        };
-        let (first, last) = (origins[span.start], origins[span.end]);
-        summaries.push(format!(
-            "### events {first}-{last}\n\n{summary}"
-        ));
-        covered.push(SeqSpan {
-            from_seq: first,
-            through_seq: last,
-        });
-        replaced += (span.end - span.start + 1) as u32;
-    }
-
-    if covered.is_empty() {
-        return None;
-    }
-
-    Some(Compaction {
-        spans: covered,
-        summary: summaries.join("\n\n"),
-        messages_replaced: replaced,
+    Some(Plan {
+        jobs,
         tokens_before: context_tokens,
     })
 }
@@ -523,6 +707,31 @@ mod tests {
             keep_tail: 30,
         };
         assert!(!policy.should_compact(999));
+    }
+
+    /// The progress card shows this number, so it has to be the sum of what the
+    /// spans actually stand for and not the number of spans.
+    #[test]
+    fn a_plan_reports_the_messages_its_spans_stand_for() {
+        let plan = Plan {
+            tokens_before: 120_000,
+            jobs: vec![
+                SpanJob {
+                    transcript: "a".into(),
+                    first_seq: 3,
+                    last_seq: 10,
+                    messages: 8,
+                },
+                SpanJob {
+                    transcript: "b".into(),
+                    first_seq: 14,
+                    last_seq: 19,
+                    messages: 6,
+                },
+            ],
+        };
+        assert_eq!(plan.messages(), 14);
+        assert_eq!(plan.jobs.len(), 2, "two spans, fourteen messages");
     }
 
     #[test]

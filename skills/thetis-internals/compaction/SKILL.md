@@ -91,6 +91,43 @@ context. A wrong summary costs correctness.
 The note that replaces a span says how many messages it replaced and which event
 sequence numbers they were, and it says that the originals are still in the log.
 
+## Progress, and stopping
+
+A compaction is several back-to-back summary calls before the turn's first
+completion. It used to be tens of seconds of total silence — no tokens, no tool
+rows, a stop button that did nothing — which is indistinguishable from a hang.
+
+`plan` now only selects; `run` does the calls and reports. Both take
+`session_id` and emit `compaction-progress` frames through
+`session.emit-compaction-progress`. The frame carries `phase`
+(`planning` | `summarizing` | `finished` | `failed` | `cancelled`), `span` /
+`spans`, `messages`, `tokens-before` / `tokens-target`, `model` and a
+human-readable `detail`.
+
+**The frames are transient, like `stream-delta`.** They are never persisted:
+the log already records the outcome as `ContextCompacted`, and a progress
+stream in the log would be a hundred near-identical rows. The consequence is
+that a page reloaded mid-compaction shows no card — correct, not a bug.
+
+The web gateway renders them as kind `"compacting"`, and `transcript.js` keeps
+a single `compactNode` card under the last message, updated in place. Anything
+that ends the attempt clears it: `compacted`, `incident` and `turn-finished`.
+That last one matters, because a stop landing *inside* a summary call traps the
+guest via `budget.cancel()` and no `cancelled` frame is ever emitted.
+
+Stopping works on two levels, and both are needed:
+
+- `run` calls `stop_requested` before each span, so a stop during span one is
+  not answered by four more requests. A nudge found there is carried back to
+  the caller and pushed onto `pending` — consuming it here would lose it.
+- The host's `llm::chat` is wrapped in `interruptible`, because it was a single
+  await lasting tens of seconds with no stop checkpoint at all. `stream_next`
+  had its own race; the non-streaming path had nothing.
+
+`maybe_compact`'s caller also checks `stopped_before_starting()` before entering
+the loop, so a turn stopped during compaction ends with `stopped_by =
+"cancelled"` and zero iterations rather than proceeding to a completion.
+
 ## Failure branches
 
 | Symptom | Cause | Action |
@@ -98,4 +135,7 @@ sequence numbers they were, and it says that the originals are still in the log.
 | Nothing is compacted although the context is large | The middle is not eligible, or every round is protected | Check `keep_head` and `keep_tail` against the conversation length. A short conversation has no eligible middle. |
 | The log says "message and origin lists disagree" | A `push` did not add to both lists | Find the code path that added a message without a sequence. Compaction refuses rather than guess, because a panic would trap the turn. |
 | A summary got summarized | A note did not take the `user` role | Notes must be `user` role. Check `compaction::note`. |
+| The UI goes silent and stop does nothing for tens of seconds | A summary call is not interruptible | Check `llm::chat` is still wrapped in `interruptible` in `host_api.rs`. |
+| The progress card spins forever | Nothing cleared `compactNode` | Every terminal path must clear it — `compacted`, `incident`, `turn-finished`. |
+| No card appears at all after a reload | Progress frames are transient by design | Expected. The `compacted` event is the durable record. |
 | The provider refuses the request after a compaction | A span split a tool round | Check `rounds` and `eligible_middle`. A round must stay whole. |

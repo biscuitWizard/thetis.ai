@@ -138,6 +138,20 @@ impl Turn {
         self.retrieve_skills_once();
         self.maybe_compact();
 
+        // A stop pressed during compaction should end the turn there, not after
+        // one more completion paid for at the full context size.
+        if self.stopped_before_starting() {
+            self.stopped_by = "cancelled";
+            return Ok(TurnStats {
+                iterations: 0,
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.completion_tokens,
+                cost_usd: self.cost_usd,
+                tools_used: self.tools_used,
+                stopped_by: self.stopped_by.to_string(),
+            });
+        }
+
         loop {
             if self.iterations >= self.max_iterations {
                 self.stopped_by = "max-iterations";
@@ -392,14 +406,29 @@ impl Turn {
             return;
         }
 
-        let Some(plan) =
-            compaction::plan(&self.messages, &self.origins, self.context_tokens, &policy)
-        else {
+        let Some(plan) = compaction::plan(
+            &self.session_id,
+            &self.messages,
+            &self.origins,
+            self.context_tokens,
+            &policy,
+        ) else {
             return;
         };
 
-        let replaced = plan.messages_replaced;
-        host::append(&self.session_id, &SessionEvent::ContextCompacted(plan));
+        // Summarizing is several model calls and can take tens of seconds, so it
+        // reports progress and watches the inbox. Anything the user typed while
+        // it ran comes back here rather than being swallowed: compaction is not
+        // part of the conversation and has no business consuming its input.
+        let (result, carried) = compaction::run(&self.session_id, plan, &policy);
+        self.pending.extend(carried);
+
+        let Some(record) = result else {
+            return;
+        };
+
+        let replaced = record.messages_replaced;
+        host::append(&self.session_id, &SessionEvent::ContextCompacted(record));
 
         // Rebuild through the compaction just recorded.
         self.rehydrate();
@@ -407,6 +436,17 @@ impl Turn {
             LogLevel::Info,
             &format!("compaction: {replaced} messages replaced by a summary"),
         );
+    }
+
+    /// Whether the user stopped the turn before it got as far as its first
+    /// completion.
+    ///
+    /// Compaction is the only thing that runs before that point and the only
+    /// thing that takes long enough for a stop to land during it. Without this
+    /// the loop's first checkpoint is *after* a completion, so a turn stopped
+    /// during compaction still paid for a full model call before noticing.
+    fn stopped_before_starting(&mut self) -> bool {
+        matches!(self.drain_inbox(), Interrupt::Cancelled)
     }
 
     /// The base prompt, the mode's own instructions, and the skills this

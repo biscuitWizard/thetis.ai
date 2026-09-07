@@ -22,6 +22,9 @@ let live = null; // element collecting streamed tokens
 let onInspect = null; // opens the Context tab at the latest request
 let onAnswer = null; // sends an ask_user form's answers as a user message
 let pendingNode = null; // the optimistic row for a message not yet acknowledged
+// The live compaction card, while one is running. Transient, like `live`: the
+// progress frames are never persisted, so nothing replays it.
+let compactNode = null;
 // Ask forms still open. A user message means they were answered — during a
 // replay as much as live — so they lock rather than invite a second answer.
 let openAsks = [];
@@ -42,6 +45,7 @@ export function mountTranscript(hooks = {}) {
 export function reset() {
   live = null;
   pendingNode = null;
+  compactNode = null;
   openAsks = [];
   open.clear();
   clear(root);
@@ -403,8 +407,75 @@ const RENDERERS = {
     completeToolRow(ev);
   },
 
+  /* Compaction, while it is happening.
+   *
+   * The card is transient and updates in place: the frames are a progress
+   * stream, not a log, so appending a row per frame would bury the conversation
+   * under a hundred near-identical lines. It sits under the last message, which
+   * is where the reader is already looking, and it is the answer to a turn that
+   * used to go completely silent — no tokens, no tool rows, a dead stop button —
+   * for the tens of seconds several summary calls take. */
+  compacting(ev) {
+    live = null;
+    root.querySelector(".empty")?.remove();
+
+    if (!compactNode) {
+      compactNode = el(
+        "div",
+        { class: "compacting" },
+        el(
+          "div",
+          { class: "compacting-head" },
+          el("span", { class: "spinner" }),
+          el("span", { class: "compacting-title" }, "Compacting context"),
+          el("span", { class: "compacting-count" }, "")
+        ),
+        el("div", { class: "compacting-track" }, el("span", { class: "compacting-fill" })),
+        el("div", { class: "compacting-detail" }, ""),
+        el("div", { class: "compacting-foot" }, "")
+      );
+      root.append(compactNode);
+    }
+
+    const done = ev.phase === "finished" || ev.phase === "failed" || ev.phase === "cancelled";
+    const spans = ev.spans || 0;
+    // Planning has no span count yet, so the bar shows a sliver rather than
+    // nothing: a 0% bar next to a spinner reads as stuck.
+    const share = done ? 1 : spans > 0 ? Math.min(1, (ev.span || 0) / spans) : 0.06;
+
+    compactNode.classList.toggle("is-done", done);
+    compactNode.classList.toggle("is-bad", ev.phase === "failed" || ev.phase === "cancelled");
+    compactNode.querySelector(".compacting-fill").style.width = `${Math.round(share * 100)}%`;
+    compactNode.querySelector(".compacting-count").textContent =
+      spans > 0 && !done ? `span ${ev.span || 0} of ${spans}` : ev.phase;
+    compactNode.querySelector(".compacting-detail").textContent = ev.detail || "";
+
+    const bits = [];
+    if (ev.tokens_before > 0) {
+      bits.push(`${fmtK(ev.tokens_before)} tokens → target ${fmtK(ev.tokens_target || 0)}`);
+    }
+    if (ev.messages > 0) bits.push(`${ev.messages} messages summarized`);
+    if (ev.model) bits.push(ev.model);
+    compactNode.querySelector(".compacting-foot").textContent = bits.join(" · ");
+
+    // The spinner stops meaning anything once the run is over, and the
+    // `compacted` event that follows carries the summary worth keeping.
+    if (done) {
+      compactNode.querySelector(".spinner")?.remove();
+      const finished = compactNode;
+      compactNode = null;
+      // A run that produced nothing has no `compacted` event to replace this,
+      // so it stays as the record of the attempt. One that succeeded is about to
+      // be superseded, so it goes.
+      if (ev.phase === "finished") setTimeout(() => finished.remove(), 400);
+    }
+  },
+
   compacted(ev) {
     live = null;
+    // The progress card has said its piece; this row replaces it.
+    compactNode?.remove();
+    compactNode = null;
     // Foldable rather than a bare line: the summary is what the model now sees
     // in place of those messages, so it should be readable on demand.
     const node = el(
@@ -431,6 +502,11 @@ const RENDERERS = {
 
   incident(ev) {
     live = null;
+    // A turn that died mid-compaction leaves a card with a spinner on it and
+    // nothing coming to finish it, which is the same lie this whole change is
+    // about. Both endings below clear it for that reason.
+    compactNode?.remove();
+    compactNode = null;
     // An incident ends a turn. Without this, replaying a log that ends in one
     // would leave the composer showing "working…" with nothing running.
     store.set({ busy: false });
@@ -482,6 +558,8 @@ const RENDERERS = {
   "turn-finished"(ev) {
     store.set({ busy: false });
     live = null;
+    compactNode?.remove();
+    compactNode = null;
 
     // The ledger the Usage view and the header's spend chip read. These totals
     // are authoritative for the turn, so the running tally it was accumulating

@@ -104,6 +104,21 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "tokens_before": c.tokens_before,
             "summary": c.summary,
         }),
+
+        // Transient, like a token delta: the transcript draws one progress card
+        // and updates it in place rather than appending a row per frame. The
+        // `compacted` event above is what finally replaces it.
+        SessionEvent::CompactionProgress(p) => json!({
+            "kind": "compacting",
+            "phase": p.phase,
+            "span": p.span,
+            "spans": p.spans,
+            "messages": p.messages,
+            "tokens_before": p.tokens_before,
+            "tokens_target": p.tokens_target,
+            "model": p.model,
+            "detail": p.detail,
+        }),
     };
 
     let obj = body.as_object_mut()?;
