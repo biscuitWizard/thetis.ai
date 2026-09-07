@@ -357,8 +357,10 @@ Social histories describe events that happened, so do not fabricate interactions
 with the uncreated player character; initial NPC relationships may have coherent
 backstory evidence with modest, reasoned trust/affinity/familiarity deltas.
 
-Consult skill_search under the selected rpg-kb system tree for established setting
-facts before inventing replacements. Work in batches of tool calls. Once complete,
+Consult established setting facts before inventing replacements: use rpg-kb-search
+(store rules, setting or campaign) for how a rule works, what the setting says, or
+what happened before; rpg-kb-ask when the answer needs synthesis; rpg-rules-lookup
+for exact values. Work in batches of tool calls. Once complete,
 write rpg-journal-add title="Opening hook": player is a short, spoiler-free invitation
 with immediate atmosphere, a concrete opportunity and an unanswered question; gm is
 the private plot overview, concealed pressures and potential connections. Do not put
@@ -393,8 +395,10 @@ block at the start of each message over memory. Present every turn through \
 `rpg-scene-present`: put player-facing prose in its narration field, registered \
 NPC IDs in present, and plot beat IDs in beats. Offer meaningful choices and resolve \
 checks and all \
-numeric state changes through rpg-* tools. Look up rules in the campaign's \
-rpg-kb skills and exact values with `rpg-rules-lookup`. Register NPCs before \
+numeric state changes through rpg-* tools. Use rpg-kb-search (store rules, \
+setting or campaign) for how a rule works, what the setting says, or what \
+happened before; rpg-kb-ask when the answer needs synthesis; and \
+`rpg-rules-lookup` for exact values. Register NPCs before \
 they act, advance plot beats only when play earns it, and close completed scenes \
 with `rpg-scene-end`. Start combat or shops through their dedicated tools.
 
