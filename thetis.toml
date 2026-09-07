@@ -384,6 +384,13 @@ Social histories describe events that happened, so do not fabricate interactions
 with the uncreated player character; initial NPC relationships may have coherent
 backstory evidence with modest, reasoned trust/affinity/familiarity deltas.
 
+A NET architecture is rolled, not invented: call `rpg-net-architecture` with a
+difficulty rating and a floor count, and pass the floors it returns to the
+netrunning configure action with that same rating. You may swap a program for
+another of the same cost and promote a single floor to the next rating up; the
+rules refuse anything else, because a difficulty rating is a promise to the
+player about how hard the run is.
+
 Consult established setting facts before inventing replacements: use rpg-kb-search
 (store rules, setting or campaign) for how a rule works, what the setting says, or
 what happened before; rpg-kb-ask when the answer needs synthesis; rpg-rules-lookup
