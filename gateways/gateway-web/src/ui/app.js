@@ -1497,6 +1497,7 @@ $("archive-chat").addEventListener("click", (event) => {
     confirmLabel: "Archive",
     onConfirm: () => {
       connection.send({ type: "archive", id });
+      admin.close();
       store.set({ current: null, title: "", branch: null, branchGraph: null });
       terminals.setSession(null);
       setHeader();
@@ -1511,6 +1512,9 @@ $("archive-chat").addEventListener("click", (event) => {
 // --- actions ----------------------------------------------------------------
 
 function openSession(id) {
+  // The panel takes the place of the stage; choosing a conversation is the
+  // way back to it.
+  admin.close();
   if (id === store.current) return;
   connection.send({ type: "open", id, previous: store.current || undefined });
 }
@@ -1594,7 +1598,7 @@ const composer = mountComposer({
 // exactly when the trunk revision and the served UI build have changed.
 const status = statusbar.mountStatusbar((frame) => connection.send(frame));
 admin.mountAdmin((frame) => connection.send(frame));
-$("admin-link")?.addEventListener("click", () => admin.open());
+$("admin-link")?.addEventListener("click", () => admin.toggle());
 connection.onOpen(() => status.refresh());
 
 connection.connect();

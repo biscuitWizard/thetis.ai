@@ -1,11 +1,13 @@
-/* The control panel: every operator control and every setting, on the stage.
+/* The control panel: every operator control and every setting.
  *
- * Administrators only. The footer's "control panel" button opens it as a tab
- * with the stage's whole width, because it is tables and forms rather than a
- * list: trunk's history, the worker fleet, the accounts, the model catalogue,
- * and the hundred-odd settings in thetis.toml grouped the way the file groups
- * them. The host-rendered /admin page keeps the same controls in plain HTML
- * for when this UI is the thing that is broken, and is linked from here.
+ * Administrators only. The footer's "Control panel" button opens it in place
+ * of the stage and the rail — not as a tab beside the conversation, because
+ * it is tables and forms rather than a list and wants the whole width: trunk's
+ * history, the worker fleet, the accounts, the model catalogue, and the
+ * hundred-odd settings in thetis.toml grouped the way the file groups them.
+ * The sidebar stays, and choosing a conversation there is the way back. The
+ * host-rendered /admin page keeps the same controls in plain HTML for when
+ * this UI is the thing that is broken, and is linked from here.
  *
  * Everything here is an affordance, never a check. The host refuses every op
  * for anyone who is not an administrator, and answers `admin-result` with the
@@ -19,18 +21,14 @@
  * A new section of the panel is one entry in SECTIONS.
  */
 
-import { clear, el, setHidden } from "../lib/dom.js";
+import { $, clear, el, icon, setHidden } from "../lib/dom.js";
 import { toast, popover } from "../lib/toast.js";
-import * as stage from "./stage.js";
 
-const TAB = "admin";
-const GEAR = [
-  "M10 6.5a3.5 3.5 0 1 0 0 7a3.5 3.5 0 0 0 0-7z",
-  "M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4",
-];
+const CLOSE = ["M6 6l8 8M14 6l-8 8"];
 
 let send = () => false;
 let pane = null;
+let isOpen = false;
 let nav = null;
 let main = null;
 let banner = null;
@@ -111,10 +109,14 @@ function needOf(frame) {
 /** Called once from app.js. `sender` submits a frame to the host. */
 export function mountAdmin(sender) {
   send = sender;
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && isOpen && !document.querySelector(".popover")) close();
+  });
 }
 
 export function onUser(frame) {
   user = frame;
+  if (isOpen && !frame.admin) close();
 }
 
 /** The host answered `admin` with "unknown frame type": an older gateway. */
@@ -123,22 +125,38 @@ export function onUnsupported() {
   if (main) draw();
 }
 
-/** Opens the panel on a section, building the tab the first time. */
+export function opened() {
+  return isOpen;
+}
+
+export function toggle() {
+  if (isOpen) close();
+  else open();
+}
+
+/** Opens the panel on a section, in place of the stage and the rail. */
 export function open(sectionId = active) {
   if (user && !user.admin) {
     toast("The control panel is for administrators.", { tone: "error" });
     return;
   }
-  pane = stage.openTab({
-    id: TAB,
-    kind: "admin",
-    label: "Control panel",
-    hint: "Settings, accounts, models, trunk and the worker fleet",
-    icon: GEAR,
-    build,
-    onShow: () => request(section(active).needs),
-  });
+  pane = $("admin-panel");
+  if (!pane) return;
+  if (!main) build(pane);
+  isOpen = true;
+  document.body.classList.add("is-admin-open");
+  setHidden(pane, false);
+  $("admin-link")?.classList.add("is-active");
   show(sectionId);
+}
+
+/** Puts the stage and the rail back. The panel keeps its state for next time. */
+export function close() {
+  if (!isOpen) return;
+  isOpen = false;
+  document.body.classList.remove("is-admin-open");
+  if (pane) setHidden(pane, true);
+  $("admin-link")?.classList.remove("is-active");
 }
 
 function build(node) {
@@ -149,9 +167,14 @@ function build(node) {
 
   const head = el(
     "div",
-    { class: "stage-bar" },
-    el("span", { class: "stage-bar-name" }, "Control panel"),
-    el("span", { class: "stage-bar-gap" }),
+    { class: "admin-head" },
+    el(
+      "div",
+      {},
+      el("h1", { class: "admin-head-title" }, "Control panel"),
+      el("p", { class: "admin-head-sub" }, "Operator controls and every setting of this installation. Changes to configuration take effect at the next restart.")
+    ),
+    el("span", { class: "admin-head-gap" }),
     el(
       "button",
       {
@@ -161,6 +184,11 @@ function build(node) {
         onClick: () => request(section(active).needs),
       },
       "Refresh"
+    ),
+    el(
+      "button",
+      { type: "button", class: "icon-btn", title: "Close the control panel (Esc)", "aria-label": "Close the control panel", onClick: close },
+      icon(CLOSE, { size: 16, width: 1.8 })
     )
   );
 
@@ -214,7 +242,7 @@ export function onFrame(frame) {
       return;
   }
   const need = needOf(frame);
-  if (main && section(active).needs.includes(need)) draw();
+  if (isOpen && section(active).needs.includes(need)) draw();
 }
 
 /* An outcome. It is filed under the slot its control reads, and told as a
@@ -230,7 +258,7 @@ function onResult(frame) {
   if (["act", "sign-out", "restart"].includes(frame.op)) {
     toast(frame.message || (frame.ok ? "Done." : "That was refused."), { tone: frame.ok ? "good" : "error" });
   }
-  if (main) draw();
+  if (isOpen) draw();
 }
 
 function slotOf(frame) {
@@ -330,13 +358,14 @@ function heading(title, help, aside) {
 }
 
 function table(columns, rows) {
+  const headed = columns.some((c) => c !== "");
   return el(
     "div",
     { class: "admin-table-wrap" },
     el(
       "table",
       { class: "admin-table" },
-      el("thead", {}, el("tr", {}, ...columns.map((c) => el("th", {}, c)))),
+      headed ? el("thead", {}, el("tr", {}, ...columns.map((c) => el("th", {}, c)))) : null,
       el("tbody", {}, ...rows.map((cells) => el("tr", {}, ...cells.map((cell) => el("td", {}, cell)))))
     )
   );
@@ -565,17 +594,27 @@ function entriesBlock(tableId, opts = {}) {
   return el(
     "section",
     { class: "admin-block" },
-    heading(info?.label || tableId, info?.help || "", [addButton]),
+    heading(info?.label || tableId, info?.help || "", [editing === "" ? null : addButton]),
     resultNote(slot),
     el("div", { class: "panel-list" }, ...blocks)
   );
 }
 
-function entryCard(info, entry, opts) {
-  const summary = info.columns
-    .filter((c) => c.key !== "id" && entry.fields[c.key] !== undefined && entry.fields[c.key] !== "" && entry.fields[c.key] !== null)
-    .map((c) => `${c.key}: ${describeValue(entry.fields[c.key])}`)
+/** A card's one-line summary: the short columns, clipped. A prompt or a map
+ *  is a paragraph and belongs in the edit form, not on the card. */
+function summarise(info, entry) {
+  const clip = (s) => (s.length > 90 ? `${s.slice(0, 88)}…` : s);
+  return info.columns
+    .filter((c) => c.key !== "id" && !["longtext", "map", "secret"].includes(c.kind))
+    .filter((c) => entry.fields[c.key] !== undefined && entry.fields[c.key] !== "" && entry.fields[c.key] !== null)
+    .map((c) => `${c.key}: ${clip(describeValue(entry.fields[c.key]))}`)
+    .concat(info.columns.filter((c) => ["longtext", "map"].includes(c.kind) && entry.fields[c.key]).map((c) => `${c.key}: …`))
+    .concat(info.columns.filter((c) => c.kind === "secret" && entry.fields[c.key] === "***").map((c) => `${c.key}: set`))
     .join(" · ");
+}
+
+function entryCard(info, entry, opts) {
+  const summary = summarise(info, entry);
   return el(
     "div",
     { class: "card" },
@@ -757,7 +796,7 @@ function renderTrunk() {
               el("span", { class: "mono" }, short(c.rev), c.head ? " " : "", c.head ? pill("head", "pill-on") : null),
               c.subject,
               el("span", { class: "quiet" }, c.author),
-              c.head ? "" : actionButton("trunk-reset", c.rev),
+              c.head ? "" : actionButton("trunk-reset", c.rev, "Reset here"),
             ])
           )
     ),

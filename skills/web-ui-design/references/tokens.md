@@ -347,7 +347,7 @@ resolved colour strings and cannot read a custom property itself.
 | `ui/app.css` | Layout and components |
 | `ui/app.js` | Wiring: frame handlers, the rail tab list, `INVALIDATED_BY`, header, actions |
 | `ui/lib/` | `dom` · `socket` · `store` · `markdown` · `toast` |
-| `ui/views/` | `rail` · `panel` · `transcript` · `composer` · `sessions` · `branch` · `workspace` · `context` · `picker` · `admin` (the control panel: a stage tab via `stage.openTab`, a `SECTIONS` registry, forms rendered from the host's field and column descriptions) |
+| `ui/views/` | `rail` · `panel` · `transcript` · `composer` · `sessions` · `branch` · `workspace` · `context` · `picker` · `admin` (the control panel: takes the place of the stage and the rail while open (`body.is-admin-open`), a `SECTIONS` registry, forms rendered from the host's field and column descriptions) |
 
 ### Host — `crates/thetis/src/`
 

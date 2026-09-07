@@ -91,7 +91,6 @@ function drawStrip() {
       tab.kind === "agent" ? el("span", { class: `stage-dot is-${tab.state || "running"}` }) : null,
       tab.kind === "file" ? el("span", { class: "stage-tab-icon" }, icon(["M5 3.5h7l3 3v10H5z", "M12 3.5v3h3"], { size: 13, width: 1.6 })) : null,
       tab.kind === "plan" ? el("span", { class: "stage-tab-icon" }, icon(["M6 4.5h8M6 8h8M6 11.5h5", "M3.5 4.5h.01M3.5 8h.01M3.5 11.5h.01"], { size: 13, width: 1.6 })) : null,
-      tab.icon ? el("span", { class: "stage-tab-icon" }, icon(tab.icon, { size: 13, width: 1.6 })) : null,
       label,
       tab.note ? el("span", { class: "stage-tab-note" }, tab.note) : null,
       tab.closable
@@ -807,36 +806,6 @@ export function onResult(frame) {
   syncFile(tab);
 }
 
-// --- app tabs -----------------------------------------------------------------
-
-/* Opens a tab owned by another view, or brings it forward.
- *
- * The control panel is the first of these: a pane that is neither a
- * conversation, a child, a file nor the plan, but a surface of its own that
- * wants the stage's width. The caller builds the pane once, on creation, and
- * keeps its own state; the stage only owns the strip and which pane shows.
- *
- * @param {object} spec  id, kind, label, hint, icon (path list), closable,
- *                       build(pane), onShow()
- */
-export function openTab(spec) {
-  let tab = find(spec.id);
-  if (!tab) {
-    tab = add({
-      id: spec.id,
-      kind: spec.kind || "app",
-      label: spec.label || spec.id,
-      hint: spec.hint || spec.label || "",
-      icon: spec.icon || null,
-      closable: spec.closable !== false,
-      onShow: spec.onShow || null,
-    });
-    spec.build?.(tab.pane);
-  }
-  show(spec.id);
-  return tab.pane;
-}
-
 // --- odds and ends ------------------------------------------------------------
 
 function human(n) {
@@ -888,5 +857,5 @@ export function mountStage(hooks = {}) {
   setHidden($("pane-chat"), false);
   drawStrip();
 
-  return { show, openFile, focusAgent, openAgentPane, setChatTitle, activeTab, openPlan, openTab };
+  return { show, openFile, focusAgent, openAgentPane, setChatTitle, activeTab, openPlan };
 }

@@ -143,35 +143,45 @@ body { display: flex; flex-direction: column; }
 
 .sidebar-foot {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: var(--gap-2);
   padding: var(--gap-3) var(--gap-4);
   border-top: 1px solid var(--hairline);
   font-size: var(--text-xs);
 }
+.foot-row { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; }
 
-/* Name and logout read as one item: "bob · log out". */
-.foot-user {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--gap-2);
+/* Who: the face, the name, and the connection state at the far end. */
+.foot-identity .status { margin-left: auto; flex: none; }
+.foot-name {
   min-width: 0;
-}
-.foot-user:empty { display: none; }
-.foot-user #user-name {
-  max-width: 11ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+.foot-name:empty { display: none; }
+
+/* What: the control panel and the way out, as quiet icon-and-word buttons.
+   The row disappears when neither applies (a plain account in local mode),
+   so the footer never ends in an empty line. */
+.foot-actions { gap: var(--gap-3); }
+.foot-actions:not(:has(:not([hidden]))) { display: none; }
+.foot-actions form { display: inline-flex; margin: 0; }
+.foot-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 6px;
+  margin-left: -6px;
+  border-radius: var(--r-sm);
   color: var(--text-dim);
+  font-size: var(--text-xs);
 }
-.foot-user #user-name:empty { display: none; }
-.foot-user form { display: inline-flex; margin: 0; }
-.foot-user #user-name:not(:empty) + form:not([hidden])::before {
-  content: "·";
-  color: var(--text-faint);
-  margin-right: var(--gap-2);
-}
+.foot-action svg { width: 14px; height: 14px; flex: none; }
+.foot-action:hover { color: var(--text); background: var(--surface-3); }
+.foot-action.is-active { color: var(--accent); background: var(--accent-wash); }
 
 /* The "everyone's conversations" switch stays lit while it is on, so the
  * sidebar's contents are never a mystery. */
@@ -3512,17 +3522,41 @@ body { display: flex; flex-direction: column; }
 
 /* --- the control panel ---------------------------------------------------------
  *
- * A stage tab, not a rail panel: it is tables and forms, and wants the width.
- * A section nav down the left, the section on the right. Every colour is a
- * token; the only new shapes are the settings rows and the tables, which
- * nothing else on the page had needed.
+ * Neither a rail panel nor a stage tab: while it is open it takes the place of
+ * the stage and the rail, and the sidebar stays as the way back. It is tables
+ * and forms, and wants the width; a section nav down the left, the section on
+ * the right. Every colour is a token; the only new shapes are the settings
+ * rows and the tables, which nothing else on the page had needed.
  */
+
+.admin-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+body.is-admin-open .main,
+body.is-admin-open .rail { display: none; }
+
+.admin-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: var(--gap-3) var(--gap-5);
+  border-bottom: 1px solid var(--hairline);
+}
+.admin-head-title { margin: 0; font-size: var(--text-lg); font-weight: 600; letter-spacing: -.01em; }
+.admin-head-sub { margin: 1px 0 0; font-size: var(--text-xs); color: var(--text-faint); }
+.admin-head-gap { flex: 1 1 auto; }
 
 .admin-shell {
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-columns: 11rem minmax(0, 1fr);
+  grid-template-columns: 12.5rem minmax(0, 1fr);
 }
 .admin-nav {
   display: flex;
@@ -3552,8 +3586,8 @@ body { display: flex; flex-direction: column; }
   overflow-y: auto;
   padding: var(--gap-4) var(--gap-5) var(--gap-6);
 }
-.admin-main > * { max-width: 64rem; }
-.admin-title { margin: 0 0 var(--gap-3); font-size: var(--text-lg); font-weight: 600; letter-spacing: -.01em; }
+.admin-main > * { max-width: 68rem; }
+.admin-title { margin: 0 0 var(--gap-4); font-size: var(--text-lg); font-weight: 600; letter-spacing: -.01em; }
 
 .admin-banner {
   flex: 0 0 auto;
@@ -3598,6 +3632,7 @@ body { display: flex; flex-direction: column; }
 }
 .admin-table td { padding: var(--gap-2) var(--gap-3); border-bottom: 1px solid var(--hairline); vertical-align: middle; }
 .admin-table tr:last-child td { border-bottom: none; }
+.admin-table td:last-child { white-space: nowrap; }
 .admin-table .mono { font-family: var(--mono); font-size: var(--text-xs); }
 .admin-table .quiet { color: var(--text-faint); }
 .admin-actions { display: inline-flex; gap: var(--gap-1); flex-wrap: wrap; }
