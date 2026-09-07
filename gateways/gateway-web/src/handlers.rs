@@ -521,6 +521,10 @@ fn tool_group(name: &str) -> &'static str {
         _ if name.starts_with("branch_") => "Version control",
         _ if name.starts_with("web-") || name.starts_with("web_") => "Web",
         _ if name.starts_with("notion-") => "Notion",
+        // The git-* components and the git_clone built-in. Kept apart from
+        // "Version control", which is this conversation's own sandbox branch —
+        // a different thing from a remote repository on GitHub.
+        _ if name.starts_with("git-") || name.starts_with("git_") => "Git",
         _ => "Other",
     }
 }

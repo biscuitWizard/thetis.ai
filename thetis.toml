@@ -325,8 +325,13 @@ retries = 3
 version = "2026-03-11"
 timeout_secs = 30
 
-# The GitHub tool group. Every `github-*` tool inherits this block, so the
+# The git tool group. Every `git-*` tool inherits this block, so the
 # credential is named once rather than once per tool.
+#
+# Named `[tools.git]` because the group is named `git-*`: the scope a tool reads
+# is derived from its own name (`tool_config_scopes` in config.rs), so renaming
+# the tools renamed the block. An existing `[tools.github]` block is no longer
+# read by anything — move its keys here.
 #
 # The identity is a **GitHub App**, not a bot user with a personal access token.
 # An App is its own principal: it authors commits under a stable `<slug>[bot]`
@@ -345,9 +350,9 @@ timeout_secs = 30
 # so the orchestrator reads that file and inlines it — see `inline_file_secrets`
 # in crates/thetis/src/config.rs. The path must resolve inside the project root.
 #
-# Run `github-whoami` after setting this up: it exercises the whole chain and
+# Run `git-whoami` after setting this up: it exercises the whole chain and
 # names the step that failed rather than returning a bare 401.
-[tools.github]
+[tools.git]
 # app_id = "123456"
 # private_key_path = "secrets/github-app.pem"
 # Only needed when the App is installed on more than one account, where guessing
