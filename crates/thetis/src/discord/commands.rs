@@ -19,13 +19,27 @@ use std::sync::Arc;
 use crate::config::DiscordSettings;
 use crate::grip::Grip;
 
-use super::{PAIR_SCOPE, issue_code, paired_users, session_for};
+use super::{issue_code, paired_users, policy, session_for};
 
 /// Who invoked a command, independent of whether it came as a message or an
 /// interaction. Only the identity and the privacy of the channel matter.
 pub struct Invoker {
     pub user_id: String,
     pub is_dm: bool,
+}
+
+/// Which Thetis account a command's invoker is, or a synthetic per-channel
+/// owner when the snowflake is bound to nothing.
+///
+/// Every command that touches a conversation goes through this rather than
+/// using the snowflake or the conversation key, because the account is what
+/// authority is resolved from and what fork routing compares. The synthetic
+/// fallback is not an account — it carries the read-only Discord policy and
+/// names no principal — but it is a stable id, which is what the caller needs.
+fn account_of(grip: &Arc<Grip>, invoker: &Invoker, key: &str) -> String {
+    grip.cfg
+        .auth
+        .owner_for_discord(&invoker.user_id, &format!("discord:{key}"))
 }
 
 /// One command as Discord needs to be told about it.
@@ -83,6 +97,40 @@ const SPECS: &[Spec] = &[
     },
 ];
 
+/// Commands advertised only when the operator has enabled them.
+///
+/// `/fork` is here rather than in [`SPECS`] because a command in the picker is
+/// a promise. Advertising one that always answers "the operator has not enabled
+/// this" teaches people the bot is broken, and — worse for something that
+/// concerns permissions — it advertises the existence of an escalation path on
+/// every install that has deliberately not opened one.
+const OPTIONAL_SPECS: &[(&str, Spec)] = &[(
+    "fork",
+    Spec {
+        name: "fork",
+        description: "Talk to a conversation running under your own permissions",
+        argument: Some(("state", "Say `off` to go back to the read-only conversation")),
+    },
+)];
+
+/// The commands to register, given what is switched on.
+fn specs_for(cfg: &DiscordSettings) -> Vec<&'static Spec> {
+    let mut specs: Vec<&'static Spec> = SPECS.iter().collect();
+    for (name, spec) in OPTIONAL_SPECS {
+        let enabled = match *name {
+            "fork" => cfg.allow_fork,
+            // A new optional command with no switch would silently never be
+            // advertised, which is a confusing way to find out about a missing
+            // arm. Refuse to guess.
+            other => unreachable!("no switch is wired up for the optional command /{other}"),
+        };
+        if enabled {
+            specs.push(spec);
+        }
+    }
+    specs
+}
+
 /// The payload for a bulk overwrite of the application's global commands.
 ///
 /// Both context fields are named explicitly, and that is load-bearing.
@@ -118,7 +166,7 @@ const SPECS: &[Spec] = &[
 /// enabled. Asking only for guild install, which every application supports,
 /// cannot hit it. Verified live: the PUT answers 200 and Discord echoes
 /// `contexts: [0, 1]` and `integration_types: [0]` on all eight commands.
-pub fn schema() -> Value {
+pub fn schema(cfg: &DiscordSettings) -> Value {
     const CHAT_INPUT: u64 = 1;
     const STRING_OPTION: u64 = 3;
     /// Installation context: the app was installed to a server.
@@ -127,8 +175,8 @@ pub fn schema() -> Value {
     const CONTEXT_GUILD: u64 = 0;
     const CONTEXT_BOT_DM: u64 = 1;
     Value::Array(
-        SPECS
-            .iter()
+        specs_for(cfg)
+            .into_iter()
             .map(|spec| {
                 let mut command = json!({
                     "name": spec.name,
@@ -173,37 +221,60 @@ pub async fn run(
 ) -> Result<Option<String>> {
     let reply = match name {
         "help" => {
-            let list = SPECS
-                .iter()
+            let list = specs_for(cfg)
+                .into_iter()
                 .map(|s| format!("`/{}` — {}", s.name, s.description))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // The second paragraph has to stay true when forking is on. The
+            // guarantee is unchanged — *this* conversation cannot change
+            // anything, and no command can make it — but saying nothing more
+            // would misdescribe an instance where `/fork` exists.
+            let caveat = if cfg.allow_fork {
+                "\n\n`/fork` does not change that. It moves your messages to a \
+                 *different* conversation, one that runs under the permissions \
+                 your own Thetis account already has. This one stays read-only, \
+                 and so does everyone else's."
+            } else {
+                ""
+            };
             format!(
                 "**Commands**\n{list}\n\n\
                  I am in **{}** mode: I can read and research, but I cannot change \
                  anything on this machine. That is enforced by the grip, not by \
-                 me, and there is no command to change it.",
+                 me, and there is no command to change it.{caveat}",
                 cfg.mode
             )
         }
 
         "new" => {
-            let kv_key = format!("discord.session.{key}");
-            let synthetic_owner = format!("discord:{key}");
-            let owner = grip
-                .cfg
-                .auth
-                .owner_for_discord(&invoker.user_id, &synthetic_owner);
-            let meta = grip
-                .persist
-                .create_session(Some(format!("Discord {key}")), &cfg.mode, &owner)
-                .await?;
-            grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
-            "Started a fresh conversation. I have forgotten what came before.".to_string()
+            // Shared with the first-message path deliberately: this is where a
+            // conversation's ceiling is stamped, and a second copy of the
+            // creation code is a second place to forget it.
+            super::new_session_for(grip, key, &invoker.user_id).await?;
+            let account = account_of(grip, invoker, key);
+            // `/new` resets the read-only conversation. It deliberately does not
+            // touch a bound fork: that one has more authority and may be
+            // mid-task, so discarding it has to be asked for in as many words.
+            let forked = super::fork_for(grip, key)
+                .await?
+                .is_some_and(|(_, owner)| policy::may_prompt_fork(&owner, &account));
+            if forked {
+                "Started a fresh read-only conversation. Your messages are still \
+                 going to your fork, though — say `/fork off` first if you meant \
+                 to talk to this one."
+                    .to_string()
+            } else {
+                "Started a fresh conversation. I have forgotten what came before.".to_string()
+            }
         }
 
         "stop" => {
-            let session_id = session_for(grip, key, &invoker.user_id).await?;
+            // Routed, like /status: stopping the read-only conversation while
+            // the speaker's fork carries on working is the worst possible
+            // answer to someone typing /stop.
+            let account = account_of(grip, invoker, key);
+            let session_id = super::route_for(grip, key, &account, &invoker.user_id).await?;
             if grip.cancel(&session_id).await {
                 "Stopping.".to_string()
             } else {
@@ -212,7 +283,12 @@ pub async fn run(
         }
 
         "status" => {
-            let session_id = session_for(grip, key, &invoker.user_id).await?;
+            // The conversation *this speaker* is talking to, which is their
+            // fork if they have one bound here. Reporting the read-only one
+            // while their messages went elsewhere would be a lie about the very
+            // thing someone runs /status to find out.
+            let account = account_of(grip, invoker, key);
+            let session_id = super::route_for(grip, key, &account, &invoker.user_id).await?;
             let meta = grip
                 .persist
                 .get_session(&session_id)
@@ -224,8 +300,21 @@ pub async fn run(
                 meta.model.clone()
             };
             let spend = grip.persist.get_spend(&session_id).await.unwrap_or(0.0);
+            // Read off the stored ceiling, not the mode. The mode only filters
+            // the tool list inside a component this instance can rewrite; the
+            // ceiling is what `host_api::require` actually enforces, so it is
+            // the honest answer to "what can this thing do".
+            let authority = match grip.persist.ceiling_of(&session_id).await {
+                Ok(Some(c)) if c.read_only => "read-only".to_string(),
+                Ok(Some(_)) => format!("your own permissions, as `{account}`"),
+                // No ceiling row means nothing narrows the speaker. That should
+                // not happen for a conversation reachable from Discord, so say
+                // so rather than implying a bound that is not there.
+                Ok(None) => "unbounded (unexpected here — tell an operator)".to_string(),
+                Err(_) => "unknown".to_string(),
+            };
             format!(
-                "**Session** `{}`\n**Mode** {} (read-only)\n**Model** {}\n\
+                "**Session** `{}`\n**Mode** {}\n**Can do** {authority}\n**Model** {}\n\
                  **Events** {}\n**Spent** ${:.4}",
                 meta.id, meta.mode, model, meta.event_count, spend
             )
@@ -247,7 +336,10 @@ pub async fn run(
         }
 
         "model" => {
-            let session_id = session_for(grip, key, &invoker.user_id).await?;
+            // Routed, like /status and /stop: someone changing the model means
+            // the conversation they are speaking to.
+            let account = account_of(grip, invoker, key);
+            let session_id = super::route_for(grip, key, &account, &invoker.user_id).await?;
             if argument.is_empty() {
                 let meta = grip.persist.get_session(&session_id).await?;
                 let current = meta
@@ -281,9 +373,26 @@ pub async fn run(
 
         "whoami" => {
             let paired = paired_users(grip).await;
+            let account = account_of(grip, invoker, key);
+            // Which Thetis account this snowflake is bound to, if any — the
+            // thing that decides what a fork could do. An unbound identity is
+            // reported as unlinked rather than as its synthetic owner id, which
+            // would read like an account and is not one.
+            let linked = match policy::may_fork(cfg, &account) {
+                Ok(()) => format!("`{account}` — `/fork` will run as you"),
+                Err(policy::ForkRefusal::Unbound) => {
+                    "not linked to a Thetis account".to_string()
+                }
+                Err(policy::ForkRefusal::Disabled) if account.starts_with("discord:") => {
+                    "not linked to a Thetis account".to_string()
+                }
+                Err(policy::ForkRefusal::Disabled) => {
+                    format!("`{account}` (forking is not enabled here)")
+                }
+            };
             format!(
                 "Your Discord id is `{}`.\nAuthorised: {}\nAdministrator: {}\n\
-                 This conversation is `{}`.",
+                 Thetis account: {linked}\nThis conversation is `{}`.",
                 invoker.user_id,
                 cfg.authorized(&invoker.user_id, &paired),
                 cfg.is_admin(&invoker.user_id),
@@ -295,30 +404,189 @@ pub async fn run(
         // rather than ignored, so the refusal is unambiguous.
         "mode" => "There is no mode command. This surface is read-only by design.".to_string(),
 
+        "fork" => fork(grip, cfg, invoker, key, argument).await?,
+
         _ => return Ok(None),
     };
 
     Ok(Some(reply))
 }
 
+/// `/fork` — start, or hand back to, a conversation that runs under the
+/// invoker's own permissions.
+///
+/// The read-only conversation in this channel is left exactly as it was. What
+/// changes is only where *this person's* messages go: a fork is bound to the
+/// conversation key, and `super::route_for` sends a message to it when the
+/// speaker is the account that authorised it and to the ordinary read-only
+/// conversation otherwise. So the write-enabled conversation stays promptable —
+/// which is the point, a fork you cannot follow up with is a fire-and-forget
+/// wish — while nobody else in the channel can address it.
+///
+/// Authority itself does not depend on that routing. Every turn runs under
+/// `policy(speaker) ∩ ceiling(session)`, so even a message that somehow reached
+/// the fork from another account would be executed with *that* account's
+/// permissions, narrowed by the fork's ceiling. The routing rule is about
+/// coherence — one conversation, one authority, legible refusals — not about
+/// being the thing that stops an escalation.
+async fn fork(
+    grip: &Arc<Grip>,
+    cfg: &DiscordSettings,
+    invoker: &Invoker,
+    key: &str,
+    argument: &str,
+) -> Result<String> {
+    // The resolved account, never the snowflake and never the channel. With
+    // `group_sessions_per_user = false` a channel's key carries no user id, so
+    // anything keyed on the conversation would authorise the whole channel.
+    let account = account_of(grip, invoker, key);
+
+    if let Err(refusal) = policy::may_fork(cfg, &account) {
+        return Ok(match refusal {
+            policy::ForkRefusal::Disabled => "Forking is not enabled on this instance. \
+                 An operator has to set `discord.allow_fork`, because it is the one \
+                 thing here that can start work which changes this machine."
+                .to_string(),
+            policy::ForkRefusal::Unbound => "Your Discord account is not linked to a Thetis \
+                 account, so there are no permissions of yours to run under. An \
+                 administrator links them with `discord_id` on your user entry."
+                .to_string(),
+        });
+    }
+
+    if argument.trim().eq_ignore_ascii_case("off") {
+        // Only your own binding. Unbinding is not destructive, but it is not
+        // nothing either: it decides where a *different* account's messages go,
+        // and someone whose fork was quietly detached would have their next
+        // message answered by a conversation with none of the context or the
+        // authority they were relying on.
+        let Some((_, owner)) = super::fork_for(grip, key).await? else {
+            return Ok("You were not talking to a fork.".to_string());
+        };
+        if !policy::may_prompt_fork(&owner, &account) {
+            return Ok(format!(
+                "The fork here belongs to `{owner}`, so it is not yours to put \
+                 away. You are already talking to the read-only conversation."
+            ));
+        }
+        super::forget_fork(grip, key).await?;
+        return Ok("Back to the read-only conversation. The fork is still there in \
+             the web UI, and `/fork` will start a new one."
+            .to_string());
+    }
+
+    if let Some((existing, owner)) = super::fork_for(grip, key).await? {
+        // Someone else's fork is bound here. Do not replace it — that would let
+        // one person quietly take over another's in-flight work — and do not
+        // join it either.
+        if !policy::may_prompt_fork(&owner, &account) {
+            return Ok(format!(
+                "There is already a fork here, authorised by a different account \
+                 (`{owner}`). Only they can talk to it. Your messages are going to \
+                 the read-only conversation."
+            ));
+        }
+        return Ok(format!(
+            "You are already talking to your fork, conversation `{existing}`. \
+             Say `/fork off` to go back to the read-only conversation."
+        ));
+    }
+
+    let parent = session_for(grip, key, &invoker.user_id).await?;
+    let id = super::fork_session_for(grip, key, &account, Some(&parent)).await?;
+    Ok(format!(
+        "Talking to a fork under your own permissions, as `{account}`.\n\
+         Conversation `{id}` — it is in the web UI, and it is the same one every \
+         time you speak here until you say `/fork off`.\n\
+         Everyone else in this channel still gets the read-only conversation."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Settings with everything optional switched off, which is the shape an
+    /// install has unless an operator has decided otherwise.
+    fn settings() -> DiscordSettings {
+        crate::discord::policy::tests::settings()
+    }
+
+    /// Settings with every optional command enabled, for asserting the ones
+    /// that only exist when switched on are still well-formed.
+    fn everything() -> DiscordSettings {
+        let mut cfg = settings();
+        cfg.allow_fork = true;
+        cfg
+    }
+
+    /// Every command name `run` has an arm for, advertised or not.
+    const HANDLED: &[&str] = &[
+        "help", "new", "stop", "status", "models", "model", "pair", "whoami", "mode", "fork",
+    ];
+
     #[test]
     fn every_advertised_command_is_handled() {
         // A command in the picker that `run` does not know would answer "not a
-        // command I know" — worse than not offering it.
-        let handled = [
-            "help", "new", "stop", "status", "models", "model", "pair", "whoami", "mode",
-        ];
-        for spec in SPECS {
+        // command I know" — worse than not offering it. Optional commands are
+        // checked too: being conditionally advertised is no excuse for being
+        // unhandled, since the condition is the operator's to flip.
+        for spec in SPECS.iter().chain(OPTIONAL_SPECS.iter().map(|(_, s)| s)) {
             assert!(
-                handled.contains(&spec.name),
+                HANDLED.contains(&spec.name),
                 "/{} is registered but not handled",
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn an_optional_command_is_absent_until_it_is_switched_on() {
+        // Advertising something that always refuses teaches people the bot is
+        // broken, and for /fork specifically it would announce an escalation
+        // path on every install that deliberately has none.
+        let off = schema(&settings());
+        let names: Vec<&str> = off
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"fork"), "got {names:?}");
+
+        let on = schema(&everything());
+        let names: Vec<&str> = on
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fork"), "got {names:?}");
+    }
+
+    #[test]
+    fn an_optional_command_obeys_the_same_registration_rules() {
+        // The context fields are what make a command invocable at all, and an
+        // optional command takes a different path through `specs_for` — so the
+        // rules are asserted over the enabled-everything schema too, not just
+        // the default one.
+        for command in schema(&everything()).as_array().unwrap() {
+            let name = command["name"].as_str().unwrap();
+            assert_eq!(command["contexts"], json!([0, 1]), "/{name}");
+            assert_eq!(command["integration_types"], json!([0]), "/{name}");
+            let description = command["description"].as_str().unwrap();
+            assert!((1..=100).contains(&description.chars().count()), "/{name}");
+            assert_eq!(name, name.to_lowercase(), "/{name}");
+        }
+    }
+
+    #[test]
+    fn every_optional_command_has_a_switch_wired_up() {
+        // `specs_for` panics on an optional command with no switch, rather than
+        // silently never advertising it. This is the test that turns that panic
+        // into a compile-time-ish guarantee instead of a production surprise.
+        let _ = specs_for(&settings());
+        let _ = specs_for(&everything());
     }
 
     #[test]
@@ -331,7 +599,7 @@ mod tests {
 
     #[test]
     fn the_schema_satisfies_discords_naming_rules() {
-        let commands = schema();
+        let commands = schema(&settings());
         let commands = commands.as_array().expect("an array of commands");
         assert_eq!(commands.len(), SPECS.len());
         for command in commands {
@@ -361,7 +629,7 @@ mod tests {
         // while the client's picker silently refuses to offer the command and
         // no INTERACTION_CREATE is ever sent. Leaving them out is what made
         // every slash command dead on a guild.
-        for command in schema().as_array().expect("an array of commands") {
+        for command in schema(&settings()).as_array().expect("an array of commands") {
             let name = command["name"].as_str().unwrap();
             assert_eq!(
                 command["contexts"],
@@ -383,7 +651,7 @@ mod tests {
         // [0, 1] would "work" and would quietly add a surface: a user-installed
         // command travels with the person, into servers and DMs the operator
         // never approved.
-        for command in schema().as_array().unwrap() {
+        for command in schema(&settings()).as_array().unwrap() {
             let types = command["integration_types"].as_array().unwrap();
             assert!(
                 !types.contains(&json!(1)),
@@ -397,7 +665,7 @@ mod tests {
     fn the_private_channel_context_is_not_requested() {
         // PRIVATE_CHANNEL (2) is only meaningful for a user-installed command.
         // Asking for it on a guild-install-only command is incoherent.
-        for command in schema().as_array().unwrap() {
+        for command in schema(&settings()).as_array().unwrap() {
             let contexts = command["contexts"].as_array().unwrap();
             assert!(!contexts.contains(&json!(2)));
         }
@@ -405,7 +673,7 @@ mod tests {
 
     #[test]
     fn an_optional_argument_is_declared_as_an_optional_string() {
-        let commands = schema();
+        let commands = schema(&settings());
         let model = commands
             .as_array()
             .unwrap()
@@ -419,7 +687,7 @@ mod tests {
 
     #[test]
     fn a_command_with_no_argument_declares_no_options() {
-        let commands = schema();
+        let commands = schema(&settings());
         let new = commands
             .as_array()
             .unwrap()

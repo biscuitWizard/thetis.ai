@@ -530,12 +530,44 @@ function toBottom(instant) {
  *
  * `role` picks the avatar as well as the colour — "user" and "assistant" are
  * the two that have a face, and any other role (a system note, a tool) gets no
- * avatar rather than a blank tile. */
+ * avatar rather than a blank tile.
+ *
+ * Most rows have no author to speak of — an assistant reply, a tool, a system
+ * note — so this keeps its short signature and `authored` below handles the one
+ * case that does. */
 function row(role, who, ...content) {
+  return authored(role, who, undefined, ...content);
+}
+
+/* What to call the person who sent a message.
+ *
+ * "you" when it is the reader — which covers a solo conversation, every message
+ * from before authorship existed, and `local` mode where there are no accounts
+ * — and their name otherwise. Second person for yourself and a name for
+ * everyone else is how a chat transcript normally reads; showing your own
+ * account id back at you would be a regression from the "you" this replaces.
+ *
+ * The surface is worth showing when someone spoke from Discord, because in a
+ * conversation someone can reach two ways it explains where a message came
+ * from. */
+function byline(author) {
+  const me = store.user;
+  const mine = !author?.id || me?.local || author.id === me?.id;
+  if (mine) return "you";
+  const name = author.display?.trim() || author.id;
+  return author.surface && author.surface !== "web" ? `${name} · ${author.surface}` : name;
+}
+
+/* A row whose speaker matters.
+ *
+ * `authorId` reaches the avatar so a user row belonging to someone else does
+ * not get painted with the reader's own picture; `undefined` means the reader,
+ * which is every row in a conversation with one speaker. */
+function authored(role, who, authorId, ...content) {
   const node = el(
     "div",
     { class: `row ${role}` },
-    avatarFor(role),
+    avatarFor(role, authorId),
     el("div", { class: "row-head" }, who),
     ...content
   );
@@ -758,7 +790,7 @@ const RENDERERS = {
     live = null;
     // Whatever was asked has now been replied to, one way or another.
     lockAsks();
-    row("user", "you",
+    authored("user", byline(ev.author), ev.author?.id,
       ev.text ? userText(ev.text, ev.attachments) : null,
       thumbs(ev.attachments));
   },

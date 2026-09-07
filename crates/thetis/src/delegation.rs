@@ -174,7 +174,20 @@ pub struct SpawnRequest {
 /// leave the parent unable to fan out at all. The parent chooses to block by
 /// calling [`wait`] afterwards, which is also how a synchronous delegation is
 /// expressed — spawn, then wait on that one child.
-pub async fn spawn(grip: &Arc<Grip>, parent_id: &str, req: SpawnRequest) -> Result<SubagentRow> {
+/// Starts a sub-agent under the authority of the turn that asked for it.
+///
+/// `ceiling` is the spawning turn's *effective* policy — what the speaker could
+/// actually do at the moment they delegated, not what the conversation's owner
+/// could do. Stamped on the child so a delegated turn can never be a way to
+/// gain authority the delegator did not have: `owner_of_root` walks a child to
+/// its root before resolving policy, which alone would have given the child the
+/// root owner's permissions regardless of who was speaking.
+pub async fn spawn(
+    grip: &Arc<Grip>,
+    parent_id: &str,
+    req: SpawnRequest,
+    ceiling: Option<crate::policy::EffectivePolicy>,
+) -> Result<SubagentRow> {
     let cfg = &grip.cfg;
     if !cfg.subagents.enabled {
         bail!("delegation is switched off (subagents.enabled = false)");
@@ -266,6 +279,23 @@ pub async fn spawn(grip: &Arc<Grip>, parent_id: &str, req: SpawnRequest) -> Resu
         .await
         .context("creating the sub-agent's session")?;
 
+    // Before the child can run: its ceiling is the authority the spawning turn
+    // held. Narrowed further by the parent's own ceiling, because a child must
+    // not exceed the conversation it was spawned from even if the speaker's
+    // account is wider than that conversation allows.
+    if let Some(mut ceiling) = ceiling {
+        if let Ok(Some(parent_ceiling)) = grip.persist.ceiling_of(parent_id).await {
+            ceiling = ceiling.intersect(&parent_ceiling);
+        }
+        if let Err(e) = grip.persist.set_ceiling(&child.id, &ceiling).await {
+            // Fail the spawn rather than run a child with no ceiling: an
+            // unstamped child falls back to the root owner's policy, which is
+            // the escalation this parameter exists to prevent.
+            let _ = grip.persist.archive_session(&child.id, true).await;
+            return Err(e).context("stamping the sub-agent's ceiling");
+        }
+    }
+
     // Registered before the model is set and before the turn starts, because
     // registration is what makes this session a child — and therefore what
     // routes it to this worker, hides it from the sidebar, and stops it
@@ -340,7 +370,9 @@ pub async fn spawn(grip: &Arc<Grip>, parent_id: &str, req: SpawnRequest) -> Resu
          further. If the task is ambiguous, state the reading you chose and carry on.\n",
     );
 
-    grip.submit(&child.id, brief, Vec::new()).await?;
+    // No speaker: the brief comes from the system, so the child's first turn
+    // resolves from its own ceiling and owner rather than from a person.
+    grip.submit(&child.id, brief, Vec::new(), None).await?;
 
     // In the parent's transcript, so the delegation is visible in the log and
     // not only in a tool result the UI has to interpret.

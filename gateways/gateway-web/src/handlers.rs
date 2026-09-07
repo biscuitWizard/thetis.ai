@@ -76,6 +76,34 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
             _ => vec![error("set-mode requires an id and a mode")],
         },
 
+        // Who else is in this conversation. Answers with the whole list on
+        // every path — read, invite and remove — so the panel redraws from
+        // what the host now actually holds rather than from what the browser
+        // hoped it wrote. A refused invite therefore leaves no phantom row.
+        "participants" => match id {
+            Some(session) => vec![participants(session)],
+            None => vec![error("participants requires an id")],
+        },
+
+        "participant-add" => match (id, frame.get("account").and_then(Value::as_str)) {
+            (Some(session), Some(account)) => match host::add_participant(session, account) {
+                Ok(()) => vec![participants(session)],
+                Err(why) => vec![error(&why), participants(session)],
+            },
+            _ => vec![error("participant-add requires an id and an account")],
+        },
+
+        "participant-remove" => match (id, frame.get("account").and_then(Value::as_str)) {
+            (Some(session), Some(account)) => match host::remove_participant(session, account) {
+                // The removed person may be the reader themselves leaving, in
+                // which case the conversation is no longer theirs to see, so
+                // the sidebar is refreshed too.
+                Ok(()) => vec![participants(session), sessions()],
+                Err(why) => vec![error(&why), participants(session)],
+            },
+            _ => vec![error("participant-remove requires an id and an account")],
+        },
+
         "skills" => match id {
             Some(session) => vec![skills(session)],
             None => vec![error("skills requires an id")],
@@ -1086,6 +1114,38 @@ fn session_settings(session_id: &str) -> GatewayAction {
         "session": session_id,
         "mode": meta.as_ref().map(|m| m.mode.clone()).unwrap_or_default(),
         "model": meta.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
+    }))
+}
+
+/// The participants panel: who is here, and who could be invited.
+///
+/// `invitable` comes back empty for anyone but the owner — the host decides
+/// that, not this code — so a guest simply sees the roster with no invite
+/// control, rather than being offered one that would be refused.
+///
+/// `read_only` travels with each row because it is the only way a reader can
+/// tell what someone else can do here. The conversation looks identical to
+/// everyone, but each turn runs under its own speaker's authority, and that is
+/// worth showing rather than leaving to be discovered.
+fn participants(session_id: &str) -> GatewayAction {
+    let here = host::participants(session_id);
+    let invitable = host::invitable_accounts(session_id);
+    reply(json!({
+        "type": "participants",
+        "session": session_id,
+        "participants": here.iter().map(|p| json!({
+            "account": p.account,
+            "display": p.display,
+            "added_by": p.added_by,
+            "added_ms": p.added_ms,
+            "read_only": p.read_only,
+            "owner": p.owner,
+        })).collect::<Vec<_>>(),
+        "invitable": invitable.iter().map(|a| json!({
+            "id": a.id,
+            "display": a.display,
+            "read_only": a.read_only,
+        })).collect::<Vec<_>>(),
     }))
 }
 

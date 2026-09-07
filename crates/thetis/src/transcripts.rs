@@ -584,6 +584,7 @@ mod tests {
         SessionEvent::UserMessage(UserMsg {
             text: text.to_string(),
             attachments: vec![],
+            author: None,
         })
     }
 
@@ -812,6 +813,7 @@ mod tests {
                 mime: "image/png".into(),
                 data_base64: "AAA".into(),
             }],
+            author: None,
         });
         let entries = entries_of(&event, true);
         assert_eq!(entries.len(), 1);

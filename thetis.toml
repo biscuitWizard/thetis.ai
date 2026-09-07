@@ -694,12 +694,21 @@ timeout_secs = 30
 
 # The Discord bot. Off until a token is set.
 #
-# The safety property here is `mode`: every session the bot creates is stamped
-# with it, and the agent withholds every mutating tool for a mode marked
-# read_only. The connector refuses to start if this mode is missing or is not
-# read-only, because the agent treats an unknown mode as full access -- so a
-# typo would otherwise expose the dev kit over chat. There is deliberately no
-# command to change the mode from Discord.
+# The safety property here is the *ceiling*: every conversation the bot creates
+# is stamped with an EffectivePolicy that is read-only and cannot delegate, and
+# that is enforced in the host, whoever speaks and whatever the agent component
+# has been rewritten to believe.
+#
+# `mode` is stamped too and is checked at startup -- the connector refuses to
+# start if it is missing or not read-only -- but it is defence in depth, not the
+# guarantee. A mode only filters the tool list inside agents/agent-core, which
+# is a component a privileged conversation can rewrite, and which treats an
+# unknown mode as unrestricted. There is deliberately no command to change the
+# mode from Discord, and changing it from the web UI grants nothing, because the
+# ceiling does not move with it.
+#
+# `allow_fork` below is the one deliberate exception, and it works by creating a
+# separate conversation rather than by lifting any of this.
 [discord]
 enabled = true
 # DISCORD_BOT_TOKEN overrides this, which is the better place for it: a token
@@ -730,6 +739,27 @@ group_sessions_per_user = true
 stream_edit_interval_ms = 1200
 # How long a pairing code stays valid.
 pairing_code_ttl_secs = 900
+# Let someone whose Discord id is linked to a Thetis account use /fork.
+#
+# A fork is a *separate* conversation, running under that account's own
+# permissions rather than the read-only ceiling every Discord conversation gets.
+# The conversation in the channel is untouched: it stays read-only, and so does
+# everyone else's, including in a shared channel. Only the account that
+# authorised a fork is routed to it.
+#
+# Discord grants nothing by itself. The ceiling is the account's own policy,
+# taken once at creation, and someone with no `discord_id` binding on a
+# [[users]] entry is refused -- so the whole chain of custody between a
+# snowflake and a set of permissions is an administrator writing that binding.
+# Narrowing the account narrows its existing forks immediately, because every
+# turn runs under policy(speaker) intersected with the stored ceiling; widening
+# the account does not widen a fork that already exists.
+#
+# Off by default because it is the one thing here that lets a message typed in
+# chat begin work that changes this machine. That is a change of posture, so it
+# is an operator's decision rather than an inherited one. When off, /fork is not
+# even registered, so the picker never offers it.
+allow_fork = false
 
 [control]
 # Whether the agent may restart the orchestrator. A restart is how changes to

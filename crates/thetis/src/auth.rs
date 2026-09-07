@@ -249,6 +249,17 @@ pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
     }
     Some(Principal::from_user(u))
 }
+/// Whether this principal may see and act on a conversation.
+///
+/// Three ways in, checked in this order: a blanket grant, ownership, and an
+/// invitation. The invitation check is last of the three that can succeed
+/// because it is the only one that touches a second table, and the common case
+/// is a conversation of one's own.
+///
+/// Being a participant grants *access*, never *authority*: what a participant's
+/// turn may do is `policy(speaker) ∩ ceiling(session)`, resolved separately in
+/// `store::session_policy`. That is what makes an invitation safe to hand out —
+/// it cannot lend the invitee any of the owner's capabilities.
 pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
     if p.policy.see_all_sessions {
         return Ok(());
@@ -256,7 +267,15 @@ pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
     let st = g.local_store().context("ownership is gateway-only")?;
     match st.owner_of_root(id)? {
         Some(o) if o == p.user_id => Ok(()),
-        Some(_) => bail!("conversation belongs to another user"),
+        Some(_) => {
+            if st.is_participant(id, &p.user_id)? {
+                Ok(())
+            } else {
+                // The same message either way: distinguishing "not yours" from
+                // "does not exist" tells an outsider which ids are real.
+                bail!("conversation belongs to another user")
+            }
+        }
         None => bail!("no such conversation"),
     }
 }

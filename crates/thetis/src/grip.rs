@@ -506,14 +506,32 @@ impl Grip {
         s.data_mut().principal = Some(principal);
         s
     }
+    /// A store for work on behalf of a conversation.
+    ///
+    /// `speaker` is the account whose message started this turn, and it is what
+    /// the policy is resolved from — not the conversation's owner. That is the
+    /// difference that makes a shared conversation safe: a read-only
+    /// participant speaking in a write-enabled conversation gets their own
+    /// authority, narrowed further by the conversation's ceiling, and never the
+    /// owner's. `None` means nobody identifiable asked (a resume after a
+    /// restart, a legacy event), and falls back to the owner as before.
     pub async fn session_store(
         self: &Arc<Self>,
         caps: Caps,
         budget: Budget,
         id: &str,
+        speaker: Option<&str>,
     ) -> wasmtime::Store<crate::runtime::HostState> {
+        let owner = self.persist.owner_of_root(id).await.ok().flatten();
+        // Whoever is speaking, falling back to the owner when the turn has no
+        // attributed author.
+        let acting = speaker
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+            .or_else(|| owner.clone());
+
         let policy = if matches!(&self.role, Role::Worker(_)) {
-            self.persist.session_policy(id).await.map(Arc::new).unwrap_or_else(|error| {
+            self.persist.session_policy(id, acting.as_deref()).await.map(Arc::new).unwrap_or_else(|error| {
                 tracing::warn!(session = id, %error, "could not load session policy; denying worker capabilities");
                 let mut denied = self.cfg.auth.local_policy.as_ref().clone();
                 denied.admin = false;
@@ -523,18 +541,26 @@ impl Grip {
                 Arc::new(denied)
             })
         } else {
-            match self.persist.owner_of_root(id).await {
-                Ok(Some(owner)) => self.cfg.auth.policy_for(&owner),
-                _ => self.cfg.auth.local_policy.clone(),
+            // The gateway can resolve locally, but the rule is the same one:
+            // the speaker's policy, narrowed by the conversation's ceiling.
+            match &acting {
+                Some(who) => {
+                    let mut resolved = self.cfg.auth.policy_for(who).as_ref().clone();
+                    if let Ok(Some(ceiling)) = self.persist.ceiling_of(id).await {
+                        resolved = resolved.intersect(&ceiling);
+                    }
+                    Arc::new(resolved)
+                }
+                None => self.cfg.auth.local_policy.clone(),
             }
         };
-        let owner = self.persist.owner_of_root(id).await.ok().flatten();
-        let principal = owner.map(|owner| {
-            let user = self.cfg.auth.user(&owner);
+        // The principal is the speaker too, so spend and ownership checks
+        // inside the turn attribute to whoever actually asked for the work.
+        let principal = acting.map(|who| {
+            let user = self.cfg.auth.user(&who);
             Arc::new(crate::auth::Principal::new(
-                owner.clone(),
-                user.map(|u| u.name.clone())
-                    .unwrap_or_else(|| owner.clone()),
+                who.clone(),
+                user.map(|u| u.name.clone()).unwrap_or_else(|| who.clone()),
                 user.map(|u| u.role.clone()).unwrap_or_default(),
                 policy.clone(),
             ))
@@ -551,9 +577,18 @@ impl Grip {
 
     /// Runs one agentic turn to completion inside a fresh store.
     ///
+    /// `speaker` is the account whose message started this turn; the turn's
+    /// authority is resolved from it rather than from whoever owns the
+    /// conversation. `None` for a turn nobody identifiable asked for, such as a
+    /// resume after a restart.
+    ///
     /// A trap (guest panic, memory limit, blown budget) surfaces here as an
     /// `Err`, never as a process failure.
-    pub async fn run_turn(self: &Arc<Self>, session_id: &str) -> Result<TurnStats, TurnError> {
+    pub async fn run_turn(
+        self: &Arc<Self>,
+        session_id: &str,
+        speaker: Option<&str>,
+    ) -> Result<TurnStats, TurnError> {
         let loaded = self
             .loader
             .get(&Aspect::Agent)
@@ -563,7 +598,9 @@ impl Grip {
         // which host imports await directly; the budget only enforces the
         // grace window once one has been raised.
         let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
-        let mut store = self.session_store(Caps::Agent, budget, session_id).await;
+        let mut store = self
+            .session_store(Caps::Agent, budget, session_id, speaker)
+            .await;
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -626,7 +663,11 @@ impl Grip {
         };
 
         let budget = Budget::probe("agent list-tools", self.cfg.probe_budget);
-        let mut store = self.session_store(Caps::Agent, budget, session_id).await;
+        // A probe, so the owner's view is the right one: this answers "what
+        // does this conversation offer", not "what may this speaker do".
+        let mut store = self
+            .session_store(Caps::Agent, budget, session_id, None)
+            .await;
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -652,11 +693,23 @@ impl Grip {
 
     /// Routes a user message into a session, starting a turn or nudging one
     /// that is already running.
+    ///
+    /// `author` says who sent it, and travels with the message all the way to
+    /// the turn. It carries two different kinds of thing deliberately joined:
+    /// `id`, from which the turn's authority is resolved, and `display`/
+    /// `surface`, which are presentation only. They travel together because
+    /// splitting them is how a transcript ends up showing one name while the
+    /// permissions come from another.
+    ///
+    /// `None` means the system sent it rather than a person — a delegated
+    /// brief, a merge manifest — and such a turn falls back to the
+    /// conversation's owner.
     pub async fn submit(
         self: &Arc<Self>,
         session_id: &str,
         message: String,
         attachments: Vec<Attachment>,
+        author: Option<crate::bindings::types::Author>,
     ) -> Result<()> {
         if self.persist.get_session(session_id).await?.is_none() {
             return Err(anyhow!("no such session: {session_id}"));
@@ -693,12 +746,17 @@ impl Grip {
                         "session": session_id,
                         "message": message,
                         "attachments": attachments,
+                        // Sent as `author`; an older gateway that does not know
+                        // the key drops it and the message persists
+                        // unattributed rather than failing.
+                        "author": author,
                     }),
                 )
                 .await?;
             }
             Role::Worker(_) => {
-                self.sessions.submit(self, session_id, message, attachments);
+                self.sessions
+                    .submit(self, session_id, message, attachments, author);
             }
         }
         Ok(())
@@ -728,6 +786,41 @@ impl Grip {
                 }
             }
             Role::Worker(_) => self.sessions.cancel(session_id),
+        }
+    }
+
+    /// Stops a turn if, and only if, `account` is the one who started it.
+    ///
+    /// Called when someone is removed from a conversation: their turn is
+    /// running under authority they no longer have. Unlike [`Self::cancel`]
+    /// this never starts a worker to deliver the message — if nothing is
+    /// running there is nothing to revoke, and spawning a checkout to say so
+    /// would be absurd.
+    pub async fn cancel_turn_by(self: &Arc<Self>, session_id: &str, account: &str) -> bool {
+        match &self.role {
+            Role::Gateway(router) => {
+                let Some(peer) = router.live_peer(session_id).await else {
+                    return false;
+                };
+                match peer
+                    .call(
+                        "cancel_turn_by",
+                        serde_json::json!({ "session": session_id, "account": account }),
+                    )
+                    .await
+                {
+                    Ok(v) => v
+                        .get("stopped")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    Err(e) => {
+                        tracing::warn!(session = %session_id, error = %e,
+                            "could not revoke a removed participant's turn");
+                        false
+                    }
+                }
+            }
+            Role::Worker(_) => self.sessions.cancel_turn_by(session_id, account),
         }
     }
 
@@ -876,6 +969,7 @@ impl Grip {
         name: &str,
         session_id: &str,
         args_json: &str,
+        speaker: Option<&str>,
     ) -> std::result::Result<String, String> {
         let aspect = Aspect::tool(name);
         let Some(loaded) = self.loader.get(&aspect) else {
@@ -887,7 +981,12 @@ impl Grip {
         let config_json = self.cfg.tool_config_json(name);
 
         let budget = Budget::new(format!("tool {name}"), self.cfg.tool_budget);
-        let mut store = self.session_store(Caps::Tool, budget, session_id).await;
+        // A tool runs with the authority of whoever asked for the turn, not
+        // the conversation's owner — otherwise a component tool would be the
+        // way around per-speaker resolution.
+        let mut store = self
+            .session_store(Caps::Tool, budget, session_id, speaker)
+            .await;
 
         let result = async {
             let tool = crate::bindings::tool::Tool::instantiate_async(

@@ -24,6 +24,7 @@ import * as workspace from "./views/workspace.js";
 import * as panel from "./views/panel.js";
 import * as rail from "./views/rail.js";
 import * as todoView from "./views/todo.js";
+import * as participantsView from "./views/participants.js";
 import * as stage from "./views/stage.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
@@ -120,6 +121,7 @@ const connection = new Connection({
 // needs it to fan a change out to the other tabs watching this conversation —
 // so it is added here rather than made the view's business.
 avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame }));
+participantsView.mountParticipants((frame) => connection.send(frame));
 
 connection.onOpen(() => {
   // Live state held from before the socket dropped may describe a host that
@@ -234,6 +236,10 @@ connection
     // the frames anyway; this is so the refusal is never the first thing seen.
     rail.setTabHidden("workspace", frame.workspace === "none");
     rail.setTabHidden("branch", false);
+    // In `local` mode there are no accounts, so a conversation has exactly one
+    // person in it and there is nobody to invite. The tab would list only
+    // yourself and offer an empty picker.
+    rail.setTabHidden("participants", Boolean(frame.local));
     if (frame.read_only) {
       document.body.classList.add("is-read-only");
     } else {
@@ -339,6 +345,10 @@ connection
   .on("todo", (frame) => {
     if (frame.session !== store.current) return;
     todoView.onFrame(frame);
+  })
+  .on("participants", (frame) => {
+    if (frame.session !== store.current) return;
+    participantsView.onFrame(frame);
   })
 
   .on("opened", (frame) => store.set({ current: frame.session }))
@@ -1355,7 +1365,16 @@ rail.mountRail([
   // and in the 380px panel a dozen of them wrapped every three or four words.
   { id: "tools", label: "Tools", hint: "Tools — everything the agent can call here", icon: rail.ICONS.tools, wide: true, activate: openTools },
   { id: "models", label: "Models", hint: "Models — the picker's catalogue: list, edit, add by slug", icon: rail.ICONS.models, activate: openModels },
+  // Last, and hidden without accounts: with one person there is nothing to
+  // say, and a "People" tab listing only yourself is furniture.
+  { id: "participants", label: "People", hint: "People — who else is in this conversation, and what they can do here", icon: rail.ICONS.people, activate: openParticipants },
 ]);
+
+/** The roster is per-conversation, so the tab asks for it as it opens. */
+function openParticipants() {
+  participantsView.openTab();
+  participantsView.request();
+}
 
 /** After switching conversations, the open tab shows the new one's content. */
 function refreshOpenTab() {
@@ -1375,6 +1394,9 @@ function refreshOpenTab() {
       break;
     case "tools":
       openTools();
+      break;
+    case "participants":
+      openParticipants();
       break;
     // Files and Models are global: nothing to refresh.
   }

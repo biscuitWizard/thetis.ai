@@ -77,12 +77,48 @@ fn delegation_available() -> bool {
 ///
 /// Asked of the grip rather than hardcoded, so adding a read-only mode is a
 /// configuration change and needs nothing here.
+///
+/// **An unrecognised mode is treated as read-only.** This used to end
+/// `.unwrap_or(false)`, which meant a mode nothing had heard of got the *full*
+/// tool surface — the most permissive possible answer to the least informed
+/// possible question. A typo in a config file, or a mode deleted while a
+/// conversation still referenced it, silently widened that conversation.
+///
+/// The direction matters more than the case being rare. Failing open here is
+/// unrecoverable in the ordinary way: nothing errors, nothing is logged by the
+/// caller, and the conversation simply has tools it should not. Failing closed
+/// is visible the moment someone tries to use one, and the fix — name the mode
+/// correctly — is the same either way.
+///
+/// Since session ceilings landed this is defence in depth rather than the
+/// boundary: an `EffectivePolicy` in `host_api::require` is what actually stops
+/// a call, and it does so whatever this returns and whatever this component has
+/// been rewritten to believe. That is the right relationship, and it is not a
+/// reason to leave a fail-open default in the soft layer.
+///
+/// An empty mode is *not* unrecognised — it is the ordinary "no mode set" case,
+/// which means unrestricted, and is how most conversations run.
 fn read_only(mode: &str) -> bool {
-    sys::list_modes()
-        .into_iter()
-        .find(|m| m.id == mode)
-        .map(|m| m.read_only)
-        .unwrap_or(false)
+    let modes = sys::list_modes();
+    decide_read_only(mode, &modes.iter().map(|m| (m.id.as_str(), m.read_only)).collect::<Vec<_>>())
+}
+
+/// The rule behind [`read_only`], separated from the host call so it can be
+/// tested. `known` is the offered modes as `(id, read_only)`.
+fn decide_read_only(mode: &str, known: &[(&str, bool)]) -> bool {
+    if mode.is_empty() {
+        return false;
+    }
+    match known.iter().find(|(id, _)| *id == mode) {
+        Some((_, ro)) => *ro,
+        // Distinguish "the host told us nothing at all" from "the host listed
+        // modes and this is not one of them". An empty list means the question
+        // could not be answered — a host that offers no modes has no opinion —
+        // and inferring danger from silence would withhold every mutating tool
+        // from a perfectly ordinary conversation.
+        None if known.is_empty() => false,
+        None => true,
+    }
 }
 
 /// Whether this account's policy denies a built-in or hot-loaded tool by name.
@@ -4258,6 +4294,49 @@ mod policy_denies_tests {
     fn empty_or_whitespace_denies_nothing() {
         assert!(!pattern_denies("", "terminal_run"));
         assert!(!pattern_denies("   ,  ,", "terminal_run"));
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::decide_read_only;
+
+    /// A plausible set of offered modes.
+    const KNOWN: &[(&str, bool)] = &[("agent", false), ("build", false), ("chat", true)];
+
+    #[test]
+    fn a_known_mode_is_answered_from_its_declaration() {
+        assert!(decide_read_only("chat", KNOWN));
+        assert!(!decide_read_only("agent", KNOWN));
+        assert!(!decide_read_only("build", KNOWN));
+    }
+
+    #[test]
+    fn an_unknown_mode_is_treated_as_read_only() {
+        // H2. This used to answer `false` — the most permissive possible answer
+        // to the least informed possible question. A typo in a config file, or
+        // a mode deleted while a conversation still named it, silently handed
+        // that conversation every mutating tool.
+        assert!(decide_read_only("agnet", KNOWN), "a typo must not widen");
+        assert!(decide_read_only("not-a-mode-at-all", KNOWN));
+    }
+
+    #[test]
+    fn no_mode_at_all_is_unrestricted() {
+        // The ordinary case, and not the same as an unrecognised one: most
+        // conversations carry no mode and are not meant to be narrowed.
+        assert!(!decide_read_only("", KNOWN));
+        assert!(!decide_read_only("", &[]));
+    }
+
+    #[test]
+    fn silence_from_the_host_is_not_evidence_of_danger() {
+        // An empty list means the question could not be answered, not that this
+        // mode is unknown. Inferring read-only from it would withhold every
+        // mutating tool from a working conversation the first time `list_modes`
+        // came back empty.
+        assert!(!decide_read_only("agent", &[]));
+        assert!(!decide_read_only("anything", &[]));
     }
 }
 

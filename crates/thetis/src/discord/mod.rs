@@ -22,7 +22,7 @@ pub mod commands;
 pub mod policy;
 pub mod split;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +42,16 @@ const PAIR_KEY: &str = "discord.paired_users";
 /// Named here rather than in `ask` so the rendering module stays independent of
 /// which tool happens to drive it.
 const ASK_TOOL: &str = "ask_user";
+
+/// Prefix of the system note recording a fork in the transcript it was asked
+/// for. The rest is the fork's session id, a space, and the authorising account.
+///
+/// A fork is the one place where a conversation reaches for more authority than
+/// it has, so it leaves a mark in the conversation that reached. `SPAWN_NOTE`
+/// exists for the same reason and is read by the web gateway to know which
+/// child logs to replay; this one is only ever read by a person, which is why
+/// it does not share that constant's shape.
+const FORK_NOTE: &str = "discord:forked ";
 
 /// Starts the connector, unless it is switched off or misconfigured.
 ///
@@ -78,8 +88,36 @@ pub fn spawn(grip: Arc<Grip>) -> Result<()> {
         ));
     }
 
+    // Forking is the one thing here that can begin work which writes, so it is
+    // announced at startup. An operator reading the log should be able to see
+    // that this instance has it on without going to look at the config.
+    //
+    // It is *also* the reason the two checks above are no longer the whole
+    // story, and the reason they are still there: the ordinary conversation in
+    // every channel remains read-only, and a fork is a separate conversation
+    // ceilinged by an account that already holds those permissions in the web
+    // UI. Discord grants nothing; it names someone who was already granted.
+    if cfg.allow_fork {
+        tracing::info!(
+            "discord.allow_fork is on: a Discord user linked to a Thetis account may \
+             use /fork to talk to a conversation running under that account's own \
+             permissions. Ordinary channel conversations stay read-only."
+        );
+    }
+
     if cfg.allow_all_users {
         tracing::warn!("DISCORD_ALLOW_ALL_USERS is on: anyone who can see the bot may talk to it");
+        if cfg.allow_fork {
+            // Together these are not a hole — an unbound snowflake resolves to
+            // a synthetic owner and `may_fork` refuses it, so "anyone" still
+            // cannot fork — but the combination deserves saying out loud,
+            // because it means the set of people who may fork is exactly the
+            // set of `discord_id` bindings and nothing else is checking.
+            tracing::warn!(
+                "allow_all_users and allow_fork are both on: forking is gated only by \
+                 the discord_id bindings on your users, so review them"
+            );
+        }
     } else if cfg.allowed_users.is_empty() {
         tracing::warn!(
             "no Discord users are allowed yet; add ids to discord.allowed_users, \
@@ -167,7 +205,10 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                             // and the bot never hears about it at all.
                             if !commands_registered && !application_id.is_empty() {
                                 match rest
-                                    .register_commands(&application_id, commands::schema())
+                                    .register_commands(
+                                        &application_id,
+                                        commands::schema(&grip.cfg.discord),
+                                    )
                                     .await
                                 {
                                     // `count` is the number Discord stored in a
@@ -453,12 +494,25 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
         return Ok(());
     }
 
-    let session_id = session_for(&grip, &key, &msg.author_id).await?;
-    let attributed = policy::attribute(&msg, &text, cfg.group_sessions_per_user);
+    // Which Thetis account this Discord identity is, if any. An unbound
+    // snowflake resolves to its synthetic per-channel owner, which holds the
+    // `discord:` policy and nothing more. Resolved before routing, because
+    // which conversation this message belongs to depends on the account.
+    let account = grip
+        .cfg
+        .auth
+        .owner_for_discord(&msg.author_id, &format!("discord:{key}"));
+    let author = policy::author_of(&msg, &account);
+
+    // The read-only conversation, unless this speaker has a fork bound here.
+    let session_id = route_for(&grip, &key, &account, &msg.author_id).await?;
 
     // Subscribe before submitting, or a fast first token could be missed.
     let events = grip.events_tx.subscribe();
-    grip.submit(&session_id, attributed, Vec::new()).await?;
+    // The message text goes in unmodified. Identity used to be prefixed onto it
+    // here; it is a field on the message now.
+    grip.submit(&session_id, text, Vec::new(), Some(author))
+        .await?;
     let _ = rest.typing(&msg.channel_id).await;
 
     let author_id = msg.author_id.clone();
@@ -1038,7 +1092,22 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
 
     let answers = ask::compose(&state);
     let events = grip.events_tx.subscribe();
-    grip.submit(&state.session_id, answers, Vec::new()).await?;
+    // Answers to a question form are spoken by whoever filled it in — not by
+    // whoever the turn that asked belonged to. `state.user_id` is the person
+    // the form was addressed to, and the click was re-authorized against it
+    // above, so this is the same identity either way; taking it from the state
+    // rather than the click keeps it that way if that check ever changes.
+    let account = grip
+        .cfg
+        .auth
+        .owner_for_discord(&state.user_id, &format!("discord:{}", state.channel_id));
+    let author = crate::bindings::types::Author {
+        id: account,
+        display: policy::display_name(&component.user_name),
+        surface: "discord".into(),
+    };
+    grip.submit(&state.session_id, answers, Vec::new(), Some(author))
+        .await?;
     let _ = rest.typing(&state.channel_id).await;
     stream_reply(
         grip,
@@ -1073,8 +1142,8 @@ async fn retire(rest: &Rest, component: &Component, message: &str) -> Result<()>
 /// Finds or creates the Thetis session backing a Discord conversation.
 ///
 /// The mapping is persisted, so a channel keeps its history across restarts.
-/// The mode is stamped at creation: this is the point where the read-only
-/// guarantee is applied, and nothing exposed over Discord can undo it.
+/// The ceiling is stamped at creation: that is where the read-only guarantee is
+/// applied, and nothing exposed over Discord can undo it.
 ///
 /// A conversation that is gone *or archived* is not reused. Archiving is how
 /// someone says they are finished with a transcript: it shuts the worker down
@@ -1084,13 +1153,14 @@ async fn retire(rest: &Rest, component: &Component, message: &str) -> Result<()>
 /// if the channel had never spoken. Archiving is therefore equivalent to `/new`
 /// for every surface at once, and the archived transcript stays readable.
 async fn session_for(grip: &Grip, key: &str, discord_user_id: &str) -> Result<String> {
-    let kv_key = format!("discord.session.{key}");
+    let kv_key = policy::session_map_key(key);
     if let Some(existing) = grip.persist.kv_get(PAIR_SCOPE, &kv_key).await? {
         // `get_session` returns archived sessions too — archiving only sets a
         // flag, it does not delete — so the flag has to be read, not merely
         // the session's existence.
         let found = grip.persist.get_session(&existing).await?;
         if policy::may_reuse_session(found.as_ref().map(|m| m.archived)) {
+            reassert_ceiling(grip, &existing).await?;
             return Ok(existing);
         }
         match found {
@@ -1101,6 +1171,72 @@ async fn session_for(grip: &Grip, key: &str, discord_user_id: &str) -> Result<St
         }
     }
 
+    new_session_for(grip, key, discord_user_id).await
+}
+
+/// Checks that a reused Discord conversation still has its ceiling, and puts it
+/// back if not.
+///
+/// H1, in the form that survives ceilings. The plan called for re-asserting the
+/// *mode* on a mapped session, on the grounds that the web UI can change it.
+/// Since step 3 the mode is not what bounds anything, so re-stamping it would
+/// be theatre — and worse, it would fight a deliberate change: someone may have
+/// switched a Discord conversation to a different read-only mode on purpose.
+///
+/// What must not drift is the ceiling, and this is the one place a Discord
+/// conversation is picked up again after arbitrary time and arbitrary
+/// intervening writes. A missing ceiling row is the dangerous state — absence
+/// means "nothing narrows the speaker" — so it is repaired rather than trusted.
+///
+/// Deliberately does *not* overwrite a ceiling that is present but different: a
+/// fork is reached through its own mapping and never through here, but an
+/// operator who has narrowed one conversation further should not have it
+/// silently widened back to the default. Only absence is repaired, and it is
+/// logged as a warning, because in a healthy system it should never happen.
+///
+/// **Errors fail closed**, which is worth the silence it can cause. The two
+/// outcomes are not symmetric: refusing to answer makes the bot mute and says
+/// why in the log, while carrying on would answer under a conversation nothing
+/// narrows — and for a Discord identity bound to an admin account, "nothing
+/// narrows" is the dev kit over chat. A mute bot is a bug report; the other is
+/// not noticed at all.
+async fn reassert_ceiling(grip: &Grip, session_id: &str) -> Result<()> {
+    match grip.persist.ceiling_of(session_id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            tracing::warn!(session = %session_id,
+                "a Discord conversation had no ceiling; restamping it");
+            grip.persist
+                .set_ceiling(session_id, &grip.cfg.auth.discord_policy)
+                .await
+                .context("restamping a Discord conversation's ceiling")
+        }
+        Err(e) => Err(e.context(
+            "reading a Discord conversation's ceiling; refusing to answer rather \
+             than answer unbounded",
+        )),
+    }
+}
+
+/// Creates a Discord conversation, stamps its ceiling, and maps the channel to
+/// it. Both ways a Discord session comes into being — a channel speaking for
+/// the first time and `/new` — go through here, so neither can forget the
+/// ceiling.
+///
+/// **The ceiling is what makes the read-only guarantee real.** Until it existed
+/// the guarantee rested on `discord.mode`, and a mode only filters the tool list
+/// inside `agents/agent-core` — a component a privileged conversation can
+/// rewrite, and one that treats an unrecognised mode as unrestricted. The
+/// ceiling is an `EffectivePolicy` checked in `host_api::require`, so it holds
+/// whoever speaks, whatever the mode says, and whatever the agent component has
+/// been rewritten to believe. Changing the mode from the web UI no longer grants
+/// anything, because the ceiling does not move with it.
+pub(crate) async fn new_session_for(
+    grip: &Grip,
+    key: &str,
+    discord_user_id: &str,
+) -> Result<String> {
+    let kv_key = policy::session_map_key(key);
     let title = format!("Discord {key}");
     let synthetic_owner = format!("discord:{key}");
     let owner = grip
@@ -1111,9 +1247,194 @@ async fn session_for(grip: &Grip, key: &str, discord_user_id: &str) -> Result<St
         .persist
         .create_session(Some(title), &grip.cfg.discord.mode, &owner)
         .await?;
+
+    // Stamped before the channel is mapped to it. A conversation reachable from
+    // chat without a ceiling would resolve to the speaker's own policy, and a
+    // bound account's own policy is exactly what Discord must not confer.
+    if let Err(e) = grip
+        .persist
+        .set_ceiling(&meta.id, &grip.cfg.auth.discord_policy)
+        .await
+    {
+        // Fail closed: leave the channel unmapped rather than pointing it at a
+        // conversation whose authority was never bounded.
+        let _ = grip.persist.archive_session(&meta.id, true).await;
+        return Err(e.context("stamping the Discord conversation's ceiling"));
+    }
+
     grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
     tracing::info!(session = %meta.id, %key, mode = %grip.cfg.discord.mode,
         "created a Discord session");
+    Ok(meta.id)
+}
+
+/// Finds the fork backing a Discord conversation key, if there is a live one.
+///
+/// Returns the conversation id and the account that authorised it. The owner is
+/// read back from the store rather than recomputed, because the question being
+/// asked of it is "whose permissions is this thing running under" and the
+/// answer must be the one that was recorded when it was created, not one
+/// re-derived from whoever is asking now.
+async fn fork_for(grip: &Grip, key: &str) -> Result<Option<(String, String)>> {
+    let kv_key = policy::fork_key(key);
+    let existing = match grip.persist.kv_get(PAIR_SCOPE, &kv_key).await? {
+        // Empty is how the table spells absent: it has no delete, so `/fork off`
+        // clears the binding by writing empty.
+        Some(id) if !id.is_empty() => id,
+        _ => return Ok(None),
+    };
+    let found = grip.persist.get_session(&existing).await?;
+    if !policy::may_reuse_session(found.as_ref().map(|m| m.archived)) {
+        // Archiving is how someone says they are finished with a transcript,
+        // and it means the same here as everywhere else: the fork is over. It
+        // is not silently replaced, though — unlike ambient chat, a fork is
+        // created by an explicit act, so ending one should require another.
+        tracing::info!(session = %existing, %key, "the Discord fork is gone or archived");
+        return Ok(None);
+    }
+    // A fork with no ceiling row is the one case that must never be answered:
+    // absence means nothing narrows the speaker, and this conversation exists
+    // precisely because its speaker holds permissions the surface does not.
+    // Unlike an ordinary Discord conversation it cannot be repaired to a known
+    // default — the correct ceiling was a snapshot of an account's policy at a
+    // moment that has passed, and re-deriving it now is exactly the widening
+    // C4.4 forbids. So refuse, loudly, and let the fork be unbound.
+    if grip.persist.ceiling_of(&existing).await?.is_none() {
+        anyhow::bail!(
+            "the fork {existing} has no ceiling; refusing to route to it. Its \
+             authority cannot be reconstructed safely — say `/fork off` and \
+             `/fork` again to make a new one."
+        );
+    }
+    let owner = grip.persist.owner_of_root(&existing).await?.unwrap_or_default();
+    Ok(Some((existing, owner)))
+}
+
+/// Unbinds a fork from a Discord conversation key, returning whether one was
+/// bound.
+///
+/// The conversation itself is deliberately left alone: not archived, not
+/// stopped. `/fork off` is a statement about where messages go, and someone who
+/// wants the work to end says so in the web UI, where they can see what they
+/// are ending.
+/// The KV table has no delete — clearing a key writes empty — so unbinding
+/// writes `""`, and every reader treats empty as absent.
+async fn forget_fork(grip: &Grip, key: &str) -> Result<bool> {
+    let kv_key = policy::fork_key(key);
+    let bound = grip
+        .persist
+        .kv_get(PAIR_SCOPE, &kv_key)
+        .await?
+        .is_some_and(|v| !v.is_empty());
+    if !bound {
+        return Ok(false);
+    }
+    grip.persist.kv_put(PAIR_SCOPE, &kv_key, "").await?;
+    Ok(true)
+}
+
+/// Which conversation an inbound Discord message belongs to.
+///
+/// This is the routing rule that lets a fork stay promptable without turning a
+/// channel into a shared write-enabled workspace. A message goes to the fork
+/// only when the speaker is the account that authorised it; everyone else in the
+/// same channel keeps talking to the read-only conversation, as though the fork
+/// were not there.
+///
+/// The check is on the resolved account rather than the snowflake or the
+/// conversation key, for the reason spelled out in `policy::may_fork`: with
+/// `group_sessions_per_user = false` the key is shared by the whole channel.
+async fn route_for(grip: &Grip, key: &str, account: &str, discord_user_id: &str) -> Result<String> {
+    if let Some((fork, owner)) = fork_for(grip, key).await? {
+        if policy::may_prompt_fork(&owner, account) {
+            return Ok(fork);
+        }
+        tracing::debug!(%key, %account, %owner,
+            "a fork is bound here but this speaker is not its account; using the \
+             read-only conversation");
+    }
+    session_for(grip, key, discord_user_id).await
+}
+
+/// Creates a conversation that runs under the authorising account's own
+/// permissions, and maps this Discord conversation key to it.
+///
+/// This is the one thing reachable from chat that can lead to the machine being
+/// changed, so what bounds it is worth stating precisely.
+///
+/// **The ceiling is the account's own policy, resolved once, here.** Not the
+/// Discord policy — that is the whole point — and not a role named in the
+/// command, because a Discord message is the weakest identity in the system and
+/// should not get to choose from a menu of authorities. It gets exactly what
+/// its bound account already holds in the web UI and nothing else, so `/fork`
+/// grants no permission that did not already exist; it only reaches an existing
+/// one from a different chair.
+///
+/// **Resolved once, and never again.** A stored ceiling is a snapshot, and the
+/// direction of the asymmetry is deliberate: if the account is later narrowed,
+/// the narrowing takes effect immediately, because every turn intersects the
+/// speaker's *live* policy with this ceiling. If the account is later widened,
+/// the fork does not widen with it. That is the safe direction — revocation is
+/// prompt, escalation is not retroactive — and it is why the ceiling is written
+/// at creation rather than recomputed per turn.
+async fn fork_session_for(
+    grip: &Grip,
+    key: &str,
+    account: &str,
+    parent: Option<&str>,
+) -> Result<String> {
+    let ceiling = grip.cfg.auth.policy_for(account);
+
+    // A fork with the Discord ceiling would be a fork in name only, and one
+    // with no ceiling row at all would resolve to the speaker's bare policy —
+    // fine today, since only that same account may prompt it, but it would stop
+    // being fine the moment anything else could. Refuse rather than create
+    // something whose authority is not written down.
+    if ceiling.read_only {
+        anyhow::bail!(
+            "the account {account} is read-only, so a fork would do nothing it \
+             cannot already do here"
+        );
+    }
+
+    let title = format!("Fork for {account} (Discord)");
+    let mode = ceiling.default_mode.clone();
+    let meta = grip
+        .persist
+        .create_session(Some(title), &mode, account)
+        .await?;
+
+    if let Err(e) = grip.persist.set_ceiling(&meta.id, &ceiling).await {
+        // Fail closed, exactly as `new_session_for` does: an unmapped orphan is
+        // recoverable, a chat-reachable conversation whose authority was never
+        // bounded is not.
+        let _ = grip.persist.archive_session(&meta.id, true).await;
+        return Err(e.context("stamping the fork's ceiling"));
+    }
+
+    grip.persist
+        .kv_put(PAIR_SCOPE, &policy::fork_key(key), &meta.id)
+        .await?;
+
+    // A note in the parent transcript, so the read-only conversation someone
+    // was having records that it spawned something with more authority. Without
+    // this the fork is invisible from the place it was asked for, and an
+    // escalation nobody can see from where it happened is one nobody audits.
+    if let Some(parent) = parent {
+        let _ = grip
+            .persist
+            .append_event(
+                parent,
+                crate::bindings::types::SessionEvent::SystemNote(format!(
+                    "{FORK_NOTE}{} {account}",
+                    meta.id
+                )),
+            )
+            .await;
+    }
+
+    tracing::info!(session = %meta.id, %key, %account, %mode,
+        "created a Discord fork under an account's own permissions");
     Ok(meta.id)
 }
 

@@ -684,6 +684,23 @@ pub struct DiscordSettings {
     pub stream_edit_interval: Duration,
     /// Longest a pairing code stays valid.
     pub pairing_code_ttl: Duration,
+    /// Whether `/fork` is offered: a Discord user with a bound Thetis account
+    /// may start a conversation that runs under *their own* permissions rather
+    /// than the read-only Discord ceiling.
+    ///
+    /// **Off by default, and deliberately an operator's decision.** Everything
+    /// else about this connector is arranged so that nothing reachable from
+    /// chat can change the machine — `spawn` refuses to start if
+    /// `discord.mode` is not read-only. A fork does not weaken that (it is a
+    /// separate conversation, ceilinged by an account that already holds those
+    /// permissions in the web UI, and Discord confers no authority it merely
+    /// names a person who has some) but it does mean a message typed in Discord
+    /// can begin work that writes. That is a change of posture, so it is opted
+    /// into rather than inherited.
+    ///
+    /// When off, `/fork` is absent from the registered schema entirely, so the
+    /// picker never offers something that would be refused.
+    pub allow_fork: bool,
 }
 
 impl DiscordSettings {
@@ -1763,6 +1780,7 @@ mod spec {
         pub group_sessions_per_user: bool,
         pub stream_edit_interval_ms: u64,
         pub pairing_code_ttl_secs: u64,
+        pub allow_fork: bool,
     }
     impl Default for Discord {
         fn default() -> Self {
@@ -1779,6 +1797,9 @@ mod spec {
                 group_sessions_per_user: true,
                 stream_edit_interval_ms: 1_200,
                 pairing_code_ttl_secs: 900,
+                // Off. See `DiscordSettings::allow_fork`: it is the one thing
+                // here that lets chat begin work which writes.
+                allow_fork: false,
             }
         }
     }
@@ -2762,6 +2783,7 @@ impl Config {
                     file.discord.stream_edit_interval_ms.max(250),
                 ),
                 pairing_code_ttl: Duration::from_secs(file.discord.pairing_code_ttl_secs.max(30)),
+                allow_fork: env.parse("DISCORD_ALLOW_FORK", file.discord.allow_fork),
             },
 
             browser: BrowserSettings {

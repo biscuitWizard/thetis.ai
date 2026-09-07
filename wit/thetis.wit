@@ -35,9 +35,72 @@ interface types {
     data-base64: string,
   }
 
+  /// Who a message came from.
+  ///
+  /// Identity used to travel inside the message text as `[Name] said this`,
+  /// because there was nowhere else to put it — which meant a display name
+  /// containing a bracket could forge a second speaker, and nothing downstream
+  /// could tell an attribution apart from prose. This is that field.
+  ///
+  /// `id` is the authorization-relevant one and is always stamped by the host
+  /// from the connection's own principal, never taken from a guest: a guest
+  /// that could name an author could name a better one. `display` is
+  /// presentation only and is never compared.
+  record author {
+    /// A Thetis account id, or `discord:<snowflake>` for an unbound Discord
+    /// identity. Matches the owner ids in the ownership and participant tables.
+    id: string,
+    /// The name to show. Sanitised, and never used for any decision.
+    display: string,
+    /// Where it arrived from: `web`, `discord`, or `system` for a message the
+    /// machine wrote to itself.
+    surface: string,
+  }
+
+  /// Someone invited into a conversation they do not own.
+  record participant {
+    /// The Thetis account id.
+    account: string,
+    /// The name to show, resolved from config at read time rather than stored,
+    /// so renaming an account does not leave stale names in old invitations.
+    display: string,
+    /// Who invited them. Empty for the owner, who invited nobody.
+    added-by: string,
+    /// When, or 0 for the owner, who was here from the start.
+    added-ms: s64,
+    /// Whether this is the conversation's owner. The owner is listed as a
+    /// participant because they are one — and because it is the only thing
+    /// that tells a reader whose conversation this is, which decides whether
+    /// they are offered the invite and remove controls at all.
+    owner: bool,
+    /// Whether their own account is read-only. Shown because it explains what
+    /// this person can do here, which is otherwise invisible: the conversation
+    /// looks the same to everyone, but each turn runs under its speaker's own
+    /// authority.
+    read-only: bool,
+  }
+
+  /// An account an invitation could name.
+  record account {
+    id: string,
+    display: string,
+    read-only: bool,
+  }
+
   record user-msg {
     text: string,
     attachments: list<attachment>,
+    /// Absent for every message stored before authorship existed, and for
+    /// anything the system writes to a transcript on its own behalf.
+    ///
+    /// `option<>` is load-bearing, not stylistic: session events are persisted
+    /// as plain serde over these generated types, with no version tag and no
+    /// migration step, and a generated type cannot carry `#[serde(default)]`.
+    /// A required field would make every stored user message fail to
+    /// deserialise, and one bad row fails the whole `events()` read — so a
+    /// single legacy message would make its conversation unreadable in the
+    /// transcript, in rehydration and in search at once.
+    author: option<author>,
   }
 
   record tool-call {
@@ -502,7 +565,7 @@ interface sys {
 
 interface session {
   use types.{attachment, event-record, session-event, session-meta, inbox-item,
-             tool-manifest, compaction-progress};
+             tool-manifest, compaction-progress, participant, account};
 
   events: func(session-id: string, from-seq: u64) -> list<event-record>;
   append: func(session-id: string, event: session-event) -> u64;
@@ -528,6 +591,24 @@ interface session {
   submit: func(session-id: string, message: string, attachments: list<attachment>);
   set-session-mode: func(session-id: string, mode: string);
   set-session-model: func(session-id: string, model: string);
+
+  // Who has been invited into a conversation, besides its owner.
+  //
+  // Access and authority are deliberately separate. Being a participant lets
+  // someone see a conversation and speak in it; what their turn may actually
+  // *do* is `policy(speaker) ∩ ceiling(session)`, resolved natively on every
+  // turn. So an invitation can never lend the invitee any of the owner's
+  // capabilities — a read-only account invited into a privileged conversation
+  // stays read-only in it — which is what makes inviting safe.
+  //
+  // Only the owner may invite. Removal is the owner's too, except that anyone
+  // may remove themselves. Both are enforced natively; the gateway asks.
+  participants: func(session-id: string) -> list<participant>;
+  add-participant: func(session-id: string, account: string) -> result<_, string>;
+  remove-participant: func(session-id: string, account: string) -> result<_, string>;
+  // The accounts an invitation could name, for the picker. Never a way to
+  // enumerate the user list: refused unless the caller owns the conversation.
+  invitable-accounts: func(session-id: string) -> list<account>;
 
   // Exactly the tools the agent would offer the model for this session, asked
   // of the agent itself so the answer cannot drift from what it really does.

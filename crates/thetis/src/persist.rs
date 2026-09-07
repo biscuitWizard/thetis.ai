@@ -100,16 +100,96 @@ impl Persist {
         )
     }
 
-    /// Resolves the policy for a session on the trusted gateway. Workers must
+    /// Resolves the policy for a turn on the trusted gateway. Workers must
     /// not derive this from the configuration in their rewritable checkout.
-    pub async fn session_policy(&self, id: &str) -> Result<crate::policy::EffectivePolicy> {
+    ///
+    /// `speaker` is the account whose message started the turn. It is the whole
+    /// point of this call: authority belongs to whoever is speaking, narrowed
+    /// by the conversation's ceiling, so that being a participant in someone
+    /// else's conversation never lends anybody their permissions. `None` means
+    /// the turn has no identified speaker — a resume after a restart, or a
+    /// legacy event — and falls back to the owner, which is what this did
+    /// before ceilings existed.
+    pub async fn session_policy(
+        &self,
+        id: &str,
+        speaker: Option<&str>,
+    ) -> Result<crate::policy::EffectivePolicy> {
         match self {
             Persist::Remote(peer) => {
-                peer.call_as("store.session_policy", json!({"id": id}))
+                peer.call_as("store.session_policy", json!({"id": id, "speaker": speaker}))
                     .await
             }
             Persist::Local(_) => anyhow::bail!("session policy is resolved from gateway config"),
         }
+    }
+
+    /// The conversation's ceiling, if one was stamped.
+    pub async fn ceiling_of(&self, id: &str) -> Result<Option<crate::policy::EffectivePolicy>> {
+        delegate!(
+            self,
+            "store.ceiling_of",
+            |s| s.ceiling_of(id),
+            json!({"id": id})
+        )
+    }
+
+    /// Stamps a conversation's ceiling. Gateway-side only in practice: the
+    /// callers are session creation and `/fork`, never a guest.
+    pub async fn set_ceiling(&self, id: &str, policy: &crate::policy::EffectivePolicy) -> Result<()> {
+        delegate!(
+            self,
+            "store.set_ceiling",
+            |s| s.set_ceiling(id, policy),
+            json!({"id": id, "policy": policy})
+        )
+    }
+
+    pub async fn is_participant(&self, id: &str, account: &str) -> Result<bool> {
+        delegate!(
+            self,
+            "store.is_participant",
+            |s| s.is_participant(id, account),
+            json!({"id": id, "account": account})
+        )
+    }
+
+    pub async fn participants(&self, id: &str) -> Result<Vec<crate::store::ParticipantRow>> {
+        delegate!(
+            self,
+            "store.participants",
+            |s| s.participants(id),
+            json!({"id": id})
+        )
+    }
+
+    pub async fn add_participant(&self, id: &str, account: &str, added_by: &str) -> Result<()> {
+        delegate!(
+            self,
+            "store.add_participant",
+            |s| s.add_participant(id, account, added_by),
+            json!({"id": id, "account": account, "added_by": added_by})
+        )
+    }
+
+    /// Removes a participant. `by` is who is asking: the owner may remove
+    /// anyone, and anyone may remove themselves.
+    pub async fn remove_participant(&self, id: &str, account: &str, by: &str) -> Result<bool> {
+        delegate!(
+            self,
+            "store.remove_participant",
+            |s| s.remove_participant(id, account),
+            json!({"id": id, "account": account, "by": by})
+        )
+    }
+
+    pub async fn sessions_participating(&self, account: &str) -> Result<Vec<String>> {
+        delegate!(
+            self,
+            "store.sessions_participating",
+            |s| s.sessions_participating(account),
+            json!({"account": account})
+        )
     }
 
     pub async fn get_user_spend(&self, user: &str) -> Result<f64> {
@@ -627,7 +707,103 @@ fn serve_store_call_inner(
                 .owner_of_root(id)?
                 .ok_or_else(|| anyhow::anyhow!("conversation has no owner"))?;
             let cfg = cfg.ok_or_else(|| anyhow::anyhow!("session policy needs gateway config"))?;
-            to_value(cfg.auth.policy_for(&owner).as_ref())
+
+            // Whoever is speaking, not whoever owns the conversation. A
+            // participant brings their own authority and nothing more; an
+            // unidentified speaker falls back to the owner, which is what this
+            // did before there were participants at all.
+            let speaker = params
+                .get("speaker")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(owner.as_str());
+
+            // A speaker who is neither the owner nor a participant gets
+            // nothing. Without this, naming any account id in the frame would
+            // borrow its policy.
+            let known = speaker == owner || store.is_participant(id, speaker)?;
+            if !known {
+                anyhow::bail!("{speaker} is not a participant in this conversation");
+            }
+
+            let mut policy = cfg.auth.policy_for(speaker).as_ref().clone();
+
+            // The conversation's ceiling is the other half of the rule. Absent
+            // for anything created before ceilings existed, and then the
+            // speaker's own policy stands alone — today's behaviour exactly.
+            if let Some(ceiling) = store.ceiling_of(id)? {
+                policy = policy.intersect(&ceiling);
+            }
+            to_value(&policy)
+        }
+        "store.ceiling_of" => to_value(store.ceiling_of(get_str(&params, "id")?)?),
+        "store.set_ceiling" => {
+            // A worker must never raise its own conversation's ceiling, and a
+            // worker is the only kind of caller that arrives here scoped.
+            anyhow::ensure!(
+                caller_session.is_empty(),
+                "a conversation cannot set its own ceiling"
+            );
+            let policy: crate::policy::EffectivePolicy = serde_json::from_value(
+                params
+                    .get("policy")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("policy is required"))?,
+            )?;
+            to_value(store.set_ceiling(get_str(&params, "id")?, &policy)?)
+        }
+        "store.is_participant" => to_value(
+            store.is_participant(get_str(&params, "id")?, get_str(&params, "account")?)?,
+        ),
+        "store.participants" => {
+            let id = get_str(&params, "id")?;
+            let scoped = serde_json::json!({ "session": id });
+            own_session(store, &scoped, caller_session)?;
+            to_value(store.participants(id)?)
+        }
+        "store.add_participant" => {
+            // Only the owner invites, and only from the gateway: a turn that
+            // could add participants could widen who may prompt it.
+            anyhow::ensure!(
+                caller_session.is_empty(),
+                "a conversation cannot change its own participants"
+            );
+            let id = get_str(&params, "id")?;
+            let added_by = get_str(&params, "added_by")?;
+            anyhow::ensure!(
+                store.owner_of_root(id)?.as_deref() == Some(added_by),
+                "only the owner may invite"
+            );
+            to_value(store.add_participant(id, get_str(&params, "account")?, added_by)?)
+        }
+        "store.remove_participant" => {
+            anyhow::ensure!(
+                caller_session.is_empty(),
+                "a conversation cannot change its own participants"
+            );
+            let id = get_str(&params, "id")?;
+            let by = get_str(&params, "by")?;
+            let account = get_str(&params, "account")?;
+            // Symmetric with `add_participant`, which is the point: guarding
+            // only the invite would let any participant remove the others, or
+            // remove a co-participant to hide what they had seen. The one
+            // exception is leaving voluntarily, which needs nobody's
+            // permission.
+            anyhow::ensure!(
+                store.owner_of_root(id)?.as_deref() == Some(by) || by == account,
+                "only the owner may remove a participant"
+            );
+            to_value(store.remove_participant(id, account)?)
+        }
+        "store.sessions_participating" => {
+            let account = get_str(&params, "account")?;
+            if let Some(caller) = caller_owner.as_deref() {
+                anyhow::ensure!(
+                    account == caller,
+                    "cannot list another user's conversations"
+                );
+            }
+            to_value(store.sessions_participating(account)?)
         }
         "store.get_user_spend" => {
             let owner = caller_owner.as_deref().unwrap_or(get_str(&params, "user")?);
@@ -685,7 +861,37 @@ fn serve_store_call_inner(
         }
         "store.set_mode" => {
             let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
-            to_value(store.set_mode(id, get_str(&params, "mode")?)?)
+            let mode = get_str(&params, "mode")?;
+            // H1. `store.set_mode` itself validates nothing — it truncates to
+            // 32 characters and writes whatever it is given — and this arm is
+            // reachable from the browser's `set-mode` frame. An unknown mode
+            // used to be accepted silently, which mattered because
+            // `agent-core`'s `read_only(mode)` treats a mode it has never heard
+            // of as *unrestricted*. Writing "agnet" was therefore a way to
+            // widen a conversation's tool surface by typo.
+            //
+            // Since step 2 the mode is no longer what bounds a conversation —
+            // the stored ceiling is, and it is checked in `host_api::require`
+            // whatever the mode says — so this is defence in depth. It is worth
+            // having anyway: a mode nothing recognises produces a conversation
+            // whose tool list is decided by a fallback rather than by anyone's
+            // intent, and the honest answer to that is to refuse the write.
+            //
+            // The check lives here rather than in `Store` because the store
+            // holds no configuration; `cfg` is present only on the gateway
+            // side, which is also the only side this arm is served from.
+            //
+            // An empty mode is allowed: it is not an unrecognised mode but the
+            // absence of one, which is how most conversations run and the only
+            // way to clear a mode once set.
+            if let Some(cfg) = cfg {
+                anyhow::ensure!(
+                    mode.is_empty() || cfg.mode(mode).is_some(),
+                    "unknown mode: {mode}. An unrecognised mode would leave the \
+                     tool surface to a fallback rather than to a decision."
+                );
+            }
+            to_value(store.set_mode(id, mode)?)
         }
         "store.set_model" => {
             let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
@@ -875,8 +1081,348 @@ mod tests {
         fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}
     }
 
+    /// The gateway side with real configuration behind it, which is what
+    /// `store.session_policy` needs: policy is resolved from `[[users]]` and
+    /// `[[roles]]`, and the whole point of the arm is that it happens on the
+    /// gateway rather than in a worker's rewritable checkout.
+    struct GatewayWithCfg(Arc<Store>, Arc<crate::config::Config>, String);
+    impl Handler for GatewayWithCfg {
+        fn handle(
+            self: Arc<Self>,
+            method: String,
+            params: Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> {
+            let store = self.0.clone();
+            let cfg = self.1.clone();
+            let caller = self.2.clone();
+            Box::pin(async move {
+                if method == "hello" {
+                    return Ok(ipc::hello_response());
+                }
+                serve_store_call(&store, Some(&cfg), &method, params, &caller).await
+            })
+        }
+        fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}
+    }
+
+    /// Two accounts: one that can change things, one that cannot.
+    fn two_account_config() -> Arc<crate::config::Config> {
+        use crate::policy::Cap;
+        let mut cfg = crate::config::Config::load().unwrap();
+
+        let mut writer = cfg.auth.local_policy.as_ref().clone();
+        writer.admin = true;
+        writer.read_only = false;
+
+        let mut reader = cfg.auth.local_policy.as_ref().clone();
+        reader.admin = false;
+        reader.read_only = true;
+        reader.denied.insert(Cap::Delegation);
+
+        cfg.auth.users_mode = true;
+        cfg.auth.users = vec![
+            crate::config::UserSpec {
+                id: "writer".into(),
+                name: "Writer".into(),
+                role: "admin".into(),
+                password_hash: crate::config::Secret::new(""),
+                discord_id: String::new(),
+                policy: Arc::new(writer),
+            },
+            crate::config::UserSpec {
+                id: "reader".into(),
+                name: "Reader".into(),
+                role: "reader".into(),
+                password_hash: crate::config::Secret::new(""),
+                discord_id: String::new(),
+                policy: Arc::new(reader),
+            },
+        ];
+        Arc::new(cfg)
+    }
+
+    /// The rule the whole multi-user design rests on, asserted across the IPC
+    /// boundary because that is the only path a worker ever uses:
+    ///
+    ///     effective(turn) = policy(speaker) ∩ ceiling(session)
+    ///
+    /// A `Persist::Local` test would prove nothing here — `session_policy`
+    /// deliberately refuses the local arm, since a worker must not resolve
+    /// policy from configuration in its own rewritable checkout.
+    #[tokio::test]
+    async fn a_turns_authority_comes_from_the_speaker_not_the_owner() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let cfg = two_account_config();
+
+        // A conversation owned by the account that *can* change things.
+        let convo = store
+            .create_session(Some("writer's chat".into()), "agent", "writer")
+            .unwrap();
+        // The read-only account is invited in.
+        store
+            .add_participant(&convo.id, "reader", "writer")
+            .unwrap();
+
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(
+            gw_stream,
+            Arc::new(GatewayWithCfg(store.clone(), cfg.clone(), convo.id.clone())),
+        );
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        // The owner speaking gets their own authority.
+        let owner_turn = remote
+            .session_policy(&convo.id, Some("writer"))
+            .await
+            .unwrap();
+        assert!(!owner_turn.read_only, "the owner can still write");
+        assert!(!owner_turn.denies(crate::policy::Cap::FilesystemWrite));
+
+        // The invited read-only account speaking in that same conversation
+        // gets *their* authority, not the owner's. This is the question this
+        // whole design was built to answer.
+        let guest_turn = remote
+            .session_policy(&convo.id, Some("reader"))
+            .await
+            .unwrap();
+        assert!(
+            guest_turn.read_only,
+            "a read-only participant must not inherit the owner's write access"
+        );
+        assert!(guest_turn.denies(crate::policy::Cap::FilesystemWrite));
+        assert!(guest_turn.denies(crate::policy::Cap::Devkit));
+        assert!(!guest_turn.admin);
+
+        // Someone who was never invited borrows nothing by naming themselves.
+        assert!(
+            remote
+                .session_policy(&convo.id, Some("stranger"))
+                .await
+                .is_err(),
+            "a non-participant must be refused, not resolved"
+        );
+
+        // No speaker falls back to the owner, which is what a resume after a
+        // restart does and what every turn did before this existed.
+        let resumed = remote.session_policy(&convo.id, None).await.unwrap();
+        assert!(!resumed.read_only);
+    }
+
+    /// The other half of the rule: a conversation's ceiling narrows *everyone*,
+    /// including an admin. This is what makes the Discord guarantee hard rather
+    /// than a tool filter in a component the agent can rewrite.
+    #[tokio::test]
+    async fn a_ceiling_narrows_even_an_admin() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let cfg = two_account_config();
+
+        let convo = store
+            .create_session(Some("from discord".into()), "chat", "writer")
+            .unwrap();
+
+        // A Discord-flavoured ceiling: read-only, no delegation.
+        let mut ceiling = cfg.auth.local_policy.as_ref().clone();
+        ceiling.admin = false;
+        ceiling.read_only = true;
+        ceiling.denied.insert(crate::policy::Cap::Delegation);
+        store.set_ceiling(&convo.id, &ceiling).unwrap();
+
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(
+            gw_stream,
+            Arc::new(GatewayWithCfg(store.clone(), cfg.clone(), convo.id.clone())),
+        );
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        // The admin owner speaking under that ceiling is read-only anyway.
+        let turn = remote
+            .session_policy(&convo.id, Some("writer"))
+            .await
+            .unwrap();
+        assert!(turn.read_only, "the ceiling binds the owner too");
+        assert!(!turn.admin, "and takes admin away with it");
+        assert!(turn.denies(crate::policy::Cap::Devkit));
+        assert!(turn.denies(crate::policy::Cap::Delegation));
+
+        // Reading is untouched: a ceiling narrows, it does not disable.
+        assert!(!turn.denies(crate::policy::Cap::FilesystemRead));
+    }
+
+    /// A conversation must not be able to raise its own ceiling, and a worker
+    /// is the only caller that arrives scoped to one.
+    #[tokio::test]
+    async fn a_conversation_cannot_raise_its_own_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let cfg = two_account_config();
+        let convo = store
+            .create_session(None, "chat", "writer")
+            .unwrap();
+
+        let mut narrow = cfg.auth.local_policy.as_ref().clone();
+        narrow.read_only = true;
+        store.set_ceiling(&convo.id, &narrow).unwrap();
+
+        // A session-bound caller: exactly how a worker's IPC arrives.
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(
+            gw_stream,
+            Arc::new(GatewayWithCfg(store.clone(), cfg.clone(), convo.id.clone())),
+        );
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        let mut wide = cfg.auth.local_policy.as_ref().clone();
+        wide.admin = true;
+        wide.read_only = false;
+        assert!(
+            remote.set_ceiling(&convo.id, &wide).await.is_err(),
+            "a turn that could widen its own ceiling would not have one"
+        );
+        assert!(
+            remote
+                .add_participant(&convo.id, "reader", "writer")
+                .await
+                .is_err(),
+            "nor may it invite someone who could then prompt it"
+        );
+
+        // And the stored ceiling is untouched.
+        assert!(store.ceiling_of(&convo.id).unwrap().unwrap().read_only);
+    }
+
+    /// Removal is guarded the same way inviting is.
+    ///
+    /// Guarding only the invite is the plausible mistake, and it is a real
+    /// hole: any participant could then evict the others, or evict a
+    /// co-participant to hide what they had been shown. The single exception
+    /// is leaving, which needs nobody's permission.
+    #[tokio::test]
+    async fn only_the_owner_removes_someone_else_but_anyone_may_leave() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let cfg = two_account_config();
+        let convo = store
+            .create_session(None, "agent", "writer")
+            .unwrap();
+        store.add_participant(&convo.id, "reader", "writer").unwrap();
+
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        // Unscoped: the gateway acting for a browser, which is the only way a
+        // participant change ever arrives.
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(
+            gw_stream,
+            Arc::new(GatewayWithCfg(store.clone(), cfg.clone(), String::new())),
+        );
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        // A participant cannot evict a fellow guest…
+        store.add_participant(&convo.id, "other", "writer").unwrap();
+        assert!(
+            remote
+                .remove_participant(&convo.id, "other", "reader")
+                .await
+                .is_err(),
+            "a guest must not be able to remove another guest"
+        );
+        assert!(store.is_participant(&convo.id, "other").unwrap());
+
+        // …but may remove themselves.
+        assert!(remote
+            .remove_participant(&convo.id, "reader", "reader")
+            .await
+            .unwrap());
+        assert!(!store.is_participant(&convo.id, "reader").unwrap());
+
+        // And the owner may remove anyone.
+        assert!(remote
+            .remove_participant(&convo.id, "other", "writer")
+            .await
+            .unwrap());
+        assert!(!store.is_participant(&convo.id, "other").unwrap());
+    }
+
     /// The gateway side as a *session-bound* worker sees it: every call is
     /// pinned to `caller_session`, exactly as `roles::gateway` serves a
+    /// H1. The browser's `set-mode` frame reaches `store.set_mode`, and the
+    /// store validates nothing — it truncates to 32 characters and writes
+    /// whatever it is handed. An unknown mode used to be accepted silently,
+    /// which mattered because `agent-core` treated a mode it had never heard of
+    /// as unrestricted: `set-mode "agnet"` was a way to widen a conversation by
+    /// typo.
+    ///
+    /// Asserted across the wire because that is the only path the frame takes.
+    #[tokio::test]
+    async fn a_mode_nobody_declared_cannot_be_written() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+        let cfg = two_account_config();
+
+        let convo = store
+            .create_session(Some("chat".into()), "agent", "writer")
+            .unwrap();
+
+        // `set_mode` is scoped by owner, not by session, so the caller session
+        // is left empty and `caller_owner` does the work.
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(
+            gw_stream,
+            Arc::new(GatewayWithCfg(store.clone(), cfg.clone(), String::new())),
+        );
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        // The two built-in modes are accepted.
+        remote.set_mode(&convo.id, "plan").await.unwrap();
+        assert_eq!(
+            store.get_session(&convo.id).unwrap().unwrap().mode,
+            "plan",
+            "a declared mode must still be settable"
+        );
+        remote.set_mode(&convo.id, "agent").await.unwrap();
+
+        // A typo is refused rather than written.
+        let refused = remote.set_mode(&convo.id, "agnet").await;
+        assert!(refused.is_err(), "an unknown mode must be refused");
+        let complaint = format!("{:#}", refused.unwrap_err());
+        assert!(
+            complaint.contains("unknown mode"),
+            "the refusal should say what was wrong, got: {complaint}"
+        );
+
+        // And the refusal left the conversation as it was, rather than half
+        // applying — the mode that was valid a moment ago is still in place.
+        assert_eq!(
+            store.get_session(&convo.id).unwrap().unwrap().mode,
+            "agent",
+            "a refused write must not have landed"
+        );
+
+        // Clearing the mode is not the same as naming an unknown one: an empty
+        // mode is the ordinary "no mode set" case and the only way back to it.
+        remote.set_mode(&convo.id, "").await.unwrap();
+        assert_eq!(
+            store.get_session(&convo.id).unwrap().unwrap().mode,
+            "",
+            "it must stay possible to clear a mode"
+        );
+    }
+
     /// worker's IPC.
     struct GatewayAs(Arc<Store>, String);
     impl Handler for GatewayAs {

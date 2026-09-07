@@ -130,6 +130,13 @@ pub const ASSETS: &[Asset] = &[
         mime: JS,
         body: include_str!("ui/views/todo.js"),
     },
+    // Who else is in this conversation, and what their own account lets them do
+    // here — which is the only place the per-speaker permission rule is visible.
+    Asset {
+        path: "/views/participants.js",
+        mime: JS,
+        body: include_str!("ui/views/participants.js"),
+    },
     // The centre stage's tab strip: the conversation first and always, then a
     // tab per sub-agent and per open file. Owns which pane is showing, the
     // conversation's title and rename, and the file editors.
