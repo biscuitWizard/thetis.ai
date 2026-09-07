@@ -98,7 +98,7 @@ impl Policy {
         Self {
             enabled: sys::config_get("compact_enabled").as_deref() != Some("false"),
             window: num("context_window", 200_000.0) as u32,
-            threshold: num("compact_threshold", 0.6),
+            threshold: num("compact_threshold", 1.0),
             target: num("compact_target", 0.25),
             summary_model: sys::config_get("summary_model").unwrap_or_default(),
             keep_head: num("keep_head", 4.0) as usize,
@@ -116,7 +116,7 @@ impl Policy {
 
     /// Whether a context this size is worth compacting.
     pub fn should_compact(&self, context_tokens: u32) -> bool {
-        self.enabled && context_tokens > 0 && context_tokens > self.trigger_tokens()
+        self.enabled && context_tokens > 0 && context_tokens >= self.trigger_tokens()
     }
 }
 
@@ -726,6 +726,21 @@ mod tests {
         assert_eq!(policy.target_tokens(), 250);
         // An unknown context size is not a reason to compact.
         assert!(!policy.should_compact(0));
+    }
+
+    #[test]
+    fn the_trigger_can_be_the_full_window() {
+        let policy = Policy {
+            enabled: true,
+            window: 1000,
+            threshold: 1.0,
+            target: 0.25,
+            summary_model: String::new(),
+            keep_head: 4,
+            keep_tail: 30,
+        };
+        assert!(!policy.should_compact(999));
+        assert!(policy.should_compact(1000));
     }
 
     #[test]
