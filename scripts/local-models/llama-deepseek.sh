@@ -17,7 +17,7 @@ exec "$HOME/llama.cpp/build/bin/llama-server" \
   -m "$M/UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf" \
   -a deepseek-v4-flash \
   --host 127.0.0.1 --port 8080 \
-  -dev CUDA1,CUDA2,CUDA3 -ngl 99 -ts "${DEEPSEEK_SPLIT:-20,12,11}" -ncmoe "${DEEPSEEK_CPU_MOE:-18}" \
+  -dev CUDA1,CUDA2,CUDA3 -ngl 99 -ts "${DEEPSEEK_SPLIT:-18,12,13}" -ncmoe "${DEEPSEEK_CPU_MOE:-6}" \
   -c "${DEEPSEEK_CTX:-131072}" -np 2 -fa auto \
   -t 40 -b 2048 -ub 512 \
   ${DEEPSEEK_DRAFT:+--spec-type draft-dspark -md "$M/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" -devd CUDA1} \
