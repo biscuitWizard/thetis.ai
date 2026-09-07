@@ -90,7 +90,7 @@ fn write_token_file(data_dir: &std::path::Path, token: &str) {
 
 /// The token decision, split out so both branches are testable: a `OnceLock`
 /// latches on first use, so a test cannot exercise both paths in one process.
-pub(crate) fn resolve_token(existing: Option<String>) -> String {
+fn resolve_token(existing: Option<String>) -> String {
     // A sidecar is already running with this token; anything else is rejected.
     if let Some(found) = existing {
         let found = found.trim();

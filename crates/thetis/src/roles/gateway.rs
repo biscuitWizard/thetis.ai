@@ -92,8 +92,6 @@ pub async fn run() -> Result<()> {
     // design: it checks node, installs the pinned Playwright if the vendored
     // copy is missing, and reports through the tools rather than stopping boot.
     crate::browser::spawn(cfg.clone());
-    // The campaign knowledge sidecar, supervised here for the same reasons.
-    crate::kb_sidecar::spawn(cfg.clone());
     // Before anything is resumed: a sub-agent recorded as running cannot be,
     // because nothing has started yet. Those rows are the wreckage of whatever
     // restart brought us here, and nothing else will ever clear them — a child
