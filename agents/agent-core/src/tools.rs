@@ -339,12 +339,14 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
             name: "restart_orchestrator",
             description:
                 "Restart this conversation's own runtime — no other conversation notices. \
-                 Needed for changes to settings read only at startup, or to run a kernel \
-                 you rebuilt in this branch (build it first with \
-                 `cargo build --release -p thetis` in a terminal; the new binary is \
-                 probed before it is adopted, and a broken one falls back). This turn \
-                 continues afterwards unless you say otherwise; say why first, because \
-                 the restart happens just after your turn ends.",
+                 Needed for changes to settings read only at startup, and for changes to \
+                 the orchestrator's own source under crates/. Do NOT build the \
+                 orchestrator yourself in a terminal: if you have edited crates/ or wit/, \
+                 this rebuilds it for you, in the background, and reports the result here. \
+                 A build that fails restarts nothing and gives you the compiler error; a \
+                 binary that will not start is probed and rejected before it is adopted. \
+                 This turn continues afterwards unless you say otherwise; say why first, \
+                 because the restart happens just after your turn ends.",
             mutating: true,
             parameters: obj(
                 json!({

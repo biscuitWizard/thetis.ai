@@ -159,4 +159,4 @@ privileges of the orchestrator.
 |---|---|
 | A file is not where this map says | Run `list_code` for the aspect, or `list_path`. This map can be stale; the tools cannot. |
 | A dev-kit write is refused | Read the message. It names the rule: path confinement, or which protected list matched. |
-| You must change the kernel or the contract | The dev kit cannot reach them. Edit with `write_path`, build with `cargo build --release -p thetis` in a terminal, then `restart_orchestrator` — only this conversation's runtime restarts, and a broken kernel falls back. For the contract, read `careful-surgery/contract-changes` first. |
+| You must change the kernel or the contract | The dev kit cannot reach them. Edit with `write_path`, then `restart_orchestrator` — it rebuilds the orchestrator for you in the background and reports here; a build that fails restarts nothing. Never run cargo on the kernel yourself. Only this conversation's runtime restarts, and a broken kernel falls back. For the contract, read `careful-surgery/contract-changes` first. |

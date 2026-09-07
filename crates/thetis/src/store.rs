@@ -26,6 +26,10 @@ pub struct Interrupted {
 const NO_RESUME_KEY: &str = "__no_resume";
 /// How many times running this turn has ended in an interruption.
 const RESUME_ATTEMPTS_KEY: &str = "__resume_attempts";
+/// Set just before a restart the system asked for, and cleared when
+/// reconciliation sees it. An interruption the orchestrator caused on purpose
+/// is not evidence that the turn is unhealthy.
+const EXPECTED_RESTART_KEY: &str = "__expected_restart";
 const MAX_RESUME_ATTEMPTS: u32 = 2;
 
 /// session id -> SessionMeta (json)
@@ -348,14 +352,27 @@ impl Store {
     /// results never arrived. Both have to be dealt with before the turn can
     /// resume: a model request carrying tool calls with no matching results is
     /// rejected outright by most providers, so the log is made coherent first.
+    /// Repairs interrupted turns, optionally for one session only.
+    ///
+    /// `only` matters when several conversations are running: a worker dying
+    /// is news about *that* conversation, and sweeping the whole fleet on
+    /// every death drags in sessions that are merely between workers — an
+    /// agent mid-restart looks exactly like a crashed one from out here. Three
+    /// self-modifying agents turned that into a resume storm, each death
+    /// resuming the others and spending their attempt budgets until every
+    /// conversation was abandoned. Only the boot sweep wants the whole fleet.
     pub fn reconcile_interrupted_turns(
         &self,
         note: &str,
         skip: &[String],
+        only: Option<&str>,
     ) -> Result<Vec<Interrupted>> {
         let mut found = Vec::new();
 
         for meta in self.list_sessions(true)? {
+            if only.is_some_and(|id| id != meta.id) {
+                continue;
+            }
             // A session with a live worker is not interrupted, whatever its
             // log looks like mid-turn: a dangling turn-started and unanswered
             // tool calls are exactly what a *running* turn looks like from
@@ -405,9 +422,27 @@ impl Store {
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
 
-            // A turn that keeps dying takes the process with it each time.
+            // Did we ask for this? Adopting a rebuilt kernel means stopping
+            // the worker mid-turn on purpose, and that is the supported way to
+            // pick up your own changes — several agents do it repeatedly in one
+            // turn. Counting it as a death spent the whole budget on healthy
+            // work and abandoned the turn with "interrupted 2 times".
+            //
+            // The guard itself dates from the single-process orchestrator,
+            // where a turn that died really did take everything with it. With
+            // a worker per conversation a dying turn costs only its own worker,
+            // so the budget is only meant for a turn that crashes it *by
+            // itself*, repeatedly.
+            let expected = self
+                .kv_get(&meta.id, EXPECTED_RESTART_KEY)?
+                .is_some_and(|v| !v.is_empty());
+            if expected {
+                self.kv_put(&meta.id, EXPECTED_RESTART_KEY, "")?;
+            }
+
+            // A turn that keeps dying takes its worker with it each time.
             // Stop after a couple of tries rather than looping forever.
-            let exhausted = attempts >= MAX_RESUME_ATTEMPTS;
+            let exhausted = !expected && attempts >= MAX_RESUME_ATTEMPTS;
             let resume = !opted_out && !exhausted;
 
             if opted_out {
@@ -421,7 +456,7 @@ impl Store {
                     )),
                 )?;
                 self.clear_resume_attempts(&meta.id)?;
-            } else if resume {
+            } else if resume && !expected {
                 self.kv_put(&meta.id, RESUME_ATTEMPTS_KEY, &(attempts + 1).to_string())?;
             } else {
                 // Deliberately not carrying on, so the turn has to be closed:
@@ -456,6 +491,12 @@ impl Store {
     }
 
     /// Records that the next restart of this session should not resume its turn.
+    /// Declares that this session is about to be interrupted on purpose, so
+    /// the next reconciliation does not charge it an attempt.
+    pub fn expect_restart(&self, session_id: &str) -> Result<()> {
+        self.kv_put(session_id, EXPECTED_RESTART_KEY, "1")
+    }
+
     pub fn set_no_resume(&self, session_id: &str, no_resume: bool) -> Result<()> {
         self.kv_put(session_id, NO_RESUME_KEY, if no_resume { "1" } else { "" })
     }
@@ -960,7 +1001,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         finish_turn(&store, &done);
         let cut_short = mid_turn(&store, "interrupted", None);
 
-        let found = store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+        let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, cut_short);
         assert!(found[0].resume, "an interrupted turn resumes by default");
@@ -978,7 +1019,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let (store, _d) = temp_store();
         let id = mid_turn(&store, "mid tool call", Some("call_abc"));
 
-        store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+        store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
 
         // Providers reject a request whose tool calls have no matching results,
         // so the turn could not be resumed without this.
@@ -1015,7 +1056,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
             )
             .unwrap();
 
-        store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+        store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
 
         let results = store
             .events(&id, 0)
@@ -1032,7 +1073,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         let id = mid_turn(&store, "one-way", None);
         store.set_no_resume(&id, true).unwrap();
 
-        let found = store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+        let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
         assert_eq!(found.len(), 1);
         assert!(!found[0].resume);
 
@@ -1044,7 +1085,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
 
         // The preference is spent, so a later interruption resumes normally.
         store.append_event(&id, SessionEvent::TurnStarted).unwrap();
-        let again = store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+        let again = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
         assert!(again[0].resume);
     }
 
@@ -1055,7 +1096,7 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
 
         // Each pass ends mid-turn again, as it would if resuming crashed.
         for expected in [true, true, false] {
-            let found = store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+            let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
             assert_eq!(found[0].resume, expected, "attempt outcome");
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
         }
@@ -1068,17 +1109,79 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
     }
 
     #[test]
+    fn a_restart_we_asked_for_is_not_charged_against_the_turn() {
+        let (store, _d) = temp_store();
+        let id = mid_turn(&store, "self-modifying", None);
+
+        // Adopting a kernel you just built means restarting mid-turn, and an
+        // agent iterating on the orchestrator does it repeatedly. Before this,
+        // the third one hit the cap and the turn was abandoned for doing
+        // exactly what the design intends.
+        for round in 0..6 {
+            store.expect_restart(&id).unwrap();
+            let found = store
+                .reconcile_interrupted_turns("restarted", &[], None)
+                .unwrap();
+            assert!(found[0].resume, "round {round} must still resume");
+            store.append_event(&id, SessionEvent::TurnStarted).unwrap();
+        }
+        assert!(
+            !store
+                .events(&id, 0)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))),
+            "an expected restart must never exhaust the budget"
+        );
+
+        // But a genuine crash-loop is still caught: the marker is one-shot, so
+        // once it is spent the ordinary budget applies again.
+        for expected in [true, true, false] {
+            let found = store
+                .reconcile_interrupted_turns("restarted", &[], None)
+                .unwrap();
+            assert_eq!(found[0].resume, expected, "unexpected deaths still count");
+            store.append_event(&id, SessionEvent::TurnStarted).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_conversation_dying_does_not_disturb_another() {
+        let (store, _d) = temp_store();
+        let dead = mid_turn(&store, "the one whose worker died", None);
+        let busy = mid_turn(&store, "someone else mid-restart", None);
+
+        // A worker death is news about its own conversation. Sweeping the
+        // fleet dragged in every session that merely had no worker at that
+        // instant, which with several self-modifying agents fed back on itself
+        // until they had all spent their budgets.
+        let found = store
+            .reconcile_interrupted_turns("restarted", &[], Some(&dead))
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, dead);
+
+        let untouched = store.events(&busy, 0).unwrap();
+        assert!(
+            !untouched
+                .iter()
+                .any(|r| matches!(&r.event, SessionEvent::SystemNote(_))),
+            "the other conversation must not even be annotated"
+        );
+    }
+
+    #[test]
     fn finishing_a_turn_clears_the_attempt_count() {
         let (store, _d) = temp_store();
         let id = mid_turn(&store, "recovers", None);
 
-        store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+        store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
         store.clear_resume_attempts(&id).unwrap();
 
         // Back to a clean slate: the cap starts counting from zero again.
         for _ in 0..2 {
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
-            let found = store.reconcile_interrupted_turns("restarted", &[]).unwrap();
+            let found = store.reconcile_interrupted_turns("restarted", &[], None).unwrap();
             assert!(found[0].resume);
         }
     }
