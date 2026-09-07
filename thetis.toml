@@ -497,18 +497,26 @@ max_universal = 20
 # scoping is a token and attention optimisation, never a permission boundary.
 # Read-only modes remain the only thing that actually withholds a capability.
 #
-# The evidence for doing this is mixed, which is why it ships off. Naive tool
-# attachment cost 9.5% accuracy on average across six commercial models
-# (MCPGauge, arXiv 2508.12566) and tool-calling accuracy falls 7-85% as a
-# catalog grows from 8K to 120K tokens (LongFuncEval, 2505.10570) — but an
-# adaptive cut-off also scored 0% on hard queries that a larger fixed candidate
-# set got 16.7% on (2605.24660). Turn it on, read the `tool accounting:` log
-# line at the end of each turn either side, and decide from this deployment's own
-# numbers.
+# On since the accounting justified it. This deployment offers 78 tools in
+# ~17.1K tokens of definitions, past both of Anthropic's thresholds for tool
+# search being worth it (>10 tools, >10K tokens). The mechanism that matters is
+# not the count but confusability: 74% of these tools share a name stem with
+# another, and `list` spans 7 groups, `search` and `read` 5 each. Measured over
+# seven logged turns, scoping cuts the mean same-verb rival set from 4.7 to 2.1
+# (-56%), which is the failure mode MCPGauge (arXiv 2508.12566) priced at 9.5%
+# accuracy across six commercial models.
+#
+# Two things this does NOT fix. Definitions are only 19% of a ~90K mean prompt
+# here and are served from the prompt cache 95.7% of the time, so this is not
+# the lever for context pressure — conversation history is. And 78 -> ~33 tools
+# is still far above the K~7.4 optimum in 2605.24660, because route_threshold
+# below is a coarse cut rather than an adaptive one.
+#
+# To reverse: set false and restart. Watch the `tool accounting:` line for turns
+# where `tool_search` is called or a group is admitted late — those are routing
+# misses, and they are what would justify making the threshold adaptive.
 [tool_groups]
-# Off means every tool is offered exactly as before, and only the accounting
-# runs. Also settable via THETIS_TOOL_GROUPING.
-grouping_enabled = false
+grouping_enabled = true
 # Log, at the end of each turn, how many tool definitions were offered and how
 # many were actually called. Independent of `grouping_enabled`: the baseline is
 # what makes the change judgeable, so this is on even when nothing is scoped.
