@@ -17,12 +17,33 @@ cleanup() {
   if [[ -z ${THETIS_CAMPAIGN_KEEP_SCRATCH:-} ]]; then rm -rf "$scratch"; else echo "scratch kept at $scratch"; fi
 }
 trap cleanup EXIT INT TERM
-mkdir -p "$scratch"/{data,artifacts,worktrees}
+mkdir -p "$scratch"/{data,artifacts,worktrees,workspace}
 # Run the orchestrators against a clean disposable checkout. Bootstrap artifacts
 # are only cacheable for a clean tree; the developer checkout may contain this
 # harness edit or unrelated work from another agent.
-git clone --quiet --local --no-hardlinks "$root" "$scratch/source"
+if [[ -d "$scratch/source/.git" ]]; then
+  git -C "$scratch/source" add -A -- . ":!target*"
+  git -C "$scratch/source" reset --hard "$(git -C "$root" rev-parse HEAD)" >/dev/null
+else
+  git clone --quiet --local --no-hardlinks "$root" "$scratch/source"
+fi
+# Include the working diff in the disposable checkout so review fixes are tested.
+git -C "$root" diff --binary HEAD -- . ':!.claude/worktrees' ':!target*' > "$scratch/review.patch"
+if [[ -s "$scratch/review.patch" ]]; then
+  git -C "$scratch/source" apply "$scratch/review.patch"
+  git -C "$scratch/source" add -A -- . ":!target*"
+  git -C "$scratch/source" -c user.name='Campaign verification' -c user.email='verification@localhost' commit --quiet -m 'Snapshot campaign review changes'
+fi
 cp "$root/thetis.toml" "$scratch/thetis.toml"
+# Distinct local model IDs make task routing observable without paid requests.
+for role in architect plotting scene referee shop; do
+  cat >>"$scratch/thetis.toml" <<EOF
+
+[[models]]
+id = "mock/$role"
+label = "Test $role"
+EOF
+done
 cat >"$scratch/thetis.local.toml" <<EOF
 [server]
 bind = "127.0.0.1:7797"
@@ -99,24 +120,28 @@ MOCK_LLM_SCRIPT="$root/services/playwright-sidecar/fixtures/campaign-walkthrough
 mock_pid=$!
 THETIS_ROOT="$scratch/source" THETIS_CONFIG="$scratch/thetis.toml" THETIS_LOCAL_CONFIG="" \
   THETIS_BIND="127.0.0.1:7797" THETIS_DATA_DIR="$scratch/data" THETIS_ARTIFACTS_DIR="$scratch/artifacts" \
-  THETIS_WORKSPACE_DIR="${THETIS_WORKSPACE_DIR:-/opt/thetis/workspace}" \
+  THETIS_WORKSPACE_DIR="$scratch/workspace" \
   setsid "$root/target/debug/thetis" >"$scratch/thetis.log" 2>&1 &
 thetis_pid=$!
 
 for _ in $(seq 1 180); do
   status=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:7797/play/ || true)
-  if [[ "$status" == 200 ]]; then break; fi
+  if [[ "$status" == 200 ]] && curl --silent http://127.0.0.1:7797/play/ | rg -q 'id="play-area"'; then break; fi
   if ! kill -0 "$thetis_pid" 2>/dev/null; then
     cat "$scratch/thetis.log" >&2
     exit 1
   fi
   sleep 1
 done
-curl --fail --silent http://127.0.0.1:7797/play/ >/dev/null || {
+curl --fail --silent http://127.0.0.1:7797/play/ | rg -q 'id="play-area"' || {
   echo "scratch orchestrator did not become ready" >&2; cat "$scratch/thetis.log" >&2; exit 1;
 }
 
 case "$mode" in
+  --serve)
+    echo "Campaign review server ready at http://127.0.0.1:7797/play/"
+    wait "$thetis_pid"
+    ;;
   --protocol)
     THETIS_CAMPAIGN_WS_URL=ws://127.0.0.1:7797/play/ws \
       cargo test --manifest-path "$root/Cargo.toml" -p thetis --test ws_campaign -- --ignored --nocapture
@@ -125,6 +150,11 @@ case "$mode" in
     THETIS_CAMPAIGN_URL=http://127.0.0.1:7797/play/ \
     THETIS_WALKTHROUGH_ARTIFACTS="$artifacts" \
       npm --prefix "$root/services/playwright-sidecar" run walkthrough:campaign
+    for role in plotting scene referee shop; do
+      rg -q "mock request model=mock/$role" "$scratch/mock-llm.log" || {
+        echo "campaign task never used its selected $role model" >&2; exit 1;
+      }
+    done
     ;;
   *) echo "usage: $0 [--browser|--protocol]" >&2; exit 2 ;;
 esac

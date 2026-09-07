@@ -340,11 +340,15 @@ Anything in the file can be overridden per run. The common ones:
 Budget and limit values have `THETIS_`-prefixed overrides too, named after
 their keys — `THETIS_TURN_BUDGET_SECS`, `THETIS_MAX_ITERATIONS`, and so on.
 
-**Tabletop RPG campaign work.** The repository contains the canonical
-`rpg/rules` source tree for shared campaign rules and state, plus operating
-guides under [`skills/rpg`](skills/rpg). This work is still being assembled: the
-presence of a source module or guide does not mean its campaign tools, system
-data, or `/play` experience are available in the running build.
+**Tabletop RPG campaigns.** Open `/play` for campaign setup, character creation,
+branching stories, relationship memory, character advancement, combat and
+character fate, trading, task-specific models, rules lookup, and portable saves. Cyberpunk
+RED and the intentionally small D20 starter system share the canonical
+`rpg/rules` implementation. Operating guides live under [`skills/rpg`](skills/rpg).
+Run `bash scripts/run-campaign-walkthrough.sh` for the isolated Playwright
+walkthrough; set `THETIS_CAMPAIGN_SYSTEM=cyberpunk-red` to test RED. See the
+[campaign review and verification report](docs/campaign-review.md) for coverage
+and implementation boundaries.
 
 ## Layout
 

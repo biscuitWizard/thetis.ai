@@ -1,8 +1,77 @@
 [
   {
-    "when": "(?i)build this d20 tabletop campaign",
+    "when": "(?is)revisit.*plot",
     "reply": {
-      "text": "The Lantern Stair is ready beneath the town.",
+      "text": "The stair remains the central mystery; Mara can reveal the next clue. Planning is complete.",
+      "tool_calls": []
+    }
+  },
+  {
+    "when": "(?is)player:\\s*face the fatal trial",
+    "reply": {
+      "text": "The falling stone leaves Wren critically wounded.",
+      "tool_calls": [
+        {
+          "name": "rpg-sheet-update",
+          "arguments": {
+            "hp": 0
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)player:\\s*reflect on the journey",
+    "reply": {
+      "text": "The inn door closes behind you.",
+      "tool_calls": [
+        {
+          "name": "rpg-scene-end",
+          "arguments": {
+            "player_summary": "You reflected on what the lantern stair has taught you.",
+            "gm_summary": "The player is prepared to explore.",
+            "decisions": ["Prepared for the descent"],
+            "time_passed": 1
+          }
+        },
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "With your supplies packed, you return to the stair. The light below is steady now. Somewhere in the dark, a bell sounds.",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "narrative",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?i)build this .* tabletop campaign",
+    "reply": {
+      "text": "A stair opens beneath the quiet town.",
       "tool_calls": [
         {
           "name": "rpg-world-create",
@@ -10,93 +79,380 @@
             "kind": "location",
             "id": "lantern-stair",
             "name": "The Lantern Stair",
-            "details": "A sealed stair descending beneath the inn.",
-            "scale": "minor"
+            "details": "Rain-dark stone descends beneath the Lantern Inn. A blue flame waits at the foot of the steps."
           }
         },
         {
-          "name": "ask_user",
+          "name": "rpg-world-create",
           "arguments": {
-            "intro": "The initial campaign location is registered.",
-            "questions": [
-              {"id":"continue","question":"Continue to character creation?","type":"choice","options":["Continue"]}
-            ]
+            "kind": "npc",
+            "id": "mara",
+            "name": "Mara",
+            "details": "The innkeeper knows the stair."
+          }
+        },
+        {
+          "name": "rpg-world-update",
+          "arguments": {
+            "id": "mara",
+            "patch": {
+              "known_to_player": true
+            }
           }
         }
       ]
     }
   },
   {
-    "when": "(?is)begin the campaign",
+    "when": "(?i)continue building",
     "reply": {
-      "text": "Rain ticks against the inn windows. Beneath the floorboards, the old stair waits.",
+      "text": "The first location is ready. Begin with this small world, or keep developing its foundations.",
+      "tool_calls": []
+    }
+  },
+  {
+    "when": "(?is)player:\\s*(begin the campaign|explore the lantern stair)",
+    "reply": {
+      "text": "Rain taps against the windows of the Lantern Inn. Below the floorboards, something stirs.",
       "tool_calls": [
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "pc",
+            "to": "mara",
+            "kind": "relationship",
+            "interaction": {
+              "id": "mara-greeting",
+              "summary": "Mara offered a safe route.",
+              "reason": "A shared experience changes how Wren sees Mara.",
+              "deltas": {
+                "trust": 10,
+                "affinity": 5,
+                "familiarity": 10
+              },
+              "statuses": ["acquaintance"]
+            }
+          }
+        },
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "mara",
+            "to": "pc",
+            "kind": "relationship",
+            "interaction": {
+              "id": "mara-opinion",
+              "summary": "Wren listened to Mara\u2019s warning.",
+              "reason": "Mara appreciates a careful visitor.",
+              "deltas": {
+                "trust": 4,
+                "affinity": 3,
+                "familiarity": 5
+              },
+              "statuses": ["cautious ally"]
+            }
+          }
+        },
         {
           "name": "rpg-scene-present",
           "arguments": {
             "location_id": "lantern-stair",
-            "present": ["The sealed stair beneath the inn has opened."],
+            "present": [],
             "beats": [],
+            "narration": "Rain taps against the windows of the Lantern Inn. The keeper slides a brass key across the table.\n\n\u201cSomeone lit the old lantern,\u201d she says. \u201cIt has been dark for thirty years.\u201d\n\nBeyond the cellar door, warm light spills up a stair that should have been sealed. Your next step is yours to choose.",
             "choices": [
-              {"id": "enter", "label": "Enter the ruin", "skill": "perception"}
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
             ],
             "input_mode": "both",
-            "phase": "narrative"
+            "phase": "narrative",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
           }
         }
       ]
     }
   },
   {
-    "when": "(?is)action:\\s*start combat with the sentinel",
+    "when": "(?is)player:\\s*start combat with the sentinel",
     "reply": {
-      "text": "A stone sentinel unfolds from the wall, then its old binding gutters out.",
+      "text": "The sentinel rises from its alcove.",
       "tool_calls": [
         {
           "name": "rpg-combat-start",
           "arguments": {
             "actors": [
-              {"id":"pc","name":"Wren","hp":12,"hp_max":12,"armor":1,"initiative":0,"attack":4,"defense":12,"damage":"1d8","npc":false},
-              {"id":"sentinel","name":"Ruin Sentinel","hp":8,"hp_max":8,"armor":0,"initiative":0,"attack":2,"defense":10,"damage":"1d4","npc":true}
+              {
+                "id": "pc",
+                "name": "Wren",
+                "hp": 12,
+                "hp_max": 12,
+                "armor": 0,
+                "initiative": 0,
+                "reflex": 100,
+                "attack": 100,
+                "defense": 30,
+                "damage": "1d8+8",
+                "npc": false
+              },
+              {
+                "id": "sentinel",
+                "name": "Ruin Sentinel",
+                "hp": 1,
+                "hp_max": 1,
+                "armor": 0,
+                "initiative": 0,
+                "attack": 2,
+                "defense": 1,
+                "damage": "1d1",
+                "npc": true
+              }
             ]
           }
         },
         {
-          "name": "rpg-combat-end",
-          "arguments": {"summary":"The sentinel's binding fails before it can strike."}
-        },
-        {
-          "name": "ask_user",
+          "name": "rpg-scene-present",
           "arguments": {
-            "intro": "The combat exchange is resolved.",
-            "questions": [
-              {"id":"continue","question":"Continue the campaign?","type":"choice","options":["Continue"]}
-            ]
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "A stone sentinel steps across the landing. Its lantern burns a warning blue.",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "combat",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
           }
         }
       ]
     }
   },
   {
-    "when": "(?is)action:\\s*visit the lantern shop",
+    "when": "(?is)combat result:",
     "reply": {
-      "text": "Mara opens a narrow cabinet of expedition supplies.",
+      "text": "The sentinel lowers its lantern.",
+      "tool_calls": [
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "Your strike breaks the old binding. The sentinel settles back into its alcove, and the path ahead falls quiet.",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "narrative",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)System: cyberpunk-red.*Player:\\s*visit the lantern shop",
+    "reply": {
+      "text": "Mara opens a cabinet of expedition supplies.",
       "tool_calls": [
         {
           "name": "rpg-shop-open",
           "arguments": {
             "vendor_id": "mara",
-            "items": ["dagger", "shortbow"],
+            "items": ["medium-pistol", "heavy-pistol", "smg"],
             "multiplier": 1.0
           }
         },
         {
-          "name": "ask_user",
+          "name": "rpg-scene-present",
           "arguments": {
-            "intro": "The shop is open.",
-            "questions": [
-              {"id":"continue","question":"Review the shop?","type":"choice","options":["Continue"]}
-            ]
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "\u201cTake what you need,\u201d Mara says. \u201cThe stair is longer than it looks.\u201d",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "shop",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)player:\\s*visit the lantern shop",
+    "reply": {
+      "text": "Mara opens a cabinet of expedition supplies.",
+      "tool_calls": [
+        {
+          "name": "rpg-shop-open",
+          "arguments": {
+            "vendor_id": "mara",
+            "items": ["dagger", "shortbow", "longsword"],
+            "multiplier": 1.0
+          }
+        },
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "\u201cTake what you need,\u201d Mara says. \u201cThe stair is longer than it looks.\u201d",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "shop",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)i leave the shop",
+    "reply": {
+      "text": "The inn door closes behind you.",
+      "tool_calls": [
+        {
+          "name": "rpg-world-link",
+          "arguments": {
+            "from": "pc",
+            "to": "mara",
+            "kind": "relationship",
+            "interaction": {
+              "id": "mara-trade",
+              "summary": "Mara supplied Wren for the descent.",
+              "reason": "A shared experience changes how Wren sees Mara.",
+              "deltas": {
+                "trust": 5,
+                "affinity": 5,
+                "familiarity": 5
+              },
+              "statuses": ["acquaintance"]
+            }
+          }
+        },
+        {
+          "name": "rpg-scene-end",
+          "arguments": {
+            "player_summary": "You traded supplies with Mara before returning to the lantern stair.",
+            "gm_summary": "The player is prepared to explore.",
+            "decisions": ["Prepared for the descent"],
+            "time_passed": 1
+          }
+        },
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "With your supplies packed, you return to the stair. The light below is steady now. Somewhere in the dark, a bell sounds.",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "narrative",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
           }
         }
       ]
@@ -104,6 +460,41 @@
   },
   {
     "when": ".*",
-    "reply": {"text":"The lantern flame leans toward the stair."}
+    "reply": {
+      "text": "The lantern flame leans toward the stair.",
+      "tool_calls": [
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": [],
+            "beats": [],
+            "narration": "A draft rises from below, carrying the scent of rain and old stone. The lantern is still waiting.",
+            "choices": [
+              {
+                "id": "enter",
+                "label": "Explore the lantern stair",
+                "skill": "perception",
+                "dv": 1
+              },
+              {
+                "id": "fight",
+                "label": "Start combat with the sentinel"
+              },
+              {
+                "id": "shop",
+                "label": "Visit the lantern shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "narrative",
+            "transition": {
+              "button": "",
+              "narration": ""
+            }
+          }
+        }
+      ]
+    }
   }
 ]

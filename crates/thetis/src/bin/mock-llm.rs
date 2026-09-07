@@ -40,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
 async fn completions(
     Json(body): Json<Value>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        println!("mock request model={model}");
+    }
     let last_user_content = body
         .get("messages")
         .and_then(Value::as_array)
@@ -384,6 +387,8 @@ fn text_frames(text: &str, slow: bool) -> Vec<(String, Duration)> {
 }
 
 fn scripted_frames(text: Option<&str>, tool_calls: &[(String, Value)]) -> Vec<(String, Duration)> {
+    static REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request = REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut frames = Vec::new();
     if let Some(text) = text {
         if !text.is_empty() {
@@ -395,7 +400,7 @@ fn scripted_frames(text: Option<&str>, tool_calls: &[(String, Value)]) -> Vec<(S
             chunk(
                 json!({ "tool_calls": [{
                     "index": index,
-                    "id": format!("call_mock_{}", index + 1),
+                    "id": format!("call_mock_{request}_{}", index + 1),
                     "type": "function",
                     "function": { "name": name, "arguments": arguments.to_string() },
                 }]}),

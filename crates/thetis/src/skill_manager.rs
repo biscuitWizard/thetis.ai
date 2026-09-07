@@ -817,6 +817,10 @@ mod tests {
         // No key: every test here stays off the network, so retrieval takes the
         // lexical path and no test can be billed or made flaky by the provider.
         cfg.openrouter_api_key = None;
+        for provider in &mut cfg.providers {
+            provider.api_key = None;
+            provider.base_urls = vec!["https://openrouter.ai/api/v1".into()];
+        }
 
         let db = Arc::new(Store::open(&dir.path().join("t.redb")).unwrap());
         let mgr = SkillManager::new(Arc::new(cfg), crate::persist::Persist::Local(db)).unwrap();
@@ -1161,6 +1165,10 @@ mod tests {
         let mut cfg = Config::load().unwrap();
         cfg.paths.skills = dir.path().join("skills");
         cfg.openrouter_api_key = None;
+        for provider in &mut cfg.providers {
+            provider.api_key = None;
+            provider.base_urls = vec!["https://openrouter.ai/api/v1".into()];
+        }
         cfg.skills.max_universal = 2;
         let db = Arc::new(Store::open(&dir.path().join("t2.redb")).unwrap());
         let capped = SkillManager::new(Arc::new(cfg), crate::persist::Persist::Local(db)).unwrap();

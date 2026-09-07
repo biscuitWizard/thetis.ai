@@ -300,13 +300,53 @@ pub async fn cache_key_with(
     let rel = cfg.aspect_source_rel(aspect)?;
     let aspect_tree = git.tree_oid(rev, &rel).await.ok()??;
     let wit_tree = git.tree_oid(rev, "wit").await.ok()?.unwrap_or_default();
-    Some(BuildCache::cache_key(&[
-        &aspect_tree,
-        &wit_tree,
-        kernel_wit_fingerprint(),
-        &cfg.build.target,
-        &cfg.build.profile,
-    ]))
+    let manifest = git
+        .run_raw(&["show", &format!("{rev}:{rel}/Cargo.toml")])
+        .await
+        .ok()?;
+    let inputs = declared_build_inputs(&String::from_utf8_lossy(&manifest.stdout));
+    let mut parts = vec![
+        aspect_tree,
+        wit_tree,
+        kernel_wit_fingerprint().into(),
+        cfg.build.target.clone(),
+        cfg.build.profile.clone(),
+    ];
+    for input in inputs {
+        parts.push(input.clone());
+        parts.push(git.tree_oid(rev, &input).await.ok()??);
+    }
+    Some(BuildCache::cache_key(
+        &parts.iter().map(String::as_str).collect::<Vec<_>>(),
+    ))
+}
+
+/// Repository-relative shared source/data trees that participate in a guest build.
+/// Explicit inputs cover Rust include_str! data as well as Cargo path dependencies.
+fn declared_build_inputs(manifest: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(manifest) else {
+        return vec![];
+    };
+    let mut paths = value
+        .get("package")
+        .and_then(|v| v.get("metadata"))
+        .and_then(|v| v.get("thetis"))
+        .and_then(|v| v.get("build-inputs"))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter(|path| {
+            !path.is_empty()
+                && std::path::Path::new(path)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// A loader revision number derived from a cache key, so "did the component
@@ -371,7 +411,16 @@ pub fn discover_aspects(cfg: &crate::config::Config) -> Vec<Aspect> {
 /// own files were not changing, so a source-only fingerprint would have
 /// suppressed the retry correctly, but a later `wit/` fix must un-suppress it.
 fn source_fingerprint(cfg: &Config, aspect: &Aspect) -> Option<String> {
-    fingerprint_dirs(&[cfg.aspect_source_dir(aspect), cfg.paths.wit.clone()])
+    let source = cfg.aspect_source_dir(aspect);
+    let mut roots = vec![source.clone(), cfg.paths.wit.clone()];
+    if let Ok(manifest) = std::fs::read_to_string(source.join("Cargo.toml")) {
+        roots.extend(
+            declared_build_inputs(&manifest)
+                .iter()
+                .map(|p| cfg.root.join(p)),
+        );
+    }
+    fingerprint_dirs(&roots)
 }
 
 /// The hashing behind [`source_fingerprint`], over an explicit set of roots so
@@ -1067,6 +1116,27 @@ mod fingerprint_tests {
     /// The negative cache is only safe if the fingerprint moves whenever the
     /// build's input moves. Too sticky and a fixed tree stays suppressed —
     /// which would be far worse than the spinning it replaced.
+    #[test]
+    fn shared_build_inputs_are_relative_sorted_and_deduplicated() {
+        let inputs = declared_build_inputs(
+            r#"[package.metadata.thetis]
+build-inputs = ["rpg/systems", "../outside", "/absolute", "rpg/rules", "rpg/rules"]"#,
+        );
+        assert_eq!(inputs, vec!["rpg/rules", "rpg/systems"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = inputs
+            .iter()
+            .map(|p| tmp.path().join(p))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        std::fs::write(roots[0].join("rules.rs"), "original").unwrap();
+        std::fs::write(roots[1].join("gear.json"), "[]").unwrap();
+        let before = fingerprint_dirs(&roots).unwrap();
+        std::fs::write(roots[1].join("gear.json"), "[1]").unwrap();
+        assert_ne!(before, fingerprint_dirs(&roots).unwrap());
+    }
     #[test]
     fn the_fingerprint_tracks_source_and_contract_but_not_mtime() {
         let tmp = tempfile::TempDir::new().unwrap();
