@@ -424,9 +424,7 @@ max_attachments = 24
 # explicit breakpoints.
 [cache]
 enabled = true
-# "5m" or "1h". The longer one costs twice as much to write, and is worth it
-# only if gaps between turns regularly exceed five minutes.
-ttl = "5m"
+ttl = "1h"
 # Spacing of the stable anchor breakpoints in the message list. A cache read
 # looks back at most twenty blocks, so a turn that runs many tools can overshoot
 # the previous mark; the anchors hold still and stay within reach. Smaller means

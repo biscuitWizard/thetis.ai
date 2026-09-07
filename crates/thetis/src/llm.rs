@@ -125,6 +125,17 @@ impl LlmClient {
         request_json: &str,
         stream: bool,
     ) -> Result<(serde_json::Value, String), LlmError> {
+        self.prepare_body_for(request_json, stream, None)
+    }
+
+    /// As [`Self::prepare_body`], but tagged with the conversation it belongs
+    /// to so the provider can keep it on one warm cache.
+    fn prepare_body_for(
+        &self,
+        request_json: &str,
+        stream: bool,
+        session: Option<&str>,
+    ) -> Result<(serde_json::Value, String), LlmError> {
         let mut body: serde_json::Value = serde_json::from_str(request_json)
             .map_err(|e| LlmError::BadRequest(format!("request is not valid JSON: {e}")))?;
 
@@ -146,6 +157,19 @@ impl LlmClient {
 
             obj.insert("model".into(), resolved.wire_model.clone().into());
             obj.insert("stream".into(), stream.into());
+
+            // Sticky routing. OpenRouter fronts several replicas of a given
+            // model, and a prompt cache lives on *one* of them. Without a
+            // stable key it pins a conversation only after a first cache hit,
+            // so the early turns scatter across replicas and every one of them
+            // misses cold. Naming the conversation makes turn two land on the
+            // machine that holds turn one's cache.
+            if let Some(session) = session.filter(|s| !s.is_empty()) {
+                obj.entry("user")
+                    .or_insert_with(|| format!("thetis:{session}").into());
+                obj.entry("session_id")
+                    .or_insert_with(|| session.to_string().into());
+            }
             if stream {
                 // Ask for a usage record on the final chunk, which is also the
                 // only place cache hits are reported.
@@ -182,13 +206,10 @@ impl LlmClient {
             );
         }
 
-        let trimmed = trim_failed_tool_rounds(&mut body);
-        if trimmed > 0 {
-            tracing::warn!(
-                count = trimmed,
-                "trimmed failed tool call/result pairs before prompt-cache checkpoints"
-            );
-        }
+        // Only the private marker goes. The prefix is deliberately left
+        // append-only: mutating it mid-array is what used to invalidate the
+        // prompt cache on every turn a tool failed. See `strip_private_markers`.
+        strip_private_markers(&mut body);
 
         // Last, and only once the model is settled: which provider is about to
         // serve this decides whether breakpoints help or merely cost writes.
@@ -206,16 +227,40 @@ impl LlmClient {
         provider_id: &str,
         streaming: bool,
     ) -> Result<reqwest::Response, LlmError> {
+        self.send_for(body, provider_id, streaming, None).await
+    }
+
+    /// As [`Self::send`], but keeps one conversation on one replica.
+    async fn send_for(
+        &self,
+        body: &serde_json::Value,
+        provider_id: &str,
+        streaming: bool,
+        session: Option<&str>,
+    ) -> Result<reqwest::Response, LlmError> {
         let provider = self
             .cfg
             .provider(provider_id)
             .unwrap_or_else(|| self.cfg.fallback_provider());
-        // Claim a slot in the rotation. One increment per request, so
-        // concurrent workers spread over the replicas rather than all opening
-        // on the first one.
-        let slot = self
-            .next_replica
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Which replica serves this. A rotating counter spreads load evenly,
+        // which is right for throughput and wrong for caching: the prompt cache
+        // is per-endpoint, so a conversation that rotates pays a full cache
+        // write on every turn. Hashing the session id instead pins one
+        // conversation to one endpoint — still spread across conversations,
+        // because different ids hash differently, but stable within one. The
+        // retry path below keeps stepping to the next replica, so a dead
+        // endpoint is still escaped.
+        let slot = match session.filter(|s| !s.is_empty()) {
+            Some(session) => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                session.hash(&mut hasher);
+                hasher.finish() as usize
+            }
+            None => self
+                .next_replica
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
 
         // A local server usually has no key, and an empty bearer token is
         // worse than none: some endpoints reject it outright. OpenRouter, by
@@ -302,8 +347,18 @@ impl LlmClient {
 
     /// Non-streaming completion; returns the raw provider JSON.
     pub async fn chat(&self, request_json: &str) -> Result<String, LlmError> {
-        let (body, provider) = self.prepare_body(request_json, false)?;
-        let resp = self.send(&body, &provider, false).await?;
+        self.chat_for(request_json, None).await
+    }
+
+    /// As [`Self::chat`], tagged with the conversation. Compaction's summary
+    /// calls go through here, and they share the session's prefix.
+    pub async fn chat_for(
+        &self,
+        request_json: &str,
+        session: Option<&str>,
+    ) -> Result<String, LlmError> {
+        let (body, provider) = self.prepare_body_for(request_json, false, session)?;
+        let resp = self.send_for(&body, &provider, false, session).await?;
         resp.text()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))
@@ -312,7 +367,17 @@ impl LlmClient {
     /// Opens a streaming completion. Chunks are pumped into the returned handle
     /// by a background task.
     pub async fn open_stream(&self, request_json: &str) -> Result<StreamHandle, LlmError> {
-        let (body, provider) = self.prepare_body(request_json, true)?;
+        self.open_stream_for(request_json, None).await
+    }
+
+    /// As [`Self::open_stream`], tagged with the conversation so successive
+    /// turns reuse one provider's warm prompt cache.
+    pub async fn open_stream_for(
+        &self,
+        request_json: &str,
+        session: Option<&str>,
+    ) -> Result<StreamHandle, LlmError> {
+        let (body, provider) = self.prepare_body_for(request_json, true, session)?;
         // Streaming requests are the turns themselves (compaction goes through
         // `chat`), so this is the one the inspector wants.
         let body = Arc::new(body);
@@ -325,7 +390,7 @@ impl LlmClient {
                 body: body.clone(),
             });
         }
-        let resp = self.send(&body, &provider, true).await?;
+        let resp = self.send_for(&body, &provider, true, session).await?;
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
@@ -799,78 +864,51 @@ fn dedupe_tool_results(body: &mut serde_json::Value) -> usize {
     before - messages.len()
 }
 
-/// Removes failed tool calls and their results before cache breakpoints are
-/// selected. The guest annotates failed results with `thetis_tool_ok = false`;
-/// this host-only marker is consumed here and never reaches a provider.
+/// Strips the host-only `thetis_tool_ok` marker, which the guest sets on every
+/// tool result and no provider must ever see.
 ///
-/// A whole failed pair is removed so the remaining request is structurally
-/// valid, except that the most recent failed pair is always preserved: it is
-/// the feedback the model needs to correct its next action. Successful/unknown
-/// results merely lose the private marker. If an assistant mixed failed and
-/// successful calls, only the old failed calls go; an assistant message left
-/// with neither text nor calls is removed as well.
-fn trim_failed_tool_rounds(body: &mut serde_json::Value) -> usize {
+/// Returns how many markers were removed.
+///
+/// # Why this no longer trims failed tool rounds
+///
+/// It used to. The guest annotates failures so that old, low-value failed
+/// call/result pairs could be dropped here, before cache breakpoints were
+/// chosen, to save context. That was a net *loss*, for two compounding reasons.
+///
+/// Prompt caching is a pure prefix match: a single changed byte invalidates
+/// every cache entry from that point on. The old rule preserved only the
+/// *newest* failed pair — and "newest" moves. The turn after a new failure
+/// arrived, the previously-protected pair was suddenly eligible and vanished
+/// from the *middle* of the prefix, invalidating the whole suffix and forcing it
+/// to be re-written at Anthropic's 1.25x cache-write premium. Tool failures are
+/// routine in an agentic loop, so this fired continually.
+///
+/// Removal also shifted every later index, and `cache::breakpoint_positions`
+/// places its anchors positionally. The anchors that exist precisely to stay
+/// valid across the 20-block lookback were themselves knocked off their marks.
+///
+/// The arithmetic is decisive. A cached token reads at roughly 0.1x the input
+/// price, so keeping a stale failed result costs 0.1x in perpetuity; evicting it
+/// forces a re-write at 1.25x. Trimming to save context cost more than it saved
+/// on any conversation long enough for the saving to matter.
+///
+/// So the message prefix is now append-only, which is the property caching
+/// rewards. Shedding context is compaction's job — it summarizes whole rounds
+/// and records the fact, rather than silently rewriting history under the cache.
+fn strip_private_markers(body: &mut serde_json::Value) -> usize {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return 0;
     };
 
-    // Keep the newest failure intact. It is the model's immediate feedback for
-    // the next completion; trimming it makes the failed call appear never to
-    // have happened and invites the exact same call again. Older failures are
-    // low-value history and may be removed before cache anchors are chosen.
-    let newest_failed = messages.iter().rev().find_map(|m| {
-        (m.get("role").and_then(serde_json::Value::as_str) == Some("tool")
-            && m.get("thetis_tool_ok").and_then(serde_json::Value::as_bool) == Some(false))
-        .then(|| m.get("tool_call_id").and_then(serde_json::Value::as_str))
-        .flatten()
-        .map(str::to_string)
-    });
-
-    let failed: std::collections::HashSet<String> = messages
-        .iter()
-        .filter(|m| {
-            m.get("role").and_then(serde_json::Value::as_str) == Some("tool")
-                && m.get("thetis_tool_ok").and_then(serde_json::Value::as_bool) == Some(false)
-        })
-        .filter_map(|m| m.get("tool_call_id").and_then(serde_json::Value::as_str))
-        .filter(|id| newest_failed.as_deref() != Some(*id))
-        .map(str::to_string)
-        .collect();
-
-    let mut removed = 0;
-    messages.retain_mut(|message| {
-        let role = message.get("role").and_then(serde_json::Value::as_str).unwrap_or("");
-        if role == "tool" {
-            let is_failed = message
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| failed.contains(id));
-            message.as_object_mut().map(|o| o.remove("thetis_tool_ok"));
-            if is_failed {
-                removed += 1;
-                return false;
-            }
-        } else if role == "assistant" {
-            let empty_text = message
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(str::is_empty);
-            if let Some(calls) = message.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
-                let before = calls.len();
-                calls.retain(|call| {
-                    call.get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_none_or(|id| !failed.contains(id))
-                });
-                removed += before - calls.len();
-                if before > 0 && calls.is_empty() && empty_text {
-                    return false;
-                }
+    let mut stripped = 0;
+    for message in messages.iter_mut() {
+        if let Some(obj) = message.as_object_mut() {
+            if obj.remove("thetis_tool_ok").is_some() {
+                stripped += 1;
             }
         }
-        true
-    });
-    removed
+    }
+    stripped
 }
 
 #[cfg(test)]
@@ -1151,6 +1189,67 @@ mod tests {
         assert_eq!(body["model"], "mistral-small");
     }
 
+    /// The cache lives on one replica, so the whole point is that the same
+    /// conversation resolves to the same endpoint every turn.
+    #[test]
+    fn one_conversation_stays_on_one_replica() {
+        let client = two_provider_client();
+        let provider = client.cfg.provider("local").unwrap();
+        let slot_for = |session: &str| -> String {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            session.hash(&mut hasher);
+            provider.url_for("chat/completions", hasher.finish() as usize)
+        };
+        assert_eq!(
+            slot_for("conv-abc"),
+            slot_for("conv-abc"),
+            "the same session must resolve to the same endpoint on every turn"
+        );
+    }
+
+    /// Without a session the old rotation must survive: that is what spreads
+    /// load for callers that have no conversation to be sticky about.
+    #[test]
+    fn a_request_with_no_session_still_rotates() {
+        let client = two_provider_client();
+        let first = client
+            .next_replica
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let second = client
+            .next_replica
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(first, second, "the rotation counter still advances");
+    }
+
+    /// The session tag has to actually reach the wire, or sticky routing is
+    /// left to OpenRouter's guesswork.
+    #[test]
+    fn a_session_is_named_on_the_wire_for_sticky_routing() {
+        let client = two_provider_client();
+        let (body, _) = client
+            .prepare_body_for(
+                r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#,
+                true,
+                Some("conv-384b4729"),
+            )
+            .unwrap();
+        assert_eq!(body["session_id"], "conv-384b4729");
+        assert_eq!(body["user"], "thetis:conv-384b4729");
+    }
+
+    /// A request with no session must look exactly as it always did, so
+    /// nothing downstream sees a new field it did not expect.
+    #[test]
+    fn a_request_without_a_session_gains_no_routing_fields() {
+        let client = two_provider_client();
+        let (body, _) = client
+            .prepare_body(r#"{"model":"anthropic/claude-sonnet-4.5","messages":[]}"#, true)
+            .unwrap();
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("user").is_none());
+    }
+
     fn roles(body: &serde_json::Value) -> Vec<String> {
         body["messages"]
             .as_array()
@@ -1209,8 +1308,10 @@ mod tests {
         assert_eq!(roles(&body)[2], "user");
     }
 
+    /// The private marker must never reach a provider: it is not a field any
+    /// of them accept, and a strict endpoint rejects the request outright.
     #[test]
-    fn older_failed_tool_pairs_are_trimmed_before_caching() {
+    fn the_private_tool_marker_never_reaches_a_provider() {
         let mut body = serde_json::json!({ "messages": [
             { "role": "system", "content": "prompt" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -1219,41 +1320,86 @@ mod tests {
             ]},
             { "role": "tool", "tool_call_id": "bad", "content": "failed", "thetis_tool_ok": false },
             { "role": "tool", "tool_call_id": "good", "content": "worked", "thetis_tool_ok": true },
-            { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "latest", "function": { "name": "z", "arguments": "{}" } }
-            ]},
-            { "role": "tool", "tool_call_id": "latest", "content": "latest failure", "thetis_tool_ok": false }
         ]});
 
-        assert_eq!(trim_failed_tool_rounds(&mut body), 2);
+        assert_eq!(strip_private_markers(&mut body), 2);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "good");
-        assert_eq!(messages[4]["tool_call_id"], "latest");
-        assert!(messages.iter().all(|m| m.get("thetis_tool_ok").is_none()));
+        assert!(
+            messages.iter().all(|m| m.get("thetis_tool_ok").is_none()),
+            "the host-only marker must be gone"
+        );
     }
 
+    /// Failed rounds stay in the request. They cost 0.1x as cached tokens;
+    /// evicting them would re-write the suffix at the 1.25x write premium.
     #[test]
-    fn the_most_recent_failed_tool_pair_is_never_trimmed() {
+    fn failed_tool_rounds_are_kept_so_the_prefix_stays_cacheable() {
         let mut body = serde_json::json!({ "messages": [
             { "role": "system", "content": "prompt" },
             { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "old", "function": { "name": "git-whoami", "arguments": "{}" } }
+                { "id": "bad", "function": { "name": "x", "arguments": "{}" } }
             ]},
-            { "role": "tool", "tool_call_id": "old", "content": "old failure", "thetis_tool_ok": false },
+            { "role": "tool", "tool_call_id": "bad", "content": "failed", "thetis_tool_ok": false },
             { "role": "assistant", "content": "", "tool_calls": [
-                { "id": "new", "function": { "name": "git-whoami", "arguments": "{}" } }
+                { "id": "latest", "function": { "name": "z", "arguments": "{}" } }
             ]},
-            { "role": "tool", "tool_call_id": "new", "content": "fix your credentials", "thetis_tool_ok": false }
+            { "role": "tool", "tool_call_id": "latest", "content": "also failed", "thetis_tool_ok": false }
         ]});
 
-        assert_eq!(trim_failed_tool_rounds(&mut body), 2);
+        strip_private_markers(&mut body);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "new");
-        assert_eq!(messages[2]["tool_call_id"], "new");
-        assert!(messages[2].get("thetis_tool_ok").is_none());
+        assert_eq!(messages.len(), 5, "no message is dropped");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "bad");
+        assert_eq!(messages[2]["content"], "failed");
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// Turn N ends with one failed round; turn N+1 appends another. The bytes
+    /// the provider saw on turn N must still be a prefix of what it sees on
+    /// turn N+1 — otherwise every cache entry from the divergence onward is
+    /// invalidated and re-written at a premium. The old rule broke exactly
+    /// this: the first failed pair was protected on turn N as the "newest",
+    /// then dropped from the middle on turn N+1.
+    #[test]
+    fn a_new_failure_leaves_the_earlier_prefix_byte_identical() {
+        let turn_n = serde_json::json!([
+            { "role": "system", "content": "prompt" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "f1", "function": { "name": "x", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "f1", "content": "first failure", "thetis_tool_ok": false }
+        ]);
+
+        // The same conversation one round later, as the log would replay it.
+        let turn_n_plus_1 = serde_json::json!([
+            { "role": "system", "content": "prompt" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "f1", "function": { "name": "x", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "f1", "content": "first failure", "thetis_tool_ok": false },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "f2", "function": { "name": "y", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "f2", "content": "second failure", "thetis_tool_ok": false }
+        ]);
+
+        let mut first = serde_json::json!({ "messages": turn_n });
+        let mut second = serde_json::json!({ "messages": turn_n_plus_1 });
+        strip_private_markers(&mut first);
+        strip_private_markers(&mut second);
+
+        let first = first["messages"].as_array().unwrap();
+        let second = second["messages"].as_array().unwrap();
+
+        assert!(second.len() > first.len(), "the later turn only grew");
+        for (i, earlier) in first.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_string(earlier).unwrap(),
+                serde_json::to_string(&second[i]).unwrap(),
+                "message {i} changed between turns, which invalidates the cache from here on"
+            );
+        }
     }
 
     #[test]
@@ -1266,7 +1412,7 @@ mod tests {
             { "role": "tool", "tool_call_id": "only", "content": "fix your credentials", "thetis_tool_ok": false }
         ]});
 
-        assert_eq!(trim_failed_tool_rounds(&mut body), 0);
+        assert_eq!(strip_private_markers(&mut body), 1);
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
         assert!(body["messages"][2].get("thetis_tool_ok").is_none());
     }

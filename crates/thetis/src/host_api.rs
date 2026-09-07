@@ -584,7 +584,10 @@ impl llm::Host for HostState {
         // it runs several of these back to back before the turn's first
         // completion, and while they ran the stop button, the terminal views
         // and everything else driven by the turn were dead.
-        let result = self.interruptible("the completion", llm.chat(&request_json)).await;
+        let session = self.session_id.clone();
+        let result = self
+            .interruptible("the completion", llm.chat_for(&request_json, session.as_deref()))
+            .await;
         self.yielded();
         Ok(match result {
             Ok(result) => result,
@@ -602,7 +605,9 @@ impl llm::Host for HostState {
             return Ok(Err(e));
         }
         let llm = self.grip.llm.clone();
-        let opened = llm.open_stream(&request_json).await;
+        let opened = llm
+            .open_stream_for(&request_json, self.session_id.as_deref())
+            .await;
         self.yielded();
         self.capture_request(&llm);
 
