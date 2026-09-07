@@ -213,17 +213,44 @@ impl Turn {
             // button was pressed, because the only checkpoint was past the end
             // of the loop — which is precisely the case the button is for.
             let mut stopped_at = None;
+            // Set when a question really reached the user, which ends the turn
+            // once the batch is done.
+            let mut asked = false;
             for (i, call) in reply.tool_calls.iter().enumerate() {
                 if matches!(self.drain_inbox(), Interrupt::Cancelled) {
                     stopped_at = Some(i);
                     break;
                 }
-                self.dispatch(call);
+                // Only a successful call counts: a malformed one was rejected
+                // and never shown, so pausing for an answer nobody was asked
+                // for would hang the conversation on the model's own mistake.
+                if self.dispatch(call) && call.name == tools::ASK_USER {
+                    asked = true;
+                }
             }
 
             if let Some(i) = stopped_at {
                 self.cancel_remaining(&reply.tool_calls, i);
                 self.stopped_by = "cancelled";
+                break;
+            }
+
+            // The turn ends here, whatever the model intended to do next. The
+            // instruction in the tool's result used to be the only thing
+            // stopping it, and an instruction is not a guarantee: the model
+            // would carry on past its own questions and sometimes answer them
+            // itself, which is the whole reason this is enforced in the loop.
+            // Any remaining calls in the batch have already run and been
+            // answered above, so the log is complete and the next turn — begun
+            // by the user's answers — rehydrates cleanly.
+            if asked {
+                self.stopped_by = "asked";
+                // The inbox is deliberately *not* drained here. Anything the
+                // user typed while the questions were being posed is left in it,
+                // so the session actor sees a leftover nudge and starts a
+                // follow-up turn to answer it. Draining it would consume the
+                // message and end the turn silently, leaving them ignored until
+                // they filled in a form they may no longer want.
                 break;
             }
 
@@ -562,7 +589,10 @@ impl Turn {
         Ok(reply)
     }
 
-    fn dispatch(&mut self, call: &ToolCall) {
+    /// Runs one tool call and records its result. Reports whether it succeeded,
+    /// which the loop uses to tell a question that was really put to the user
+    /// from one that was rejected as malformed.
+    fn dispatch(&mut self, call: &ToolCall) -> bool {
         host::append(&self.session_id, &SessionEvent::ToolInvocation(call.clone()));
         if !self.tools_used.iter().any(|n| n == &call.name) {
             self.tools_used.push(call.name.clone());
@@ -579,6 +609,7 @@ impl Turn {
             },
         };
 
+        let ok = result.ok;
         let seq = host::append(&self.session_id, &SessionEvent::ToolResult(result.clone()));
         self.push(
             json!({
@@ -588,6 +619,7 @@ impl Turn {
             }),
             seq,
         );
+        ok
     }
 
     /// Reads mid-turn input and reports what it found.

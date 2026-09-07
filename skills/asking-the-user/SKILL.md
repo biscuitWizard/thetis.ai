@@ -4,7 +4,7 @@ brief = "How the ask_user tool renders as a form in the web transcript and as co
 when_to_use = "Use when changing the ask_user tool, the transcript form it draws, or the Discord question flow — or when adding structured questions to a new chat surface. Also use when an ask_user form renders wrong, cannot be answered, can be answered twice, or when a Discord interaction gets no reply. Not for ordinary tool authoring, and not for the composer or normal message rendering."
 universal = false
 tags = ["ask_user", "questions", "choices", "multiple choice", "form", "discord components", "select menu", "modal", "transcript", "interaction"]
-version = 1
+version = 2
 ---
 
 # Asking the user structured questions
@@ -17,7 +17,8 @@ invariants. Break one and the failure is a user who cannot answer.
 
 | Piece | Where | Job |
 |---|---|---|
-| The tool | `agents/agent-core/src/tools.rs` (`fn ask_user`) | Validate, return prose, end the turn |
+| The tool | `agents/agent-core/src/tools.rs` (`fn ask_user`) | Validate, return prose |
+| The loop | `agents/agent-core/src/lib.rs` (`fn run`) | End the turn when the call succeeded |
 | Web form | `gateways/gateway-web/src/ui/views/askuser.js` | Draw a card in the transcript |
 | Discord | `crates/thetis/src/discord/ask.rs` + `mod.rs` | Post components, collect, resubmit |
 
@@ -31,10 +32,34 @@ would buy nothing and would have to be versioned forever.
 
 These hold on every surface. Each one is a real failure that was designed out.
 
-1. **The tool cannot block.** A turn is a single pass; the answer arrives as the
-   user's *next message*, starting the next turn. So `ask_user` validates and
-   returns immediately, and its result text tells the model to end the turn and
-   not restate the questions in prose. A tool that waited would deadlock.
+1. **The tool returns at once and the loop ends the turn.** `ask_user` validates,
+   returns, and then `run()` in `agents/agent-core/src/lib.rs` breaks out of the
+   loop with `stopped_by = "asked"`. The answer arrives as the user's *next*
+   message, starting the next turn.
+
+   The enforcement is the point. This used to rest only on the result text
+   saying "End your turn now", and an instruction is not a guarantee — the model
+   would carry on past its own questions and sometimes answer them itself. The
+   loop now decides, so the pause holds whatever the model intended. Two details
+   that matter if you touch it:
+
+   - Only a **successful** call pauses. A malformed one was rejected and never
+     shown, so pausing would hang the conversation on the model's own mistake.
+     `dispatch` returns the outcome for exactly this.
+   - The inbox is **not** drained on the way out. Text the user typed while the
+     questions were being posed stays queued, so the session actor starts a
+     follow-up turn for it; draining would swallow it.
+
+   An earlier version of this file claimed a blocking tool "would deadlock".
+   That is false, and worth knowing so nobody rejects the idea for the wrong
+   reason: host imports are async and the session actor selects on `rx.recv()`
+   concurrently with the turn future, so a parked guest still receives nudges,
+   and the epoch timer cannot trap it because epoch interruption only fires
+   while the guest executes wasm. Blocking is *possible*. It is not done because
+   it would cost real safety: the inbox has no `Notify` to wake on, a restart
+   mid-wait answers the unanswered call with a failure stub and kills the form,
+   Discord's resubmit flow would need reworking, and a turn parked on a human
+   holds a worker open indefinitely. Ending the turn keeps all of that free.
 2. **Every choice question ends with a free-text option.** A list the model
    wrote is a guess about the answer space; this is how the user disagrees with
    it. Added by the *renderer*, never by the caller, so no surface can offer a
@@ -136,6 +161,12 @@ Rules `handle_component` in `mod.rs` must keep:
 - Tool and Discord: `cargo test -p thetis --lib discord`. `ask.rs`'s tests cover
   custom_id round-trips, the option cap, control retirement, stale indices,
   char-boundary truncation and the free-text/skip guarantee on both renderings.
+- The tool's own validation: `cargo test` in `agents/agent-core`, module
+  `ask_user_tests`. These pin the wire name and check that every malformed shape
+  returns `Err`, which is what stops a rejected call from pausing the turn.
+  Do **not** call `available()` from a host test: building the tool list reads
+  capability flags through host imports that do not exist outside wasm, and the
+  process aborts with SIGABRT rather than failing a test.
 - Web: the live port serves trunk's UI, so use `/preview/<full session id>/` —
   the **full** uuid, not the branch's short suffix, or you get "has no branch
   yet, so it has nothing to preview". Then drive headless Chrome over CDP and
@@ -155,4 +186,8 @@ Rules `handle_component` in `mod.rs` must keep:
 | Discord replies 401 to a callback | An Authorization header on an interaction callback |
 | Form unanswerable after a restart | State kept in memory instead of KV |
 | Tool missing in a read-only mode | `mutating` set to true |
+| The model asks, then keeps working or answers itself | The loop is not breaking on `asked` — check `run()` still matches `tools::ASK_USER` |
+| A malformed call pauses the turn anyway | The `asked` flag is being set without checking `dispatch`'s return |
+| A mid-turn message is silently lost after asking | Something drained the inbox on the `asked` path |
+| Turn footer badges every ask as an anomaly | A surface is not treating `stopped_by == "asked"` like `"stop"` |
 | `/preview/` 404s with "no branch yet" | Short session id instead of the full uuid |

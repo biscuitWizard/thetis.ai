@@ -508,7 +508,13 @@ const RENDERERS = {
     if (ev.iterations > 1) bits.push(`${ev.iterations} steps`);
     if (ev.cost > 0) bits.push(`$${ev.cost.toFixed(4)}`);
     if (ev.prompt_tokens > 0) bits.push(`${fmtK(ev.prompt_tokens)} → ${fmtK(ev.completion_tokens || 0)} tok`);
-    if (ev.stopped_by && ev.stopped_by !== "stop") bits.push(ev.stopped_by);
+    /* "asked" is a turn that ended by putting questions to the user, which is
+     * an ordinary ending rather than something that went wrong — the form is
+     * right there in the transcript saying so. Listed with "stop" so it does
+     * not get the badge that "cancelled" or "llm-error" deserve. */
+    if (ev.stopped_by && ev.stopped_by !== "stop" && ev.stopped_by !== "asked") {
+      bits.push(ev.stopped_by);
+    }
 
     const content = [bits.join(" · ")];
     if (onInspect) {

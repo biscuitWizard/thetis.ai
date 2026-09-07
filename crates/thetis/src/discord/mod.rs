@@ -918,9 +918,9 @@ async fn stream_reply(
             SessionEvent::ToolInvocation(call) if call.name == ASK_TOOL => {
                 /* The questions get their own message with real controls, rather
                  * than the "… ask_user" progress note. The turn is ending here —
-                 * the tool tells the model to stop and wait — so anything said
-                 * before the questions is flushed first, or it would be
-                 * overwritten by the turn-finished text and lost. */
+                 * the agent's loop ends it as soon as this call succeeds — so
+                 * anything said before the questions is flushed first, or it
+                 * would be overwritten by the turn-finished text and lost. */
                 if !buffer.trim().is_empty() {
                     flush(&rest, &channel_id, &mut message_id, &buffer).await;
                     last_sent = buffer.clone();

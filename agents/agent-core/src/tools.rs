@@ -204,7 +204,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // question matters most — it is the only thing such a session can do
         // besides read. That is also what lets Discord use it.
         ToolDef {
-            name: "ask_user",
+            name: ASK_USER,
             description:
                 "Ask the user one or more questions and have them answered in the interface \
                  rather than in prose. Each question is either multiple choice or open ended; \
@@ -213,8 +213,8 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
                  decision between options, a missing detail, a preference — and prefer it to \
                  writing questions into your reply, because the user gets something to click \
                  and the answers come back labelled. All the questions are presented at once. \
-                 End your turn after calling this: the answers arrive as the user's next \
-                 message.",
+                 Calling this ends your turn: the answers arrive as the user's next message, so \
+                 ask as soon as you need input rather than guessing and pressing on.",
             mutating: false,
             parameters: obj(
                 json!({
@@ -932,7 +932,7 @@ pub fn invoke(
     match name {
         "remember" => remember(session_id, &args),
         "recall" => recall(session_id, &args),
-        "ask_user" => ask_user(&args),
+        ASK_USER => ask_user(&args),
 
         "skill_fetch" => skills::fetch(
             &req_str(&args, "id")?,
@@ -1184,6 +1184,12 @@ pub fn invoke(
 /// allows only five component rows per message, so this is both a UX limit and
 /// a wire limit.
 const MAX_QUESTIONS: usize = 5;
+
+/// The tool's name, in one place because the turn loop matches on it to end
+/// the turn after a question is asked. A literal in both spots could drift
+/// apart, and the failure would be silent: the pause would stop happening.
+pub const ASK_USER: &str = "ask_user";
+
 /// Choices per question. Discord's select menu allows 25 options, and one is
 /// spent on "something else", so 24 is the real ceiling.
 const MAX_OPTIONS: usize = 24;
@@ -1276,12 +1282,16 @@ fn ask_user(args: &Value) -> Result<String, String> {
     }
 
     // Said back plainly, because this string is what the model reads next. It
-    // has to stop the model from also asking in prose, and from waiting for an
-    // answer inside this turn.
+    // no longer has to *ask* for the turn to end — the loop ends it as soon as
+    // this call succeeds — but it still has to stop the model from restating
+    // the questions in prose, since whatever it writes next is the last thing
+    // the user reads before the form.
     Ok(format!(
         "Put {} question(s) to the user:\n{}\n\nEvery choice question also offers a free-text \
-         answer, and every question can be skipped. End your turn now — the answers arrive as \
-         the user's next message. Do not ask these again in your reply.",
+         answer, and every question can be skipped. This turn now ends automatically and the \
+         answers arrive as the user's next message, so do not ask these again in your reply and \
+         do not attempt further work: anything you plan to do with the answers belongs in the \
+         next turn. A brief sign-off is fine.",
         raw.len(),
         summary.join("\n")
     ))
@@ -1641,4 +1651,94 @@ fn format_exec(result: ExecResult) -> String {
         out.push_str("[no output]");
     }
     out
+}
+
+/// Tests for the parts of `ask_user` the turn loop depends on.
+///
+/// The loop ends the turn when a call named [`ASK_USER`] *succeeds*, so two
+/// things have to hold: the advertised name must equal the constant the loop
+/// matches on, and validation must reject a malformed question rather than
+/// returning `Ok`. Both are checked here because both fail silently — a rename
+/// would simply stop the pause happening, and an `Ok` on a question that was
+/// never shown would hang the conversation waiting for an answer.
+#[cfg(test)]
+mod ask_user_tests {
+    use super::{ask_user, ASK_USER, MAX_OPTIONS, MAX_QUESTIONS};
+    use serde_json::json;
+
+    // `available()` is deliberately not called here: building the tool list
+    // reads capability flags through host imports, which do not exist outside
+    // wasm, and calling it from a host test aborts the process rather than
+    // failing. The constant is what both the tool definition and the turn loop
+    // refer to, so pinning its value is what actually guards against drift.
+    #[test]
+    fn the_wire_name_is_pinned() {
+        assert_eq!(
+            ASK_USER, "ask_user",
+            "the web form, the Discord flow and the turn loop all key off this exact string"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_question_succeeds_so_the_turn_pauses() {
+        let result = ask_user(&json!({
+            "questions": [{ "question": "Ship it?", "options": ["yes", "no"] }]
+        }));
+        assert!(result.is_ok(), "a valid question must report success");
+    }
+
+    #[test]
+    fn an_open_question_needs_no_options() {
+        assert!(ask_user(&json!({
+            "questions": [{ "question": "What broke?", "type": "open" }]
+        }))
+        .is_ok());
+    }
+
+    // Each of these must be an `Err`. The loop only pauses on success, so a
+    // rejection here is what keeps a malformed call from stalling the
+    // conversation on a form the user never saw.
+    #[test]
+    fn a_choice_question_with_no_options_is_rejected() {
+        assert!(ask_user(&json!({
+            "questions": [{ "question": "Pick one", "type": "choice" }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn a_question_with_no_text_is_rejected() {
+        assert!(ask_user(&json!({ "questions": [{ "question": "   " }] })).is_err());
+    }
+
+    #[test]
+    fn an_empty_or_missing_question_list_is_rejected() {
+        assert!(ask_user(&json!({ "questions": [] })).is_err());
+        assert!(ask_user(&json!({})).is_err());
+    }
+
+    #[test]
+    fn too_many_questions_is_rejected() {
+        let questions: Vec<_> = (0..MAX_QUESTIONS + 1)
+            .map(|i| json!({ "question": format!("q{i}"), "type": "open" }))
+            .collect();
+        assert!(ask_user(&json!({ "questions": questions })).is_err());
+    }
+
+    #[test]
+    fn too_many_options_is_rejected() {
+        let options: Vec<_> = (0..MAX_OPTIONS + 1).map(|i| format!("o{i}")).collect();
+        assert!(ask_user(&json!({
+            "questions": [{ "question": "Pick", "options": options }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn an_unknown_type_is_rejected_rather_than_guessed() {
+        assert!(ask_user(&json!({
+            "questions": [{ "question": "Eh?", "type": "dropdown" }]
+        }))
+        .is_err());
+    }
 }
