@@ -353,12 +353,15 @@ at least two intersecting B plots, factions with competing goals and resources,
 locations with distinctive atmosphere and opportunities, and NPCs whose conflicting
 loyalties can change. One of those locations must be somewhere the player character
 could live: the apartment, garage, club or base they call home and return to between
-jobs. Give it the ordinary detail of a place someone sleeps in. Meet the supplied build targets. Register every entity with
+jobs. Give it the ordinary detail of a place someone sleeps in, and mark it
+role="hub". Meet the supplied build targets. Register every entity with
 rpg-world-create; prose alone does not create world state. For each beat provide
 scale, details, key_events and multiple conclusions (success, failure, compromise)
 as possibilities, not inevitable outcomes. For each NPC provide personality,
 background, motivations, flaws, quirks, a readable speech color and appropriate
-statblock_id from rpg-npc-stat/rules lookup. Factions need goals and private pressures.
+statblock_id from rpg-npc-stat/rules lookup. Every person also needs an
+appearance — what anyone in the room can see, in concrete nouns — and a
+one-line impression, the read you get in a moment. Both are player-safe. Factions need goals and private pressures.
 Use rpg-world-link for alliances, rivalries, membership, location ties and causal
 connections between storylines; include details explaining each link. Give major
 beats links to the people, places and factions that can move them. World generation
