@@ -75,7 +75,15 @@ model = "openai/gpt-5.6-sol"
 # call it is the total deadline for the whole request. It is deliberately not a
 # cap on total generation time: as one, it severed long answers mid-body and
 # surfaced as "transport error: error decoding response body".
-request_timeout_secs = 180
+#
+# Raised from 180 on 2026-09-07. A local llama-server sends nothing at all
+# while it processes the prompt, and a campaign world build hands it an
+# eight-thousand-token prompt behind whatever else is queued on the same GPUs,
+# so silence of a few minutes is ordinary rather than a stall. At 180 the build
+# tripped the timeout and retried, which re-sent the whole prompt and made the
+# queue worse -- a feedback loop that no world build ever escaped. Raising a
+# *read* timeout costs nothing while a server is answering normally.
+request_timeout_secs = 600
 max_retries = 3
 # Your OpenRouter key. OPENROUTER_API_KEY overrides this when set, so you can
 # keep a key here for convenience and still override it per run.
