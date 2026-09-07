@@ -590,12 +590,6 @@ const TOOL_GROUP_NOTE = {
   Other: "Tools outside the named domains, including anything a connected server provides.",
 };
 
-/* Which tool groups the user has unfolded. Groups open collapsed — a dozen
- * domains of paragraph-length descriptions is not a scannable list — and this
- * set survives the redraws that `INVALIDATED_BY` triggers, so a group the user
- * opened does not snap shut when the agent builds a tool. */
-const openToolGroups = new Set();
-
 function drawTools() {
   const tools = store.tools || [];
 
@@ -613,22 +607,12 @@ function drawTools() {
     ...[...byGroup.keys()].filter((g) => !TOOL_GROUP_ORDER.includes(g)).sort(),
   ];
 
-  const blocks = ordered.map((group) => {
+  const blocks = [];
+  for (const group of ordered) {
     const items = byGroup.get(group);
-    return panel.collapsibleSection(
-      {
-        title: group,
-        count: items.length,
-        note: TOOL_GROUP_NOTE[group],
-        open: openToolGroups.has(group),
-        onToggle: (open) => {
-          if (open) openToolGroups.add(group);
-          else openToolGroups.delete(group);
-        },
-      },
-      items.map(panel.toolItem)
-    );
-  });
+    blocks.push(panel.section({ title: group, count: items.length, note: TOOL_GROUP_NOTE[group] }));
+    blocks.push(...items.map(panel.toolItem));
+  }
 
   rail.open({
     id: "tools",
@@ -948,9 +932,7 @@ rail.mountRail([
   { id: "workspace", label: "Files", hint: "Files — the shared workspace every agent reads and writes", icon: rail.ICONS.files, wide: true, activate: () => workspaceView.open() },
   { id: "context", label: "Context", hint: "Context — the exact request the model receives", icon: rail.ICONS.context, wide: true, activate: () => context.openTab() },
   { id: "skills", label: "Skills", hint: "Skills — what reached this conversation's prompt, and why", icon: rail.ICONS.skills, activate: openSkills },
-  // Wide, like Files and Context: a tool's description is a paragraph of prose,
-  // and in the 380px panel a dozen of them wrapped every three or four words.
-  { id: "tools", label: "Tools", hint: "Tools — everything the agent can call here", icon: rail.ICONS.tools, wide: true, activate: openTools },
+  { id: "tools", label: "Tools", hint: "Tools — everything the agent can call here", icon: rail.ICONS.tools, activate: openTools },
   { id: "models", label: "Models", hint: "Models — the picker's catalogue: list, edit, add by slug", icon: rail.ICONS.models, activate: openModels },
 ]);
 
@@ -1114,20 +1096,6 @@ mountSessions({
 
 transcript.mountTranscript({
   onInspect: () => context.openTab("request"),
-  /* Answers from an `ask_user` form go through the ordinary send path: they are
-   * a user message, they belong in the log as one, and reusing `send` means the
-   * pending row, the composer lock and the failure handling all apply without a
-   * second mechanism. Returns whether the socket took it, as the composer does. */
-  onAnswer: (text) => {
-    if (!store.current) {
-      toast("No conversation open — the answers were not sent.", { tone: "error" });
-      return false;
-    }
-    const sent = connection.send({ type: "send", id: store.current, text, attachments: [] });
-    if (sent) beginPending(text, []);
-    else toast("Not connected — the answers were not sent.", { tone: "error" });
-    return sent;
-  },
 });
 
 const composer = mountComposer({

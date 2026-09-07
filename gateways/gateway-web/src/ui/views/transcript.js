@@ -12,19 +12,11 @@
 import { $, clear, el } from "../lib/dom.js";
 import { store } from "../lib/store.js";
 import { renderMarkdown } from "../lib/markdown.js";
-import { askCard, parseAsk } from "./askuser.js";
-
-/** The tool whose call renders as a form instead of a tool row. */
-const ASK_TOOL = "ask_user";
 
 let root = null;
 let live = null; // element collecting streamed tokens
 let onInspect = null; // opens the Context tab at the latest request
-let onAnswer = null; // sends an ask_user form's answers as a user message
 let pendingNode = null; // the optimistic row for a message not yet acknowledged
-// Ask forms still open. A user message means they were answered — during a
-// replay as much as live — so they lock rather than invite a second answer.
-let openAsks = [];
 // Tool calls awaiting their result, by call id. A call and its result are one
 // row, so the result has to find the row the call opened.
 const open = new Map();
@@ -35,14 +27,12 @@ const RESULT_PREVIEW_CHARS = 4000;
 export function mountTranscript(hooks = {}) {
   root = $("transcript");
   onInspect = hooks.onInspect || null;
-  onAnswer = hooks.onAnswer || null;
   showEmpty();
 }
 
 export function reset() {
   live = null;
   pendingNode = null;
-  openAsks = [];
   open.clear();
   clear(root);
   store.set({
@@ -296,48 +286,9 @@ function fmtK(n) {
 
 // --- event renderers --------------------------------------------------------
 
-/* Draws an ask_user call as a form.
- *
- * Returns false when the arguments cannot be read, so the caller falls back to
- * the ordinary tool row: a malformed call is still something the reader should
- * be able to see, and a silently missing row would look like a lost turn.
- */
-function askRow(ev) {
-  const ask = parseAsk(ev.arguments);
-  if (!ask?.questions.length) return false;
-
-  const card = askCard(ask, {
-    onAnswer: (text) => {
-      const sent = onAnswer?.(text);
-      // No handler wired is a programming error, not a dead socket; treat a
-      // missing hook as a failure so the form does not claim it sent.
-      return sent === undefined ? false : sent;
-    },
-  });
-  root.append(card);
-  openAsks.push(card);
-  return true;
-}
-
-/** Locks every open form: the user has answered, so the controls are spent. */
-function lockAsks() {
-  openAsks.forEach((card) => {
-    if (card.classList.contains("is-answered")) return;
-    card.classList.add("is-answered");
-    card.querySelectorAll("input, textarea, button").forEach((node) => {
-      node.disabled = true;
-    });
-    const foot = card.querySelector(".ask-foot");
-    if (foot) clear(foot).append(el("div", { class: "ask-note" }, "Answered."));
-  });
-  openAsks = [];
-}
-
 const RENDERERS = {
   user(ev) {
     live = null;
-    // Whatever was asked has now been replied to, one way or another.
-    lockAsks();
     row("user", "you",
       ev.text ? el("div", { class: "bubble-text" }, ev.text) : null,
       thumbs(ev.attachments));
@@ -390,18 +341,10 @@ const RENDERERS = {
 
   "tool-call"(ev) {
     live = null;
-    // The form stands in for the tool row entirely. Showing both would put the
-    // same questions on screen twice, once as JSON.
-    if (ev.name === ASK_TOOL && askRow(ev)) return;
     open.set(ev.id, toolRow(ev));
   },
 
-  "tool-result"(ev) {
-    // The result of an ask is only the note telling the model to stop and wait.
-    // The form above says all of that to the reader already.
-    if (ev.name === ASK_TOOL && !open.has(ev.id)) return;
-    completeToolRow(ev);
-  },
+  "tool-result": completeToolRow,
 
   compacted(ev) {
     live = null;
@@ -471,13 +414,7 @@ const RENDERERS = {
     );
   },
 
-  // Deliberately does *not* clear `liveTurn`. A turn cut short by a restart
-  // leaves spend that no ledger row covers yet — the host sweeps it into the
-  // next row to be written — so clearing here made the header drop by whatever
-  // the killed turn had cost, which is the "reset" this whole fix is about.
-  // `liveTurn` therefore means "spend since the last ledger row", matching the
-  // host's anchor exactly, and only a finished turn retires it.
-  "turn-started": () => store.set({ busy: true }),
+  "turn-started": () => store.set({ busy: true, liveTurn: null }),
 
   "turn-finished"(ev) {
     store.set({ busy: false });
@@ -486,23 +423,19 @@ const RENDERERS = {
     // The ledger the Usage view and the header's spend chip read. These totals
     // are authoritative for the turn, so the running tally it was accumulating
     // is dropped rather than added to them.
-    // Keyed by sequence so a row cannot land twice. A frame can arrive both
-    // live and again in a replay — a reconnect mid-turn does exactly that — and
-    // an accumulating total counted the same turn twice when it did.
-    const seq = ev.seq ?? `t${store.turnStats.length}`;
-    if (!store.turnStats.some((t) => t.seq === seq)) {
-      store.turnStats.push({
-        seq,
-        cost: ev.cost || 0,
-        prompt_tokens: ev.prompt_tokens || 0,
-        completion_tokens: ev.completion_tokens || 0,
-        iterations: ev.iterations || 1,
-        stopped_by: ev.stopped_by || "stop",
-        ts: ev.ts,
-      });
-    }
-    store.set({ liveTurn: null });
-    recomputeTotals();
+    store.turnStats.push({
+      cost: ev.cost || 0,
+      prompt_tokens: ev.prompt_tokens || 0,
+      completion_tokens: ev.completion_tokens || 0,
+      iterations: ev.iterations || 1,
+      stopped_by: ev.stopped_by || "stop",
+      ts: ev.ts,
+    });
+    store.set({
+      spendSession: (store.spendSession || 0) + (ev.cost || 0),
+      liveTurn: null,
+    });
+    store.touch("turnStats");
 
     const bits = [];
     if (ev.iterations > 1) bits.push(`${ev.iterations} steps`);
@@ -530,20 +463,6 @@ const RENDERERS = {
   },
 };
 
-/* Session totals, recomputed from the ledger rather than accumulated.
- *
- * A running `+=` total is only correct if every contribution arrives exactly
- * once, and on a socket that reconnects and replays, that is not a property the
- * UI can assume. Deriving the total from the rows means a duplicate frame, a
- * replay or a late arrival cannot corrupt it: the same rows always give the same
- * total, and it is right after a refresh because the rows come from the log.
- */
-function recomputeTotals() {
-  const cost = store.turnStats.reduce((sum, t) => sum + (t.cost || 0), 0);
-  store.set({ spendSession: cost });
-  store.touch("turnStats");
-}
-
 export function applyEvent(ev) {
   const follow = atBottom();
   // Any event at all means this conversation is no longer empty, so the
@@ -560,7 +479,7 @@ export function replay(events) {
     return;
   }
   events.forEach((ev) => RENDERERS[ev.kind]?.(ev));
-  recomputeTotals();
+  store.touch("turnStats");
   // A restored transcript should start at the end, without animating there.
   toBottom(true);
 }

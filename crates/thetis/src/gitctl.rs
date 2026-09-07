@@ -234,27 +234,6 @@ impl GitCtl {
         Ok(out)
     }
 
-    /// As `run_hooked`, but a non-zero exit is returned rather than raised.
-    ///
-    /// Publishing needs this: git's own wording for a refused push says
-    /// nothing about which of its several causes applies, and the caller can
-    /// only translate stderr it is still holding. Callers must check
-    /// `out.status` themselves — nothing else here reports failure.
-    pub async fn run_hooked_status(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {
-        let _guard = self.write_lock().lock_owned().await;
-        let mut cmd = self.base_cmd(true);
-        cmd.args(args);
-        for (key, value) in envs {
-            cmd.env(key, value);
-        }
-        crate::control::run_child(
-            cmd,
-            GIT_TIMEOUT,
-            &format!("git {} in {}", args.join(" "), self.dir.display()),
-        )
-        .await
-    }
-
     /// As `run_raw`, with extra environment — the temp-index plumbing the
     /// public export uses (`GIT_INDEX_FILE`).
     pub async fn run_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<Output> {

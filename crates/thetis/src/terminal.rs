@@ -259,47 +259,7 @@ impl Terminals {
         command: &str,
         timeout: Duration,
     ) -> Result<TerminalOutput> {
-        self.run_until(cfg, id, command, timeout, None).await
-    }
-
-    /// `run`, but giving up the wait as soon as `cancel` is raised.
-    ///
-    /// A stopped command is *not* killed and the shell is left alone: a session
-    /// whose shell died mid-command would be useless afterwards, and a partly
-    /// applied command is not made better by severing it. What changes is that
-    /// nobody waits for it any longer — whatever it printed so far is returned
-    /// immediately, flagged as timed out, and the shell finishes in its own
-    /// time. The next `read` on the session picks up the rest.
-    pub async fn run_until(
-        &self,
-        cfg: &Config,
-        id: &str,
-        command: &str,
-        timeout: Duration,
-        cancel: Option<Arc<crate::session::CancelFlag>>,
-    ) -> Result<TerminalOutput> {
         Self::require_enabled(cfg)?;
-
-        // The shell is confined at `open`, but nothing stopped it walking out
-        // afterwards, and in practice that is what happened: 38% of the
-        // commands three self-modifying agents ran began `cd` into the shared
-        // trunk checkout, so "one worktree per conversation" stopped being
-        // isolation the moment a build started. Refused up front, with the
-        // reason, because the alternative is three agents in one cargo target
-        // directory finding out the hard way.
-        if let Some(escape) = escapes_the_roots(cfg, command) {
-            return Err(anyhow!(
-                "this command would leave your workspace by changing directory to {escape}. \
-                 Your own checkout is {}, and it is the only tree you should build or edit — \
-                 it is a full checkout of the project, not a fragment. Working in the shared \
-                 one collides with the other conversations doing the same thing.",
-                cfg.filesystem
-                    .roots
-                    .first()
-                    .map(|r| r.display().to_string())
-                    .unwrap_or_else(|| cfg.root.display().to_string()),
-            ));
-        }
 
         let marker = format!(
             "__thetis_done_{}__",
@@ -387,11 +347,7 @@ impl Terminals {
                     truncated,
                 });
             }
-            // A stop is treated like the deadline arriving early: same
-            // partial output, same "still running" flag, just without
-            // the wait.
-            let stopped = cancel.as_ref().is_some_and(|c| c.raised());
-            if stopped || Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 // End the runaway before returning. Otherwise it keeps
                 // running, keeps writing into the buffer, and keeps the shell
                 // from reading the *next* command — so every later call to this
@@ -418,15 +374,8 @@ impl Terminals {
                 // Whatever arrived is still worth returning: a command that was
                 // merely slow has usually printed something useful.
                 let truncated = partial.len() > cfg.terminal.max_output_bytes;
-                let mut output = clip(partial, cfg.terminal.max_output_bytes);
-                if stopped {
-                    tracing::info!(terminal = %id, "stopped waiting for a command: the turn was stopped");
-                    output.push_str(
-                        "\n\n[you stopped this turn; the command is still running in the shell]",
-                    );
-                }
                 return Ok(TerminalOutput {
-                    output,
+                    output: clip(partial, cfg.terminal.max_output_bytes),
                     timed_out: true,
                     truncated,
                 });
@@ -460,32 +409,6 @@ impl Terminals {
             session.terminate().await;
         }
     }
-}
-
-/// The first `cd` target in `command` that lands outside the configured roots.
-///
-/// Deliberately a text check on the command rather than a check after the
-/// fact: by the time the shell reports its new directory the build has already
-/// run in the wrong tree. Only absolute targets are judged — a relative `cd`
-/// cannot escape a root without `..`, which `hostfs::resolve` already refuses.
-fn escapes_the_roots(cfg: &Config, command: &str) -> Option<String> {
-    for raw in command.split(|c| c == ';' || c == '&' || c == '|' || c == '\n') {
-        let mut words = raw.split_whitespace();
-        if words.next().map(str::trim) != Some("cd") {
-            continue;
-        }
-        let Some(target) = words.next() else { continue };
-        // `cd -`, `cd ~`, `cd $VAR`: not statically knowable, and none of them
-        // is the pattern this is here to stop.
-        let target = target.trim_matches(|c| c == '"' || c == '\'');
-        if !target.starts_with('/') {
-            continue;
-        }
-        if crate::hostfs::resolve(cfg, target).is_err() {
-            return Some(target.to_string());
-        }
-    }
-    None
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -739,37 +662,6 @@ mod tests {
     /// end-of-stream, so every later command in the session timed out with no
     /// output and the terminal was silently dead.
     #[tokio::test]
-    async fn a_command_that_leaves_the_workspace_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::load().unwrap();
-        cfg.terminal.enabled = true;
-        cfg.filesystem.enabled = true;
-        cfg.filesystem.roots = vec![dir.path().canonicalize().unwrap()];
-
-        let terminals = Terminals::new();
-        let id = terminals.open(&cfg, None).await.unwrap();
-        let wait = Duration::from_secs(10);
-
-        // The exact shape three agents used to reach the shared checkout.
-        let err = terminals
-            .run(&cfg, &id, "cd /usr/share && cargo build --release", wait)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("leave your workspace"), "{err}");
-        assert!(err.contains("/usr/share"), "it must name where it would have gone: {err}");
-
-        // The session survives the refusal and still works.
-        let ok = terminals.run(&cfg, &id, "echo still-usable", wait).await.unwrap();
-        assert_eq!(ok.output, "still-usable");
-
-        // Moving around *inside* the workspace is untouched.
-        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
-        let moved = terminals.run(&cfg, &id, "cd sub && pwd", wait).await.unwrap();
-        assert!(moved.output.contains("sub"), "{moved:?}");
-    }
-
-    #[tokio::test]
     async fn a_binary_byte_does_not_kill_the_session() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::load().unwrap();
@@ -912,140 +804,6 @@ mod tests {
             "{:?}",
             listed.iter().map(|s| &s.cwd).collect::<Vec<_>>()
         );
-
-        terminals.close_all().await;
-    }
-
-    /// The reported bug, at the level that actually reproduces it: a long
-    /// command, a stop while it runs, and a call that has to come back promptly
-    /// rather than waiting out its timeout.
-    #[tokio::test]
-    async fn stopping_a_turn_abandons_a_running_command() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::load().unwrap();
-        cfg.terminal.enabled = true;
-        cfg.filesystem.enabled = true;
-        cfg.filesystem.roots = vec![dir.path().canonicalize().unwrap()];
-
-        let terminals = Terminals::new();
-        let id = terminals.open(&cfg, None).await.unwrap();
-
-        let cancel = Arc::new(crate::session::CancelFlag::default());
-        cancel.begin_turn();
-
-        // Raise the stop shortly after the command starts.
-        let raiser = {
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                cancel.raise();
-            })
-        };
-
-        let started = Instant::now();
-        // A generous timeout: the point is that the stop, not the deadline, is
-        // what ends the wait.
-        let out = terminals
-            .run_until(
-                &cfg,
-                &id,
-                "echo starting; sleep 30",
-                Duration::from_secs(30),
-                Some(cancel),
-            )
-            .await
-            .unwrap();
-        let waited = started.elapsed();
-        raiser.await.unwrap();
-
-        assert!(
-            waited < Duration::from_secs(5),
-            "the stop must cut the wait short, but it took {waited:?}"
-        );
-        assert!(out.timed_out, "the command did not finish");
-        assert!(
-            out.output.contains("you stopped this turn"),
-            "the guest should be told why it came back early: {:?}",
-            out.output
-        );
-        // Output from before the stop is not thrown away.
-        assert!(
-            out.output.contains("starting"),
-            "partial output is still worth having: {:?}",
-            out.output
-        );
-
-        terminals.close_all().await;
-    }
-
-    #[tokio::test]
-    async fn a_command_that_finishes_first_is_unaffected_by_a_later_stop() {
-        // The stop must not cost a result that was already in hand.
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::load().unwrap();
-        cfg.terminal.enabled = true;
-        cfg.filesystem.enabled = true;
-        cfg.filesystem.roots = vec![dir.path().canonicalize().unwrap()];
-
-        let terminals = Terminals::new();
-        let id = terminals.open(&cfg, None).await.unwrap();
-
-        let cancel = Arc::new(crate::session::CancelFlag::default());
-        cancel.begin_turn();
-
-        let out = terminals
-            .run_until(
-                &cfg,
-                &id,
-                "echo done",
-                Duration::from_secs(10),
-                Some(cancel.clone()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(out.output, "done");
-        assert!(!out.timed_out);
-
-        // Stopping afterwards changes nothing about what was returned.
-        cancel.raise();
-        assert_eq!(out.output, "done");
-
-        terminals.close_all().await;
-    }
-
-    #[tokio::test]
-    async fn a_stop_raised_before_the_command_returns_immediately() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::load().unwrap();
-        cfg.terminal.enabled = true;
-        cfg.filesystem.enabled = true;
-        cfg.filesystem.roots = vec![dir.path().canonicalize().unwrap()];
-
-        let terminals = Terminals::new();
-        let id = terminals.open(&cfg, None).await.unwrap();
-
-        let cancel = Arc::new(crate::session::CancelFlag::default());
-        cancel.begin_turn();
-        cancel.raise();
-
-        let started = Instant::now();
-        let out = terminals
-            .run_until(
-                &cfg,
-                &id,
-                "sleep 30",
-                Duration::from_secs(30),
-                Some(cancel),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "an already-stopped turn must not wait at all"
-        );
-        assert!(out.timed_out);
 
         terminals.close_all().await;
     }

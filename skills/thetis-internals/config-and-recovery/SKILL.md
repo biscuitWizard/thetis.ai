@@ -104,7 +104,7 @@ You **can** break it by making the system prompt unstable. See the
 `restart_orchestrator(reason, resume?)` restarts **this conversation's own
 runtime** — no other conversation notices. It is needed for a change to a
 startup-only setting, or to run a kernel you rebuilt in this branch (build it
-first — `restart_orchestrator` does that for you).
+first: `cargo build --release -p thetis` in a terminal).
 
 - The restart is scheduled, not immediate. The call returns, the turn finishes,
   and the user reads the reason before the process goes away. Say why first.

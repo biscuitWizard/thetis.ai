@@ -31,7 +31,6 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const REVISIONS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("revisions");
-const BRANCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("branches");
 
 /// Old field name -> new field name.
 const RENAMES: &[(&str, &str)] = &[("slot", "aspect"), ("slot_tree", "aspect_tree")];
@@ -183,106 +182,12 @@ fn verify(db_path: &Path, cache_root: &Path) -> Result<(usize, usize)> {
     Ok((rows, entries))
 }
 
-/// Re-points every conversation branch at the current trunk commit.
-///
-/// A conversation row pins the trunk commit its branch forked from, and the
-/// commit of any kernel it built for itself. Rewriting trunk's history leaves
-/// both naming commits that trunk no longer has: the branch panel then shows a
-/// base that does not exist, and the worker looks for a cached kernel under a
-/// path that was never written. Re-pointing the base and clearing the kernel
-/// (empty means "run the trunk binary") puts both back in step.
-///
-/// Only sensible immediately after the branches themselves have been rebased
-/// onto that commit.
-fn repoint_branches(db_path: &Path, base: &str, root: &Path, apply: bool) -> Result<usize> {
-    if !db_path.is_file() {
-        return Ok(0);
-    }
-    let db = Database::open(db_path)?;
-    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
-    {
-        let txn = db.begin_read()?;
-        let table = match txn.open_table(BRANCHES) {
-            Ok(table) => table,
-            Err(_) => return Ok(0),
-        };
-        for row in table.iter()? {
-            let (k, v) = row?;
-            let session = k.value().to_string();
-            let mut parsed: Value = serde_json::from_slice(v.value())
-                .with_context(|| format!("decoding the branch row for {session}"))?;
-            let Some(object) = parsed.as_object_mut() else {
-                continue;
-            };
-            // The checkout path is absolute and stored, so moving the tree
-            // leaves it naming a directory that is gone. The worker then finds
-            // no checkout there and tries to create one — which fails, because
-            // the branch is already checked out at the *new* path, and the
-            // conversation cannot be opened at all.
-            let wanted_worktree = object
-                .get("worktree")
-                .and_then(Value::as_str)
-                .and_then(|w| w.rsplit('/').next())
-                .map(|name| root.join("worktrees").join(name))
-                .map(|p| p.to_string_lossy().into_owned());
-            let stale_worktree = match (&wanted_worktree, object.get("worktree").and_then(Value::as_str)) {
-                (Some(wanted), Some(current)) => wanted != current,
-                _ => false,
-            };
-            let stale_base = object.get("base_commit").and_then(Value::as_str) != Some(base);
-            let has_kernel = object
-                .get("kernel_commit")
-                .and_then(Value::as_str)
-                .is_some_and(|k| !k.is_empty());
-            if !stale_base && !has_kernel && !stale_worktree {
-                continue;
-            }
-            if let Some(wanted) = wanted_worktree {
-                object.insert("worktree".into(), Value::String(wanted));
-            }
-            object.insert("base_commit".into(), Value::String(base.to_string()));
-            object.insert("kernel_commit".into(), Value::String(String::new()));
-            pending.push((session, serde_json::to_vec(&parsed)?));
-        }
-    }
-
-    if pending.is_empty() || !apply {
-        return Ok(pending.len());
-    }
-    let txn = db.begin_write()?;
-    {
-        let mut table = txn.open_table(BRANCHES)?;
-        for (session, bytes) in &pending {
-            table.insert(session.as_str(), bytes.as_slice())?;
-        }
-    }
-    txn.commit()?;
-    Ok(pending.len())
-}
-
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let apply = args.iter().any(|a| a == "--apply");
-    let mut paths: Vec<&String> = Vec::new();
-    let mut skip_next = false;
-    for a in &args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if a == "--repoint-branches" {
-            skip_next = true;
-            continue;
-        }
-        if !a.starts_with("--") {
-            paths.push(a);
-        }
-    }
+    let paths: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if paths.len() != 2 {
-        eprintln!(
-            "usage: migrate-legacy-names <data-dir> <artifacts-dir> [--apply] \
-             [--repoint-branches <trunk-commit>]"
-        );
+        eprintln!("usage: migrate-legacy-names <data-dir> <artifacts-dir> [--apply]");
         std::process::exit(2);
     }
 
@@ -294,31 +199,8 @@ fn main() -> Result<()> {
         data.join("thetis.redb")
     };
 
-    let repoint = args
-        .iter()
-        .position(|a| a == "--repoint-branches")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-
     let revisions = migrate_revisions(&db_path, apply)?;
     let cache = migrate_build_cache(&artifacts.join("cache"), apply)?;
-
-    if let Some(base) = &repoint {
-        // Canonicalised, because the checkout path written into each row is
-        // used verbatim as a worker's root. Deriving it from a relative
-        // argument silently stores a relative path, and the worker then
-        // resolves it against its own working directory — which is the
-        // worktree itself, so every lookup lands somewhere that does not
-        // exist and the conversation cannot start.
-        let root = std::fs::canonicalize(data)
-            .with_context(|| format!("resolving {}", data.display()))?
-            .parent()
-            .map(Path::to_path_buf)
-            .context("the data directory has no parent")?;
-        let n = repoint_branches(&db_path, base, &root, apply)?;
-        let verb = if apply { "re-pointed" } else { "would re-point" };
-        println!("{verb} {n} conversation branches at {base}");
-    }
 
     let verb = if apply { "migrated" } else { "would migrate" };
     println!("{verb} {revisions} revision rows in {}", db_path.display());

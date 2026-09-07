@@ -71,7 +71,7 @@ Grouped by concern.
 | `branches.rs` | The branch registry: which conversation runs which branch and checkout. |
 | `merge.rs` | Gateway-side merging. The branch is squashed to one commit, then trunk fast-forwards; only a human triggers it. |
 | `buildcache.rs` | Content-addressed artifacts plus smoke verdicts, keyed by tree oid. |
-| `publish.rs` | The publish boundary: the filtered history that becomes `main` on the remote, and the pre-push guard. Local `main` is trunk and never leaves the machine. |
+| `publish.rs` | The publish boundary: the filtered `public` branch and the pre-push guard. |
 | `revisions.rs` | The retired revision registry, kept read-only for migration. |
 | `watchdog.rs` | Liveness probes and the circuit breaker. Repeated traps reset an aspect's source to the branch's last green build. |
 | `watcher.rs` | Hot reload. A human edit goes through the same pipeline as your own. |
@@ -122,30 +122,6 @@ ui/views/*.js      sidebar, transcript, composer, picker, panel
 A new file needs one line in `assets.rs`. A new client action needs one function
 in `handlers.rs` and one entry in its dispatch table.
 
-### Seeing your own UI changes
-
-The gateway component does two jobs, and only one of them is yours while you
-work:
-
-- **Rendering** — turning events into transcript frames — runs in *your*
-  worker, from your build. Change it and your own conversation shows it at
-  once.
-- **Serving the interface** — the HTML, CSS and JavaScript a browser loads —
-  runs in the gateway process, from **trunk's** build. Your version of those
-  files reaches no browser until your work is merged.
-
-So a UI edit compiles green and appears to do nothing. It is not broken and you
-have not misunderstood it — you are simply not the one serving that file yet.
-
-Open **`/preview/<your session id>/`** to see your own build. It serves your
-interface against the real running system: the websocket, the workspace routes
-and everything else stay live, so you are looking at your UI driving real
-conversations rather than an empty copy. The page is served from the build
-cache, so let the dev kit rebuild `gateway:web` first and then reload.
-
-Do not start a second Thetis to look at a UI change. It was the only way once;
-it is not any more.
-
 ## What the dev kit lets you write
 
 Two different limits. Do not confuse them.
@@ -183,4 +159,4 @@ privileges of the orchestrator.
 |---|---|
 | A file is not where this map says | Run `list_code` for the aspect, or `list_path`. This map can be stale; the tools cannot. |
 | A dev-kit write is refused | Read the message. It names the rule: path confinement, or which protected list matched. |
-| You must change the kernel or the contract | The dev kit cannot reach them. Edit with `write_path`, then `restart_orchestrator` — it rebuilds the orchestrator for you in the background and reports here; a build that fails restarts nothing. Never run cargo on the kernel yourself. Only this conversation's runtime restarts, and a broken kernel falls back. For the contract, read `careful-surgery/contract-changes` first. |
+| You must change the kernel or the contract | The dev kit cannot reach them. Edit with `write_path`, build with `cargo build --release -p thetis` in a terminal, then `restart_orchestrator` — only this conversation's runtime restarts, and a broken kernel falls back. For the contract, read `careful-surgery/contract-changes` first. |
