@@ -44,9 +44,17 @@ recovery. **Redaction**: a secret can be written but never read back.
 
 `toml_edit` does the write, so the comments that explain each setting survive.
 
-**Nothing is applied live.** The process reads its configuration one time, at
-startup. Almost every setting is marked `[needs restart]`. Call
-`restart_orchestrator` to finish the job.
+**Most settings apply at once.** A write reloads the configuration in the
+process that made it: everything read at use — the model and providers, the
+prompt, limits, budgets, context, tool groups, file and shell access, the
+accounts and roles — is in force from the next call. The few that something
+was built from at boot (the listener, memory ceilings, the WASI sandbox, the
+watchdog, the browser and Discord connectors, paths) are marked
+`[needs restart]`, and the reply to `set_config` names them; call
+`restart_orchestrator` to finish those. A worker reloads its own worktree's
+`thetis.toml` and the shared `thetis.local.toml`; the gateway and other
+workers read theirs, so an installation-wide change is best made from the
+control panel, which reloads the gateway and every live worker.
 
 The sections are documented in `thetis.toml` itself. Read the file rather than a
 list here. `references/volatility.md` says why.

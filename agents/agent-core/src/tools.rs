@@ -565,7 +565,8 @@ fn transcript_tools() -> Vec<ToolDef> {
 /// Reading and changing the grip's own settings.
 ///
 /// Writes land in the config file with its comments intact and are refused
-/// unless the result would still load; nothing takes effect until a restart.
+/// unless the result would still load. A write is applied at once where the
+/// setting is read at use; the answer names anything that waits for a restart.
 fn configuration_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -601,8 +602,9 @@ fn configuration_tools() -> Vec<ToolDef> {
         ToolDef {
             name: "set_config",
             description: "Change one setting and write it back to the config file. The change is \
-                 refused if the result would not load. Settings are read at startup, so call \
-                 restart_orchestrator afterwards for it to take effect.",
+                 refused if the result would not load, and applied at once in this conversation \
+                 when the setting is read at use; the reply names anything that waits for a \
+                 restart, which restart_orchestrator finishes.",
             mutating: true,
             parameters: obj(
                 json!({
@@ -2384,9 +2386,9 @@ pub fn invoke(session_id: &str, mode: &str, name: &str, args_json: &str) -> Resu
                 .map(|e| e.value)
                 .unwrap_or_else(|| "<unset>".to_string());
             out.push(format!(
-                "configured default: {configured}\n  (llm.model, read at startup from this \
-                 worktree's own thetis.toml — a later edit does not apply until restart, and \
-                 other conversations have their own copy)"
+                "configured default: {configured}\n  (llm.model, from this worktree's own \
+                 thetis.toml — set_config applies an edit here at once, and other \
+                 conversations have their own copy)"
             ));
 
             Ok(out.join("\n"))

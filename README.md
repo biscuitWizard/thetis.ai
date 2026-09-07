@@ -238,7 +238,9 @@ An administrator edits all of this from the **control panel** in the web UI
 (sidebar footer), which describes every setting with its type, help and
 source, edits the `[[models]]`, `[[providers]]`, `[[modes]]`, `[[roles]]` and
 `[[users]]` lists, validates each write against the whole configuration, and
-offers the restart that applies it. The schema behind it is
+applies it at once — the process reloads its configuration, and only the
+settings something was built from at boot (the listener, memory ceilings, the
+sandbox, the connectors, paths) wait for the restart the panel then offers. The schema behind it is
 `crates/thetis/src/settings/schema.rs`; a setting added to `config.rs` must be
 described there, and a test says so.
 

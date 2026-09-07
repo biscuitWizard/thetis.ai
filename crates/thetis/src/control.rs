@@ -525,7 +525,7 @@ fn refuse_if_disk_is_tight(cfg: &crate::config::Config) -> Result<()> {
 /// anyway.
 /// Closes the shells and asks whoever owns the process tree to bounce us.
 async fn finish_restart(grip: &Arc<Grip>, reason: String) {
-    let delay = grip.cfg.control.restart_delay;
+    let delay = grip.cfg().control.restart_delay;
     tracing::warn!(reason = %reason, "restart requested; the process will replace itself shortly");
 
     let grip = grip.clone();
@@ -540,7 +540,7 @@ async fn finish_restart(grip: &Arc<Grip>, reason: String) {
                 // built its own kernel, the gateway probes it and respawns
                 // the worker on it; otherwise the worker just comes back on
                 // the binary it was started with.
-                let built = grip.cfg.root.join("target/release/thetis");
+                let built = grip.cfg().root.join("target/release/thetis");
                 let kernel = built.is_file().then(|| built.display().to_string());
                 peer.notify(
                     "restart_worker",
@@ -656,13 +656,13 @@ fn build_then_restart(
             }
         };
 
-        if let Err(e) = refuse_if_disk_is_tight(&grip.cfg) {
+        if let Err(e) = refuse_if_disk_is_tight(&grip.cfg()) {
             note(format!("{e:#}")).await;
             return;
         }
 
         tracing::info!(session = %session_id, "building this branch's kernel before restarting");
-        match build_kernel(&grip.cfg).await {
+        match build_kernel(&grip.cfg()).await {
             Ok(KernelBuild::Built(path)) => {
                 if let Err(e) = probe_kernel(&path).await {
                     note(format!(
@@ -720,7 +720,7 @@ pub async fn request_restart(
     resume: bool,
     session_id: Option<&str>,
 ) -> Result<String> {
-    let cfg = &grip.cfg;
+    let cfg = &grip.cfg();
 
     if !cfg.control.allow_restart {
         return Err(anyhow!(

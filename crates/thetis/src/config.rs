@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::aspect::Aspect;
@@ -722,6 +723,12 @@ impl DiscordSettings {
         }
     }
 }
+
+/// The configuration as the running process holds it: swappable, so a change
+/// written to the files can be applied without a restart. Every reader takes a
+/// snapshot (`Grip::cfg`) for the duration of one call; the next call sees the
+/// next configuration.
+pub type SharedConfig = Arc<arc_swap::ArcSwap<Config>>;
 
 #[derive(Debug, Clone)]
 pub struct Config {

@@ -184,10 +184,10 @@ pub async fn run() -> Result<()> {
 /// registry for deployments whose cache has not been populated yet, and to
 /// the host-rendered page when neither has anything.
 pub async fn load_ui_gateway(grip: &Arc<Grip>) {
-    let aspect = Aspect::gateway(&grip.cfg.primary_gateway);
+    let aspect = Aspect::gateway(&grip.cfg().primary_gateway);
 
-    let trunk = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
-    if let Some(key) = crate::pipeline::cache_key_with(&trunk, &grip.cfg, "HEAD", &aspect).await {
+    let trunk = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
+    if let Some(key) = crate::pipeline::cache_key_with(&trunk, &grip.cfg(), "HEAD", &aspect).await {
         if let Ok(Some(meta)) = grip.buildcache.lookup(&aspect.key(), &key) {
             match grip
                 .buildcache
@@ -244,13 +244,13 @@ pub async fn load_ui_gateway(grip: &Arc<Grip>) {
 /// nothing else can break the deadlock, because workers only spawn for
 /// messages that arrive through this very UI.
 fn bootstrap_ui_if_missing(grip: Arc<Grip>) {
-    let aspect = Aspect::gateway(&grip.cfg.primary_gateway);
+    let aspect = Aspect::gateway(&grip.cfg().primary_gateway);
     if grip.loader.get(&aspect).is_some() {
         return;
     }
     tokio::spawn(async move {
         tracing::info!(%aspect, "no UI build exists anywhere; bootstrapping one from trunk");
-        let build = match grip.builder.build(&grip.cfg, &aspect).await {
+        let build = match grip.builder.build(&grip.cfg(), &aspect).await {
             Ok(build) if build.success => build,
             Ok(build) => {
                 tracing::error!(%aspect, "bootstrap build failed:\n{}", build.stderr);
@@ -263,8 +263,8 @@ fn bootstrap_ui_if_missing(grip: Arc<Grip>) {
         };
         let Some(wasm) = build.wasm_path else { return };
 
-        let trunk = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
-        let key = crate::pipeline::cache_key_with(&trunk, &grip.cfg, "HEAD", &aspect).await;
+        let trunk = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
+        let key = crate::pipeline::cache_key_with(&trunk, &grip.cfg(), "HEAD", &aspect).await;
         let revision = key
             .as_deref()
             .map(crate::pipeline::key_revision)
@@ -283,7 +283,7 @@ fn bootstrap_ui_if_missing(grip: Arc<Grip>) {
         // Cache it under trunk's tree — only when the tree is clean, or the
         // key would mislabel the artifact.
         if let (Some(key), Ok(false)) = (&key, trunk.is_dirty().await) {
-            let rel = grip.cfg.aspect_source_rel(&aspect).unwrap_or_default();
+            let rel = grip.cfg().aspect_source_rel(&aspect).unwrap_or_default();
             let meta = crate::buildcache::BuildMeta {
                 aspect: aspect.key(),
                 key: key.clone(),

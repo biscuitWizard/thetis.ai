@@ -52,7 +52,7 @@ pub async fn merge_to_trunk(
     let store = grip
         .local_store()
         .context("merging is a gateway operation")?;
-    let branches = Branches::new(grip.cfg.clone(), store.clone());
+    let branches = Branches::new(grip.cfg().clone(), store.clone());
     let row = branches
         .get(session_id)?
         .ok_or_else(|| anyhow!("this conversation has no branch yet — nothing to merge"))?;
@@ -105,8 +105,8 @@ pub async fn merge_to_trunk(
     // issued the verdict — and a branch that changed the contract earns its
     // greens under its own kernel, which is still evidence the source builds
     // and runs.
-    for aspect in pipeline::discover_aspects(&grip.cfg) {
-        let rel = grip.cfg.aspect_source_rel(&aspect);
+    for aspect in pipeline::discover_aspects(&grip.cfg()) {
+        let rel = grip.cfg().aspect_source_rel(&aspect);
         let Some(rel) = rel else { continue };
         let branch_aspect_tree = root.tree_oid(&gated_tip, &rel).await?.unwrap_or_default();
         let trunk_aspect_tree = root.tree_oid(&trunk, &rel).await?.unwrap_or_default();
@@ -371,10 +371,10 @@ async fn summarize_subject(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let model = if grip.cfg.context.summary_model.is_empty() {
-        grip.cfg.model.clone()
+    let model = if grip.cfg().context.summary_model.is_empty() {
+        grip.cfg().model.clone()
     } else {
-        grip.cfg.context.summary_model.clone()
+        grip.cfg().context.summary_model.clone()
     };
 
     let prompt = format!(
@@ -430,7 +430,7 @@ async fn summarize_subject(
 /// Runs detached: the build takes minutes and the browser's merge request must
 /// not wait on it.
 async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) {
-    let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
+    let root = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
     if !crate::control::kernel_source_moved(&root, before, "HEAD").await {
         return;
     }
@@ -460,7 +460,7 @@ async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) 
             )
             .await;
 
-        let built = match crate::control::build_kernel(&grip.cfg).await {
+        let built = match crate::control::build_kernel(&grip.cfg()).await {
             Ok(crate::control::KernelBuild::Built(path)) => path,
             // Contention, not failure. The build already going covers this
             // merge too, so the announcement above stays true and this adds

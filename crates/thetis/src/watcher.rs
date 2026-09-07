@@ -25,9 +25,9 @@ pub type WatchHandle = Debouncer<notify::RecommendedWatcher, RecommendedCache>;
 /// the watcher.
 pub fn spawn(grip: Arc<Grip>) -> Result<WatchHandle> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Aspect>();
-    let cfg = grip.cfg.clone();
+    let cfg = grip.cfg().clone();
 
-    let debounce = grip.cfg.watchdog.debounce;
+    let debounce = grip.cfg().watchdog.debounce;
     let mut debouncer = new_debouncer(debounce, None, move |result: DebounceEventResult| {
         let Ok(events) = result else { return };
         let mut aspects = HashSet::new();
@@ -54,7 +54,7 @@ pub fn spawn(grip: Arc<Grip>) -> Result<WatchHandle> {
     })
     .context("creating file watcher")?;
 
-    for path in grip.cfg.watched_dirs() {
+    for path in grip.cfg().watched_dirs() {
         if path.is_dir() {
             debouncer
                 .watch(&path, RecursiveMode::Recursive)

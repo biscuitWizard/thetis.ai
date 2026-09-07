@@ -113,7 +113,7 @@ pub async fn update_from_trunk(grip: &Arc<Grip>, session_id: &str) -> Result<Bra
 
     // The merge rewrites source files; without suppression the watcher would
     // race it with rebuilds of half-merged trees.
-    grip.suppress_watch_all(grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch_all(grip.cfg().watchdog.watch_suppression);
 
     match git.merge(&trunk_ref(), "update from trunk").await? {
         MergeOutcome::Clean { head } => {
@@ -173,7 +173,7 @@ pub async fn reset_to(grip: &Arc<Grip>, session_id: &str, rev: &str) -> Result<B
         .ok_or_else(|| anyhow!("'{rev}' does not name a commit"))?;
     let before = git.head().await?;
 
-    grip.suppress_watch_all(grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch_all(grip.cfg().watchdog.watch_suppression);
     git.sync_paths_to(&target, ".").await?;
     let short = &target[..12.min(target.len())];
     let commit = grip
@@ -214,7 +214,7 @@ pub async fn complete_merge(
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| "update from trunk (conflicts resolved)".to_string());
 
-    grip.suppress_watch_all(grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch_all(grip.cfg().watchdog.watch_suppression);
     let head = git.commit_merge(&message).await?;
     let rebuilt = refresh_everything(grip, &before, session_id, "resolved trunk update").await;
     grip.skills.invalidate();
@@ -240,7 +240,7 @@ pub async fn abort_merge(grip: &Arc<Grip>, session_id: &str) -> Result<BranchSta
         bail!("there is no merge in progress to abort");
     }
     let head = git.head().await?;
-    grip.suppress_watch_all(grip.cfg.watchdog.watch_suppression);
+    grip.suppress_watch_all(grip.cfg().watchdog.watch_suppression);
     git.merge_abort().await?;
     append_op(
         grip,
@@ -304,7 +304,7 @@ async fn refresh_branch_kernel(
     session_id: &str,
     cause: &str,
 ) -> Option<String> {
-    let built = crate::control::kernel_binary(&grip.cfg.root);
+    let built = crate::control::kernel_binary(&grip.cfg().root);
     if !built.is_file() {
         return None;
     }
@@ -318,7 +318,7 @@ async fn refresh_branch_kernel(
     let session = session_id.to_string();
     let cause = cause.to_string();
     tokio::spawn(async move {
-        match crate::control::build_kernel(&grip.cfg).await {
+        match crate::control::build_kernel(&grip.cfg()).await {
             // A build already running is the build this wanted. It will
             // restart on its own when it lands, so saying anything here would
             // only contradict it.
@@ -374,7 +374,7 @@ async fn refresh_changed_aspects(grip: &Arc<Grip>, before: &str, session_id: &st
     let failed: Vec<String> = Vec::new();
     let mut deferred = Vec::new();
 
-    for aspect in pipeline::discover_aspects(&grip.cfg) {
+    for aspect in pipeline::discover_aspects(&grip.cfg()) {
         let old_key = pipeline::aspect_cache_key(grip, before, &aspect).await;
         let new_key = pipeline::aspect_cache_key(grip, "HEAD", &aspect).await;
         if old_key == new_key {

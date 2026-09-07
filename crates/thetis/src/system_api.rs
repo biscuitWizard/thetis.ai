@@ -100,7 +100,7 @@ async fn status(grip: &Arc<Grip>, principal: &crate::auth::Principal) -> Value {
 /// Trunk's name, head commit and cleanliness — the version everything else
 /// starts from and the page is served from.
 async fn trunk_facts(grip: &Arc<Grip>) -> Value {
-    let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
+    let root = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
     let name = root
         .current_branch()
         .await
@@ -127,12 +127,12 @@ struct UiFacts {
 }
 
 async fn ui_facts(grip: &Arc<Grip>) -> UiFacts {
-    let aspect = crate::aspect::Aspect::gateway(&grip.cfg.primary_gateway);
+    let aspect = crate::aspect::Aspect::gateway(&grip.cfg().primary_gateway);
     let loaded = grip.loader.get(&aspect);
     let revision = loaded.as_ref().map(|c| c.revision);
 
-    let trunk = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
-    let key = crate::pipeline::cache_key_with(&trunk, &grip.cfg, "HEAD", &aspect).await;
+    let trunk = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
+    let key = crate::pipeline::cache_key_with(&trunk, &grip.cfg(), "HEAD", &aspect).await;
 
     let serving = match (revision, key) {
         (None, _) => "fallback",

@@ -339,7 +339,7 @@ async fn materialize(
     let store = grip
         .local_store()
         .context("only the gateway can spawn workers")?;
-    let branches = Branches::new(grip.cfg.clone(), store.clone());
+    let branches = Branches::new(grip.cfg().clone(), store.clone());
 
     // The chosen starting revision, if the user picked one before the first
     // message pinned the branch.
@@ -575,7 +575,7 @@ fn clear_branch_kernel(grip: &Arc<Grip>, session_id: &str) -> bool {
     let Some(store) = grip.local_store() else {
         return false;
     };
-    let branches = Branches::new(grip.cfg.clone(), store.clone());
+    let branches = Branches::new(grip.cfg().clone(), store.clone());
     match branches.get(session_id) {
         Ok(Some(mut row)) if !row.kernel_commit.is_empty() => {
             row.kernel_commit = String::new();
@@ -665,7 +665,7 @@ impl ipc::Handler for GatewayHandler {
                     .context("gateway has no local store")?;
                 return crate::persist::serve_store_call(
                     store,
-                    Some(&self.grip.cfg),
+                    Some(&self.grip.cfg()),
                     &method,
                     params,
                     &self.session_id,
@@ -795,7 +795,7 @@ impl ipc::Handler for GatewayHandler {
                     // A fresh deployment serves the fallback page until some
                     // worker's first build lands in the cache; a branch at
                     // trunk's head keys identically to trunk, so try again.
-                    let ui = crate::aspect::Aspect::gateway(&grip.cfg.primary_gateway);
+                    let ui = crate::aspect::Aspect::gateway(&grip.cfg().primary_gateway);
                     if grip.loader.get(&ui).is_none() {
                         crate::roles::gateway::load_ui_gateway(&grip).await;
                     }
@@ -998,7 +998,7 @@ fn branch_kernel_path(
         return None;
     }
     let path = grip
-        .cfg
+        .cfg()
         .paths
         .artifacts
         .join("cache/kernel")
@@ -1022,14 +1022,14 @@ async fn adopt_branch_kernel(grip: &Arc<Grip>, session_id: &str, kernel: &str) -
     crate::control::probe_kernel(kernel).await?;
 
     let store = grip.local_store().context("gateway only")?;
-    let branches = Branches::new(grip.cfg.clone(), store.clone());
+    let branches = Branches::new(grip.cfg().clone(), store.clone());
     let mut row = branches
         .get(session_id)?
         .context("no branch to adopt a kernel for")?;
 
     // Keyed by the branch's current commit: the kernel is a build of it.
     let commit = crate::gitctl::GitCtl::new(&row.worktree).head().await?;
-    let dir = grip.cfg.paths.artifacts.join("cache/kernel").join(&commit);
+    let dir = grip.cfg().paths.artifacts.join("cache/kernel").join(&commit);
     std::fs::create_dir_all(&dir)?;
     let cached = dir.join("thetis");
 
@@ -1075,7 +1075,7 @@ fn spawn_worker_process(
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().context("socketpair")?;
     let theirs_fd = theirs.into_raw_fd();
 
-    let cfg = &grip.cfg;
+    let cfg = &grip.cfg();
     let exe = match kernel {
         Some(kernel) => {
             tracing::info!(session = %session_id, kernel = %kernel.display(), "spawning on a branch kernel");

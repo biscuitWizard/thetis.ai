@@ -57,9 +57,9 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         .layer(middleware::from_fn_with_state(grip.clone(), guard_origin))
         .with_state(grip.clone());
 
-    let listener = bind_with_retry(grip.cfg.bind_addr).await?;
+    let listener = bind_with_retry(grip.cfg().bind_addr).await?;
 
-    tracing::info!(addr = %grip.cfg.bind_addr, "thetis listening");
+    tracing::info!(addr = %grip.cfg().bind_addr, "thetis listening");
     axum::serve(listener, app).await.context("http server")?;
     Ok(())
 }
@@ -139,7 +139,8 @@ fn origin_allowed(public_origin: Option<&crate::config::Origin>, origin: &str) -
 /// `guard_local` with one extra allowed authority. In local mode there is
 /// none, and the behaviour is byte for byte the loopback-only rule above.
 async fn guard_origin(State(grip): State<Arc<Grip>>, req: Request, next: Next) -> Response {
-    let public = grip.cfg.public_origin.as_ref();
+    let cfg = grip.cfg();
+    let public = cfg.public_origin.as_ref();
     let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !origin_allowed(public, origin) {
@@ -159,10 +160,10 @@ async fn authenticate(State(grip): State<Arc<Grip>>, mut req: Request, next: Nex
     let public = matches!(req.uri().path(), "/login" | "/logout");
     match crate::auth::resolve(&grip, req.headers()).await {
         Some(p) => {
-            if req.uri().path() == "/login" && grip.cfg.auth.users_mode {
+            if req.uri().path() == "/login" && grip.cfg().auth.users_mode {
                 return Redirect::to("/").into_response();
             }
-            if req.uri().path().starts_with("/admin") && (!grip.cfg.admin_enabled || !p.is_admin())
+            if req.uri().path().starts_with("/admin") && (!grip.cfg().admin_enabled || !p.is_admin())
             {
                 return (StatusCode::FORBIDDEN, "admin console unavailable").into_response();
             }
@@ -216,17 +217,17 @@ struct LoginForm {
     next: String,
 }
 async fn login_page(State(g): State<Arc<Grip>>, Query(q): Query<LoginQuery>) -> Response {
-    if !g.cfg.auth.users_mode {
+    if !g.cfg().auth.users_mode {
         return Redirect::to("/").into_response();
     }
-    crate::auth::page(&g.cfg, None, &q.next).into_response()
+    crate::auth::page(&g.cfg(), None, &q.next).into_response()
 }
 async fn login_submit(
     State(g): State<Arc<Grip>>,
     headers: HeaderMap,
     Form(f): Form<LoginForm>,
 ) -> Response {
-    if !g.cfg.auth.users_mode {
+    if !g.cfg().auth.users_mode {
         return StatusCode::NOT_FOUND.into_response();
     }
     // Looked up the way people type it: `Alice` finds `alice`.
@@ -234,15 +235,16 @@ async fn login_submit(
     // Cooling off is decided before the password is looked at, and for names
     // that do not exist too, so a guess-the-username loop gets the same
     // answer as a guess-the-password one.
-    if crate::auth::login_locked(&typed, &g.cfg) {
+    if crate::auth::login_locked(&typed, &g.cfg()) {
         return crate::auth::page(
-            &g.cfg,
+            &g.cfg(),
             Some("Too many attempts. Try again in a minute."),
             &f.next,
         )
         .into_response();
     }
-    let user = g.cfg.auth.user(&typed);
+    let cfg = g.cfg();
+    let user = cfg.auth.user(&typed);
     // An unknown user costs the same argon2 work as a wrong password, so the
     // response time does not say which accounts exist.
     let ok = match user {
@@ -253,9 +255,9 @@ async fn login_submit(
         }
     };
     let Some(u) = user.filter(|_| ok) else {
-        crate::auth::login_failed(&typed, &g.cfg);
+        crate::auth::login_failed(&typed, &g.cfg());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        return crate::auth::page(&g.cfg, Some("Wrong user or password."), &f.next).into_response();
+        return crate::auth::page(&g.cfg(), Some("Wrong user or password."), &f.next).into_response();
     };
     crate::auth::login_succeeded(&typed);
     let t = crate::auth::new_token();
@@ -264,7 +266,7 @@ async fn login_submit(
         user_id: u.id.clone(),
         created_ms: now,
         last_seen_ms: now,
-        expires_ms: now + g.cfg.auth.session_ttl.as_millis() as u64,
+        expires_ms: now + g.cfg().auth.session_ttl.as_millis() as u64,
         user_agent: headers
             .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
@@ -285,13 +287,13 @@ async fn login_submit(
     }
     tracing::info!(user = %u.id, "signed in");
     (
-        [(header::SET_COOKIE, crate::auth::set_cookie(&g.cfg, &t))],
+        [(header::SET_COOKIE, crate::auth::set_cookie(&g.cfg(), &t))],
         Redirect::to(&crate::auth::safe_next(&f.next)),
     )
         .into_response()
 }
 async fn logout(State(g): State<Arc<Grip>>, headers: HeaderMap) -> Response {
-    if !g.cfg.auth.users_mode {
+    if !g.cfg().auth.users_mode {
         return StatusCode::NOT_FOUND.into_response();
     }
     if let (Some(t), Some(s)) = (crate::auth::cookie_value(&headers), g.local_store()) {
@@ -407,7 +409,7 @@ async fn workspace_download(
     if principal.policy.denies(crate::policy::Cap::Workspace) {
         return (StatusCode::FORBIDDEN, "workspace access is withheld").into_response();
     }
-    let resolved = match crate::workspace_api::resolve(&grip.cfg, &path) {
+    let resolved = match crate::workspace_api::resolve(&grip.cfg(), &path) {
         Ok(resolved) => resolved,
         Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
     };
@@ -466,7 +468,7 @@ async fn workspace_upload(
     if principal.policy.denies(crate::policy::Cap::WorkspaceWrite) {
         return (StatusCode::FORBIDDEN, "workspace writes are withheld").into_response();
     }
-    let resolved = match crate::workspace_api::resolve(&grip.cfg, &path) {
+    let resolved = match crate::workspace_api::resolve(&grip.cfg(), &path) {
         Ok(resolved) => resolved,
         Err(e) => return (StatusCode::FORBIDDEN, format!("{e:#}")).into_response(),
     };
@@ -1107,7 +1109,7 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
             // world has no filesystem import, so the files every agent can see
             // are reachable only from here.
             if crate::workspace_api::handles(&frame_type) {
-                for reply in crate::workspace_api::handle(&grip.cfg, frame).await {
+                for reply in crate::workspace_api::handle(&grip.cfg(), frame).await {
                     if out_tx.send(reply).await.is_err() {
                         return;
                     }
@@ -1219,7 +1221,7 @@ fn decorate_sessions(grip: &Grip, principal: &crate::auth::Principal, frame: Str
         return value.to_string();
     };
     let name_of = |owner: &str| -> String {
-        if let Some(user) = grip.cfg.auth.user(owner) {
+        if let Some(user) = grip.cfg().auth.user(owner) {
             return user.name.clone();
         }
         match owner.strip_prefix("discord:") {

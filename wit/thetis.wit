@@ -1034,6 +1034,10 @@ interface admin {
     restart-available: bool,
     config-path: string,
     overlay-path: string,
+    /// Settings whose value on disk differs from what this process booted
+    /// with and cannot be applied without a restart. Empty once the files are
+    /// back to what booted, or after a restart.
+    pending-restart: list<string>,
   }
   /// One configuration setting with what a form needs to edit it.
   record field {
@@ -1104,7 +1108,12 @@ interface admin {
   save-entry: func(section: string, id: string, fields-json: string) -> result<string, string>;
   remove-entry: func(section: string, id: string) -> result<string, string>;
 
-  /// Restarts the orchestrator, to apply configuration.
+  /// Reads the configuration files again and applies what can be applied
+  /// live; the answer says what was applied and what waits for a restart.
+  /// Every write above does this on its own; this is for a file edited by
+  /// other means.
+  reload: func() -> result<string, string>;
+  /// Restarts the orchestrator, for what a reload cannot apply.
   restart: func(reason: string) -> result<string, string>;
 }
 
@@ -1237,9 +1246,10 @@ interface control {
 
 // Reading and changing the grip's own configuration.
 //
-// Writes go to the file the process was started from, with its comments
-// intact, and are rejected unless the result would still load. Nothing takes
-// effect until Thetis restarts.
+// Writes go back to the configuration files with their comments intact, and
+// are rejected unless the result would still load. A successful write is
+// applied at once where the setting is read at use (`config-entry.live`);
+// the answer says which settings still wait for a restart.
 interface configuration {
   use types.{config-entry};
 

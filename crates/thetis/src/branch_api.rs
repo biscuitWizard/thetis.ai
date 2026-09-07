@@ -87,7 +87,7 @@ async fn dispatch(
                 .await?
             } else {
                 let store = grip.local_store().context("gateway only")?;
-                let branches = Branches::new(grip.cfg.clone(), store.clone());
+                let branches = Branches::new(grip.cfg().clone(), store.clone());
                 match branches.get(session)? {
                     Some(row) => {
                         let root = branches.root_git();
@@ -129,7 +129,7 @@ async fn dispatch(
         // costs the running turn nothing.
         "branch-graph" => {
             let store = grip.local_store().context("gateway only")?;
-            let branches = Branches::new(grip.cfg.clone(), store.clone());
+            let branches = Branches::new(grip.cfg().clone(), store.clone());
             let root = branches.root_git();
             let trunk_name = root.current_branch().await?;
             let limit = frame
@@ -184,7 +184,7 @@ async fn dispatch(
 
         "branch-trunk-log" => {
             let limit = frame.get("limit").and_then(Value::as_u64).unwrap_or(30) as usize;
-            let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
+            let root = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
             let commits: Vec<Value> = root
                 .log("HEAD", limit.clamp(1, 200))
                 .await?
@@ -206,7 +206,7 @@ async fn dispatch(
         // The user picked a starting revision before their first message.
         "branch-base" => {
             let store = grip.local_store().context("gateway only")?;
-            let branches = Branches::new(grip.cfg.clone(), store.clone());
+            let branches = Branches::new(grip.cfg().clone(), store.clone());
             if branches.get(session)?.is_some() {
                 anyhow::bail!(
                     "this conversation already has its branch; the starting point is fixed"
@@ -352,7 +352,7 @@ async fn status_frame(
     session: &str,
 ) -> Result<String> {
     let store = grip.local_store().context("gateway only")?;
-    let branches = Branches::new(grip.cfg.clone(), store.clone());
+    let branches = Branches::new(grip.cfg().clone(), store.clone());
     let root = branches.root_git();
     let trunk_head = root.head().await.unwrap_or_default();
 

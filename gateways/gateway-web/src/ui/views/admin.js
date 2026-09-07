@@ -50,8 +50,6 @@ const state = {
   results: {},
   /** Which list section has a form open, and for which entry ("" = add). */
   editing: {},
-  /** Whether a configuration write succeeded since the last restart. */
-  dirty: false,
 };
 
 // --- the sections -------------------------------------------------------------
@@ -172,7 +170,7 @@ function build(node) {
       "div",
       {},
       el("h1", { class: "admin-head-title" }, "Control panel"),
-      el("p", { class: "admin-head-sub" }, "Operator controls and every setting of this installation. Changes to configuration take effect at the next restart.")
+      el("p", { class: "admin-head-sub" }, "Operator controls and every setting of this installation. A saved setting is applied at once; the few that cannot be say so, and the banner names what waits for a restart.")
     ),
     el("span", { class: "admin-head-gap" }),
     el(
@@ -242,7 +240,12 @@ export function onFrame(frame) {
       return;
   }
   const need = needOf(frame);
-  if (isOpen && section(active).needs.includes(need)) draw();
+  if (!isOpen) return;
+  if (section(active).needs.includes(need)) draw();
+  // The banner reads the overview whichever section is showing: a write
+  // answers with a fresh one so the pending list is current, and it lands
+  // after the frames that redraw the section.
+  else if (need === "overview") drawBanner();
 }
 
 /* An outcome. It is filed under the slot its control reads, and told as a
@@ -251,11 +254,8 @@ export function onFrame(frame) {
 function onResult(frame) {
   const slot = slotOf(frame);
   state.results[slot] = { ok: Boolean(frame.ok), message: frame.message || "" };
-  if (frame.ok && ["set-field", "save-entry", "remove-entry"].includes(frame.op)) {
-    state.dirty = true;
-  }
   if (frame.ok && frame.op === "save-entry") state.editing[frame.section] = null;
-  if (["act", "sign-out", "restart"].includes(frame.op)) {
+  if (["act", "sign-out", "restart", "reload"].includes(frame.op)) {
     toast(frame.message || (frame.ok ? "Done." : "That was refused."), { tone: frame.ok ? "good" : "error" });
   }
   if (isOpen) draw();
@@ -312,14 +312,24 @@ function draw() {
   for (const block of s.render() || []) if (block) main.append(block);
 }
 
+/* The banner says what the files hold that the running process does not.
+ * Writes are applied as they land; what is left is the handful of settings
+ * something was built from at boot, and the host names them. */
 function drawBanner() {
   if (!banner) return;
   clear(banner);
+  const pending = state.overview?.pending_restart || [];
   const restartable = state.overview?.restart_available !== false;
-  if (!state.dirty) return setHidden(banner, true);
+  if (pending.length === 0) return setHidden(banner, true);
   banner.append(
     ...[
-      el("span", {}, "Configuration changed. It is read at startup, so restart Thetis for it to take effect."),
+      el(
+        "span",
+        {},
+        `${pending.length === 1 ? "One setting waits" : `${pending.length} settings wait`} for a restart: `,
+        ...pending.flatMap((k, i) => [i ? ", " : "", el("code", { class: "mono" }, k)]),
+        "."
+      ),
       restartable ? restartButton("Restart now") : el("span", { class: "quiet" }, "Restarting is off (control.allow_restart)."),
       resultNote("restart"),
     ].filter(Boolean)
@@ -408,6 +418,19 @@ function actionButton(actionId, target, label) {
   );
 }
 
+function reloadButton() {
+  return el(
+    "button",
+    {
+      type: "button",
+      class: "ghost-btn sm",
+      title: "Read the configuration files again and apply what can be applied without a restart — for a file edited by other means",
+      onClick: () => { delete state.results.reload; ask("reload"); },
+    },
+    "Reload from disk"
+  );
+}
+
 function restartButton(label = "Restart Thetis") {
   return el(
     "button",
@@ -473,6 +496,7 @@ function fieldRow(f) {
 
   const badges = [
     pill(f.source, f.source === "env" ? "pill-warn" : f.source === "default" ? "" : "pill-info"),
+    f.restart_required ? pill("restart", "pill-warn") : null,
     f.env ? el("span", { class: "admin-env mono", title: "Environment variable that overrides this setting" }, f.env) : null,
   ];
 
@@ -484,7 +508,13 @@ function fieldRow(f) {
       { class: "admin-field-copy" },
       el("div", { class: "admin-field-name" }, el("code", { class: "admin-field-key" }, name), ...badges),
       f.help ? el("p", { class: "admin-field-help" }, f.help) : null,
-      el("p", { class: "admin-field-meta" }, SOURCE_HINT[f.source] || "", f.default_value !== "" && f.source !== "default" && !f.secret ? ` Default: ${f.default_value}.` : "")
+      el(
+        "p",
+        { class: "admin-field-meta" },
+        SOURCE_HINT[f.source] || "",
+        f.default_value !== "" && f.source !== "default" && !f.secret ? ` Default: ${f.default_value}.` : "",
+        f.restart_required ? " Applied at the next restart." : " Applied as soon as it is saved."
+      )
     ),
     el("div", { class: "admin-field-control" }, control(f, locked, save), resultNote(slot))
   );
@@ -773,7 +803,7 @@ function renderOverview() {
     );
   }
   return [
-    el("section", { class: "admin-block" }, heading("System", "What the orchestrator is doing right now.", [o.restart_available ? restartButton() : null, resultNote("restart")]), table(["", ""], facts)),
+    el("section", { class: "admin-block" }, heading("System", "What the orchestrator is doing right now.", [reloadButton(), o.restart_available ? restartButton() : null, resultNote("restart")]), table(["", ""], facts)),
     w
       ? el("section", { class: "admin-block" }, heading("Waits", "What the system is waiting on: workers still materialising, outstanding calls with their age, and who holds the build lock."), el("details", { class: "admin-json" }, el("summary", {}, "Raw waits"), el("pre", { class: "card-pre" }, JSON.stringify(w, null, 2))))
       : null,
@@ -947,7 +977,7 @@ function renderRecovery() {
     el(
       "section",
       { class: "admin-block" },
-      heading("Recovery", "The host-rendered console is served by the orchestrator with no WebAssembly in its path, so it keeps working when every guest is broken.", [o?.restart_available ? restartButton() : null, resultNote("restart")]),
+      heading("Recovery", "The host-rendered console is served by the orchestrator with no WebAssembly in its path, so it keeps working when every guest is broken.", [reloadButton(), o?.restart_available ? restartButton() : null, resultNote("restart")]),
       note(el("a", { href: "/admin", target: "_blank", rel: "noopener" }, "Open /admin"), " — the same controls as Trunk, Conversations, Accounts and Publishing here, as plain forms.", o && !o.admin_enabled ? " The console is currently disabled." : "")
     ),
     ...fieldsBlocks(["control", "build", "watchdog", "paths"]),
