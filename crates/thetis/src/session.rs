@@ -14,6 +14,86 @@ use tokio::sync::mpsc;
 use crate::bindings::types::{Attachment, InboxItem, SessionEvent, TurnStats, UserMsg};
 use crate::grip::Grip;
 
+/// What the provider actually charged for a turn, recovered from the event log.
+///
+/// The agent accumulates these itself and reports them in `TurnStats`, but only
+/// for a turn that reaches its own `Ok` return. A turn that is stopped or that
+/// faults returns nothing, and a turn that is *resumed* after an interruption
+/// starts its counters from zero — so the agent's own totals are missing exactly
+/// the turns that cost the most. The log is not: every assistant step appends
+/// its `usage` before anything can go wrong with it, and the log is append-only.
+/// So the log is the authority here, and this reads it back.
+///
+/// `since` is the sequence of the last turn *terminator*, not of this turn's
+/// start. Anchoring on the terminator is what makes the ledger complete: a turn
+/// killed by a restart never gets a `TurnFinished` at all, so its spend has no
+/// row of its own and anchoring on `TurnStarted` would drop it for good. Counted
+/// from the last terminator instead, that orphaned spend is swept into the next
+/// turn to finish, and the invariant holds — the `TurnFinished` records of a
+/// session sum to the total usage of its assistant steps, each counted once.
+fn usage_since(events: &[crate::bindings::types::EventRecord], since: u64) -> (u32, u32, f64) {
+    let mut prompt = 0u32;
+    let mut completion = 0u32;
+    let mut cost = 0.0f64;
+    for record in events.iter().filter(|r| r.seq > since) {
+        if let SessionEvent::AssistantMessage(msg) = &record.event {
+            if let Some(u) = &msg.usage {
+                prompt = prompt.saturating_add(u.prompt_tokens);
+                completion = completion.saturating_add(u.completion_tokens);
+                cost += u.cost_usd;
+            }
+        }
+    }
+    (prompt, completion, cost)
+}
+
+/// Fills in a terminator for a turn that produced no stats of its own.
+///
+/// A stop and a fault both used to append an all-zero `TurnStats`, which the UI
+/// adds to the session ledger as written — so an interrupted turn did not merely
+/// go unrecorded, it published a zero that made the running total appear to
+/// reset. Reading the spend back out of the log instead means the number only
+/// ever moves in the direction spend moves.
+async fn stats_from_log(
+    grip: &Arc<Grip>,
+    session_id: &str,
+    since_seq: u64,
+    stopped_by: &str,
+) -> TurnStats {
+    let events = grip
+        .persist
+        .events(session_id, since_seq)
+        .await
+        .unwrap_or_default();
+    let steps = events
+        .iter()
+        .filter(|r| matches!(r.event, SessionEvent::AssistantMessage(_)))
+        .count() as u32;
+    let (prompt_tokens, completion_tokens, cost_usd) = usage_since(&events, since_seq);
+    TurnStats {
+        iterations: steps,
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        tools_used: Vec::new(),
+        stopped_by: stopped_by.to_string(),
+    }
+}
+
+/// The sequence of the most recent turn terminator, or 0 if this session has
+/// never finished a turn. Everything after it is spend no ledger row covers yet.
+async fn last_settled_seq(grip: &Arc<Grip>, session_id: &str) -> u64 {
+    grip.persist
+        .events(session_id, 0)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find(|r| matches!(r.event, SessionEvent::TurnFinished(_)))
+        .map(|r| r.seq)
+        .unwrap_or(0)
+}
+
 pub enum SessionMsg {
     User(UserMsg),
     /// Continue a turn that was cut short, with no new user input. The agent is
@@ -263,6 +343,13 @@ async fn actor(
         // stale. Must happen before the first host call the guest can make.
         cancel.begin_turn();
 
+        // Where the unaccounted-for spend starts: the last turn to publish a
+        // ledger row. Read before this turn's own marker so that spend left
+        // behind by a turn the restart killed is picked up here rather than
+        // lost. Nothing is double counted, because the row this turn writes
+        // moves the anchor past it.
+        let since_seq = last_settled_seq(&grip, &session_id).await;
+
         if let Err(e) = grip.append_event(&session_id, SessionEvent::TurnStarted).await {
             tracing::error!(session = %session_id, error = %e, "failed to log turn start");
         }
@@ -309,6 +396,16 @@ async fn actor(
 
         match outcome {
             Ok(stats) => {
+                // The agent's own count covers only the part of the turn it
+                // ran, which after a resume is not the whole turn. The log
+                // covers all of it, so the log's totals win and the agent's
+                // richer detail — which tools it used — is kept.
+                let mut stats = stats;
+                let from_log = stats_from_log(&grip, &session_id, since_seq, &stats.stopped_by).await;
+                stats.prompt_tokens = from_log.prompt_tokens;
+                stats.completion_tokens = from_log.completion_tokens;
+                stats.cost_usd = from_log.cost_usd;
+                stats.iterations = stats.iterations.max(from_log.iterations);
                 let _ = grip.append_event(&session_id, SessionEvent::TurnFinished(stats)).await;
                 // The turn made it to the end, so a later interruption starts
                 // counting from zero again.
@@ -321,18 +418,12 @@ async fn actor(
             // incident made a successful stop read as a crash.
             Err(_) if stopped => {
                 tracing::info!(session = %session_id, "turn stopped by the user");
+                // A stopped turn has usually spent real money before the user
+                // hit the button, so its row reports what the log says it cost
+                // rather than zero.
+                let stats = stats_from_log(&grip, &session_id, since_seq, "cancelled").await;
                 let _ = grip
-                    .append_event(
-                        &session_id,
-                        SessionEvent::TurnFinished(TurnStats {
-                            iterations: 0,
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            cost_usd: 0.0,
-                            tools_used: Vec::new(),
-                            stopped_by: "cancelled".to_string(),
-                        }),
-                    )
+                    .append_event(&session_id, SessionEvent::TurnFinished(stats))
                     .await;
                 // Nothing to pick up later: the user asked for this to end.
                 let _ = grip.persist.clear_resume_attempts(&session_id).await;
@@ -349,18 +440,11 @@ async fn actor(
                 // else — so a failed turn used to leave it listening forever
                 // and the user got silence instead of the error. `stopped-by`
                 // carries the reason in-band rather than widening the record.
+                // Same reasoning as a stop: a turn that fails on its tenth step
+                // has been paid for nine times, and the ledger should say so.
+                let stats = stats_from_log(&grip, &session_id, since_seq, "error").await;
                 let _ = grip
-                    .append_event(
-                        &session_id,
-                        SessionEvent::TurnFinished(crate::bindings::types::TurnStats {
-                            iterations: 0,
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            cost_usd: 0.0,
-                            tools_used: Vec::new(),
-                            stopped_by: "error".to_string(),
-                        }),
-                    )
+                    .append_event(&session_id, SessionEvent::TurnFinished(stats))
                     .await;
 
                 // Only the agent's own misbehaviour counts against its breaker;
@@ -412,7 +496,102 @@ fn take_all(inbox: &Arc<Mutex<VecDeque<InboxItem>>>) -> Vec<InboxItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::types::EventRecord;
     use std::time::Duration;
+
+    fn assistant_step(seq: u64, prompt: u32, completion: u32, cost: f64) -> EventRecord {
+        EventRecord {
+            seq,
+            ts_ms: 0,
+            event: SessionEvent::AssistantMessage(crate::bindings::types::AssistantMsg {
+                content: String::new(),
+                tool_calls: Vec::new(),
+                model: "test/model".to_string(),
+                usage: Some(crate::bindings::types::TokenUsage {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    cost_usd: cost,
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn usage_is_summed_from_every_step_after_the_anchor() {
+        // The bug this guards: an interrupted turn reported zero, so the
+        // session total went backwards. Spend before the anchor belongs to an
+        // earlier ledger row and must not be counted twice.
+        let events = vec![
+            assistant_step(1, 100, 10, 0.01),
+            assistant_step(2, 200, 20, 0.02),
+            assistant_step(3, 400, 40, 0.04),
+        ];
+
+        let (prompt, completion, cost) = usage_since(&events, 0);
+        assert_eq!(prompt, 700, "every step counts when nothing has settled");
+        assert_eq!(completion, 70);
+        assert!((cost - 0.07).abs() < 1e-9);
+
+        let (prompt, completion, cost) = usage_since(&events, 2);
+        assert_eq!(prompt, 400, "only the steps after the last ledger row");
+        assert_eq!(completion, 40);
+        assert!((cost - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn turns_anchored_in_sequence_sum_to_the_session_total() {
+        // The invariant the ledger rests on: however the turns are cut, each
+        // step is counted exactly once across all of them.
+        let events = vec![
+            assistant_step(1, 100, 10, 0.01),
+            assistant_step(2, 200, 20, 0.02),
+            assistant_step(4, 400, 40, 0.04),
+            assistant_step(5, 800, 80, 0.08),
+        ];
+
+        // Each row is computed when its turn ends, against the log as it stood
+        // then — so the first sees only the steps logged before it settled.
+        // Slicing is how the test reproduces that; at runtime the log simply
+        // has not grown yet.
+        let first = usage_since(&events[..2], 0);
+        // The first row settled at seq 3, which becomes the next anchor.
+        let second = usage_since(&events, 3);
+        let whole = usage_since(&events, 0);
+
+        assert_eq!(first.0, 300, "the steps before the first row settled");
+        assert_eq!(second.0, 1200, "the steps after it, including a resumed turn");
+        assert_eq!(
+            first.0 + second.0,
+            whole.0,
+            "the rows must sum to the session total, no gap and no overlap"
+        );
+        assert_eq!(first.1 + second.1, whole.1);
+        assert!((first.2 + second.2 - whole.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_step_with_no_usage_record_is_not_an_error() {
+        // A stream that dies before the final chunk carries no usage. That is a
+        // missing number, not a reason to fail or to guess.
+        let events = vec![
+            assistant_step(1, 100, 10, 0.01),
+            EventRecord {
+                seq: 2,
+                ts_ms: 0,
+                event: SessionEvent::AssistantMessage(crate::bindings::types::AssistantMsg {
+                    content: String::new(),
+                    tool_calls: Vec::new(),
+                    model: String::new(),
+                    usage: None,
+                }),
+            },
+        ];
+        let (prompt, _, cost) = usage_since(&events, 0);
+        assert_eq!(prompt, 100);
+        assert!((cost - 0.01).abs() < 1e-9);
+    }
 
     #[test]
     fn a_fresh_flag_is_not_raised() {
