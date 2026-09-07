@@ -1,11 +1,11 @@
 ---
 name = "Importing a LambdaMOO textdump"
-brief = "What mooR's textdump import really promises: which dump versions load, what is preserved, approximated or dropped, and the checklist for bringing an old MOO database across."
-when_to_use = "Use when an existing LambdaMOO 1.8.x, ToastStunt or Stunt database must run on mooR: --import-format textdump, moorc --src-textdump, JHCore or LambdaCore .db files, WAIFs, anonymous objects, forked and suspended tasks, ISO-8859-1 text, or an import that stops on a verb that will not compile. Use it also to decide whether mooR can read a dump at all, and to plan the manual repairs an old core needs. Not for mooR's own objdef directory format (read objdef-format), not for exporting (mooR writes no textdump), not for choosing a core (read cores-and-bootstrap), not for MOO language compatibility in general, not for the Torchship game database, not for in-world verb authoring for a specific game, and not for Thetis's own internals."
+brief = "What mooR's textdump import really promises: which dump versions load, what is preserved or dropped, and the checklist for bringing an old MOO database across."
+when_to_use = "Use when an existing LambdaMOO 1.8.x, ToastStunt or Stunt database must run on mooR, or an import stops on a verb that will not compile. Not for mooR's own objdef directory format (read objdef-format), not for exporting (mooR writes no textdump), not for choosing a core (read cores-and-bootstrap), and not for the Torchship game database or Thetis's own internals."
 universal = false
-tags = ["moor", "textdump", "lambdamoo", "toaststunt", "stunt", "import", "legacy", "migration", "waif", "compatibility", "JHCore", "LambdaCore", "moor-textdump", "continue-on-errors"]
+tags = ["moor", "textdump", "lambdamoo", "toaststunt", "stunt", "import", "legacy", "migration", "waif", "compatibility", "JHCore", "LambdaCore", "moor-textdump", "continue-on-errors", "--import-format", "--src-textdump", "anonymous objects", "forked and suspended tasks", "iso-8859-1"]
 related = ["moor/language-and-compiler/language-features-and-compat", "moor/content-pipeline/objdef-format"]
-version = 1
+version = 2
 ---
 
 # Importing a LambdaMOO textdump
@@ -124,7 +124,8 @@ An empty program is not a working verb. Treat the warning list as the work queue
    instead of the textdump from then on.
 5. **Expect to lose queued work.** Anything the old server had forked or suspended is
    gone. Anything that depended on it must be restarted by a `server_started` hook.
-6. **Check the login path before you announce the world.** See `cores-and-bootstrap`.
+6. **Check the login path before you announce the world.** See
+   [cores-and-bootstrap](skill:moor/content-pipeline/cores-and-bootstrap).
 7. **Do not plan to go back.** There is no export to textdump.
 
 ## Invariants
@@ -167,13 +168,17 @@ An empty program is not a working verb. Treat the warning list as the work queue
 
 Read first:
 
-- `moor/language-and-compiler/language-features-and-compat` — which language
-  differences will bite an old core.
-- `moor/storage-and-state/world-state-model` — property definition, override and
-  clear state, which the reader reconstructs by hand.
+- [language-features-and-compat](skill:moor/language-and-compiler/language-features-and-compat)
+  — which language differences will bite an old core.
+- [world-state-model](skill:moor/storage-and-state/world-state-model) —
+  property definition, override and clear state, which the reader reconstructs
+  by hand.
 
 Read next:
 
-- `objdef-format` — the format an imported world should be moved to.
-- `cores-and-bootstrap` — what the server needs the imported database to contain.
-- `moor/working-in-the-repo/repo-tooling` — running `moorc`.
+- [objdef-format](skill:moor/content-pipeline/objdef-format) — the format an
+  imported world should be moved to.
+- [cores-and-bootstrap](skill:moor/content-pipeline/cores-and-bootstrap) —
+  what the server needs the imported database to contain.
+- [repo-tooling](skill:moor/working-in-the-repo/repo-tooling) — running
+  `moorc`.

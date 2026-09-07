@@ -1,11 +1,11 @@
 ---
 name = "Running verbs in mooR"
 brief = "The parts of the mooR server that execute MOO code: tasks, the scheduler, the bytecode VM, builtin functions, permissions, and the command parser."
-when_to_use = "Use when a change or a question touches the running of MOO code in the mooR server: task suspend, fork, resume, kill, ticks and seconds limits, E_MAXREC, transaction conflict retry, the activation stack, adding or fixing a builtin function, wizard and programmer bits, set_task_perms and capability grants, or how a typed command becomes a verb call. Use it to pick which child skill to read. Do not use it for the database engine or the transaction protocol itself, for the MOO compiler and opcode set, or for the RPC and host layer. Do not use it for the Torchship MOO game database, for writing in-world MOO verbs for a specific game, or for Thetis's own internals."
+when_to_use = "Use when a change touches the running of MOO code in the mooR server: task suspend, fork, resume, transaction conflict retry, the activation stack, a builtin function, wizard and programmer bits, or how a command becomes a verb call. Use it to pick which child to read. Not for the database engine, the compiler and opcode set, or the RPC layer, and not for Torchship or Thetis's own internals."
 universal = false
-tags = ["moor", "execution", "task", "scheduler", "vm", "builtin", "permissions", "command parser", "suspend", "fork", "ticks", "wizard", "verb call"]
+tags = ["moor", "execution", "task", "scheduler", "vm", "builtin", "permissions", "command parser", "suspend", "fork", "kill", "ticks", "seconds limits", "e_maxrec", "activation stack", "wizard", "programmer bits", "set_task_perms", "capability grants", "verb call"]
 children = "auto"
-version = 1
+version = 3
 ---
 
 # Running verbs in mooR
@@ -19,13 +19,18 @@ This skill is a dispatch table. Read the child that matches your work.
 
 ## Which child to read
 
-| Read | When you are working on |
-|---|---|
-| `task-scheduler` | Task lifecycle, queues, suspend, fork, resume, kill, retry after conflict, restart recovery, checkpoints, tick and time limits. |
-| `virtual-machine` | The activation stack, verb call setup, opcode execution, error propagation and unwinding, the `d` flag, `E_MAXREC`. |
-| `builtin-functions` | Adding, changing, or debugging a `bf_*` function; argument and error conventions; builtin documentation and tests. |
-| `permissions-and-security` | Who a task runs as, the wizard and programmer bits, `set_task_perms`, capability grants, where a check is and is not applied. |
-| `command-parsing` | Turning a line of typed input into a verb call: `$do_command`, prepositions, object matching, `:huh`. |
+- [task-scheduler](skill:moor/execution/task-scheduler) — task lifecycle,
+  queues, suspend, fork, resume, kill, retry after conflict, restart recovery,
+  checkpoints, tick and time limits.
+- [virtual-machine](skill:moor/execution/virtual-machine) — the activation
+  stack, verb call setup, opcode execution, error propagation and unwinding.
+- [builtin-functions](skill:moor/execution/builtin-functions) — adding,
+  changing, or debugging a `bf_*` function; argument and error conventions.
+- [permissions-and-security](skill:moor/execution/permissions-and-security) —
+  who a task runs as, the wizard and programmer bits, capability grants,
+  where a check is and is not applied.
+- [command-parsing](skill:moor/execution/command-parsing) — turning a line of
+  typed input into a verb call: prepositions, object matching, `:huh`.
 
 ## The two facts common to every child
 
@@ -61,7 +66,8 @@ Each task keeps a snapshot of its VM state, refreshed at every successful commit
 and every suspend. A conflict restores that snapshot, backs off, and runs again in
 a fresh transaction. A task that has already suspended once therefore does not
 replay the work before the suspend. The retry count is bounded; see
-`task-scheduler` for the limit and the failure it produces.
+[task-scheduler](skill:moor/execution/task-scheduler) for the limit and the
+failure it produces.
 
 The consequence for a verb author: any side effect that is not in the world state
 and not in the session buffer can happen more than once. A `fork` already
@@ -102,18 +108,18 @@ Do not change anything in this area before you understand these, in this order:
 
 1. **The transaction protocol.** What `CommitResult::ConflictRetry` means, what
    the isolation level guarantees, and which relations conflict.
-   Read `moor/storage-and-state/transactions`.
+   Read [transactions](skill:moor/storage-and-state/transactions).
 2. **The world state interface.** How verbs and properties resolve through the
    inheritance chain, and which calls take a `TaskPermissions`.
-   Read `moor/storage-and-state/world-state-model`.
+   Read [world-state-model](skill:moor/storage-and-state/world-state-model).
 3. **The program representation.** What a `Program` holds, what an opcode is, and
-   why builtin ids are frozen. Read `moor/language-and-compiler/program-and-opcodes`.
+   why builtin ids are frozen. Read [program-and-opcodes](skill:moor/language-and-compiler/program-and-opcodes).
 4. **The value model.** `Var`, `Obj`, `Symbol`, `List`, `Error`, and the flyweight
-   and lambda types. Read `moor/language-and-compiler/value-model`.
+   and lambda types. Read [value-model](skill:moor/language-and-compiler/value-model).
 
 You do not need the RPC layer to change the VM. You do need it to change how a
-task reaches the outside world; that is `moor/services/daemon-and-rpc` for hosts
-and `moor/services/workers` for out-of-process work.
+task reaches the outside world; that is [daemon-and-rpc](skill:moor/services/daemon-and-rpc)
+for hosts and [workers](skill:moor/services/workers) for out-of-process work.
 
 ## Where the code lives
 

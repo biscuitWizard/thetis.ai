@@ -5,8 +5,9 @@ when_to_use = "Use whenever the target of a change is Thetis itself: the agent l
 universal = true
 tags = ["self-mod", "safety", "devkit", "rollback", "tool-group:selfmod", "tool-group:branch"]
 children = "auto"
-version = 1
+version = 2
 ---
+# Careful self-modification
 
 When you change your own loop, a gateway, or a tool, treat it as surgery on a
 running patient. The patient is you, and the anaesthetic is the revision system.
@@ -42,5 +43,9 @@ Match caution to that ordering rather than to how large the edit feels.
 
 ## Nested topics
 
-See the child skills for the two procedures worth having written down: staging a
-contract change, and recovering from a bad revision.
+- [contract-changes](skill:careful-surgery/contract-changes) — the ordering that
+  keeps guests loadable when `wit/thetis.wit` gains or loses something. Read it
+  *before* editing the contract, not after a guest stops instantiating.
+- [recovering-a-revision](skill:careful-surgery/recovering-a-revision) — what to
+  do when a build is green but the behaviour regressed, or a component will no
+  longer load at all.

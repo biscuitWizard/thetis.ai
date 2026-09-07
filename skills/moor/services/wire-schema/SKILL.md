@@ -1,10 +1,10 @@
 ---
 name = "The mooR FlatBuffers wire schema"
-brief = "How to change a .fbs schema in mooR without breaking a running cluster or an existing database: the generation commands, and the rules for adding, deprecating and never renumbering."
-when_to_use = "Use before editing anything under crates/schema/schema/*.fbs (moor_rpc.fbs, common.fbs, var.fbs, task.fbs, moor_event_log.fbs, all_schemas.fbs) or crates/daemon/src/connections/connections.fbs. Use it when regenerating schemas_generated.rs with planus, building TypeScript bindings with flatc or npm run schema:build, adding a field, a union variant or an enum value, deprecating a field, or diagnosing a planus decode error, a missing-field error or a version mismatch between a daemon and a host. Not for the meaning of a particular RPC message (read daemon-and-rpc), not for the MOO Var type itself (read moor/language-and-compiler/value-model), and not for MOO verb code inside a running world such as the Torchship database, which the torchship skills own, or for Thetis internals."
+brief = "How to change a .fbs schema without breaking a running cluster or existing database: the generation commands, and the rules for adding and deprecating fields."
+when_to_use = "Use before editing any .fbs schema file, regenerating bindings, adding a field, a union variant or an enum value, or diagnosing a decode error or version mismatch between a daemon and a host. Not for the meaning of a particular RPC message (read daemon-and-rpc), and not for the MOO Var type itself (read moor/language-and-compiler/value-model) or Thetis internals."
 universal = false
-tags = ["moor", "flatbuffers", "fbs", "schema", "planus", "flatc", "wire format", "compatibility", "schema evolution", "moor-schema", "generated code"]
-version = 1
+tags = ["moor", "flatbuffers", "fbs", "schema", "planus", "flatc", "wire format", "compatibility", "schema evolution", "moor-schema", "generated code", "crates/schema", "moor_rpc.fbs", "common.fbs", "var.fbs", "task.fbs", "moor_event_log.fbs", "all_schemas.fbs", "connections.fbs", "schemas_generated.rs", "schema:build", "renumbering"]
+version = 2
 ---
 
 # The mooR FlatBuffers wire schema

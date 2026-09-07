@@ -616,11 +616,28 @@ impl Turn {
             );
             for card in extra {
                 prompt.push_str(&format!("\n- `{}` — {}", card.id, card.brief));
+                // A retired skill still ranks, because it documents a system
+                // that existed and someone arriving from old code needs it. But
+                // it must not be read as instruction, so mark it on the line
+                // where the decision to fetch gets made.
+                if card.status == "retired" {
+                    if card.superseded_by.is_empty() {
+                        prompt.push_str("\n  Retired: describes a system no longer in use.");
+                    } else {
+                        prompt.push_str(&format!(
+                            "\n  Retired: superseded by `{}` — prefer that unless you need the history.",
+                            card.superseded_by
+                        ));
+                    }
+                }
                 if !card.when_to_use.trim().is_empty() {
                     prompt.push_str(&format!("\n  Use when: {}", card.when_to_use.trim()));
                 }
                 if !card.children.is_empty() {
                     prompt.push_str(&format!("\n  Nested: {}", card.children.join(", ")));
+                }
+                if !card.related.is_empty() {
+                    prompt.push_str(&format!("\n  Related: {}", card.related.join(", ")));
                 }
             }
             prompt.push('\n');

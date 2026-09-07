@@ -1,11 +1,11 @@
 ---
 name = "Cores, bootstrap, and what the server needs from a database"
-brief = "Pick a bundled mooR core, bring a world up from nothing, and know which objects, properties and verbs the server itself looks for — and what breaks when they are absent."
-when_to_use = "Use when starting a mooR world for the first time, choosing between cowbell, lambda-moor, minimal-core and the benches core, running start-moor-cowbell.sh or start-moor-lambdacore.sh, reading docker-compose.yml, process-compose.yaml or moor-dev.yaml, rebuilding a core with its Makefile and moorc, or configuring checkpoint exports. Use it above all when the server runs but a connection cannot log in, or a hook such as do_login_command, user_connected, server_started, do_command, huh, handle_uncaught_error or $server_options is missing or ignored. Not for objdef file syntax (read objdef-format), not for importing a LambdaMOO textdump (read textdump-compat), not for the Torchship game database or any specific world's own objects, not for in-world verb authoring for a specific game, and not for Thetis's own internals."
+brief = "Pick a bundled mooR core, bring a world up from nothing, and know what the server itself requires from a database."
+when_to_use = "Use when starting a mooR world for the first time, or when the server runs but a connection cannot log in, or a startup hook is missing or ignored. Not for objdef file syntax (read objdef-format), not for importing a LambdaMOO textdump (read textdump-compat), and not for the Torchship game database, in-world verb authoring, or Thetis's own internals."
 universal = false
-tags = ["moor", "core", "cowbell", "lambda-moor", "lambdacore", "minimal-core", "bootstrap", "first start", "do_login_command", "server_options", "server_started", "user_connected", "checkpoint", "docker-compose", "process-compose", "moorc", "login fails", "dump_interval"]
+tags = ["moor", "core", "cowbell", "lambda-moor", "lambdacore", "minimal-core", "bootstrap", "first start", "do_login_command", "server_options", "server_started", "user_connected", "checkpoint", "docker-compose", "process-compose", "moorc", "login fails", "dump_interval", "start-moor-cowbell.sh", "start-moor-lambdacore.sh", "docker-compose.yml", "process-compose.yaml", "moor-dev.yaml", "do_command", "huh", "handle_uncaught_error"]
 related = ["moor/working-in-the-repo/build-and-run", "moor/services/daemon-and-rpc"]
-version = 1
+version = 2
 ---
 
 # Cores, bootstrap, and what the server needs from a database
@@ -26,7 +26,8 @@ experiences is written in MOO and lives in the database.
 
 So a core is not configuration and not a template. It is the world, and after the
 first start it is the live database. The source directory that built it is a
-historical record from that moment on. Read `objdef-format` for how the two diverge
+historical record from that moment on. Read
+[objdef-format](skill:moor/content-pipeline/objdef-format) for how the two diverge
 and how to move changes between them.
 
 ## The bundled cores
@@ -169,22 +170,26 @@ stopped, takes an exclusive lock on the data directory, and finds a wizard by sc
 for the wizard flag and choosing the lowest object number. It gives a REPL that can
 evaluate code, read and write properties, program verbs, and `dump`, `load` and
 `reload` objdef definitions. Use it to install or repair a login verb, then start the
-server again. Read `moor/working-in-the-repo/repo-tooling` for the tool set it
-belongs to.
+server again. Read [repo-tooling](skill:moor/working-in-the-repo/repo-tooling)
+for the tool set it belongs to.
 
 ## Read first, read next
 
 Read first:
 
-- `objdef-format` — the format every bundled core is written in.
-- `moor/working-in-the-repo/build-and-run` — building the binaries these routes run.
+- [objdef-format](skill:moor/content-pipeline/objdef-format) — the format every
+  bundled core is written in.
+- [build-and-run](skill:moor/working-in-the-repo/build-and-run) — building the
+  binaries these routes run.
 
 Read next:
 
-- `textdump-compat` — bringing a world in from an older server.
-- `moor/services/daemon-and-rpc` — the process that owns the import, the checkpoint
-  thread, and the login path.
-- `moor/execution/task-scheduler` — what `$server_options` actually controls.
+- [textdump-compat](skill:moor/content-pipeline/textdump-compat) — bringing a
+  world in from an older server.
+- [daemon-and-rpc](skill:moor/services/daemon-and-rpc) — the process that owns
+  the import, the checkpoint thread, and the login path.
+- [task-scheduler](skill:moor/execution/task-scheduler) — what
+  `$server_options` actually controls.
 - `book/src/the-system/understanding-moo-cores.md` and `bootstrapping-from-source.md`
   — good background. Check `server-assumptions-about-the-database.md` against
   `scheduler_config.rs`; the book's list is behind.

@@ -4,8 +4,9 @@ brief = "Diagnose whether a change broke the build, the load, or the behaviour, 
 when_to_use = "Use when something worked before a change and does not now: a component that will not load, a tool that returns errors, or behaviour that regressed. Use before attempting a third fix on the same problem."
 tags = ["rollback", "recovery", "self-mod", "debugging", "branch", "tool-group:branch", "tool-group:selfmod"]
 children = "none"
-version = 2
+version = 3
 ---
+# Recovering from a bad change
 
 Three failures look similar from the outside and want different responses.
 

@@ -5,7 +5,7 @@ when_to_use = "Use whenever a task involves Notion — reading a page, adding a 
 universal = false
 tags = ["notion", "database", "api", "pages", "comments", "workspace", "token", "tool-group:notion"]
 children = "auto"
-version = 2
+version = 3
 ---
 
 # Working with Notion
@@ -160,6 +160,9 @@ lookup is possible. Ids still distinguish people within a thread. Real names nee
 an integration token with user-information capability.
 
 ## Setup
+
+For adding a new notion-* tool or changing an existing one, see
+[maintaining-the-tools](skill:notion-workspace/maintaining-the-tools).
 
 One block serves every tool, because a `notion-*` tool inherits `[tools.notion]`.
 Two ways to supply the credential:

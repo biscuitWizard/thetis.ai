@@ -4,7 +4,7 @@ brief = "How the Discord bot connector works, and why its read-only guarantee re
 when_to_use = "Use when changing the Discord connector, adding another messaging surface (Slack, Telegram), or reasoning about what a chat surface is allowed to do. Also read it before exposing any new command over chat, because some commands would break the safety property."
 tags = ["discord", "gateway", "security", "modes", "kernel", "tool-group:selfmod", "tool-group:config"]
 children = "auto"
-version = 3
+version = 4
 ---
 
 # Discord connector
@@ -136,7 +136,7 @@ interaction type, and the parsers are disjoint so a payload can never match both
 Types 3 and 5 exist to serve the `ask_user` question flow — buttons, select
 menus and modals. The same re-authorization rule applies to them and matters
 more, because a component sits in a channel where anyone can click it: see
-`asking-the-user` for that flow and its invariants.
+[asking-the-user](skill:asking-the-user) for that flow and its invariants.
 
 ## Archiving is the cross-surface "start over"
 
@@ -283,8 +283,9 @@ normalising it makes fences flicker on every tick. Balance is a property of page
 ## Reading the channel is the fastest diagnosis
 
 A stalled reply is diagnosed in one call, not by reasoning about the code. Fetch
-the channel with the bot's own token (see `discord-connector/live-probing`) and
-look at `edited_timestamp` and `len` on the bot's message:
+the channel with the bot's own token (see
+[live-probing](skill:discord-connector/live-probing)) and look at
+`edited_timestamp` and `len` on the bot's message:
 
 - **Sent, one edit, hours old, short** → the loop is alive but suppressing
   updates. A content bug, as above.
@@ -334,7 +335,8 @@ discord_schema -- --nocapture` prints the exact registration payload.
 
 But do not stop there and call the rest unverifiable: **the token is on this
 box**, so what the command set actually looks like to Discord is one call away.
-See `discord-connector/live-probing`. The check that matters after touching
+See [live-probing](skill:discord-connector/live-probing). The check that
+matters after touching
 `schema()` is `GET /applications/{app}/commands` with the real token, reading
 `contexts` and `integration_types` off every entry — that is the only thing that
 distinguishes a registration Discord accepted from one a user can invoke, and it

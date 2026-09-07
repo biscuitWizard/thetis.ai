@@ -1,11 +1,11 @@
 ---
 name = "mooR processes, RPC and hosts"
 brief = "The mooR process topology: what the daemon owns, what a telnet or web host owns, and which child skill covers the RPC, the schema, workers, history or MCP."
-when_to_use = "Use when the task crosses a process boundary in mooR: moor-daemon, moor-telnet-host, moor-web-host, the single-process moor binary, curl/file workers, moor-mcp-host. Use it to decide whether work belongs in the daemon or in a host, to trace how a narrative event reaches a player, to debug ZeroMQ, CURVE, enrollment tokens, PASETO tokens, FlatBuffers or the event log, or to add a new host or worker. Then read the child skill it points at. Not for MOO verb code inside a game database (see torchship/* skills), not for the object store or the VM (see moor/storage-and-state and moor/execution), and not for Thetis's own internals."
+when_to_use = "Use when the task crosses a process boundary in mooR: deciding whether work belongs in the daemon or a host, or tracing how an event reaches a player. Then read the child skill it points at. Not for MOO verb code inside a game database, not for the object store or the VM (read moor/storage-and-state or moor/execution), and not for Thetis's own internals."
 universal = false
-tags = ["moor", "daemon", "rpc", "zeromq", "flatbuffers", "telnet-host", "web-host", "workers", "event log", "mcp", "processes", "architecture"]
+tags = ["moor", "daemon", "rpc", "zeromq", "flatbuffers", "telnet-host", "web-host", "workers", "event log", "mcp", "processes", "architecture", "moor-daemon", "moor-telnet-host", "moor-web-host", "curl-worker", "file-worker", "moor-mcp-host", "curve", "enrollment", "paseto"]
 children = "auto"
-version = 1
+version = 2
 ---
 
 # mooR processes, RPC and hosts
@@ -17,18 +17,31 @@ common to all its children. Each child holds one layer.
 
 ## The children
 
-| Child | Covers | Reach for it when |
-|---|---|---|
-| `daemon-and-rpc` | Process ownership, the two ZeroMQ transports, enrollment, CURVE, PASETO tokens, event delivery and acknowledgement | A host cannot connect, an event does not arrive, you must add an RPC message, you must decide daemon side or host side |
-| `wire-schema` | The FlatBuffers layer in `crates/schema`: the `.fbs` sources, the generation procedure, and the schema evolution rules | You must change a message, add a field, or you have a decode error or a version mismatch |
-| `hosts-and-sessions` | `moor-telnet-host`, `moor-web-host`, the single-process `moor` binary, and the `Session` abstraction: connection objects, players, buffering, output ordering | You are adding a protocol endpoint, debugging lost or misordered output, or working on login and attach |
-| `workers` | The out-of-process capability model: `worker_request()`, the worker protocol, `moor-curl-worker`, `moor-file-worker`, writing a new worker | MOO code must touch the outside world, or a worker never answers |
-| `event-log-and-history` | What history is stored, why it is encrypted, how a reconnecting client replays it, and the operational consequences | You are working on scrollback, on `set_pubkey`, or on data retention and deletion |
-| `mcp-host` | `moor-mcp-host` and the browser-side `moor-web-mcp`: what they expose to an AI assistant, and the safety boundary | You are wiring an assistant into a MOO, or auditing what one can reach |
-| `clients-and-web-ui` | What lives under `clients/`, and the contract the web host offers a browser or app client: HTTP, WebSocket frames, auth, history resume, presentations, and the npm build | You are building or debugging a client, or deciding what a client may assume |
-
-Name a child bare, as `workers`. Name a skill in another topic by path, as
-`moor/execution/task-scheduler`.
+- [daemon-and-rpc](skill:moor/services/daemon-and-rpc) — process ownership,
+  the two ZeroMQ transports, enrollment, CURVE, PASETO tokens, event delivery
+  and acknowledgement. Reach for it when a host cannot connect, an event does
+  not arrive, or you must add an RPC message.
+- [wire-schema](skill:moor/services/wire-schema) — the FlatBuffers layer in
+  `crates/schema`. Reach for it when you must change a message, add a field,
+  or you have a decode error or version mismatch.
+- [hosts-and-sessions](skill:moor/services/hosts-and-sessions) — the telnet
+  and web hosts, the single-process binary, and the `Session` abstraction.
+  Reach for it when adding a protocol endpoint, debugging lost or misordered
+  output, or working on login and attach.
+- [workers](skill:moor/services/workers) — the out-of-process capability
+  model. Reach for it when MOO code must touch the outside world, or a
+  worker never answers.
+- [event-log-and-history](skill:moor/services/event-log-and-history) — what
+  history is stored, why it is encrypted, and how a reconnecting client
+  replays it. Reach for it when working on scrollback or on data retention
+  and deletion.
+- [mcp-host](skill:moor/services/mcp-host) — what the MCP host exposes to an
+  AI assistant, and the safety boundary. Reach for it when wiring an
+  assistant into a MOO, or auditing what one can reach.
+- [clients-and-web-ui](skill:moor/services/clients-and-web-ui) — what lives
+  under `clients/`, and the contract the web host offers a browser or app
+  client. Reach for it when building or debugging a client, or deciding what
+  a client may assume.
 
 ## The topology
 

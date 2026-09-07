@@ -1660,6 +1660,9 @@ fn card(c: sm::Card) -> SkillCard {
         children: c.children,
         universal: c.universal,
         resources: c.resources,
+        related: c.related,
+        status: c.status,
+        superseded_by: c.superseded_by,
         score: c.score,
         how: c.how,
     }

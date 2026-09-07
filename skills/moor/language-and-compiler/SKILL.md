@@ -1,12 +1,12 @@
 ---
 name = "The MOO language and its compiler"
 brief = "How mooR defines and implements MOO: the compile and decompile path, the Var value model, the compiled Program format, and the LambdaMOO compatibility switches."
-when_to_use = "Use when changing or explaining the engine side of the MOO language: the moor-compiler crate (lexer, CST, AST, codegen, decompile, unparse, diagnostics), the moor-var crate (Var, Symbol, Flyweight, Error, Lambda), the opcode set, the stored program FlatBuffer, CompileOptions or FeaturesConfig, or a compile error a user reported. Use it to decide which child skill answers the question. Not for writing MOO verbs in a running world; torchship/torchship-programming/moor-book teaches MOO as an authoring language. Not for the Torchship game database or any other in-world core. Not for how the VM executes an opcode, which is moor/execution/virtual-machine. Not for Thetis internals."
+when_to_use = "Use when changing or explaining the engine side of the MOO language: the compiler, the value model, the opcode set, or a compile error a user reported. Not for writing MOO verbs (read torchship/torchship-programming/moor-book), not for how the VM executes an opcode (read moor/execution/virtual-machine), and not for the Torchship database or Thetis internals."
 universal = false
-tags = ["moor", "moo", "compiler", "language", "parser", "bytecode", "opcodes", "var", "value types", "symbol", "flyweight", "decompile", "unparse", "lambdamoo compatibility", "compile error"]
+tags = ["moor", "moo", "compiler", "language", "parser", "bytecode", "opcodes", "var", "value types", "symbol", "flyweight", "decompile", "unparse", "lambdamoo compatibility", "compile error", "moor-compiler", "moor-var", "lexer", "cst", "ast", "codegen", "diagnostics", "flatbuffer", "compileoptions", "featuresconfig"]
 children = "auto"
 related = ["moor/execution/virtual-machine", "moor/content-pipeline/objdef-format"]
-version = 1
+version = 2
 ---
 
 # The MOO language and its compiler
@@ -34,21 +34,19 @@ binary that wrote it.
 
 ## Which child to read
 
-| Question | Read |
-|---|---|
-| How does source become bytecode, and bytecode become source again? | `compiler-pipeline` |
-| Why is there a concrete syntax tree and an abstract one? | `compiler-pipeline` |
-| A user reports a bad compile error, or a wrong line number | `compiler-pipeline` |
-| What is a `Var`, and what does an operation on one cost? | `value-model` |
-| What is a symbol for? What is a flyweight for? | `value-model` |
-| Why is `"A" == "a"` true, and where does that bite? | `value-model` |
-| How do errors work as values, and when do they raise? | `value-model` |
-| What does a compiled `Program` hold? How do names and jump labels work? | `program-and-opcodes` |
-| I want to add or change an opcode | `program-and-opcodes` |
-| A stored program will not decode after an upgrade | `program-and-opcodes` |
-| Which features are mooR extensions, not LambdaMOO? | `language-features-and-compat` |
-| How is a feature switched on or off, and who decides? | `language-features-and-compat` |
-| A core built for LambdaMOO will not import | `language-features-and-compat` |
+- [compiler-pipeline](skill:moor/language-and-compiler/compiler-pipeline) —
+  how source becomes bytecode and bytecode becomes source again, why there is
+  a concrete syntax tree and an abstract one, and a bad compile error or wrong
+  line number.
+- [value-model](skill:moor/language-and-compiler/value-model) — what a `Var`
+  is and what an operation on one costs, symbols and flyweights, why `"A" ==
+  "a"`, and how errors work as values.
+- [program-and-opcodes](skill:moor/language-and-compiler/program-and-opcodes)
+  — what a compiled `Program` holds, adding or changing an opcode, and a
+  stored program that will not decode after an upgrade.
+- [language-features-and-compat](skill:moor/language-and-compiler/language-features-and-compat)
+  — which features are mooR extensions rather than LambdaMOO, how a feature
+  is switched on or off, and a core that will not import.
 
 ## The boundary with verb authoring
 

@@ -1,10 +1,10 @@
 ---
 name = "Transactions and conflict retry"
 brief = "How a mooR transaction starts, what it reads, how commit detects conflict, and what a retry re-runs — plus what a retry does not undo."
-when_to_use = "Use when a commit conflicts, a task retries or reports 'Transaction conflict', or you must reason about isolation, visibility, lost updates, write skew, or transaction boundaries in the mooR daemon. Use it before you move a commit or rollback point, change CommitResult handling, touch the commit pipeline, or add a relation. Not for the scheduler's queues, ticks and suspend rules, which moor/execution/task-scheduler owns. Not for MOO code style in a specific game world, the Torchship database (the torchship skills own that), or Thetis's own internals."
+when_to_use = "Use when a commit conflicts, a task retries or reports 'Transaction conflict', or you must reason about isolation, lost updates, or transaction boundaries in the mooR daemon. Not for the scheduler's queues, ticks and suspend rules (read moor/execution/task-scheduler), and not for the Torchship database."
 universal = false
-tags = ["moor", "transactions", "mvcc", "conflict", "retry", "ConflictRetry", "commit", "isolation", "snapshot isolation", "optimistic concurrency", "rollback", "moor-db", "write skew", "lost update"]
-version = 1
+tags = ["moor", "transactions", "mvcc", "conflict", "retry", "commitresult", "conflictretry", "commit", "commit pipeline", "isolation", "visibility", "snapshot isolation", "optimistic concurrency", "rollback", "moor-db", "write skew", "lost update"]
+version = 2
 ---
 
 # Transactions and conflict retry

@@ -1,10 +1,10 @@
 ---
 name = "mooR clients and the web UI contract"
-brief = "What lives under clients/ — Meadow, the Flutter client, the web SDK, moor-web-mcp — and the contract moor-web-host offers them: HTTP, WebSocket frames, auth, and history resume."
-when_to_use = "Use when building or debugging a mooR client: Meadow, meadow_flutter, @moor/web-sdk, moor-web-mcp, or a client of your own. Use it for the web host's HTTP surface and openapi.yaml, the WebSocket subprotocol and its frame markers, X-Moor auth headers, OAuth2 from a browser or a desktop app, reattach and history resume, presentations and content types, or the npm workspace and how a client is built and served next to the Rust binaries. Use it when a frame is not understood, a token expires mid-session, history will not replay, or a client and daemon are of different vintages. Not for the web host's own internals (read hosts-and-sessions), not for the RPC between processes (read daemon-and-rpc), not for the .fbs files (read wire-schema), not for the Torchship game database or in-world MOO verb authoring, and not for Thetis's own internals."
+brief = "What lives under clients/, and the contract the web host offers them: HTTP, WebSocket frames, auth, and history resume."
+when_to_use = "Use when building or debugging a mooR client, or its HTTP/WebSocket contract with the web host: auth, reattach, or history resume. Use it when a frame is not understood or a token expires mid-session. Not for the web host's own internals (read hosts-and-sessions), not for the RPC between processes (read daemon-and-rpc), and not for the .fbs files (read wire-schema) or Thetis's own internals."
 universal = false
-tags = ["moor", "meadow", "web client", "web-sdk", "flutter", "websocket", "openapi", "http api", "oauth2", "presentations", "typescript", "npm workspace", "vite", "client"]
-version = 1
+tags = ["moor", "meadow", "meadow_flutter", "web client", "web-sdk", "moor-web-mcp", "flutter", "websocket", "openapi.yaml", "http api", "oauth2", "x-moor", "presentations", "typescript", "npm workspace", "vite", "client"]
+version = 2
 ---
 
 # mooR clients and the web UI contract

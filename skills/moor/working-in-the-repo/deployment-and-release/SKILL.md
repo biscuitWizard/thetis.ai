@@ -1,11 +1,11 @@
 ---
 name = "Deploying and releasing mooR"
-brief = "What deploy/ and the Dockerfiles contain, how a release is built and gated, how keys and enrollment tokens are handled, and what an operator needs to bring a real world up."
-when_to_use = "Use when you touch a compose file, a Kubernetes manifest, a Dockerfile, a deployment script or a Debian package, because CI renders all of these on every push. Use it also when planning a real deployment: which shape to pick, how signing keys and enrollment tokens are made, what to back up, and which artefacts must never reach a diff. Do not use it for the development loop or for starting a server locally; that is build-and-run. Not for the Torchship game database, for authoring MOO verbs inside a running world, or for Thetis's own internals."
+brief = "What deploy/ and the Dockerfiles contain, how a release is gated, how keys and tokens are handled, and what an operator needs to bring a real world up."
+when_to_use = "Use when you touch a compose file, a Kubernetes manifest, a Dockerfile, a deployment script or a Debian package, because CI renders all of these on every push. Use it also when planning a real deployment: which shape to pick, how keys are made, and what must never reach a diff. Not for the development loop, and not for the Torchship database."
 universal = false
 tags = ["moor", "deploy", "deployment", "release", "docker", "docker-compose", "kubernetes", "debian package", "systemd", "nginx", "tls", "enrollment token", "signing key", "backup", "ghcr"]
 related = ["moor/services/daemon-and-rpc", "moor/content-pipeline/cores-and-bootstrap"]
-version = 1
+version = 2
 ---
 
 # Deploying and releasing mooR
@@ -31,7 +31,7 @@ changing a default that an installed system depends on.
 
 | Shape | Location | For |
 |---|---|---|
-| Development stacks | Root `docker-compose.yml`, `process-compose.yaml`, `bacon.toml`, the npm scripts | Local work. See `build-and-run` |
+| Development stacks | Root `docker-compose.yml`, `process-compose.yaml`, `bacon.toml`, the npm scripts | Local work. See [build-and-run](skill:moor/working-in-the-repo/build-and-run) |
 | Single-process, basic | `deploy/single-process/basic/` | One container running the `moor` binary: telnet, the embedded web API, and the embedded curl worker |
 | Single-process, web | `deploy/single-process/web/` | The same, plus an nginx container serving the Meadow browser client |
 | Clustered, telnet only | `deploy/clustered/telnet-only/` | Separate daemon and telnet host over IPC |
@@ -43,7 +43,7 @@ changing a default that an installed system depends on.
 The single-process shape is the intended default for a one-host install. The
 clustered shapes exist because the daemon and its hosts are genuinely separable:
 a host can restart, or live on another machine, while the world stays up.
-`moor/services/daemon-and-rpc` explains that boundary.
+[daemon-and-rpc](skill:moor/services/daemon-and-rpc) explains that boundary.
 
 Each deployment directory carries its own `README.md` and, where relevant, a
 `start.sh` and a `test.sh`. `deploy/test-all.sh` runs the deployment tests
@@ -154,7 +154,7 @@ Facts that separate a real deployment from a development one.
 **Choose the core deliberately, once.** The import runs only when the database
 does not yet exist. Whichever core you point at on first start is the world you
 have. The development launchers and the clustered examples do not agree on which
-core they import. See `moor/content-pipeline/cores-and-bootstrap`.
+core they import. See [cores-and-bootstrap](skill:moor/content-pipeline/cores-and-bootstrap).
 
 **Change the wizard password after the first login.** A freshly imported core
 has whatever the core shipped.
@@ -188,7 +188,7 @@ written by a newer server is not expected to be readable by an older one.
 | The release workflow refuses the tag | The tag is not semantic, the commit does not match, the `package.json` version differs, or the tag is not on the release branch | All four are checked before anything builds. The failing step names which |
 | An image tag is published but `latest` does not move | The tag was a pre-release | Only stable tags get the major-and-minor alias and `latest` |
 | A container build fails on the toolchain | The Dockerfile's base image is older than the workspace `rust-version` | Check the base image. Two secondary Dockerfiles lag |
-| A container build takes hours | The profile argument was not set, or was set to the full release profile | The fast release profile exists for packaging. See `build-and-run` |
+| A container build takes hours | The profile argument was not set, or was set to the full release profile | The fast release profile exists for packaging. See [build-and-run](skill:moor/working-in-the-repo/build-and-run) |
 | A build produces an unstamped binary | `.git` was not available in the build stage | The Dockerfiles copy it deliberately. Do not remove that |
 | A host or worker will not join the daemon | Enrollment token mismatch, or CURVE not configured for a TCP deployment | Confirm every component reads the same token. On one machine, prefer IPC and skip the whole mechanism |
 | Sessions break after a restart | The signing key pair changed | The key must persist across restarts. Check that the configuration directory is a volume and not container-local storage |
@@ -198,8 +198,12 @@ written by a newer server is not expected to be readable by an older one.
 
 ## Read first / read next
 
-Read `build-and-run` first for the development stacks and the cargo profiles,
-and `repo-tooling` for the scripts. Read `moor/services/daemon-and-rpc` before
-changing anything about enrolment, sockets or the process boundary, and
-`moor/content-pipeline/cores-and-bootstrap` before changing import or first-start
-behaviour. Read `conventions` for what must stay out of a diff.
+Read [build-and-run](skill:moor/working-in-the-repo/build-and-run) first for
+the development stacks and the cargo profiles, and
+[repo-tooling](skill:moor/working-in-the-repo/repo-tooling) for the scripts.
+Read [daemon-and-rpc](skill:moor/services/daemon-and-rpc) before changing
+anything about enrolment, sockets or the process boundary, and
+[cores-and-bootstrap](skill:moor/content-pipeline/cores-and-bootstrap) before
+changing import or first-start behaviour. Read
+[conventions](skill:moor/working-in-the-repo/conventions) for what must stay
+out of a diff.

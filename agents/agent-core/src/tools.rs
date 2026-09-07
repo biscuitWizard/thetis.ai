@@ -2620,8 +2620,21 @@ fn opt_arg(args: &Value, key: &str) -> Option<String> {
 fn format_skill_body(body: skills::SkillBody) -> String {
     let mut out = String::new();
 
+    // A well-formed body opens with its own `# Title`, so synthesising another
+    // one here printed the heading twice. When the body brings a title, this
+    // contributes only the locator; when it does not, it supplies both.
+    let body_has_title = body
+        .content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim_start().starts_with("# "));
+
     if body.file.is_empty() {
-        out.push_str(&format!("# {} ({})\n", body.name, body.id));
+        if body_has_title {
+            out.push_str(&format!("`{}`\n", body.id));
+        } else {
+            out.push_str(&format!("# {} ({})\n", body.name, body.id));
+        }
     } else {
         out.push_str(&format!("# {} — {}\n", body.id, body.file));
     }

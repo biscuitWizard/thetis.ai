@@ -1,12 +1,12 @@
 ---
 name = "Working in the mooR repository"
 brief = "Build, run, test and contribute to the mooR Rust workspace: which crate makes which binary, the checks CI enforces, and the rules a patch must satisfy."
-when_to_use = "Use when the task is about the repository itself: compiling the workspace, starting a server locally, choosing a test to write or run, formatting, clippy, licence headers, dependency policy, commit and pull-request norms, or a build that fails only in CI. Use it before you claim a change works. Do not use it to learn how the database, the compiler, the virtual machine or the RPC protocol behave; those are the other moor topics. Do not use it for the Torchship game database, for authoring MOO verbs inside a running world, or for Thetis's own internals."
+when_to_use = "Use when the task is about the repository itself: compiling, starting a server locally, choosing a test to write, or a build that fails only in CI. Use it before you claim a change works. Not for how the database, the compiler, the VM or the RPC protocol behave, which are the other moor topics, and not for the Torchship database or Thetis's own internals."
 universal = false
-tags = ["moor", "build", "cargo", "workspace", "test", "clippy", "rustfmt", "dprint", "ci", "contributing", "pull request", "rust"]
+tags = ["moor", "build", "cargo", "workspace", "test", "clippy", "rustfmt", "dprint", "ci", "contributing", "pull request", "rust", "licence headers", "dependency policy", "commit norms"]
 children = "auto"
 related = ["moor/services/daemon-and-rpc"]
-version = 1
+version = 2
 ---
 
 # Working in the mooR repository
@@ -23,17 +23,26 @@ disagreements found so far.
 
 ## Which child to read
 
-| Child | Covers | Reach for it when |
-|---|---|---|
-| `build-and-run` | The build graph, crates to binaries, profiles, features, and every way to start a server | You must compile something, or get a running system in front of you |
-| `testing` | Unit tests, `.moot` text tests, integration tests, consistency runs, and what CI gates | You must add a test, choose a test kind, or explain a failure |
-| `conventions` | Licence headers, formatting, clippy, dependency policy, code style, commit and pull-request norms | You are about to write or submit a change |
-| `repo-tooling` | `tools/`, `scripts/`, bacon, dprint, licensure, the book, the schema generators | You need a tool and do not know which one, or who it is for |
-| `performance-and-profiling` | The benches, `perf`, Chrome traces, runtime counters, and what zero-copy means in the hot crates | A change is meant to be faster, or something is slow and you do not know where |
-| `deployment-and-release` | `deploy/`, the Dockerfiles, the release workflow, keys and enrollment tokens, and operator facts | You touch a compose file, a manifest, a script or packaging, or you must plan a real deployment |
-
-Sibling skills are named bare in backticks. Skills in other topics are named by
-path, such as `moor/execution/task-scheduler`.
+- [build-and-run](skill:moor/working-in-the-repo/build-and-run) — the build
+  graph, crates to binaries, profiles, features, and every way to start a
+  server. Reach for it to compile something or get a running system in front
+  of you.
+- [testing](skill:moor/working-in-the-repo/testing) — unit tests, `.moot`
+  text tests, integration tests, and what CI gates. Reach for it to add a
+  test, choose a test kind, or explain a failure.
+- [conventions](skill:moor/working-in-the-repo/conventions) — licence
+  headers, formatting, clippy, dependency policy, and commit norms. Reach
+  for it before writing or submitting a change.
+- [repo-tooling](skill:moor/working-in-the-repo/repo-tooling) — `tools/`,
+  `scripts/`, bacon, dprint, licensure, the book, the schema generators.
+  Reach for it when you need a tool and do not know which one.
+- [performance-and-profiling](skill:moor/working-in-the-repo/performance-and-profiling)
+  — the benches, `perf`, Chrome traces, and runtime counters. Reach for it
+  when a change is meant to be faster, or something is slow.
+- [deployment-and-release](skill:moor/working-in-the-repo/deployment-and-release)
+  — `deploy/`, the Dockerfiles, the release workflow, and operator facts.
+  Reach for it when you touch a compose file, a manifest, or must plan a
+  real deployment.
 
 ## Facts every contributor needs
 

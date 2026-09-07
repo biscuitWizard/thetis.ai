@@ -1,11 +1,11 @@
 ---
 name = "Objdef: a world as a directory of source files"
-brief = "How mooR's objdef directories work: the file layout, object identity and constants, the multi-pass import, what round-trips, and how to load or replace one object safely."
-when_to_use = "Use when you read, write, import, export or diff objdef .moo files: constants.moo, import_export_id, import_export_hierarchy, define declarations, include!/include_bin!, property overrides, verb and method blocks, checkpoint exports, or the moor-objdef crate. Use it also for load_object, reload_object, dump_object and parse_objdef_constants, for moor-emh load and reload, for conflict modes clobber/skip/detect and entity overrides, and when an import fails to compile a verb or reports a duplicate object. Not for the LambdaMOO textdump format (read textdump-compat), not for choosing or starting a core (read cores-and-bootstrap), not for the MOO language or the compiler itself, not for the Torchship game database, not for in-world verb authoring for a specific game, and not for Thetis's own internals."
+brief = "How mooR's objdef directories work: file layout, object identity, the multi-pass import, what round-trips, and how to load or replace one object safely."
+when_to_use = "Use when you read, write, import, export or diff objdef .moo files, or when an import fails to compile a verb or reports a duplicate object. Not for the LambdaMOO textdump format (read textdump-compat), not for choosing or starting a core (read cores-and-bootstrap), and not for the MOO language, the Torchship game database, or Thetis's own internals."
 universal = false
-tags = ["moor", "objdef", "moo files", "constants.moo", "import_export_id", "load_object", "reload_object", "dump_object", "checkpoint", "export", "conflict", "clobber", "skip", "moor-objdef", "round trip", "version control"]
+tags = ["moor", "objdef", "moo files", "constants.moo", "import_export_id", "load_object", "reload_object", "dump_object", "checkpoint", "export", "conflict", "clobber", "skip", "moor-objdef", "round trip", "version control", "import_export_hierarchy", "define declarations", "include!", "include_bin!", "property overrides", "verb and method blocks", "parse_objdef_constants", "moor-emh", "detect", "entity overrides", "duplicate object"]
 related = ["moor/language-and-compiler/compiler-pipeline", "moor/storage-and-state/world-state-model"]
-version = 1
+version = 2
 ---
 
 # Objdef: a world as a directory of source files
@@ -74,7 +74,7 @@ Where do the identifiers come from on a first import?
 | Source | How identity is established |
 |---|---|
 | Objdef directory | After the load, if **no** object in the set carries an `import_export_id`, one is created for every object named by a constant, from the lower-cased constant name. If any object has one, nothing is inferred. |
-| Textdump | From the properties on `#0` that hold object values. See `textdump-compat`. |
+| Textdump | From the properties on `#0` that hold object values. See [textdump-compat](skill:moor/content-pipeline/textdump-compat). |
 
 ## Constants
 
@@ -231,15 +231,18 @@ Rules for doing this safely on a live world:
 
 Read first:
 
-- `moor/storage-and-state/world-state-model` — what a property definition, an
-  override and a verb resolution actually are.
-- `moor/language-and-compiler/compiler-pipeline` — why an exported verb body is
-  decompiled text and not your source.
+- [world-state-model](skill:moor/storage-and-state/world-state-model) — what a
+  property definition, an override and a verb resolution actually are.
+- [compiler-pipeline](skill:moor/language-and-compiler/compiler-pipeline) — why
+  an exported verb body is decompiled text and not your source.
 
 Read next:
 
-- `textdump-compat` — the other import format, and the identity bridge from `#0`.
-- `cores-and-bootstrap` — how a directory becomes a running world.
-- `moor/working-in-the-repo/repo-tooling` — `moorc` and `moor-emh`.
+- [textdump-compat](skill:moor/content-pipeline/textdump-compat) — the other
+  import format, and the identity bridge from `#0`.
+- [cores-and-bootstrap](skill:moor/content-pipeline/cores-and-bootstrap) — how
+  a directory becomes a running world.
+- [repo-tooling](skill:moor/working-in-the-repo/repo-tooling) — `moorc` and
+  `moor-emh`.
 - `book/src/the-system/objdef-file-format.md` — the syntax reference. Good, but check
   the code for anything load-bearing.

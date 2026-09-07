@@ -42,6 +42,7 @@ pub mod session;
 pub mod settings;
 pub mod embeddings;
 pub mod skill_index;
+pub mod skill_lint;
 pub mod skill_manager;
 pub mod skills;
 pub mod sshhosts;

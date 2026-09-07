@@ -1,10 +1,10 @@
 ---
 name = "mooR hosts and the session abstraction"
-brief = "What moor-telnet-host, moor-web-host and the single-process moor binary each own, and how a Session ties a connection object to a player and keeps output ordered."
-when_to_use = "Use when working on a connection endpoint or on player output: telnet listeners and TLS, the web host's HTTP routes, WebSocket or WebRTC, OAuth2, login, attach, reattach and detach, connection objects versus player objects, switch_player, connection attributes, content types, or output that arrives out of order, twice, or not at all. Use it also to decide what the single-process moor binary changes. Not for the RPC transport and tokens themselves (read daemon-and-rpc), not for the FlatBuffer definitions (read wire-schema), not for scrollback and encrypted history (read event-log-and-history), and not for MOO verb code inside a running world such as the Torchship database, which the torchship skills own, or for Thetis internals."
+brief = "What the telnet host, web host and single-process binary each own, and how a Session ties a connection object to a player and keeps output ordered."
+when_to_use = "Use when working on a connection endpoint or on player output, login, attach or reattach, or output that arrives out of order, twice, or not at all. Not for the RPC transport and tokens themselves (read daemon-and-rpc), not for the FlatBuffer definitions (read wire-schema), and not for scrollback and encrypted history (read event-log-and-history) or Thetis internals."
 universal = false
-tags = ["moor", "telnet-host", "web-host", "session", "websocket", "webrtc", "oauth2", "connection object", "player", "attach", "listeners", "output ordering", "moor-server", "single process"]
-version = 1
+tags = ["moor", "moor-telnet-host", "moor-web-host", "telnet-host", "web-host", "session", "websocket", "webrtc", "oauth2", "tls", "connection object", "player object", "switch_player", "connection attributes", "content types", "attach", "detach", "listeners", "output ordering", "moor-server", "single process"]
+version = 2
 ---
 
 # mooR hosts and the session abstraction

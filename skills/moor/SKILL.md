@@ -1,12 +1,12 @@
 ---
 name = "mooR server"
 brief = "Ground truth for the mooR server codebase: the Rust MOO engine, its transactional object database, compiler, VM, task scheduler, and daemon/host processes."
-when_to_use = "Use for any task inside the mooR repository at workspace/moor: reading or changing the daemon, kernel, db, compiler, var, vm, schema, hosts, or workers; understanding transactions, tasks, permissions, the RPC protocol, objdef or textdump databases; or building, running and testing the server. Start here to find the right sub-skill. Not for the Torchship game database or any other in-world MOO core, which torchship skills own. Not for writing verbs in a running world. Not for Thetis internals."
+when_to_use = "Use for any task inside the mooR repository at workspace/moor: reading or changing the daemon, database, compiler, VM, scheduler or host processes. Start here to find the right sub-skill. Not for the Torchship game database or any other in-world MOO core, which torchship skills own. Not for writing verbs in a running world. Not for Thetis internals."
 universal = false
-tags = ["moor", "moo", "lambdamoo", "rust", "server", "daemon", "kernel", "database", "transactions", "compiler", "virtual machine", "scheduler", "zeromq", "flatbuffers", "objdef", "architecture", "ground truth"]
+tags = ["moor", "moo", "lambdamoo", "rust", "server", "daemon", "kernel", "database", "transactions", "compiler", "virtual machine", "scheduler", "zeromq", "flatbuffers", "objdef", "architecture", "ground truth", "var", "schema", "hosts", "workers", "tasks", "permissions", "rpc protocol", "textdump", "build", "run", "test"]
 children = "auto"
 related = ["torchship"]
-version = 1
+version = 2
 ---
 
 # mooR server
@@ -51,53 +51,21 @@ daemon process holds the database and runs the tasks.
 
 ## Topics
 
-- **`moor/storage-and-state`** — The transactional object store: the transaction
-  lifecycle and conflict, the object/property/verb model, the storage engine and its
-  caches, and object lifetime and garbage collection.
-  - `transactions`
-  - `world-state-model`
-  - `storage-engine`
-  - `object-lifecycle-and-gc`
-- **`moor/language-and-compiler`** — The MOO language as the engine defines it: the
-  compile and decompile pipeline, the value model, the compiled program format, and
-  what is a mooR extension rather than LambdaMOO.
-  - `compiler-pipeline`
-  - `value-model`
-  - `program-and-opcodes`
-  - `language-features-and-compat`
-- **`moor/execution`** — Running a verb: the task scheduler and its limits, the
-  virtual machine, the builtin functions, the permission model, and the command
-  parser.
-  - `task-scheduler`
-  - `virtual-machine`
-  - `builtin-functions`
-  - `permissions-and-security`
-  - `command-parsing`
-- **`moor/services`** — The process topology and everything outside the daemon: the
-  RPC layer, the FlatBuffers wire schema, hosts and sessions, out-of-process workers,
-  the event log, the MCP host, and the client applications.
-  - `daemon-and-rpc`
-  - `wire-schema`
-  - `hosts-and-sessions`
-  - `workers`
-  - `event-log-and-history`
-  - `mcp-host`
-  - `clients-and-web-ui`
-- **`moor/content-pipeline`** — Getting a world into and out of the server: the
-  directory-based objdef format, LambdaMOO textdump compatibility, and the bundled
-  cores.
-  - `objdef-format`
-  - `textdump-compat`
-  - `cores-and-bootstrap`
-- **`moor/working-in-the-repo`** — Building, running, testing, measuring, shipping,
-  and contributing: the build graph, the development stack, the Moot harness, the
-  benches, the deployment shapes, and the project's own rules for a change.
-  - `build-and-run`
-  - `testing`
-  - `conventions`
-  - `repo-tooling`
-  - `performance-and-profiling`
-  - `deployment-and-release`
+Reach for each umbrella by what you are about to touch, not by what it contains —
+each one then points down to its own leaves.
+
+- [storage-and-state](skill:moor/storage-and-state) — changing how objects,
+  properties or verbs are stored, or anything about transactions and conflict.
+- [language-and-compiler](skill:moor/language-and-compiler) — changing the MOO
+  language itself: parsing, compiling, decompiling, the value model, or opcodes.
+- [execution](skill:moor/execution) — changing how a verb runs: the scheduler, the
+  VM, a builtin function, permission checks, or command parsing.
+- [services](skill:moor/services) — changing anything outside the daemon: RPC,
+  the wire schema, hosts, workers, the event log, the MCP host, or the clients.
+- [content-pipeline](skill:moor/content-pipeline) — moving a world into or out of
+  the server: objdef, textdump, or the bundled cores.
+- [working-in-the-repo](skill:moor/working-in-the-repo) — building, running,
+  testing, profiling, shipping, or following the project's own conventions.
 
 ## References
 

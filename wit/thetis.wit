@@ -219,6 +219,15 @@ interface types {
     universal: bool,
     /// Fetchable sibling files, e.g. "references/format.md".
     resources: list<string>,
+    /// Ids of neighbouring skills, from frontmatter `related`. A reference that
+    /// belongs to the whole skill rather than to one sentence of its body.
+    related: list<string>,
+    /// "active" or "retired". Empty means active and unstated. A retired skill
+    /// still ranks — it describes a system that existed, and a reader arriving
+    /// from old code needs it — so say so on the card rather than hiding it.
+    status: string,
+    /// For a retired skill, the id that replaced it. Empty otherwise.
+    superseded-by: string,
     /// Retrieval score, 0 when this card did not come from ranking.
     score: f64,
     /// Why this card is here: "dense", "lexical", "parent-of-match",
