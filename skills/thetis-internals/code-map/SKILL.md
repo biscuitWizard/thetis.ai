@@ -21,10 +21,23 @@ confirm a path with `list_config` if it is not where you expect it.
 | `crates/thetis` | The native kernel. |
 | `agents/agent-core` | Your own source. `target: self` in the dev kit. |
 | `gateways/gateway-web` | The chat UI and the wire protocol. |
+| `gateways/gateway-campaign` | The campaign UI at `/play`: build/continue, scenes, sheets, combat, shop. |
 | `rpg/rules` | Canonical source tree for shared tabletop campaign rules and state; inspect the current tree before assuming a module or system is complete. |
 | `rpg/systems` | System data packs consumed by `rpg/rules`, when present. |
 | `skills/rpg` | Operator and role craft for campaigns; separate from generated or installed rules knowledge. |
 | `tools/<name>` | One tool each. Campaign operations use `tools/rpg-*` when those components are present. |
+
+`rpg/rules` and `rpg/systems` are not vendored into each consumer; every crate
+that needs them — `gateways/gateway-campaign` and every `tools/rpg-*` crate —
+depends on `rpg-rules` by path and declares
+`[package.metadata.thetis] build-inputs = ["rpg/rules", "rpg/systems"]` in its
+own `Cargo.toml`. The build cache keys off those declared inputs, so editing
+anything under `rpg/rules` or `rpg/systems` invalidates every consumer's cache
+without a separate sync step. `rpg/consumers.txt` lists the `tools/rpg-*`
+crates and names `tools/rpg-roll` as the one canonical implementation among
+them (`scripts/sync-rpg.sh` copies its `src/lib.rs` to the rest) — see
+`skills/thetis-internals/tool-authorship` for the same pattern applied to
+`git-*` and `notion-*`.
 | `templates/tool-template` | What `new_tool` starts from. |
 | `skills/<id>/SKILL.md` | The skill corpus. |
 | `artifacts/cache/` | Built components and kernels, keyed by the source tree that produced them. Shared across every branch. |

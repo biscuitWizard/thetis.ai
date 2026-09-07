@@ -286,6 +286,32 @@ input: validate config delivery
 my settings: { "greeting": "hello from configuration", "retries": 3 }
 ```
 
+## Shared implementations across a family of tools
+
+Each tool is a standalone crate built for `wasm32-wasip2`, with its own
+`Cargo.toml` and no workspace, so a family of tools that share a client or an
+operation cannot share a library crate — the shared code is duplicated into
+every member instead, with one crate holding the canonical copy and a script
+that copies it into the rest. This is deliberate, not an oversight; do not
+"fix" it by trying to introduce a shared library dependency.
+
+- **`notion-*`** (eleven crates): `tools/notion-search/src/notion.rs` is
+  canonical; `tools/notion-search/sync-shared-client.sh` copies it to the
+  other ten (`--check` reports drift without writing). See
+  `skills/notion-workspace/maintaining-the-tools`.
+- **`git-*`** (`git-whoami`, `git-repo`, `git-commit`, `git-file`, …):
+  `tools/git-whoami/src/github.rs` is canonical; `scripts/sync-github-client.sh`
+  copies it to the rest.
+- **`rpg-*`** (25 crates): `tools/rpg-roll/src/lib.rs` is the canonical shared
+  operation implementation; `rpg/consumers.txt` lists every consumer crate and
+  `scripts/sync-rpg.sh` copies `tools/rpg-roll/src/lib.rs` into the other 24.
+  Edit `tools/rpg-roll`, then run the sync script, then rebuild the crates you
+  touched — a change made directly to a copy is overwritten the next sync.
+
+When you add a member to one of these families, add its path to the family's
+sync script (or its consumer list, for `rpg-*`) in the same change, or the new
+crate silently drifts from day one.
+
 ## Dependencies
 
 Prefer `add_dependency` / `remove_dependency`: they edit `[dependencies]`
