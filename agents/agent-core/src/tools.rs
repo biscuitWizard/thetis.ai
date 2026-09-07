@@ -590,7 +590,11 @@ fn devkit_tools() -> Vec<ToolDef> {
     let target_prop = json!({
         "type": "string",
         "description": "What to edit: 'self' for your own loop, 'gateway:<name>' for a chat \
-                        interface, or 'tool:<name>' for one of your tools.",
+                        interface, or 'tool:<name>' for one of your tools. Editing a gateway \
+                        changes only YOUR copy: the interface every browser loads is trunk's \
+                        until your work is merged. To see your own version, open \
+                        /preview/<this session id>/ — it serves your build against the real \
+                        running system. Never start a second Thetis to look at a UI change.",
     });
 
     vec![
