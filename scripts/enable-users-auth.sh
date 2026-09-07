@@ -24,10 +24,23 @@ binary=$root/target/release/thetis
 
 die() { echo "enable-users-auth: $*" >&2; exit 1; }
 
-id=${1:-}
-name=${2:-$id}
-[ -n "$id" ] || die "usage: scripts/enable-users-auth.sh <user-id> [\"Display Name\"]"
-[[ $id =~ ^[A-Za-z0-9._-]+$ ]] || die "a user id may hold letters, digits, dot, underscore and hyphen"
+given=${1:-}
+[ -n "$given" ] || die "usage: scripts/enable-users-auth.sh <user-id> [\"Display Name\"]"
+
+# The display name keeps whatever capitalisation was typed; the id is
+# lowercased to match what the configuration accepts. Signing in is
+# case-insensitive, so the account is still reachable by the name as written.
+name=${2:-$given}
+id=$(printf '%s' "$given" | tr '[:upper:]' '[:lower:]')
+
+# Exactly the rule config.rs enforces. Checked here, before the password is
+# asked for: validating after meant typing a password twice, having it hashed
+# and written, and only then being told the id was never going to be accepted.
+[ ${#id} -le 64 ] || die "a user id may be at most 64 characters"
+[[ $id =~ ^[a-z0-9._-]+$ ]] \
+    || die "a user id may hold only lowercase letters, digits, dot, underscore and hyphen — \`$given\` is not one"
+[ "$id" = "$given" ] || echo "enable-users-auth: using id \`$id\` (display name stays \`$name\`)" >&2
+
 [ -x "$binary" ] || die "no binary at $binary — run: cargo build --release -p thetis"
 
 if [ -f "$overlay" ] && grep -qE '^\[\[users\]\]' "$overlay"; then
