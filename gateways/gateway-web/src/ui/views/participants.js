@@ -98,6 +98,14 @@ function row(person, amOwner, me) {
                 id: state.session,
                 account: person.account,
               });
+              // The removal answers with the sidebar only, because the host
+              // cannot know whether the roster is still ours to read: leaving
+              // ends our access to this conversation, and asking anyway is
+              // refused. Here we *do* know, so ask for the fresh roster when
+              // it was somebody else who left, and stay quiet when it was us.
+              if (!isMe) {
+                send({ type: "participants", id: state.session });
+              }
             },
           },
           isMe ? "Leave" : "Remove"

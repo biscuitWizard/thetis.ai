@@ -96,9 +96,22 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
         "participant-remove" => match (id, frame.get("account").and_then(Value::as_str)) {
             (Some(session), Some(account)) => match host::remove_participant(session, account) {
                 // The removed person may be the reader themselves leaving, in
-                // which case the conversation is no longer theirs to see, so
-                // the sidebar is refreshed too.
-                Ok(()) => vec![participants(session), sessions()],
+                // which case the conversation is no longer theirs to see — so
+                // asking for the roster afterwards is refused — and a refused
+                // import traps the guest, which takes the whole dispatch with
+                // it. Leaving then answers with a wasm backtrace instead of
+                // "you left", and *because nothing is returned at all* the
+                // sidebar refresh is lost too, so the conversation stays on
+                // screen until a reload.
+                //
+                // The guest cannot tell whether the removed account is the
+                // reader (there is deliberately no identity import), so it
+                // cannot decide whether a roster is still allowed. It answers
+                // with the sidebar alone and lets the client ask for a roster
+                // if it still wants one: a request that is refused comes back
+                // as an ordinary error frame, which is recoverable, rather
+                // than as a trap in the middle of a successful mutation.
+                Ok(()) => vec![sessions()],
                 Err(why) => vec![error(&why), participants(session)],
             },
             _ => vec![error("participant-remove requires an id and an account")],
