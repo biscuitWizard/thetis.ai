@@ -345,8 +345,8 @@ branching stories, relationship memory, character advancement, combat and
 character fate, trading, task-specific models, rules lookup, and portable saves. Cyberpunk
 RED and the intentionally small D20 starter system share the canonical
 `rpg/rules` implementation. Operating guides live under [`skills/rpg`](skills/rpg).
-Run `bash scripts/run-campaign-walkthrough.sh` for the isolated Playwright
-walkthrough; set `THETIS_CAMPAIGN_SYSTEM=cyberpunk-red` to test RED. See the
+A campaign is judged by playing it: restart the service and play one at `/play`
+against a local model. See the
 [campaign review and verification report](docs/campaign-review.md) for coverage
 and implementation boundaries.
 

@@ -5,8 +5,7 @@
   "description": "Headless Playwright driver for the web-browser-* tool family. Thetis's wasm tool components cannot spawn processes, so the kernel runs this sidecar and the tools speak JSON over loopback HTTP to it.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "walkthrough:campaign": "node scripts/campaign-walkthrough.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "playwright": "1.61.0"
