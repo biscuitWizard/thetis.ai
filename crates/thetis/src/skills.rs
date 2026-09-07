@@ -35,7 +35,7 @@
 //! Files are read on demand rather than cached, so editing a skill takes effect
 //! on the next turn without a restart.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -977,22 +977,18 @@ The body.
             &format!("---\nname = \"N\"\nbrief = \"{brief}\"\n---\nBody."),
         )]);
         let diags = lint(&tree, "s");
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.severity == Severity::Error && d.message.contains("over the 200 limit"))
-        );
+        assert!(diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("over the 200 limit")));
     }
 
     #[test]
     fn lint_reports_a_missing_brief_as_an_error() {
         let (_d, tree) = tree_from(&[("s.md", "---\nname = \"N\"\n---\nBody.")]);
         let diags = lint(&tree, "s");
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.severity == Severity::Error && d.message.contains("brief is empty"))
-        );
+        assert!(diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("brief is empty")));
     }
 
     #[test]
@@ -1001,21 +997,17 @@ The body.
             "s.md",
             "---\nname = \"N\"\nbrief = \"b\"\nrelated = [\"ghost\"]\n---\nBody.",
         )]);
-        assert!(
-            lint(&tree, "s")
-                .iter()
-                .any(|d| d.message.contains("`ghost` does not exist"))
-        );
+        assert!(lint(&tree, "s")
+            .iter()
+            .any(|d| d.message.contains("`ghost` does not exist")));
     }
 
     #[test]
     fn lint_reports_an_empty_leaf() {
         let (_d, tree) = tree_from(&[("s.md", "---\nname = \"N\"\nbrief = \"b\"\n---\n")]);
-        assert!(
-            lint(&tree, "s")
-                .iter()
-                .any(|d| d.message.contains("nothing to disclose"))
-        );
+        assert!(lint(&tree, "s")
+            .iter()
+            .any(|d| d.message.contains("nothing to disclose")));
     }
 
     #[test]
@@ -1034,11 +1026,9 @@ The body.
             .collect();
         let (_d, tree) = tree_from(&refs);
 
-        assert!(
-            lint_all(&tree)
-                .iter()
-                .any(|d| d.id.is_empty() && d.message.contains("over the hard limit"))
-        );
+        assert!(lint_all(&tree)
+            .iter()
+            .any(|d| d.id.is_empty() && d.message.contains("over the hard limit")));
     }
 
     #[test]

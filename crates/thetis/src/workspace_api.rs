@@ -27,8 +27,8 @@
 //! security boundary: normalise away `..`, join to the workspace root, then
 //! confirm the result is still inside it *after* symlinks are followed.
 
-use anyhow::{Context, Result, anyhow};
-use serde_json::{Value, json};
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -792,16 +792,14 @@ pub async fn handle(cfg: &Config, frame: &Value) -> Vec<String> {
     // websocket frame. Inline it holds a runtime thread for its duration.
     match crate::offload::blocking(|| dispatch(cfg, &frame_type, frame)) {
         Ok(replies) => replies,
-        Err(e) => vec![
-            json!({
-                "type": "workspace-result",
-                "op": frame_type.trim_start_matches("workspace-"),
-                "ok": false,
-                "path": frame.get("path").and_then(Value::as_str).unwrap_or_default(),
-                "message": format!("{e:#}"),
-            })
-            .to_string(),
-        ],
+        Err(e) => vec![json!({
+            "type": "workspace-result",
+            "op": frame_type.trim_start_matches("workspace-"),
+            "ok": false,
+            "path": frame.get("path").and_then(Value::as_str).unwrap_or_default(),
+            "message": format!("{e:#}"),
+        })
+        .to_string()],
     }
 }
 
@@ -867,16 +865,14 @@ fn mutation_replies(cfg: &Config, op: &str, path: &str, message: &str) -> Vec<St
     // drop it than to work out what moved.
     invalidate_index();
 
-    let mut replies = vec![
-        json!({
-            "type": "workspace-result",
-            "op": op,
-            "ok": true,
-            "path": path,
-            "message": message,
-        })
-        .to_string(),
-    ];
+    let mut replies = vec![json!({
+        "type": "workspace-result",
+        "op": op,
+        "ok": true,
+        "path": path,
+        "message": message,
+    })
+    .to_string()];
 
     // The directory to redraw is the parent of whatever was touched — except
     // for a delete of a directory, whose parent is also its own parent.
@@ -1029,13 +1025,11 @@ mod tests {
         assert!(format!("{:#}", delete(&cfg, "notes", false).unwrap_err()).contains("confirm"));
         // Clobbering by rename.
         write(&cfg, "other.md", "x").unwrap();
-        assert!(
-            format!(
-                "{:#}",
-                rename(&cfg, "other.md", "notes/todo.md").unwrap_err()
-            )
-            .contains("already exists")
-        );
+        assert!(format!(
+            "{:#}",
+            rename(&cfg, "other.md", "notes/todo.md").unwrap_err()
+        )
+        .contains("already exists"));
         // A folder into itself.
         assert!(
             format!("{:#}", rename(&cfg, "notes", "notes/inner").unwrap_err())
@@ -1110,10 +1104,8 @@ mod tests {
         assert!(paths(&find(&cfg, "debug", "").unwrap()).is_empty());
 
         // A subsequence over the whole path: "mckvm" for moor/crates/kernel/…
-        assert!(
-            paths(&find(&cfg, "mckvm", "").unwrap())
-                .contains(&"moor/crates/kernel/src/vm.rs".to_string())
-        );
+        assert!(paths(&find(&cfg, "mckvm", "").unwrap())
+            .contains(&"moor/crates/kernel/src/vm.rs".to_string()));
 
         // A directory prefix narrows the search to inside it.
         let inside = find(&cfg, "md", "moor").unwrap();

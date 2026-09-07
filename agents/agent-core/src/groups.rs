@@ -518,6 +518,41 @@ pub fn all() -> &'static [ToolGroup] {
             members: &[],
         },
         ToolGroup {
+            id: "rpg-core",
+            brief: "Dice, checks, the character sheet, inventory, clock, journal and exact rules values for a tabletop campaign.",
+            tags: &["rpg", "campaign", "tabletop", "dice", "character"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
+            id: "rpg-world",
+            brief: "The campaign world: NPCs, factions, locations, plot beats and their relationships.",
+            tags: &["npc", "faction", "lore", "plot"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
+            id: "rpg-scene",
+            brief: "Presenting a scene to the player and closing one.",
+            tags: &["scene", "narrate"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
+            id: "rpg-combat",
+            brief: "Running a fight: initiative, actions, damage.",
+            tags: &["combat", "fight", "initiative"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
+            id: "rpg-shop",
+            brief: "Opening a vendor's stock for the player.",
+            tags: &["shop", "vendor", "merchant"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
             id: UNGROUPED,
             brief: "Tools that declare no group.",
             tags: &[],
@@ -554,6 +589,7 @@ const PREFIX_RULES: &[(&str, &str)] = &[
     ("web-", "web"),
     ("git-", "github"),
     ("moo-", "moo"),
+    ("rpg-", "rpg-core"),
 ];
 
 /// Which group a hot-loaded component belongs to: its own declaration first,
@@ -1096,6 +1132,18 @@ mod tests {
 
     fn group(id: &str) -> &'static ToolGroup {
         all().iter().find(|g| g.id == id).expect("group exists")
+    }
+
+    #[test]
+    fn rpg_groups_and_prefix_fallback_are_routable() {
+        for id in ["rpg-core", "rpg-world", "rpg-scene", "rpg-combat", "rpg-shop"] {
+            assert!(!group(id).always_on);
+            assert!(group(id).members.is_empty());
+        }
+        assert_eq!(component_group("rpg-dice-roll", &[]), "rpg-core");
+        assert_eq!(component_group("rpg-scene-present", &["group:rpg-scene".into()]), "rpg-scene");
+        assert!(score(group("rpg-combat"), &tokens("start the combat initiative")) >= 0.5);
+        assert!(score(group("rpg-shop"), &tokens("open the merchant shop")) >= 0.5);
     }
 
     #[test]

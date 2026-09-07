@@ -31,7 +31,7 @@
 
 pub mod schema;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
@@ -291,7 +291,11 @@ pub fn set(cfg: &Config, key: &str, value: &str) -> Result<String> {
                 .ok()
                 .and_then(|d| traverse(&d, &path).and_then(Item::as_value).cloned())
         })
-        .or_else(|| traverse(&defaults_document(), &path).and_then(Item::as_value).cloned());
+        .or_else(|| {
+            traverse(&defaults_document(), &path)
+                .and_then(Item::as_value)
+                .cloned()
+        });
     let kind = schema::field(key).map(|f| f.kind);
     let parsed = parse_value(value, existing.as_ref(), kind)
         .with_context(|| format!("{value:?} is not a valid value for {key}"))?;
@@ -360,12 +364,17 @@ pub fn snapshot(cfg: &Config) -> Result<Snapshot> {
             if !leaf.editable
                 || schema::field(&leaf.key).is_some()
                 || schema::table(&leaf.key).is_some()
-                || schema::TABLES.iter().any(|t| leaf.key.starts_with(&format!("{}.", t.id)))
+                || schema::TABLES
+                    .iter()
+                    .any(|t| leaf.key.starts_with(&format!("{}.", t.id)))
             {
                 continue;
             }
             let path: Vec<&str> = leaf.key.split('.').collect();
-            let raw = traverse(doc, &path).and_then(Item::as_value).map(render).unwrap_or_default();
+            let raw = traverse(doc, &path)
+                .and_then(Item::as_value)
+                .map(render)
+                .unwrap_or_default();
             out.insert(leaf.key, raw);
         }
     }
@@ -490,13 +499,14 @@ pub fn describe(cfg: &Config, prefix: Option<&str>) -> Result<Vec<Described>> {
             .and_then(Item::as_value)
             .map(render)
             .unwrap_or_default();
-        let (mut value, mut source) = if let Some(v) = traverse(&overlay, &path).and_then(Item::as_value) {
-            (render(v), "local")
-        } else if let Some(v) = traverse(&file, &path).and_then(Item::as_value) {
-            (render(v), "file")
-        } else {
-            (default_value.clone(), "default")
-        };
+        let (mut value, mut source) =
+            if let Some(v) = traverse(&overlay, &path).and_then(Item::as_value) {
+                (render(v), "local")
+            } else if let Some(v) = traverse(&file, &path).and_then(Item::as_value) {
+                (render(v), "file")
+            } else {
+                (default_value.clone(), "default")
+            };
         if let Some(env) = field.env {
             if let Some(v) = std::env::var(env).ok().filter(|v| !v.trim().is_empty()) {
                 value = v;
@@ -530,7 +540,9 @@ pub fn describe(cfg: &Config, prefix: Option<&str>) -> Result<Vec<Described>> {
             if described.contains(leaf.key.as_str())
                 || !leaf.editable
                 || schema::table(&leaf.key).is_some()
-                || schema::TABLES.iter().any(|t| leaf.key.starts_with(&format!("{}.", t.id)))
+                || schema::TABLES
+                    .iter()
+                    .any(|t| leaf.key.starts_with(&format!("{}.", t.id)))
                 || !wanted(&leaf.key)
             {
                 continue;
@@ -599,10 +611,14 @@ fn item_to_json(item: &Item) -> serde_json::Value {
         Item::None => serde_json::Value::Null,
         Item::Value(v) => value(v),
         Item::Table(t) => serde_json::Value::Object(
-            t.iter().map(|(k, v)| (k.to_string(), item_to_json(v))).collect(),
+            t.iter()
+                .map(|(k, v)| (k.to_string(), item_to_json(v)))
+                .collect(),
         ),
         Item::ArrayOfTables(a) => serde_json::Value::Array(
-            a.iter().map(|t| item_to_json(&Item::Table(t.clone()))).collect(),
+            a.iter()
+                .map(|t| item_to_json(&Item::Table(t.clone())))
+                .collect(),
         ),
     }
 }
@@ -671,10 +687,16 @@ fn mask_fields(fields: &mut serde_json::Value) {
 fn list_target(cfg: &Config, section: &schema::TableSection) -> Result<(PathBuf, &'static str)> {
     let path: Vec<&str> = section.id.split('.').collect();
     let overlay = cfg.local_overlay();
-    if matches!(traverse(&document_at(&overlay)?, &path), Some(Item::ArrayOfTables(_))) {
+    if matches!(
+        traverse(&document_at(&overlay)?, &path),
+        Some(Item::ArrayOfTables(_))
+    ) {
         return Ok((overlay, "local"));
     }
-    if matches!(traverse(&document_at(&cfg.config_path)?, &path), Some(Item::ArrayOfTables(_))) {
+    if matches!(
+        traverse(&document_at(&cfg.config_path)?, &path),
+        Some(Item::ArrayOfTables(_))
+    ) {
         return Ok((cfg.config_path.clone(), "file"));
     }
     Ok(if section.local {
@@ -710,7 +732,10 @@ pub fn entries(cfg: &Config, section: &str) -> Result<Vec<Entry>> {
         .collect())
 }
 
-fn array_mut<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut toml_edit::ArrayOfTables> {
+fn array_mut<'a>(
+    doc: &'a mut DocumentMut,
+    path: &[&str],
+) -> Result<&'a mut toml_edit::ArrayOfTables> {
     let (last, parents) = path.split_last().ok_or_else(|| anyhow!("empty section"))?;
     let mut item = doc.as_item_mut();
     for part in parents {
@@ -807,7 +832,10 @@ pub fn save_entry(
         cfg,
         &target,
         &doc.to_string(),
-        &format!("{} {id} in {section}", if created { "adding" } else { "changing" }),
+        &format!(
+            "{} {id} in {section}",
+            if created { "adding" } else { "changing" }
+        ),
     )?;
     tracing::warn!(section, id, file = %file_name(&target), "configuration changed");
     Ok(format!(
@@ -832,7 +860,12 @@ pub fn remove_entry(cfg: &Config, section: &str, id: &str) -> Result<String> {
         return Err(anyhow!("{section} has no entry {id}"));
     };
     array_mut(&mut doc, &path)?.remove(index);
-    write_validated(cfg, &target, &doc.to_string(), &format!("removing {id} from {section}"))?;
+    write_validated(
+        cfg,
+        &target,
+        &doc.to_string(),
+        &format!("removing {id} from {section}"),
+    )?;
     tracing::warn!(section, id, file = %file_name(&target), "configuration changed");
     Ok(format!(
         "{section}: removed {id} (written to {})",
@@ -1074,11 +1107,9 @@ data = "data"
         // Neither the old nor the new value appears in what is reported back,
         // and a credential lands in the overlay, never the committed file.
         assert!(!report.contains("sk-or-v1"), "{report}");
-        assert!(
-            std::fs::read_to_string(cfg.local_overlay())
-                .unwrap()
-                .contains("sk-or-v1-brand-new")
-        );
+        assert!(std::fs::read_to_string(cfg.local_overlay())
+            .unwrap()
+            .contains("sk-or-v1-brand-new"));
     }
 
     #[test]
@@ -1184,7 +1215,10 @@ data = "data"
             .into_iter()
             .filter(|k| schema::table(k).is_none() && schema::field(k).is_none())
             .collect();
-        assert!(missing.is_empty(), "settings without a schema row: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "settings without a schema row: {missing:?}"
+        );
     }
 
     /// And the other way: a row naming a key the loader does not know is a
@@ -1197,7 +1231,10 @@ data = "data"
             .map(|f| f.key)
             .filter(|k| !known.iter().any(|d| d == k))
             .collect();
-        assert!(phantom.is_empty(), "schema rows with no setting behind them: {phantom:?}");
+        assert!(
+            phantom.is_empty(),
+            "schema rows with no setting behind them: {phantom:?}"
+        );
         for f in schema::FIELDS {
             assert!(
                 schema::SECTIONS.iter().any(|(id, _, _)| *id == f.section),
@@ -1246,19 +1283,35 @@ data = "data"
         let (cfg, _d) = fixture();
         std::fs::write(cfg.local_overlay(), "[agent]\nmax_iterations = 7\n").unwrap();
         let all = describe(&cfg, Some("agent")).unwrap();
-        let it = all.iter().find(|d| d.key == "agent.max_iterations").unwrap();
+        let it = all
+            .iter()
+            .find(|d| d.key == "agent.max_iterations")
+            .unwrap();
         assert_eq!((it.value.as_str(), it.source), ("7", "local"));
     }
 
     #[test]
     fn a_tool_block_is_described_as_free_form() {
         let (cfg, _d) = fixture();
-        std::fs::write(cfg.local_overlay(), "[tools.notion]\ntoken = \"ntn_x\"\nversion = \"2026\"\n").unwrap();
+        std::fs::write(
+            cfg.local_overlay(),
+            "[tools.notion]\ntoken = \"ntn_x\"\nversion = \"2026\"\n",
+        )
+        .unwrap();
         let all = describe(&cfg, Some("tools")).unwrap();
         let token = all.iter().find(|d| d.key == "tools.notion.token").unwrap();
-        assert_eq!((token.value.as_str(), token.source, token.kind), ("***", "local", "secret"));
-        let version = all.iter().find(|d| d.key == "tools.notion.version").unwrap();
-        assert_eq!((version.value.as_str(), version.section.as_str()), ("2026", "tools"));
+        assert_eq!(
+            (token.value.as_str(), token.source, token.kind),
+            ("***", "local", "secret")
+        );
+        let version = all
+            .iter()
+            .find(|d| d.key == "tools.notion.version")
+            .unwrap();
+        assert_eq!(
+            (version.value.as_str(), version.section.as_str()),
+            ("2026", "tools")
+        );
     }
 
     // --- which file a write lands in ----------------------------------------
@@ -1271,7 +1324,9 @@ data = "data"
         let overlay = std::fs::read_to_string(cfg.local_overlay()).unwrap();
         assert!(overlay.contains("sk-or-v1-new"));
         assert!(
-            !std::fs::read_to_string(&cfg.config_path).unwrap().contains("sk-or-v1-new"),
+            !std::fs::read_to_string(&cfg.config_path)
+                .unwrap()
+                .contains("sk-or-v1-new"),
             "the committed file must not receive the key"
         );
 
@@ -1279,7 +1334,10 @@ data = "data"
         assert!(report.contains("thetis.toml)"), "{report}");
         assert!(!overlay.contains("max_iterations"));
 
-        assert_eq!(write_target(&cfg, "auth.session_ttl_hours"), cfg.local_overlay());
+        assert_eq!(
+            write_target(&cfg, "auth.session_ttl_hours"),
+            cfg.local_overlay()
+        );
     }
 
     #[test]
@@ -1287,8 +1345,12 @@ data = "data"
         let (cfg, _d) = fixture();
         std::fs::write(cfg.local_overlay(), "[agent]\nmax_iterations = 7\n").unwrap();
         set(&cfg, "agent.max_iterations", "9").unwrap();
-        assert!(std::fs::read_to_string(cfg.local_overlay()).unwrap().contains("max_iterations = 9"));
-        assert!(std::fs::read_to_string(&cfg.config_path).unwrap().contains("max_iterations = 32"));
+        assert!(std::fs::read_to_string(cfg.local_overlay())
+            .unwrap()
+            .contains("max_iterations = 9"));
+        assert!(std::fs::read_to_string(&cfg.config_path)
+            .unwrap()
+            .contains("max_iterations = 32"));
     }
 
     #[test]
@@ -1299,7 +1361,10 @@ data = "data"
         assert!(text.contains("auto_install = false"), "{text}");
         set(&cfg, "cache.explicit_vendors", "anthropic, google").unwrap();
         let text = std::fs::read_to_string(&cfg.config_path).unwrap();
-        assert!(text.contains(r#"explicit_vendors = ["anthropic", "google"]"#), "{text}");
+        assert!(
+            text.contains(r#"explicit_vendors = ["anthropic", "google"]"#),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1313,7 +1378,9 @@ data = "data"
         )
         .unwrap();
         set(&cfg, "agent.max_iterations", "12").unwrap();
-        assert!(std::fs::read_to_string(&cfg.config_path).unwrap().contains("max_iterations = 12"));
+        assert!(std::fs::read_to_string(&cfg.config_path)
+            .unwrap()
+            .contains("max_iterations = 12"));
     }
 
     // --- entries --------------------------------------------------------------
@@ -1329,7 +1396,13 @@ data = "data"
         )
         .unwrap();
         assert!(report.contains("added"), "{report}");
-        assert_eq!(snapshot(&cfg).unwrap().get("models[openai/gpt-4o]").map(|v| v.contains("GPT-4o")), Some(true));
+        assert_eq!(
+            snapshot(&cfg)
+                .unwrap()
+                .get("models[openai/gpt-4o]")
+                .map(|v| v.contains("GPT-4o")),
+            Some(true)
+        );
 
         let rows = entries(&cfg, "models").unwrap();
         assert_eq!(rows.len(), 2);
@@ -1337,7 +1410,13 @@ data = "data"
         assert_eq!(added.fields["label"], "GPT-4o");
         assert_eq!(added.source, "file");
 
-        save_entry(&cfg, "models", "openai/gpt-4o", &serde_json::json!({ "label": null, "wire_model": "gpt-4o" })).unwrap();
+        save_entry(
+            &cfg,
+            "models",
+            "openai/gpt-4o",
+            &serde_json::json!({ "label": null, "wire_model": "gpt-4o" }),
+        )
+        .unwrap();
         let rows = entries(&cfg, "models").unwrap();
         let changed = rows.iter().find(|e| e.id == "openai/gpt-4o").unwrap();
         assert!(changed.fields.get("label").is_none());
@@ -1354,17 +1433,38 @@ data = "data"
     #[test]
     fn an_entry_a_form_typed_is_parsed_by_its_column() {
         let (cfg, _d) = fixture();
-        save_entry(&cfg, "modes", "chat", &serde_json::json!({ "read_only": "true", "label": "Chat" })).unwrap();
+        save_entry(
+            &cfg,
+            "modes",
+            "chat",
+            &serde_json::json!({ "read_only": "true", "label": "Chat" }),
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&cfg.config_path).unwrap();
         assert!(text.contains("read_only = true"), "{text}");
-        let err = save_entry(&cfg, "modes", "chat", &serde_json::json!({ "colour": "red" })).unwrap_err();
-        assert!(format!("{err:#}").contains("no field named colour"), "{err:#}");
+        let err = save_entry(
+            &cfg,
+            "modes",
+            "chat",
+            &serde_json::json!({ "colour": "red" }),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no field named colour"),
+            "{err:#}"
+        );
     }
 
     #[test]
     fn a_user_password_is_hashed_and_never_shown() {
         let (cfg, _d) = fixture();
-        save_entry(&cfg, "roles", "reader", &serde_json::json!({ "read_only": true })).unwrap();
+        save_entry(
+            &cfg,
+            "roles",
+            "reader",
+            &serde_json::json!({ "read_only": true }),
+        )
+        .unwrap();
         let report = save_entry(
             &cfg,
             "users",
@@ -1373,7 +1473,10 @@ data = "data"
         )
         .unwrap();
         assert!(!report.contains("hunter2"));
-        assert!(report.contains("thetis.local.toml"), "accounts belong in the overlay: {report}");
+        assert!(
+            report.contains("thetis.local.toml"),
+            "accounts belong in the overlay: {report}"
+        );
 
         let overlay = std::fs::read_to_string(cfg.local_overlay()).unwrap();
         assert!(overlay.contains("$argon2id$"), "{overlay}");
@@ -1386,7 +1489,13 @@ data = "data"
         assert!(rows[0].fields.get("password").is_none());
         assert!(crate::auth::verify_password(
             "hunter2",
-            overlay.split("password_hash = \"").nth(1).unwrap().split('"').next().unwrap()
+            overlay
+                .split("password_hash = \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
         ));
     }
 
@@ -1394,7 +1503,13 @@ data = "data"
     fn an_entry_that_would_not_load_is_refused() {
         let (cfg, _d) = fixture();
         let before = std::fs::read_to_string(&cfg.config_path).unwrap();
-        let err = save_entry(&cfg, "models", "x/y", &serde_json::json!({ "provider": "nowhere" })).unwrap_err();
+        let err = save_entry(
+            &cfg,
+            "models",
+            "x/y",
+            &serde_json::json!({ "provider": "nowhere" }),
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("invalid"), "{err:#}");
         assert_eq!(std::fs::read_to_string(&cfg.config_path).unwrap(), before);
     }
@@ -1405,22 +1520,43 @@ data = "data"
     fn a_snapshot_sees_a_change_and_says_whether_it_is_live() {
         let (cfg, _d) = fixture();
         let before = snapshot(&cfg).unwrap();
-        assert_eq!(before.get("agent.max_iterations").map(String::as_str), Some("32"));
+        assert_eq!(
+            before.get("agent.max_iterations").map(String::as_str),
+            Some("32")
+        );
         assert!(before.contains_key("models[anthropic/claude-sonnet-4.5]"));
-        assert!(before.get("llm.api_key").unwrap().contains("sk-or-v1"), "unmasked on purpose");
+        assert!(
+            before.get("llm.api_key").unwrap().contains("sk-or-v1"),
+            "unmasked on purpose"
+        );
 
         set(&cfg, "agent.max_iterations", "40").unwrap();
         set(&cfg, "server.bind", "127.0.0.1:7778").unwrap();
-        save_entry(&cfg, "modes", "chat", &serde_json::json!({ "read_only": true })).unwrap();
+        save_entry(
+            &cfg,
+            "modes",
+            "chat",
+            &serde_json::json!({ "read_only": true }),
+        )
+        .unwrap();
         let after = snapshot(&cfg).unwrap();
 
         let keys = changed(&before, &after);
-        assert_eq!(keys, vec!["agent.max_iterations", "modes[chat]", "server.bind"]);
+        assert_eq!(
+            keys,
+            vec!["agent.max_iterations", "modes[chat]", "server.bind"]
+        );
         assert!(is_live("agent.max_iterations"));
         assert!(is_live("modes[chat]"));
         assert!(!is_live("server.bind"));
-        assert!(!is_live("limits.agent_memory_mb"), "engine limits are baked in");
-        assert!(is_live("tools.notion.version"), "tool blocks are read per invocation");
+        assert!(
+            !is_live("limits.agent_memory_mb"),
+            "engine limits are baked in"
+        );
+        assert!(
+            is_live("tools.notion.version"),
+            "tool blocks are read per invocation"
+        );
     }
 
     #[test]

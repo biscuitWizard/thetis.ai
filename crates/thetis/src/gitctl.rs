@@ -8,7 +8,7 @@
 //! reimplementations diverge from the reference implementation. Output is
 //! parsed only from plumbing formats git documents as stable.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -1156,7 +1156,10 @@ mod tests {
             .await
             .expect_err("a staged conflict is still a conflict")
             .to_string();
-        assert!(err.contains("base.txt"), "the message has to name it: {err}");
+        assert!(
+            err.contains("base.txt"),
+            "the message has to name it: {err}"
+        );
 
         fs::write(wt_path.join("base.txt"), "resolved\n").unwrap();
         wt.commit_merge("update from trunk").await.unwrap();

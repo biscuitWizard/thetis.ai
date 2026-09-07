@@ -630,6 +630,11 @@ interface session {
 interface skills {
   use types.{skill-card, skill-body, skill-diagnostic, skill-write};
 
+  record search-options {
+    prefix: string,
+    absorb-parents: bool,
+  }
+
   /// Skills marked universal, capped by configuration.
   universal: func() -> list<skill-card>;
 
@@ -646,6 +651,10 @@ interface skills {
 
   /// Ranks without remembering, for looking something up mid-conversation.
   search: func(query: string, limit: u32) -> list<skill-card>;
+
+  /// Ranks within an id subtree. Empty prefix means the whole corpus. Parent
+  /// absorption and promotion can be disabled when individual facts are wanted.
+  search-in: func(query: string, limit: u32, options: search-options) -> list<skill-card>;
 
   /// What `retrieve` last chose for this session.
   pinned: func(session-id: string) -> list<skill-card>;
@@ -959,7 +968,12 @@ interface transcripts {
 // Separate from `skills` so the gateway can show what the agent knows without
 // being able to change it: a gateway renders, it does not author.
 interface skills-view {
-  use types.{skill-card, skill-diagnostic};
+  use types.{skill-card, skill-body, skill-diagnostic};
+
+  record search-options {
+    prefix: string,
+    absorb-parents: bool,
+  }
 
   /// Every skill, parents before children, for a tree view.
   all: func() -> list<skill-card>;
@@ -967,6 +981,10 @@ interface skills-view {
   universal: func() -> list<skill-card>;
   /// What was retrieved for a conversation, with scores.
   pinned: func(session-id: string) -> list<skill-card>;
+  /// Ranked read-only lookup, optionally confined to an id subtree.
+  search: func(query: string, limit: u32, options: search-options) -> list<skill-card>;
+  /// One skill's instructions or bundled file.
+  fetch: func(id: string, file: string, offset: u32, limit: u32) -> result<skill-body, string>;
   /// Whatever linting found across the tree.
   lint: func() -> list<skill-diagnostic>;
 }

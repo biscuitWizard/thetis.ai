@@ -32,7 +32,7 @@
 //! place decides what an event *says*, and read and search cannot disagree
 //! about it.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
@@ -555,7 +555,11 @@ fn clip(text: &str, max_chars: usize) -> (String, u64) {
 
 /// `0` means "the default", and anything above the cap becomes the cap.
 fn clamp(asked: usize, default: usize, cap: usize) -> usize {
-    if asked == 0 { default } else { asked.min(cap) }
+    if asked == 0 {
+        default
+    } else {
+        asked.min(cap)
+    }
 }
 
 /// Whether a projection of `records` is what a reader would call empty.
@@ -857,13 +861,12 @@ mod tests {
         let (store, _d) = temp_store();
         let t = Transcripts::new(&store);
         assert!(t.read("no-such-id", 0, 0, 0).is_err());
-        assert!(
-            t.search(&SearchQuery {
+        assert!(t
+            .search(&SearchQuery {
                 session_id: "no-such-id".into(),
                 ..query("x")
             })
-            .is_err()
-        );
+            .is_err());
     }
 
     #[test]

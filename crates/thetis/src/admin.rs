@@ -561,7 +561,10 @@ mod tests {
             assert!(arms.contains(&a.id), "{} has no arm in act()", a.id);
         }
         for arm in &arms {
-            assert!(action(arm).is_some(), "{arm} is dispatched but not in ACTIONS");
+            assert!(
+                action(arm).is_some(),
+                "{arm} is dispatched but not in ACTIONS"
+            );
         }
     }
 

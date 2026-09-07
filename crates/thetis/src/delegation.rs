@@ -18,7 +18,7 @@
 //! a child settling can ring a bell the parent is already sleeping on, instead
 //! of the parent polling the database across an IPC boundary.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -12,8 +12,8 @@
 //! guarantee rests on the mode, so letting chat change it would defeat the whole
 //! arrangement; `/model` changes only which model answers.
 
-use anyhow::{Result, anyhow};
-use serde_json::{Value, json};
+use anyhow::{anyhow, Result};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::config::DiscordSettings;
@@ -109,7 +109,10 @@ const OPTIONAL_SPECS: &[(&str, Spec)] = &[(
     Spec {
         name: "fork",
         description: "Talk to a conversation running under your own permissions",
-        argument: Some(("state", "Say `off` to go back to the read-only conversation")),
+        argument: Some((
+            "state",
+            "Say `off` to go back to the read-only conversation",
+        )),
     },
 )];
 
@@ -380,9 +383,7 @@ pub async fn run(
             // would read like an account and is not one.
             let linked = match policy::may_fork(cfg, &account) {
                 Ok(()) => format!("`{account}` — `/fork` will run as you"),
-                Err(policy::ForkRefusal::Unbound) => {
-                    "not linked to a Thetis account".to_string()
-                }
+                Err(policy::ForkRefusal::Unbound) => "not linked to a Thetis account".to_string(),
                 Err(policy::ForkRefusal::Disabled) if account.starts_with("discord:") => {
                     "not linked to a Thetis account".to_string()
                 }
@@ -470,9 +471,11 @@ async fn fork(
             ));
         }
         super::forget_fork(grip, key).await?;
-        return Ok("Back to the read-only conversation. The fork is still there in \
+        return Ok(
+            "Back to the read-only conversation. The fork is still there in \
              the web UI, and `/fork` will start a new one."
-            .to_string());
+                .to_string(),
+        );
     }
 
     if let Some((existing, owner)) = super::fork_for(grip, key).await? {
@@ -629,7 +632,10 @@ mod tests {
         // while the client's picker silently refuses to offer the command and
         // no INTERACTION_CREATE is ever sent. Leaving them out is what made
         // every slash command dead on a guild.
-        for command in schema(&settings()).as_array().expect("an array of commands") {
+        for command in schema(&settings())
+            .as_array()
+            .expect("an array of commands")
+        {
             let name = command["name"].as_str().unwrap();
             assert_eq!(
                 command["contexts"],

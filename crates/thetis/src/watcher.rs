@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;

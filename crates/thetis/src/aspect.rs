@@ -5,7 +5,7 @@
 //! an aspect is one of the forms this system takes, which is why they are the
 //! unit of building, versioning, health tracking and rollback.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

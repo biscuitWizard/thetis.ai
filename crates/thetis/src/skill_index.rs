@@ -7,12 +7,9 @@
 //! - **BM25** — a lexical fallback for when embeddings are unavailable: no API
 //!   key, an HTTP failure, or a corpus that has never been indexed.
 //!
-//! The two are deliberately *not* fused. Benchmarked on a 35-skill corpus with
-//! 28 non-echoing queries and deliberate near-miss distractors, reciprocal-rank
-//! fusion lost to dense alone at every mixing weight tried (hit@1 0.43 vs 0.50
-//! at w_dense=0.9). Skill cards are short, paraphrased, and semantically close
-//! to one another, which is exactly the shape where lexical overlap misleads.
-//! BM25 stays as insurance, not as a contributor.
+//! BM25 remains the fallback when dense retrieval is unavailable. When configured,
+//! reciprocal-rank fusion combines dense and lexical ranks; a zero fusion weight
+//! preserves the dense-only behaviour.
 //!
 //! After ranking, two structural adjustments apply:
 //!
@@ -83,6 +80,8 @@ pub fn rank(
     query: &str,
     query_vector: Option<&[f32]>,
     limit: usize,
+    absorb: bool,
+    fusion_weight: f64,
 ) -> Vec<Ranked> {
     if limit == 0 || corpus.is_empty() {
         return Vec::new();
@@ -106,29 +105,59 @@ pub fn rank(
 
     let dense_available = query_vector.is_some() && corpus.iter().any(|c| c.vector.is_some());
 
-    let scored = if dense_available {
-        dense_scores(corpus, query_vector.unwrap())
+    let (scored, how) = if dense_available {
+        let dense = dense_scores(corpus, query_vector.unwrap());
+        if fusion_weight > 0.0 {
+            (
+                reciprocal_rank_fusion(&dense, &bm25_scores(corpus, query), fusion_weight),
+                How::Dense,
+            )
+        } else {
+            (dense, How::Dense)
+        }
     } else {
-        bm25_scores(corpus, query)
-    };
-    let how = if dense_available {
-        How::Dense
-    } else {
-        How::Lexical
+        (bm25_scores(corpus, query), How::Lexical)
     };
 
     // Keep a generous pool: absorption can collapse several entries into one,
     // and the pool is what refills the gap.
     let pool: Vec<(String, f64)> = scored.into_iter().take(CANDIDATE_POOL).collect();
 
-    let absorbed = absorb_into_parents(tree, pool);
-    let mut out: Vec<Ranked> = absorbed
+    let adjusted = if absorb {
+        absorb_into_parents(tree, pool)
+    } else {
+        pool
+    };
+    let mut out: Vec<Ranked> = adjusted
         .into_iter()
         .map(|(id, score)| Ranked { id, score, how })
         .collect();
 
     out.truncate(limit);
-    promote_parents(tree, &mut out, limit);
+    if absorb {
+        promote_parents(tree, &mut out, limit);
+    }
+    out
+}
+
+/// Weighted reciprocal-rank fusion. `weight` is the dense contribution and is
+/// clamped to [0, 1]; the lexical contribution is its complement.
+fn reciprocal_rank_fusion(
+    dense: &[(String, f64)],
+    lexical: &[(String, f64)],
+    weight: f64,
+) -> Vec<(String, f64)> {
+    const K: f64 = 60.0;
+    let weight = weight.clamp(0.0, 1.0);
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    for (rank, (id, _)) in dense.iter().enumerate() {
+        *scores.entry(id.clone()).or_default() += weight / (K + rank as f64 + 1.0);
+    }
+    for (rank, (id, _)) in lexical.iter().enumerate() {
+        *scores.entry(id.clone()).or_default() += (1.0 - weight) / (K + rank as f64 + 1.0);
+    }
+    let mut out: Vec<_> = scores.into_iter().collect();
+    sort_by_score(&mut out);
     out
 }
 
@@ -325,7 +354,7 @@ fn promote_parents(tree: &SkillTree, out: &mut Vec<Ranked>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::{SkillTree, discover};
+    use crate::skills::{discover, SkillTree};
 
     fn tree_from(files: &[(&str, &str)]) -> (tempfile::TempDir, SkillTree) {
         let dir = tempfile::tempdir().unwrap();
@@ -361,7 +390,7 @@ mod tests {
             ("b.md", &skill_file("B", "Beta things.")),
         ]);
         let corpus = lexical_corpus(&tree);
-        let out = rank(&tree, &corpus, "anything at all", None, 10);
+        let out = rank(&tree, &corpus, "anything at all", None, 10, true, 0.0);
 
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|r| r.how == How::WholeCorpus));
@@ -392,6 +421,8 @@ mod tests {
             "how do I restore an earlier revision",
             None,
             3,
+            true,
+            0.0,
         );
 
         assert_eq!(out[0].id, "rollback");
@@ -430,7 +461,15 @@ mod tests {
             })
             .collect();
 
-        let out = rank(&tree, &corpus, "irrelevant text", Some(&[1.0, 0.0]), 3);
+        let out = rank(
+            &tree,
+            &corpus,
+            "irrelevant text",
+            Some(&[1.0, 0.0]),
+            3,
+            true,
+            0.0,
+        );
         assert_eq!(out[0].id, "s3");
         assert_eq!(out[0].how, How::Dense);
     }
@@ -461,7 +500,7 @@ mod tests {
             })
             .collect();
 
-        let out = rank(&tree, &corpus, "q", Some(&[1.0, 0.0]), 5);
+        let out = rank(&tree, &corpus, "q", Some(&[1.0, 0.0]), 5, true, 0.0);
         assert!(
             !out.iter().any(|r| r.id == "s0"),
             "a mismatched vector must not be scored"
@@ -493,6 +532,8 @@ mod tests {
             "shell commands in a session",
             Some(&[1.0, 0.0]),
             2,
+            true,
+            0.0,
         );
 
         assert_eq!(out[0].id, "terminal");
@@ -528,7 +569,7 @@ mod tests {
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
-        let out = rank(&tree, &corpus, "deployment", None, 5);
+        let out = rank(&tree, &corpus, "deployment", None, 5, true, 0.0);
         let ids: Vec<&str> = out.iter().map(|r| r.id.as_str()).collect();
 
         assert!(ids.contains(&"p"), "the parent should be present");
@@ -560,7 +601,7 @@ mod tests {
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
-        let out = rank(&tree, &corpus, "zygomorphic flange", None, 4);
+        let out = rank(&tree, &corpus, "zygomorphic flange", None, 4, true, 0.0);
 
         assert_eq!(out[0].id, "p/kid");
         let parent = out.iter().find(|r| r.id == "p").expect("parent promoted");
@@ -590,7 +631,7 @@ mod tests {
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
-        let out = rank(&tree, &corpus, "widget grinding", None, 3);
+        let out = rank(&tree, &corpus, "widget grinding", None, 3, true, 0.0);
         assert_eq!(out.len(), 3);
     }
 
@@ -611,8 +652,8 @@ mod tests {
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
-        let first = rank(&tree, &corpus, "identical brief", None, 4);
-        let second = rank(&tree, &corpus, "identical brief", None, 4);
+        let first = rank(&tree, &corpus, "identical brief", None, 4, true, 0.0);
+        let second = rank(&tree, &corpus, "identical brief", None, 4, true, 0.0);
         assert_eq!(first, second);
     }
 
@@ -633,7 +674,7 @@ mod tests {
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
-        let out = rank(&tree, &corpus, "zzzz qqqq", None, 5);
+        let out = rank(&tree, &corpus, "zzzz qqqq", None, 5, true, 0.0);
         assert!(out.is_empty());
     }
 
@@ -641,7 +682,85 @@ mod tests {
     fn a_zero_limit_returns_nothing() {
         let (_d, tree) = tree_from(&[("a.md", &skill_file("A", "Alpha."))]);
         let corpus = lexical_corpus(&tree);
-        assert!(rank(&tree, &corpus, "alpha", None, 0).is_empty());
+        assert!(rank(&tree, &corpus, "alpha", None, 0, true, 0.0).is_empty());
+    }
+
+    #[test]
+    fn absorption_can_be_disabled_for_fact_siblings() {
+        let mut files = vec![
+            (
+                "p/SKILL.md".to_string(),
+                skill_file("P", "Deployment topic."),
+            ),
+            (
+                "p/a/SKILL.md".to_string(),
+                skill_file("A", "Deployment fact one."),
+            ),
+            (
+                "p/b/SKILL.md".to_string(),
+                skill_file("B", "Deployment fact two."),
+            ),
+        ];
+        for i in 0..5 {
+            files.push((
+                format!("f{i}.md"),
+                skill_file(&format!("F{i}"), "Unrelated."),
+            ));
+        }
+        let refs: Vec<_> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (_d, tree) = tree_from(&refs);
+        let corpus = lexical_corpus(&tree);
+
+        let absorbed = rank(&tree, &corpus, "deployment", None, 5, true, 0.0);
+        let facts = rank(&tree, &corpus, "deployment", None, 5, false, 0.0);
+        assert_eq!(absorbed.iter().filter(|r| r.id.starts_with("p")).count(), 1);
+        assert_eq!(facts.iter().filter(|r| r.id.starts_with("p")).count(), 3);
+    }
+
+    #[test]
+    fn fusion_changes_order_when_dense_and_lexical_disagree() {
+        let files: Vec<_> = (0..6)
+            .map(|i| {
+                let brief = if i == 1 {
+                    "Needle lexical match."
+                } else {
+                    "Other topic."
+                };
+                (format!("s{i}.md"), skill_file(&format!("S{i}"), brief))
+            })
+            .collect();
+        let refs: Vec<_> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (_d, tree) = tree_from(&refs);
+        let all = tree.all();
+        let vectors: Vec<Vec<f32>> = all
+            .iter()
+            .map(|s| {
+                if s.id == "s0" {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                }
+            })
+            .collect();
+        let corpus: Vec<_> = all
+            .iter()
+            .zip(&vectors)
+            .map(|(skill, v)| Indexed {
+                skill,
+                vector: Some(v.as_slice()),
+            })
+            .collect();
+
+        let dense = rank(&tree, &corpus, "needle", Some(&[1.0, 0.0]), 3, false, 0.0);
+        let fused = rank(&tree, &corpus, "needle", Some(&[1.0, 0.0]), 3, false, 0.5);
+        assert_eq!(dense[0].id, "s0");
+        assert_eq!(fused[0].id, "s1");
     }
 
     #[test]

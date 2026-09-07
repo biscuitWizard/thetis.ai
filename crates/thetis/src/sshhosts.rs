@@ -23,7 +23,7 @@
 //! usable from every other one. `store_path` therefore prefers the directory of
 //! the shared overlay a worker is pointed at over its own worktree.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;

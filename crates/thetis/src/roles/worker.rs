@@ -7,7 +7,7 @@
 //! gateway on the other end of fd 3.
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::os::fd::FromRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -413,7 +413,9 @@ fn spawn_retry_notices(grip: Arc<Grip>) {
                 notice.elapsed.as_secs(),
                 notice.error,
                 left,
-                (u64::from(left) * notice.elapsed.as_secs()).div_ceil(60).max(1),
+                (u64::from(left) * notice.elapsed.as_secs())
+                    .div_ceil(60)
+                    .max(1),
             );
             if let Err(e) = grip
                 .persist
@@ -489,10 +491,35 @@ fn tag_frame(frame: String, tag: &crate::delegation::ChildTag) -> String {
     serde_json::to_string(&value).unwrap_or(frame)
 }
 
+fn frame_note(route: &str, frame: String, gateway: &str) -> serde_json::Value {
+    json!({ "session": route, "frame": frame, "gateway": gateway })
+}
+
+fn sync_renderers(grip: &Arc<Grip>, renderers: &mut Vec<(String, gateway::Renderer)>) {
+    let aspects = grip.gateway_aspects();
+    renderers.retain(|(name, _)| {
+        aspects
+            .iter()
+            .any(|a| matches!(a, crate::aspect::Aspect::Gateway(n) if n == name))
+    });
+    for aspect in aspects {
+        let crate::aspect::Aspect::Gateway(name) = &aspect else {
+            continue;
+        };
+        if !renderers.iter().any(|(existing, _)| existing == name) {
+            renderers.push((
+                name.clone(),
+                gateway::Renderer::for_aspect(grip.clone(), aspect),
+            ));
+        }
+    }
+}
+
 fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
     tokio::spawn(async move {
         let mut events = grip.events_tx.subscribe();
-        let mut renderer = gateway::Renderer::new(grip.clone());
+        let mut renderers = Vec::new();
+        sync_renderers(&grip, &mut renderers);
         loop {
             match events.recv().await {
                 Ok(event) => {
@@ -510,13 +537,15 @@ fn spawn_render_loop(grip: Arc<Grip>, peer: Arc<Peer>) {
                     // child's own id instead would put every sub-agent's work
                     // somewhere nobody has open.
                     let tag = crate::delegation::frame_tag(&grip, &session_id).await;
-                    if let Some(frame) = renderer.render(event).await {
-                        let (route, frame) = match &tag {
-                            Some(tag) => (tag.root_id.clone(), tag_frame(frame, tag)),
-                            None => (session_id, frame),
-                        };
-                        peer.notify("frame", json!({ "session": route, "frame": frame }))
-                            .await;
+                    sync_renderers(&grip, &mut renderers);
+                    for (name, renderer) in &mut renderers {
+                        if let Some(frame) = renderer.render(event.clone()).await {
+                            let (route, frame) = match &tag {
+                                Some(tag) => (tag.root_id.clone(), tag_frame(frame, tag)),
+                                None => (session_id.clone(), frame),
+                            };
+                            peer.notify("frame", frame_note(&route, frame, name)).await;
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
@@ -689,11 +718,17 @@ mod tests {
         // empty speaker into policy resolution.
         assert!(author_on_frame(&json!({ "author": "alice" })).is_none());
         assert!(author_on_frame(&json!({ "author": { "id": "alice" } })).is_none());
-        assert!(
-            author_on_frame(&json!({
-                "author": { "id": "", "display": "Nobody", "surface": "web" }
-            }))
-            .is_none()
+        assert!(author_on_frame(&json!({
+            "author": { "id": "", "display": "Nobody", "surface": "web" }
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn a_frame_note_names_the_gateway_that_rendered_it() {
+        assert_eq!(
+            frame_note("s", "{}".into(), "campaign")["gateway"],
+            "campaign"
         );
     }
 

@@ -12,7 +12,7 @@
 //! worker as a side effect of someone opening a panel.
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::grip::{Grip, Role};
@@ -52,15 +52,13 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
 
     match dispatch(grip, &frame_type, &session, &terminal).await {
         Ok(reply) => vec![reply],
-        Err(e) => vec![
-            json!({
-                "type": frame_type,
-                "session": session,
-                "ok": false,
-                "message": format!("{e:#}"),
-            })
-            .to_string(),
-        ],
+        Err(e) => vec![json!({
+            "type": frame_type,
+            "session": session,
+            "ok": false,
+            "message": format!("{e:#}"),
+        })
+        .to_string()],
     }
 }
 

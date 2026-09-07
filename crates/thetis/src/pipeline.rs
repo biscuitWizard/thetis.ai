@@ -18,7 +18,7 @@
 //! turn already in flight holds its own `Arc` to the old component and finishes
 //! on it; the next call picks up the new one.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use std::time::Instant;
 use wasmtime::component::Component;
@@ -1367,7 +1367,11 @@ mod reset_subject_tests {
 
     #[test]
     fn a_reset_subject_round_trips_through_the_parser() {
-        for aspect in [Aspect::Agent, Aspect::gateway("web"), Aspect::tool("moo-server-info")] {
+        for aspect in [
+            Aspect::Agent,
+            Aspect::gateway("web"),
+            Aspect::tool("moo-server-info"),
+        ] {
             let subject = reset_commit_message(&aspect, "7ab6e96c287b");
             let (parsed, short) = parse_reset_commit(&subject).expect("parses");
             assert_eq!(parsed, aspect);

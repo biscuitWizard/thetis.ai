@@ -1397,11 +1397,9 @@ mod tests {
 
         // The live server really was the one that served it.
         let request = server.await.unwrap();
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .starts_with("post /v1/chat/completions")
-        );
+        assert!(request
+            .to_ascii_lowercase()
+            .starts_with("post /v1/chat/completions"));
     }
 
     #[test]
@@ -1757,11 +1755,9 @@ mod tests {
             "data: [DONE]\n\n",
         ))
         .await;
-        assert!(
-            !chunks
-                .iter()
-                .any(|c| matches!(c, StreamChunk::Reasoning(_)))
-        );
+        assert!(!chunks
+            .iter()
+            .any(|c| matches!(c, StreamChunk::Reasoning(_))));
     }
 
     /// A slow reasoning model can stream for longer than the timeout while
@@ -2144,11 +2140,9 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
                    data: [DONE]\n";
         let chunks = drain(sse).await;
-        assert!(
-            chunks
-                .iter()
-                .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok"))
-        );
+        assert!(chunks
+            .iter()
+            .any(|c| matches!(c, StreamChunk::Delta(d) if d == "ok")));
     }
 
     #[test]

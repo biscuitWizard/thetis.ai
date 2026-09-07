@@ -16,7 +16,7 @@
 //! be fetched from anywhere, or point back into the host filesystem, which is a
 //! different question from "may this tool use a crate".
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
@@ -325,22 +325,18 @@ opt-level = "s"
     fn removes_any_dependency_including_wit_bindgen() {
         let dir = scratch();
         remove(dir.path(), "serde_json").unwrap();
-        assert!(
-            !list(dir.path())
-                .unwrap()
-                .iter()
-                .any(|d| d.name == "serde_json")
-        );
+        assert!(!list(dir.path())
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "serde_json"));
 
         // The crate stops being a component without it. That shows up as a
         // failed build with the reason attached, not as a refusal here.
         remove(dir.path(), "wit-bindgen").unwrap();
-        assert!(
-            !list(dir.path())
-                .unwrap()
-                .iter()
-                .any(|d| d.name == "wit-bindgen")
-        );
+        assert!(!list(dir.path())
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "wit-bindgen"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! Merging to trunk is deliberately not here: trunk only ever moves in the
 //! gateway, by fast-forward, on a human's say-so.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use std::sync::Arc;
 
 use crate::bindings::branch::{BranchState, CommitInfo};

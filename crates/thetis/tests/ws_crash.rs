@@ -75,7 +75,10 @@ async fn a_worker_crash_mid_turn_is_resumed() {
             .then(|| f["kind"] == "turn-finished")
     })
     .await;
-    assert!(finished, "the resumed turn should finish, not raise an incident");
+    assert!(
+        finished,
+        "the resumed turn should finish, not raise an incident"
+    );
 }
 
 async fn wait_for<T>(

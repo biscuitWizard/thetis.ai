@@ -83,7 +83,9 @@ fn session_for(store: &Store, key: &str) -> String {
         .create_session(Some(format!("Discord {key}")), "chat", "discord:test")
         .unwrap();
     store.set_ceiling(&meta.id, &discord_ceiling()).unwrap();
-    store.kv_put(SCOPE, &session_map_key(key), &meta.id).unwrap();
+    store
+        .kv_put(SCOPE, &session_map_key(key), &meta.id)
+        .unwrap();
     meta.id
 }
 
@@ -227,7 +229,10 @@ fn only_the_authorising_account_is_routed_to_the_fork() {
     assert_eq!(route_for(&store, key, "reader").unwrap(), read_only);
     // An unbound Discord identity resolves to a synthetic owner, which is
     // refused even though it is the only "account" it has.
-    assert_eq!(route_for(&store, key, "discord:channel:c1").unwrap(), read_only);
+    assert_eq!(
+        route_for(&store, key, "discord:channel:c1").unwrap(),
+        read_only
+    );
 }
 
 #[test]
@@ -379,7 +384,9 @@ fn a_conversation_that_lost_its_ceiling_is_repaired_before_it_is_reused() {
     let legacy = store
         .create_session(Some("Discord (old)".into()), "chat", "discord:test")
         .unwrap();
-    store.kv_put(SCOPE, &session_map_key(key), &legacy.id).unwrap();
+    store
+        .kv_put(SCOPE, &session_map_key(key), &legacy.id)
+        .unwrap();
     assert!(
         store.ceiling_of(&legacy.id).unwrap().is_none(),
         "the premise: nothing narrows this conversation"
@@ -390,7 +397,10 @@ fn a_conversation_that_lost_its_ceiling_is_repaired_before_it_is_reused() {
     let again = session_for(&store, key);
     assert_eq!(again, legacy.id, "the transcript is kept, not abandoned");
     let restored = store.ceiling_of(&legacy.id).unwrap().expect("restamped");
-    assert!(restored.read_only, "the repair must be the read-only default");
+    assert!(
+        restored.read_only,
+        "the repair must be the read-only default"
+    );
     assert!(restored.denies(Cap::Delegation));
 }
 

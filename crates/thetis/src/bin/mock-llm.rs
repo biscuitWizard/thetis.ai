@@ -21,6 +21,8 @@ use axum::response::sse::{Event, Sse};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures_util::stream::Stream;
+use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::time::Duration;
@@ -35,7 +37,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn completions(Json(body): Json<Value>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn completions(
+    Json(body): Json<Value>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let last_user_content = body
         .get("messages")
         .and_then(Value::as_array)
@@ -54,9 +58,10 @@ async fn completions(Json(body): Json<Value>) -> Sse<impl Stream<Item = Result<E
     let system_prompt = body
         .get("messages")
         .and_then(Value::as_array)
-        .and_then(|msgs| msgs.iter().find(|m| {
-            m.get("role").and_then(Value::as_str) == Some("system")
-        }))
+        .and_then(|msgs| {
+            msgs.iter()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        })
         .and_then(|m| m.get("content").and_then(Value::as_str))
         .unwrap_or("")
         .to_string();
@@ -67,9 +72,7 @@ async fn completions(Json(body): Json<Value>) -> Sse<impl Stream<Item = Result<E
         .map(|tools| {
             tools
                 .iter()
-                .filter_map(|t| {
-                    t.get("function")?.get("name")?.as_str().map(str::to_string)
-                })
+                .filter_map(|t| t.get("function")?.get("name")?.as_str().map(str::to_string))
                 .collect()
         })
         .unwrap_or_default();
@@ -86,8 +89,13 @@ async fn completions(Json(body): Json<Value>) -> Sse<impl Stream<Item = Result<E
 
     let script = if already_used_tool {
         Script::Text("Done — I used a tool and here is the result.".into(), false)
+    } else if let Some(script) = scripted_reply(&text) {
+        script
     } else if last_user.contains("remember") {
-        Script::ToolCall("remember", json!({ "key": "note", "value": "the user said remember" }))
+        Script::ToolCall(
+            "remember",
+            json!({ "key": "note", "value": "the user said remember" }),
+        )
     } else if last_user.contains("recall") {
         Script::ToolCall("recall", json!({}))
     } else if last_user.contains("slow") {
@@ -266,10 +274,59 @@ fn body_preview(text: &str) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ScriptRule {
+    when: String,
+    reply: ScriptReply,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptReply {
+    text: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ScriptToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptToolCall {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+fn scripted_reply(last_user: &str) -> Option<Script> {
+    let path = std::env::var("MOCK_LLM_SCRIPT").ok()?;
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read MOCK_LLM_SCRIPT {path}: {e}"));
+    let rules: Vec<ScriptRule> = serde_json::from_str(&source)
+        .unwrap_or_else(|e| panic!("invalid MOCK_LLM_SCRIPT {path}: {e}"));
+    match_script(&rules, last_user)
+}
+
+fn match_script(rules: &[ScriptRule], last_user: &str) -> Option<Script> {
+    rules.iter().find_map(|rule| {
+        let regex = Regex::new(&rule.when)
+            .unwrap_or_else(|e| panic!("invalid MOCK_LLM_SCRIPT regex {:?}: {e}", rule.when));
+        regex.is_match(last_user).then(|| Script::Scripted {
+            text: rule.reply.text.clone(),
+            tool_calls: rule
+                .reply
+                .tool_calls
+                .iter()
+                .map(|call| (call.name.clone(), call.arguments.clone()))
+                .collect(),
+        })
+    })
+}
+
 enum Script {
     /// Reply text, and whether to stream it slowly.
     Text(String, bool),
     ToolCall(&'static str, Value),
+    Scripted {
+        text: Option<String>,
+        tool_calls: Vec<(String, Value)>,
+    },
 }
 
 impl Script {
@@ -277,6 +334,7 @@ impl Script {
         let frames = match self {
             Script::Text(text, slow) => text_frames(&text, slow),
             Script::ToolCall(name, args) => tool_frames(name, &args),
+            Script::Scripted { text, tool_calls } => scripted_frames(text.as_deref(), &tool_calls),
         };
 
         futures_util::stream::unfold(frames.into_iter(), |mut it| async move {
@@ -325,6 +383,38 @@ fn text_frames(text: &str, slow: bool) -> Vec<(String, Duration)> {
     frames
 }
 
+fn scripted_frames(text: Option<&str>, tool_calls: &[(String, Value)]) -> Vec<(String, Duration)> {
+    let mut frames = Vec::new();
+    if let Some(text) = text {
+        if !text.is_empty() {
+            frames.push((chunk(json!({ "content": text }), None), Duration::ZERO));
+        }
+    }
+    for (index, (name, arguments)) in tool_calls.iter().enumerate() {
+        frames.push((
+            chunk(
+                json!({ "tool_calls": [{
+                    "index": index,
+                    "id": format!("call_mock_{}", index + 1),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() },
+                }]}),
+                None,
+            ),
+            Duration::ZERO,
+        ));
+    }
+    let finish = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    frames.push((chunk(json!({}), Some(finish)), Duration::ZERO));
+    frames.push((usage_chunk(), Duration::ZERO));
+    frames.push(("[DONE]".to_string(), Duration::ZERO));
+    frames
+}
+
 fn tool_frames(name: &str, args: &Value) -> Vec<(String, Duration)> {
     let args_text = args.to_string();
     // Split the arguments mid-string to prove the host reassembles fragments.
@@ -357,4 +447,36 @@ fn tool_frames(name: &str, args: &Value) -> Vec<(String, Duration)> {
         (usage_chunk(), Duration::ZERO),
         ("[DONE]".to_string(), Duration::ZERO),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scripted_rules_use_first_regex_match() {
+        let rules: Vec<ScriptRule> = serde_json::from_value(json!([
+            {
+                "when": "(?i)attack.*guard",
+                "reply": { "text": "first", "tool_calls": [{
+                    "name": "rpg-check",
+                    "arguments": { "skill": "melee", "difficulty": "hard" }
+                }] }
+            },
+            { "when": "guard", "reply": { "text": "second" } }
+        ]))
+        .unwrap();
+
+        let matched = match_script(&rules, "I ATTACK the guard").expect("rule should match");
+        match matched {
+            Script::Scripted { text, tool_calls } => {
+                assert_eq!(text.as_deref(), Some("first"));
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].0, "rpg-check");
+                assert_eq!(tool_calls[0].1["skill"], "melee");
+            }
+            _ => panic!("expected scripted reply"),
+        }
+        assert!(match_script(&rules, "I leave quietly").is_none());
+    }
 }

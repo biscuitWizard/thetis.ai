@@ -8,7 +8,7 @@
 //! an `Arc<Grip>`. It owns the database, the LLM client, the component
 //! registry, and the event fan-out to connected browsers.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -74,6 +74,8 @@ impl std::fmt::Display for TurnError {
 pub struct RenderedFrame {
     pub session_id: String,
     pub frame: String,
+    /// `None` is a host-rendered frame and is visible on every gateway socket.
+    pub gateway: Option<String>,
 }
 
 pub struct Grip {
@@ -100,6 +102,8 @@ pub struct Grip {
     pub events_tx: broadcast::Sender<OutboundEvent>,
     /// Rendered frames, consumed by websocket connections.
     pub frames_tx: broadcast::Sender<RenderedFrame>,
+    /// Secondary gateway mounts, refreshed on configuration reload.
+    mounts: arc_swap::ArcSwap<Vec<crate::mounts::GatewayMount>>,
     /// What each conversation is doing right now, folded from those frames,
     /// for sidebars that are not watching it. See `activity.rs`.
     pub activity: crate::activity::Activity,
@@ -265,7 +269,11 @@ impl ReloadReport {
             parts.push(format!(
                 "{} need{} a restart: {}",
                 self.pending_restart.len(),
-                if self.pending_restart.len() == 1 { "s" } else { "" },
+                if self.pending_restart.len() == 1 {
+                    "s"
+                } else {
+                    ""
+                },
                 self.pending_restart.join(", ")
             ));
         }
@@ -292,6 +300,25 @@ impl Grip {
         self.config.load_full()
     }
 
+    pub fn mounts(&self) -> Arc<Vec<crate::mounts::GatewayMount>> {
+        self.mounts.load_full()
+    }
+
+    pub fn primary_gateway_name(&self) -> String {
+        self.cfg().primary_gateway.clone()
+    }
+
+    pub fn gateway_aspects(&self) -> Vec<Aspect> {
+        let mut aspects = vec![Aspect::gateway(&self.cfg().primary_gateway)];
+        for mount in self.mounts().iter() {
+            let aspect = mount.aspect();
+            if !aspects.contains(&aspect) {
+                aspects.push(aspect);
+            }
+        }
+        aspects
+    }
+
     /// Reads the configuration files again and puts the result in force.
     ///
     /// The same load as at boot — same root, same files, same environment —
@@ -308,6 +335,17 @@ impl Grip {
     /// local overlay is shared and reaches it at once.
     pub async fn reload_config(self: &Arc<Self>) -> anyhow::Result<ReloadReport> {
         let fresh = Arc::new(Config::load()?);
+        let fresh_mounts = crate::mounts::discover(&fresh);
+        let current_mounts = self.mounts();
+        let old_paths: Vec<_> = current_mounts
+            .iter()
+            .map(|m| (&m.gateway, &m.path))
+            .collect();
+        let new_paths: Vec<_> = fresh_mounts.iter().map(|m| (&m.gateway, &m.path)).collect();
+        if old_paths != new_paths {
+            tracing::warn!("gateway mount paths changed; restart required for HTTP routes");
+        }
+        self.mounts.store(Arc::new(fresh_mounts));
         let snapshot = crate::settings::snapshot(&fresh)?;
         let mut report = ReloadReport::default();
         {
@@ -324,15 +362,24 @@ impl Grip {
             state.current = snapshot;
         }
         self.config.store(fresh);
+        // A reload is also the explicit rescan signal for skills written by an
+        // importer or editor outside the host APIs.
+        self.skills.invalidate();
         if !report.applied.is_empty() {
             tracing::warn!(applied = %report.applied.join(", "), "configuration reloaded");
         }
 
         if let Role::Gateway(router) = &self.role {
             for session in router.live_sessions().await {
-                let Some(peer) = router.live_peer(&session).await else { continue };
+                let Some(peer) = router.live_peer(&session).await else {
+                    continue;
+                };
                 match peer
-                    .call_within("config.reload", serde_json::Value::Null, std::time::Duration::from_secs(10))
+                    .call_within(
+                        "config.reload",
+                        serde_json::Value::Null,
+                        std::time::Duration::from_secs(10),
+                    )
                     .await
                 {
                     Ok(_) => report.workers_reloaded += 1,
@@ -399,6 +446,7 @@ impl Grip {
         };
         let (events_tx, _) = broadcast::channel(1024);
         let (frames_tx, _) = broadcast::channel(1024);
+        let mounts = crate::mounts::discover(&cfg);
 
         let revisions = Arc::new(Revisions::new(cfg.clone(), persist.clone()));
         let skills = Arc::new(crate::skill_manager::SkillManager::new(
@@ -429,6 +477,7 @@ impl Grip {
             builder: Arc::new(Builder::new()),
             events_tx,
             frames_tx,
+            mounts: arc_swap::ArcSwap::from_pointee(mounts),
             activity: crate::activity::Activity::new(),
             sessions: SessionActors::new(),
             terminals: crate::terminal::Terminals::new(),

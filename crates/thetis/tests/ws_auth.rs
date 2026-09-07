@@ -29,12 +29,10 @@ struct Env {
 }
 
 fn env() -> Option<Env> {
-    let ws_url = std::env::var("THETIS_WS_URL").ok().filter(|v| !v.trim().is_empty())?;
-    let authority = ws_url
-        .strip_prefix("ws://")?
-        .split('/')
-        .next()?
-        .to_string();
+    let ws_url = std::env::var("THETIS_WS_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
+    let authority = ws_url.strip_prefix("ws://")?.split('/').next()?.to_string();
     let pair = |key: &str| -> Option<(String, String)> {
         let raw = std::env::var(key).ok()?;
         let (u, p) = raw.split_once(':')?;
@@ -76,11 +74,20 @@ impl Reply {
 
 /// One plain HTTP/1.1 exchange. Hand-rolled because the crate has no HTTP
 /// client dependency and this is four lines of protocol.
-async fn http(env: &Env, method: &str, path: &str, cookie: Option<&str>, form: Option<&str>) -> Reply {
+async fn http(
+    env: &Env,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    form: Option<&str>,
+) -> Reply {
     let mut stream = tokio::net::TcpStream::connect(&env.authority)
         .await
         .expect("connecting to the gateway");
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n", env.authority);
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n",
+        env.authority
+    );
     if let Some(c) = cookie {
         req.push_str(&format!("Cookie: thetis_session={c}\r\n"));
     }
@@ -110,7 +117,11 @@ async fn http(env: &Env, method: &str, path: &str, cookie: Option<&str>, form: O
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect();
-    Reply { status, headers, body: body.to_string() }
+    Reply {
+        status,
+        headers,
+        body: body.to_string(),
+    }
 }
 
 fn urlencode(s: &str) -> String {
@@ -126,13 +137,16 @@ fn urlencode(s: &str) -> String {
 }
 
 async fn login(env: &Env, user: &str, password: &str) -> Reply {
-    let form = format!("user={}&password={}&next=%2F", urlencode(user), urlencode(password));
+    let form = format!(
+        "user={}&password={}&next=%2F",
+        urlencode(user),
+        urlencode(password)
+    );
     http(env, "POST", "/login", None, Some(&form)).await
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect(env: &Env, cookie: Option<&str>) -> Result<Socket, u16> {
     let mut req = env.ws_url.as_str().into_client_request().unwrap();
@@ -155,7 +169,11 @@ async fn send(socket: &mut Socket, frame: Value) {
 }
 
 /// Reads frames until `pick` returns something, or gives up after a while.
-async fn wait_for<T>(socket: &mut Socket, what: &str, mut pick: impl FnMut(&Value) -> Option<T>) -> T {
+async fn wait_for<T>(
+    socket: &mut Socket,
+    what: &str,
+    mut pick: impl FnMut(&Value) -> Option<T>,
+) -> T {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -183,7 +201,11 @@ async fn listed(socket: &mut Socket, all: Option<bool>) -> Vec<String> {
         (f["type"] == "sessions").then(|| {
             f["sessions"]
                 .as_array()
-                .map(|s| s.iter().filter_map(|x| x["id"].as_str().map(str::to_string)).collect())
+                .map(|s| {
+                    s.iter()
+                        .filter_map(|x| x["id"].as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default()
         })
     })
@@ -202,12 +224,18 @@ async fn open_new(socket: &mut Socket, title: &str) -> String {
 #[ignore]
 async fn two_accounts_are_kept_apart() {
     let Some(env) = env() else {
-        eprintln!("skipped: set THETIS_WS_URL, THETIS_AUTH_ADMIN=user:pw and THETIS_AUTH_USER=user:pw");
+        eprintln!(
+            "skipped: set THETIS_WS_URL, THETIS_AUTH_ADMIN=user:pw and THETIS_AUTH_USER=user:pw"
+        );
         return;
     };
 
     // --- the door ---------------------------------------------------------
-    assert_eq!(connect(&env, None).await.err(), Some(401), "no cookie, no socket");
+    assert_eq!(
+        connect(&env, None).await.err(),
+        Some(401),
+        "no cookie, no socket"
+    );
     assert_eq!(connect(&env, Some("not-a-token")).await.err(), Some(401));
     let me = http(&env, "GET", "/api/me", None, None).await;
     assert_eq!(me.status, 401);
@@ -218,13 +246,20 @@ async fn two_accounts_are_kept_apart() {
     assert!(bad.cookie().is_none(), "no cookie on a refusal");
 
     let admin = login(&env, &env.admin.0, &env.admin.1).await;
-    assert!(matches!(admin.status, 302 | 303), "login redirects: {}", admin.status);
+    assert!(
+        matches!(admin.status, 302 | 303),
+        "login redirects: {}",
+        admin.status
+    );
     assert_eq!(admin.header("location"), Some("/"));
     let admin_cookie = admin.cookie().expect("the admin got a cookie");
     let user = login(&env, &env.user.0, &env.user.1).await;
     let user_cookie = user.cookie().expect("the user got a cookie");
     let raw = user.header("set-cookie").unwrap();
-    assert!(raw.contains("HttpOnly") && raw.contains("SameSite=Lax"), "{raw}");
+    assert!(
+        raw.contains("HttpOnly") && raw.contains("SameSite=Lax"),
+        "{raw}"
+    );
 
     // --- who am I ----------------------------------------------------------
     let me = http(&env, "GET", "/api/me", Some(&user_cookie), None).await;
@@ -235,24 +270,44 @@ async fn two_accounts_are_kept_apart() {
     assert_eq!(me["local"], false);
     assert!(me["denied"].is_array());
     let me_admin: Value = serde_json::from_str(
-        &http(&env, "GET", "/api/me", Some(&admin_cookie), None).await.body,
+        &http(&env, "GET", "/api/me", Some(&admin_cookie), None)
+            .await
+            .body,
     )
     .unwrap();
     assert_eq!(me_admin["admin"], true);
 
     // --- the admin gate ----------------------------------------------------
-    assert_eq!(http(&env, "GET", "/admin", Some(&user_cookie), None).await.status, 403);
-    assert_eq!(http(&env, "GET", "/admin", Some(&admin_cookie), None).await.status, 200);
+    assert_eq!(
+        http(&env, "GET", "/admin", Some(&user_cookie), None)
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        http(&env, "GET", "/admin", Some(&admin_cookie), None)
+            .await
+            .status,
+        200
+    );
     assert_eq!(http(&env, "GET", "/admin", None, None).await.status, 401);
 
     // --- two sockets, two sidebars -------------------------------------------
-    let mut a = connect(&env, Some(&admin_cookie)).await.expect("admin socket");
-    let mut b = connect(&env, Some(&user_cookie)).await.expect("user socket");
+    let mut a = connect(&env, Some(&admin_cookie))
+        .await
+        .expect("admin socket");
+    let mut b = connect(&env, Some(&user_cookie))
+        .await
+        .expect("user socket");
     let who = wait_for(&mut b, "the user frame", |f| {
         (f["type"] == "user").then(|| f["id"].as_str().unwrap_or("").to_string())
     })
     .await;
-    assert_eq!(who, env.user.0.to_lowercase(), "the first frame says who the socket is for");
+    assert_eq!(
+        who,
+        env.user.0.to_lowercase(),
+        "the first frame says who the socket is for"
+    );
     let admin_sees_all = wait_for(&mut a, "the admin's user frame", |f| {
         (f["type"] == "user").then(|| f["see_all"].as_bool().unwrap_or(false))
     })
@@ -265,22 +320,39 @@ async fn two_accounts_are_kept_apart() {
     assert!(!mine_a.is_empty() && !mine_b.is_empty());
 
     let seen_by_b = listed(&mut b, None).await;
-    assert!(seen_by_b.contains(&mine_b), "the user sees their own conversation");
-    assert!(!seen_by_b.contains(&mine_a), "the user does not see the admin's");
+    assert!(
+        seen_by_b.contains(&mine_b),
+        "the user sees their own conversation"
+    );
+    assert!(
+        !seen_by_b.contains(&mine_a),
+        "the user does not see the admin's"
+    );
     let seen_by_a = listed(&mut a, None).await;
     assert!(seen_by_a.contains(&mine_a));
-    assert!(!seen_by_a.contains(&mine_b), "the admin's sidebar is personal by default");
+    assert!(
+        !seen_by_a.contains(&mine_b),
+        "the admin's sidebar is personal by default"
+    );
 
     // With the grant, the switch works and is per connection: on, the admin
     // sees the user's conversation; off again, the sidebar is personal.
     if admin_sees_all {
         let everyone = listed(&mut a, Some(true)).await;
-        assert!(everyone.contains(&mine_b), "see-all shows the user's conversation");
+        assert!(
+            everyone.contains(&mine_b),
+            "see-all shows the user's conversation"
+        );
         let personal = listed(&mut a, Some(false)).await;
         assert!(!personal.contains(&mine_b), "and off again it is gone");
-        let mut a2 = connect(&env, Some(&admin_cookie)).await.expect("a second admin socket");
+        let mut a2 = connect(&env, Some(&admin_cookie))
+            .await
+            .expect("a second admin socket");
         wait_for(&mut a2, "user", |f| (f["type"] == "user").then_some(())).await;
-        assert!(!listed(&mut a2, None).await.contains(&mine_b), "a fresh socket starts personal");
+        assert!(
+            !listed(&mut a2, None).await.contains(&mine_b),
+            "a fresh socket starts personal"
+        );
         let _ = a2.close(None).await;
     } else {
         eprintln!("note: the admin's role lacks see_all_sessions; the switch is not exercised");
@@ -292,7 +364,13 @@ async fn two_accounts_are_kept_apart() {
         if f["type"] == "error" {
             Some(true)
         } else if f["type"] == "sessions" {
-            Some(f["sessions"].as_array().unwrap().iter().any(|s| s["id"] == mine_a.as_str()))
+            Some(
+                f["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["id"] == mine_a.as_str()),
+            )
         } else {
             None
         }
@@ -307,12 +385,21 @@ async fn two_accounts_are_kept_apart() {
     })
     .await;
     assert!(
-        message.contains("not yours") || message.contains("another user") || message.contains("no such"),
+        message.contains("not yours")
+            || message.contains("another user")
+            || message.contains("no such"),
         "{message}"
     );
     // A rename by id is refused the same way.
-    send(&mut b, serde_json::json!({ "type": "rename", "id": mine_a, "title": "hijacked" })).await;
-    wait_for(&mut b, "an error for the foreign rename", |f| (f["type"] == "error").then_some(())).await;
+    send(
+        &mut b,
+        serde_json::json!({ "type": "rename", "id": mine_a, "title": "hijacked" }),
+    )
+    .await;
+    wait_for(&mut b, "an error for the foreign rename", |f| {
+        (f["type"] == "error").then_some(())
+    })
+    .await;
     let still = listed(&mut a, None).await;
     assert!(still.contains(&mine_a));
 
@@ -320,10 +407,21 @@ async fn two_accounts_are_kept_apart() {
     let out = http(&env, "POST", "/logout", Some(&user_cookie), None).await;
     assert!(matches!(out.status, 302 | 303), "{}", out.status);
     assert_eq!(out.header("location"), Some("/login"));
-    assert_eq!(http(&env, "GET", "/api/me", Some(&user_cookie), None).await.status, 401, "the login is gone");
+    assert_eq!(
+        http(&env, "GET", "/api/me", Some(&user_cookie), None)
+            .await
+            .status,
+        401,
+        "the login is gone"
+    );
     assert_eq!(connect(&env, Some(&user_cookie)).await.err(), Some(401));
     // The admin is unaffected.
-    assert_eq!(http(&env, "GET", "/api/me", Some(&admin_cookie), None).await.status, 200);
+    assert_eq!(
+        http(&env, "GET", "/api/me", Some(&admin_cookie), None)
+            .await
+            .status,
+        200
+    );
 
     let _ = a.close(None).await;
     let _ = b.close(None).await;

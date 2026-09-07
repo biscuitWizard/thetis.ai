@@ -25,8 +25,12 @@ struct Env {
 }
 
 fn env() -> Option<Env> {
-    let url = std::env::var("THETIS_WS_URL").ok().filter(|v| !v.is_empty())?;
-    let root = std::env::var("THETIS_SMOKE_ROOT").ok().filter(|v| !v.is_empty())?;
+    let url = std::env::var("THETIS_WS_URL")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    let root = std::env::var("THETIS_SMOKE_ROOT")
+        .ok()
+        .filter(|v| !v.is_empty())?;
     Some(Env {
         url,
         root: root.into(),
@@ -47,7 +51,9 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
 
     // A fresh conversation has no branch yet.
     socket
-        .send(Message::Text(r#"{"type":"new","title":"ws-branch smoke"}"#.into()))
+        .send(Message::Text(
+            r#"{"type":"new","title":"ws-branch smoke"}"#.into(),
+        ))
         .await
         .unwrap();
     let session = wait_for(&mut socket, "a session id", 30, |f| {
@@ -55,7 +61,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     })
     .await;
 
-    send(&mut socket, json!({ "type": "branch-status", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-status", "id": session }),
+    )
+    .await;
     let unmaterialized = wait_for(&mut socket, "pre-branch status", 30, |f| {
         (f["type"] == "branch-status").then(|| f["materialized"].as_bool().unwrap_or(true))
     })
@@ -63,7 +73,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     assert!(!unmaterialized, "no branch before the first message");
 
     // The graph is present before the branch exists: trunk rail only.
-    send(&mut socket, json!({ "type": "branch-graph", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-graph", "id": session }),
+    )
+    .await;
     let graph = wait_for(&mut socket, "the pre-branch graph", 30, |f| {
         (f["type"] == "branch-graph").then(|| f.clone())
     })
@@ -75,9 +89,14 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     );
 
     // The starting-point picker's data source works.
-    send(&mut socket, json!({ "type": "branch-trunk-log", "limit": 5 })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-trunk-log", "limit": 5 }),
+    )
+    .await;
     let trunk_commits = wait_for(&mut socket, "trunk log", 30, |f| {
-        (f["type"] == "branch-trunk-log").then(|| f["commits"].as_array().map(Vec::len).unwrap_or(0))
+        (f["type"] == "branch-trunk-log")
+            .then(|| f["commits"].as_array().map(Vec::len).unwrap_or(0))
     })
     .await;
     assert!(trunk_commits > 0, "trunk has history to offer");
@@ -93,7 +112,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     })
     .await;
 
-    send(&mut socket, json!({ "type": "branch-status", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-status", "id": session }),
+    )
+    .await;
     let status = wait_for(&mut socket, "materialized status", 60, |f| {
         (f["type"] == "branch-status" && f["materialized"] == true).then(|| f.clone())
     })
@@ -102,7 +125,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     assert!(branch.starts_with("conv/"), "branch is {branch}");
 
     // The graph now has the branch lane, forked at a real base.
-    send(&mut socket, json!({ "type": "branch-graph", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-graph", "id": session }),
+    )
+    .await;
     let graph = wait_for(&mut socket, "the materialized graph", 30, |f| {
         (f["type"] == "branch-graph" && !f["branch_name"].is_null()).then(|| f.clone())
     })
@@ -113,7 +140,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     // Work lands in the branch: put a skill file into the worktree and let
     // the turn-end checkpoint commit it.
     let worktree = env.root.join("worktrees").join(branch.replace('/', "-"));
-    assert!(worktree.is_dir(), "worktree exists at {}", worktree.display());
+    assert!(
+        worktree.is_dir(),
+        "worktree exists at {}",
+        worktree.display()
+    );
     let skill_dir = worktree.join("skills").join("smoke-note");
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(
@@ -132,7 +163,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     })
     .await;
 
-    send(&mut socket, json!({ "type": "branch-status", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-status", "id": session }),
+    )
+    .await;
     let ahead = wait_for(&mut socket, "the branch to be ahead", 60, |f| {
         (f["type"] == "branch-status" && f["ahead"].as_u64().unwrap_or(0) > 0)
             .then(|| f["ahead"].as_u64().unwrap())
@@ -141,9 +176,14 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     assert!(ahead >= 1, "the checkpoint committed the skill");
 
     // Merge to trunk: fast-forward, then the branch is in step again.
-    send(&mut socket, json!({ "type": "branch-merge", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-merge", "id": session }),
+    )
+    .await;
     let merged = wait_for(&mut socket, "the merge result", 120, |f| {
-        (f["type"] == "branch-result" && f["op"] == "merge").then(|| f["ok"].as_bool().unwrap_or(false))
+        (f["type"] == "branch-result" && f["op"] == "merge")
+            .then(|| f["ok"].as_bool().unwrap_or(false))
     })
     .await;
     assert!(merged, "the merge fast-forwarded");
@@ -154,7 +194,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
 
     // The merge is squashed: the branch's turn checkpoints do not reach trunk,
     // and it is left exactly one commit ahead of where it forked.
-    send(&mut socket, json!({ "type": "branch-status", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-status", "id": session }),
+    )
+    .await;
     let after_merge = wait_for(&mut socket, "post-merge status", 60, |f| {
         (f["type"] == "branch-status" && f["materialized"] == true).then(|| f.clone())
     })
@@ -195,7 +239,11 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     })
     .await;
 
-    send(&mut socket, json!({ "type": "branch-update", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-update", "id": session }),
+    )
+    .await;
     let conflicts = wait_for(&mut socket, "the conflicted update", 120, |f| {
         (f["type"] == "branch-result" && f["op"] == "update")
             .then(|| f["conflicts"].as_array().map(Vec::len).unwrap_or(0))
@@ -207,13 +255,21 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     assert!(text.contains("<<<<<<<"), "markers are in the working tree");
 
     // Abort restores the pre-merge branch.
-    send(&mut socket, json!({ "type": "branch-abort", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-abort", "id": session }),
+    )
+    .await;
     wait_for(&mut socket, "the abort result", 60, |f| {
-        (f["type"] == "branch-result" && f["op"] == "abort").then(|| assert!(f["ok"].as_bool().unwrap()))
+        (f["type"] == "branch-result" && f["op"] == "abort")
+            .then(|| assert!(f["ok"].as_bool().unwrap()))
     })
     .await;
     let text = std::fs::read_to_string(worktree.join("skills/smoke-note/SKILL.md")).unwrap();
-    assert!(text.contains("The branch's version"), "abort restored the branch side");
+    assert!(
+        text.contains("The branch's version"),
+        "abort restored the branch side"
+    );
 
     // Reset restores an earlier state, as a new commit.
     send(&mut socket, json!({ "type": "branch-log", "id": session })).await;
@@ -229,7 +285,8 @@ async fn a_conversation_branches_works_merges_and_survives_conflicts() {
     )
     .await;
     wait_for(&mut socket, "the reset result", 120, |f| {
-        (f["type"] == "branch-result" && f["op"] == "reset").then(|| assert!(f["ok"].as_bool().unwrap()))
+        (f["type"] == "branch-result" && f["op"] == "reset")
+            .then(|| assert!(f["ok"].as_bool().unwrap()))
     })
     .await;
 }

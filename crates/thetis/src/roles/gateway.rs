@@ -184,8 +184,12 @@ pub async fn run() -> Result<()> {
 /// registry for deployments whose cache has not been populated yet, and to
 /// the host-rendered page when neither has anything.
 pub async fn load_ui_gateway(grip: &Arc<Grip>) {
-    let aspect = Aspect::gateway(&grip.cfg().primary_gateway);
+    for aspect in grip.gateway_aspects() {
+        load_gateway(grip, aspect).await;
+    }
+}
 
+async fn load_gateway(grip: &Arc<Grip>, aspect: Aspect) {
     let trunk = crate::gitctl::GitCtl::new(grip.cfg().root.clone());
     if let Some(key) = crate::pipeline::cache_key_with(&trunk, &grip.cfg(), "HEAD", &aspect).await {
         if let Ok(Some(meta)) = grip.buildcache.lookup(&aspect.key(), &key) {

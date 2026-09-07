@@ -174,16 +174,28 @@ fn is_mutating(name: &str) -> bool {
 /// along with everything else opaque.
 const READ_ONLY_CAP: &str = "read-only";
 
+/// The capability string a tool component uses to declare that a successful
+/// invocation ends the current turn.
+pub const ENDS_TURN_CAP: &str = "ends-turn";
+
+fn declares(manifests: &[ToolManifest], name: &str, cap: &str) -> bool {
+    manifests.iter().any(|m| m.name == name && m.capabilities.iter().any(|c| c == cap))
+}
+
+fn component_declares(name: &str, cap: &str) -> bool {
+    declares(&tooling::registry(), name, cap)
+}
+
 /// Whether a hot-loaded component declares itself read-safe.
 ///
 /// Unknown names answer `false`: a tool that is not in the registry cannot have
 /// declared anything, and guessing in its favour would be the wrong default.
 fn component_read_safe(name: &str) -> bool {
-    tooling::registry()
-        .into_iter()
-        .find(|m| m.name == name)
-        .map(|m| m.capabilities.iter().any(|c| c == READ_ONLY_CAP))
-        .unwrap_or(false)
+    component_declares(name, READ_ONLY_CAP)
+}
+
+pub fn ends_turn(name: &str) -> bool {
+    name == ASK_USER || component_declares(name, ENDS_TURN_CAP)
 }
 
 /// Every built-in the agent knows about, whether or not it is currently
@@ -829,6 +841,8 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
                 json!({
                     "query": string_prop("What you are trying to do, in natural language."),
                     "limit": { "type": "integer", "description": "How many to return; omit for the configured default." },
+                    "prefix": string_prop("Restrict results to this skill id subtree; omit for the whole corpus."),
+                    "absorb": { "type": "boolean", "description": "Whether parents absorb matching children and are promoted. Defaults to true." },
                 }),
                 &["query"],
             ),
@@ -1867,10 +1881,22 @@ pub fn invoke(session_id: &str, mode: &str, name: &str, args_json: &str) -> Resu
         .map(format_skill_body),
         "skill_search" => {
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as u32;
-            Ok(format_skill_cards(&skills::search(
-                &req_str(&args, "query")?,
-                limit,
-            )))
+            let query = req_str(&args, "query")?;
+            let prefix = opt_str(&args, "prefix");
+            let absorb = args.get("absorb").and_then(Value::as_bool).unwrap_or(true);
+            let cards = if prefix.is_empty() && absorb {
+                skills::search(&query, limit)
+            } else {
+                skills::search_in(
+                    &query,
+                    limit,
+                    &skills::SearchOptions {
+                        prefix,
+                        absorb_parents: absorb,
+                    },
+                )
+            };
+            Ok(format_skill_cards(&cards))
         }
         "skill_write" => skills::upsert(
             &req_str(&args, "id")?,
@@ -4284,6 +4310,28 @@ mod delegation_tests {
             out.contains("plan mode"),
             "a read-only profile must be recognisable as one: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ends_turn_tests {
+    use super::*;
+
+    fn manifest(name: &str, capabilities: &[&str]) -> ToolManifest {
+        ToolManifest {
+            name: name.into(),
+            description: String::new(),
+            args_schema_json: "{}".into(),
+            capabilities: capabilities.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn declaration_is_exact_for_name_and_capability() {
+        let manifests = vec![manifest("present", &["ends-turn", "activity:Presenting"] )];
+        assert!(declares(&manifests, "present", ENDS_TURN_CAP));
+        assert!(!declares(&manifests, "present", "ends"));
+        assert!(!declares(&manifests, "other", ENDS_TURN_CAP));
     }
 }
 

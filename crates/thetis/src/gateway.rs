@@ -20,20 +20,21 @@ use crate::runtime::{Budget, Caps, HostState};
 /// guest cannot accumulate unbounded state.
 const RENDERER_MAX_CALLS: u64 = 5_000;
 
-/// The gateway serving the browser UI, named in configuration.
-fn gateway_aspect(grip: &Arc<Grip>) -> Aspect {
+/// The configured primary gateway.
+fn primary_aspect(grip: &Arc<Grip>) -> Aspect {
     Aspect::gateway(&grip.cfg().primary_gateway)
 }
 
 async fn fresh_instance(
     grip: &Arc<Grip>,
+    aspect: &Aspect,
     label: &str,
     principal: Option<Arc<crate::auth::Principal>>,
 ) -> Result<(Store<HostState>, Gateway, u64)> {
     let loaded = grip
         .loader
-        .get(&gateway_aspect(grip))
-        .context("no gateway component is loaded")?;
+        .get(aspect)
+        .with_context(|| format!("no {aspect} component is loaded"))?;
     instance_of(grip, label, loaded, principal).await
 }
 
@@ -68,7 +69,15 @@ async fn instance_of(
 }
 
 pub async fn serve_asset(grip: &Arc<Grip>, path: &str) -> Result<Option<Asset>> {
-    let (mut store, gw, _) = fresh_instance(grip, "gateway serve-asset", None).await?;
+    serve_asset_of(grip, &primary_aspect(grip), path).await
+}
+
+pub async fn serve_asset_of(
+    grip: &Arc<Grip>,
+    aspect: &Aspect,
+    path: &str,
+) -> Result<Option<Asset>> {
+    let (mut store, gw, _) = fresh_instance(grip, aspect, "gateway serve-asset", None).await?;
     gw.call_serve_asset(&mut store, path)
         .await
         .map_err(anyhow::Error::from)
@@ -100,8 +109,25 @@ pub async fn on_client_message(
     frame_json: &str,
     principal: Arc<crate::auth::Principal>,
 ) -> Result<Vec<GatewayAction>> {
+    on_client_message_of(
+        grip,
+        &primary_aspect(grip),
+        client_id,
+        frame_json,
+        principal,
+    )
+    .await
+}
+
+pub async fn on_client_message_of(
+    grip: &Arc<Grip>,
+    aspect: &Aspect,
+    client_id: &str,
+    frame_json: &str,
+    principal: Arc<crate::auth::Principal>,
+) -> Result<Vec<GatewayAction>> {
     let (mut store, gw, _) =
-        fresh_instance(grip, "gateway on-client-message", Some(principal)).await?;
+        fresh_instance(grip, aspect, "gateway on-client-message", Some(principal)).await?;
     gw.call_on_client_message(&mut store, client_id, frame_json)
         .await
         .map_err(anyhow::Error::from)
@@ -111,7 +137,9 @@ pub async fn on_client_message(
 /// Warm renderer used by the single fan-out task.
 pub struct Renderer {
     grip: Arc<Grip>,
+    aspect: Aspect,
     warm: Option<Warm>,
+    unavailable_reported: bool,
 }
 
 struct Warm {
@@ -123,7 +151,23 @@ struct Warm {
 
 impl Renderer {
     pub fn new(grip: Arc<Grip>) -> Self {
-        Self { grip, warm: None }
+        Self::for_aspect(grip.clone(), primary_aspect(&grip))
+    }
+
+    pub fn for_aspect(grip: Arc<Grip>, aspect: Aspect) -> Self {
+        Self {
+            grip,
+            aspect,
+            warm: None,
+            unavailable_reported: false,
+        }
+    }
+
+    pub fn gateway_name(&self) -> &str {
+        match &self.aspect {
+            Aspect::Gateway(name) => name,
+            _ => unreachable!(),
+        }
     }
 
     /// True when the cached instance is stale: a swap happened, it aged out, or
@@ -135,7 +179,7 @@ impl Renderer {
         if warm.calls >= RENDERER_MAX_CALLS {
             return true;
         }
-        match self.grip.loader.get(&gateway_aspect(&self.grip)) {
+        match self.grip.loader.get(&self.aspect) {
             Some(current) => current.revision != warm.revision,
             None => true,
         }
@@ -143,8 +187,9 @@ impl Renderer {
 
     pub async fn render(&mut self, event: OutboundEvent) -> Option<String> {
         if self.needs_refresh() {
-            match fresh_instance(&self.grip, "gateway render-event", None).await {
+            match fresh_instance(&self.grip, &self.aspect, "gateway render-event", None).await {
                 Ok((store, instance, revision)) => {
+                    self.unavailable_reported = false;
                     self.warm = Some(Warm {
                         revision,
                         store,
@@ -153,7 +198,12 @@ impl Renderer {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "cannot render events: gateway unavailable");
+                    if !self.unavailable_reported {
+                        tracing::warn!(gateway = %self.gateway_name(), error = %e, "cannot render events: gateway unavailable");
+                        self.unavailable_reported = true;
+                    } else {
+                        tracing::debug!(gateway = %self.gateway_name(), error = %e, "gateway remains unavailable");
+                    }
                     self.warm = None;
                     return None;
                 }
@@ -213,7 +263,7 @@ pub async fn preview_component(
         .get(session_id)?
         .with_context(|| format!("{session_id} has no branch yet, so it has nothing to preview"))?;
 
-    let aspect = gateway_aspect(grip);
+    let aspect = primary_aspect(grip);
     let key =
         crate::pipeline::cache_key_with(branches.root_git(), &grip.cfg(), &row.branch_ref, &aspect)
             .await

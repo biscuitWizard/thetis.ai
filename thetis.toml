@@ -322,6 +322,49 @@ this surface is read-only and what you would have needed, rather than working \
 around it or pretending it is done.
 """
 
+[[modes]]
+id = "rpg-architect"
+label = "Campaign architect"
+description = "Builds a campaign world before play: plot beats, factions, NPCs, locations, relationships."
+read_only = false
+prompt = """
+You are the architect of a tabletop roleplaying campaign. Build the world, not \
+the play: open-ended plot beats, factions, NPCs, locations and relationships.
+
+Register everything you invent with the rpg-world-* tools before describing it. \
+Use the campaign's rpg-kb skills for established setting facts. Work in batches; \
+when the world is registered, add a journal entry titled "Premise" and answer \
+with a short summary.
+"""
+
+[[modes]]
+id = "rpg-gm"
+label = "Game master"
+description = "Runs scenes for a single player: narrates, offers choices, resolves checks through the rules tools."
+read_only = false
+prompt = """
+You are the game master of a tabletop campaign for one player. Trust the state \
+block at the start of each message over memory. Present every turn through \
+`rpg-scene-present`, offer meaningful choices, and resolve checks and all \
+numeric state changes through rpg-* tools. Look up rules in the campaign's \
+rpg-kb skills and exact values with `rpg-rules-lookup`. Register NPCs before \
+they act, advance plot beats only when play earns it, and close completed scenes \
+with `rpg-scene-end`. Start combat or shops through their dedicated tools.
+"""
+
+[[modes]]
+id = "rpg-referee"
+label = "Combat referee"
+description = "Runs a fight: NPC actions through the combat tools, terse narration, the player's options."
+read_only = false
+prompt = """
+You referee fights for one player. Resolve NPC turns in order through \
+`rpg-combat-act`, narrate only events reported by the tools, then present the \
+round through `rpg-scene-present` with phase "combat" and no choices. Look up \
+uncertain rules rather than recalling them. When an outcome is reported, call \
+`rpg-combat-end` and present one closing scene; leave rewards to the game master.
+"""
+
 # Delegation: an agent spawning agents.
 #
 # A sub-agent is a child session. It has its own event log and its own context
@@ -799,8 +842,10 @@ retrieval_enabled = true
 # How many skills to put in the L1 block. The ranker is skipped entirely when
 # the corpus is this size or smaller, since there is nothing to choose between.
 # Held below the corpus size on purpose for now, so the ranking path runs in
-# real turns while the corpus is still small. Raise to 10 once it grows.
-retrieve_limit = 4
+# real turns while the corpus is still small.
+retrieve_limit = 10
+# Weight of embedding similarity in reciprocal-rank fusion with lexical results.
+fusion_weight = 0.7
 # Embedding model and width. Both are part of the vector cache key, so changing
 # either re-embeds the corpus rather than comparing incomparable vectors.
 embedding_model = "openai/text-embedding-3-small"
@@ -852,7 +897,8 @@ grouping_enabled = true
 accounting_enabled = true
 # Groups admitted for every conversation on top of those marked always-on in
 # code (core, skills, files, extra). Ids: core, skills, files, shell, ssh,
-# selfmod, branch, config, sandbox, bigquery, notion, web, github, extra.
+# selfmod, branch, config, sandbox, bigquery, notion, web, github, rpg-core,
+# rpg-world, rpg-scene, rpg-combat, rpg-shop, extra.
 always_on = []
 # Minimum tag score for the opening message alone to admit a group. Scoring
 # saturates as m/(m+1), so one distinct tag match gives 0.50 and the default

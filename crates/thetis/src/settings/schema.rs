@@ -102,7 +102,15 @@ pub struct Field {
 }
 
 const fn f(key: &'static str, kind: Kind, section: &'static str, help: &'static str) -> Field {
-    Field { key, kind, section, help, env: None, restart: Restart::Required, choices: Choices::None }
+    Field {
+        key,
+        kind,
+        section,
+        help,
+        env: None,
+        restart: Restart::Required,
+        choices: Choices::None,
+    }
 }
 const fn fe(
     key: &'static str,
@@ -111,7 +119,15 @@ const fn fe(
     help: &'static str,
     env: &'static str,
 ) -> Field {
-    Field { key, kind, section, help, env: Some(env), restart: Restart::Required, choices: Choices::None }
+    Field {
+        key,
+        kind,
+        section,
+        help,
+        env: Some(env),
+        restart: Restart::Required,
+        choices: Choices::None,
+    }
 }
 const fn fc(
     key: &'static str,
@@ -121,15 +137,38 @@ const fn fc(
     env: Option<&'static str>,
     choices: Choices,
 ) -> Field {
-    Field { key, kind, section, help, env, restart: Restart::Required, choices }
+    Field {
+        key,
+        kind,
+        section,
+        help,
+        env,
+        restart: Restart::Required,
+        choices,
+    }
 }
 
 /// Sections whose every setting is read at use, through `Grip::cfg()`.
 /// A field outside these sections is `Required`; a field inside is `Live`
 /// unless `RESTART_ANYWAY` names it.
 const LIVE_SECTIONS: &[&str] = &[
-    "llm", "agent", "subagents", "budgets", "limits", "context", "cache", "tool_groups", "build",
-    "devkit", "filesystem", "terminal", "control", "discord", "auth", "server", "tools",
+    "llm",
+    "agent",
+    "subagents",
+    "budgets",
+    "limits",
+    "context",
+    "cache",
+    "tool_groups",
+    "build",
+    "devkit",
+    "filesystem",
+    "terminal",
+    "control",
+    "discord",
+    "auth",
+    "server",
+    "tools",
 ];
 
 /// Settings in a live section that are nonetheless baked in at boot.
@@ -243,6 +282,7 @@ pub const FIELDS: &[Field] = &[
     // --- skills -------------------------------------------------------------
     fe("skills.retrieval_enabled", Kind::Bool, "skills", "Rank skills against the opening message and pin the best few to the conversation.", "THETIS_SKILL_RETRIEVAL"),
     f("skills.retrieve_limit", Kind::Int, "skills", "How many retrieved skills a conversation gets (1 to 50)."),
+    f("skills.fusion_weight", Kind::Float, "skills", "Dense weight for reciprocal-rank fusion with BM25 (0.0 to 1.0; 0 disables fusion)."),
     fe("skills.embedding_model", Kind::Text, "skills", "The embedding model retrieval ranks with.", "THETIS_EMBEDDING_MODEL"),
     fc("skills.embedding_provider", Kind::ProviderId, "skills", "Which provider serves embeddings. Empty means the default.", Some("THETIS_EMBEDDING_PROVIDER"), Choices::Providers),
     f("skills.embedding_dimensions", Kind::Int, "skills", "Vector width the model returns (64 to 4096). Changing it re-embeds the corpus."),
@@ -347,13 +387,31 @@ pub struct Column {
 }
 
 const fn c(key: &'static str, kind: Kind, help: &'static str) -> Column {
-    Column { key, kind, help, required: false, choices: Choices::None }
+    Column {
+        key,
+        kind,
+        help,
+        required: false,
+        choices: Choices::None,
+    }
 }
 const fn req(key: &'static str, kind: Kind, help: &'static str) -> Column {
-    Column { key, kind, help, required: true, choices: Choices::None }
+    Column {
+        key,
+        kind,
+        help,
+        required: true,
+        choices: Choices::None,
+    }
 }
 const fn cc(key: &'static str, kind: Kind, help: &'static str, choices: Choices) -> Column {
-    Column { key, kind, help, required: false, choices }
+    Column {
+        key,
+        kind,
+        help,
+        required: false,
+        choices,
+    }
 }
 
 /// A section that is a list of tables, keyed by `id`.
@@ -391,33 +449,115 @@ pub const CAPABILITIES: &[&str] = &[
 
 /// The fields of a `PolicyLayer`, shared by roles and user overrides.
 pub const POLICY_COLUMNS: &[Column] = &[
-    c("admin", Kind::Bool, "Administrator: every capability, every conversation, this panel."),
-    c("read_only", Kind::Bool, "Nothing that writes: files, shells, branches, configuration, delegation."),
-    cc("deny_capabilities", Kind::List, "Capabilities withheld outright. Hard host boundaries.", Choices::Static(CAPABILITIES)),
-    cc("models", Kind::List, "The closed set of models offered. Empty means any.", Choices::Models),
-    cc("default_model", Kind::ModelId, "The model new conversations start with.", Choices::Models),
-    cc("modes", Kind::List, "The closed set of modes offered. Empty means any.", Choices::Modes),
-    cc("default_mode", Kind::ModeId, "The mode new conversations start in.", Choices::Modes),
-    c("deny_tools", Kind::List, "Tool names hidden and refused. Advisory for the agent's built-ins."),
-    c("deny_groups", Kind::List, "Tool groups hidden and refused. Advisory; never `core`."),
-    c("spend_limit_usd", Kind::Float, "Cumulative spend across the account's conversations. 0 means unlimited."),
-    c("max_children", Kind::Int, "Sub-agents one conversation may run at once."),
-    c("see_all_sessions", Kind::Bool, "May switch the sidebar to everyone's conversations."),
+    c(
+        "admin",
+        Kind::Bool,
+        "Administrator: every capability, every conversation, this panel.",
+    ),
+    c(
+        "read_only",
+        Kind::Bool,
+        "Nothing that writes: files, shells, branches, configuration, delegation.",
+    ),
+    cc(
+        "deny_capabilities",
+        Kind::List,
+        "Capabilities withheld outright. Hard host boundaries.",
+        Choices::Static(CAPABILITIES),
+    ),
+    cc(
+        "models",
+        Kind::List,
+        "The closed set of models offered. Empty means any.",
+        Choices::Models,
+    ),
+    cc(
+        "default_model",
+        Kind::ModelId,
+        "The model new conversations start with.",
+        Choices::Models,
+    ),
+    cc(
+        "modes",
+        Kind::List,
+        "The closed set of modes offered. Empty means any.",
+        Choices::Modes,
+    ),
+    cc(
+        "default_mode",
+        Kind::ModeId,
+        "The mode new conversations start in.",
+        Choices::Modes,
+    ),
+    c(
+        "deny_tools",
+        Kind::List,
+        "Tool names hidden and refused. Advisory for the agent's built-ins.",
+    ),
+    c(
+        "deny_groups",
+        Kind::List,
+        "Tool groups hidden and refused. Advisory; never `core`.",
+    ),
+    c(
+        "spend_limit_usd",
+        Kind::Float,
+        "Cumulative spend across the account's conversations. 0 means unlimited.",
+    ),
+    c(
+        "max_children",
+        Kind::Int,
+        "Sub-agents one conversation may run at once.",
+    ),
+    c(
+        "see_all_sessions",
+        Kind::Bool,
+        "May switch the sidebar to everyone's conversations.",
+    ),
 ];
 
 const MODEL_COLUMNS: &[Column] = &[
-    req("id", Kind::Text, "The name used everywhere: the picker, the session, THETIS_MODEL."),
-    c("label", Kind::Text, "Shown in the picker. Empty falls back to the id."),
-    cc("provider", Kind::ProviderId, "Which provider serves it. Empty means the default.", Choices::Providers),
-    c("wire_model", Kind::Text, "What to send as `model` when it differs from the id."),
+    req(
+        "id",
+        Kind::Text,
+        "The name used everywhere: the picker, the session, THETIS_MODEL.",
+    ),
+    c(
+        "label",
+        Kind::Text,
+        "Shown in the picker. Empty falls back to the id.",
+    ),
+    cc(
+        "provider",
+        Kind::ProviderId,
+        "Which provider serves it. Empty means the default.",
+        Choices::Providers,
+    ),
+    c(
+        "wire_model",
+        Kind::Text,
+        "What to send as `model` when it differs from the id.",
+    ),
 ];
 
 const MODE_COLUMNS: &[Column] = &[
     req("id", Kind::Text, "The mode's id."),
-    c("label", Kind::Text, "Shown in the picker. Empty falls back to the id."),
+    c(
+        "label",
+        Kind::Text,
+        "Shown in the picker. Empty falls back to the id.",
+    ),
     c("description", Kind::Text, "One line under the label."),
-    c("read_only", Kind::Bool, "Withhold every tool that changes something, and refuse them at dispatch."),
-    c("prompt", Kind::LongText, "Appended to the system prompt. {agent_name} is substituted."),
+    c(
+        "read_only",
+        Kind::Bool,
+        "Withhold every tool that changes something, and refuse them at dispatch.",
+    ),
+    c(
+        "prompt",
+        Kind::LongText,
+        "Appended to the system prompt. {agent_name} is substituted.",
+    ),
 ];
 
 const PROVIDER_COLUMNS: &[Column] = &[
@@ -432,37 +572,137 @@ const PROVIDER_COLUMNS: &[Column] = &[
 const ROLE_COLUMNS: &[Column] = &[
     req("id", Kind::Text, "The role's id, named by users."),
     c("description", Kind::Text, "What the role is for."),
-    c("admin", Kind::Bool, "Administrator: every capability, every conversation, this panel."),
-    c("read_only", Kind::Bool, "Nothing that writes: files, shells, branches, configuration, delegation."),
-    cc("deny_capabilities", Kind::List, "Capabilities withheld outright. Hard host boundaries.", Choices::Static(CAPABILITIES)),
-    cc("models", Kind::List, "The closed set of models offered. Empty means any.", Choices::Models),
-    cc("default_model", Kind::ModelId, "The model new conversations start with.", Choices::Models),
-    cc("modes", Kind::List, "The closed set of modes offered. Empty means any.", Choices::Modes),
-    cc("default_mode", Kind::ModeId, "The mode new conversations start in.", Choices::Modes),
-    c("deny_tools", Kind::List, "Tool names hidden and refused. Advisory for the agent's built-ins."),
-    c("deny_groups", Kind::List, "Tool groups hidden and refused. Advisory; never `core`."),
-    c("spend_limit_usd", Kind::Float, "Cumulative spend across the account's conversations. 0 means unlimited."),
-    c("max_children", Kind::Int, "Sub-agents one conversation may run at once."),
-    c("see_all_sessions", Kind::Bool, "May switch the sidebar to everyone's conversations."),
+    c(
+        "admin",
+        Kind::Bool,
+        "Administrator: every capability, every conversation, this panel.",
+    ),
+    c(
+        "read_only",
+        Kind::Bool,
+        "Nothing that writes: files, shells, branches, configuration, delegation.",
+    ),
+    cc(
+        "deny_capabilities",
+        Kind::List,
+        "Capabilities withheld outright. Hard host boundaries.",
+        Choices::Static(CAPABILITIES),
+    ),
+    cc(
+        "models",
+        Kind::List,
+        "The closed set of models offered. Empty means any.",
+        Choices::Models,
+    ),
+    cc(
+        "default_model",
+        Kind::ModelId,
+        "The model new conversations start with.",
+        Choices::Models,
+    ),
+    cc(
+        "modes",
+        Kind::List,
+        "The closed set of modes offered. Empty means any.",
+        Choices::Modes,
+    ),
+    cc(
+        "default_mode",
+        Kind::ModeId,
+        "The mode new conversations start in.",
+        Choices::Modes,
+    ),
+    c(
+        "deny_tools",
+        Kind::List,
+        "Tool names hidden and refused. Advisory for the agent's built-ins.",
+    ),
+    c(
+        "deny_groups",
+        Kind::List,
+        "Tool groups hidden and refused. Advisory; never `core`.",
+    ),
+    c(
+        "spend_limit_usd",
+        Kind::Float,
+        "Cumulative spend across the account's conversations. 0 means unlimited.",
+    ),
+    c(
+        "max_children",
+        Kind::Int,
+        "Sub-agents one conversation may run at once.",
+    ),
+    c(
+        "see_all_sessions",
+        Kind::Bool,
+        "May switch the sidebar to everyone's conversations.",
+    ),
 ];
 
 const USER_COLUMNS: &[Column] = &[
-    req("id", Kind::Text, "Lower-case letters, digits, dots, dashes, underscores; how the person signs in."),
-    c("name", Kind::Text, "Display name. Empty falls back to the id."),
-    cc("role", Kind::RoleId, "The role whose policy this account inherits.", Choices::Roles),
-    c("password", Kind::Secret, "A new password. Hashed here and stored as password_hash; never read back."),
-    c("password_env", Kind::Text, "An environment variable holding the hash instead of the file."),
-    c("discord_id", Kind::Text, "The Discord account bound to this one, for /fork."),
-    c("overrides", Kind::Map, "Per-user narrowing of the role's policy: the same fields a role has."),
+    req(
+        "id",
+        Kind::Text,
+        "Lower-case letters, digits, dots, dashes, underscores; how the person signs in.",
+    ),
+    c(
+        "name",
+        Kind::Text,
+        "Display name. Empty falls back to the id.",
+    ),
+    cc(
+        "role",
+        Kind::RoleId,
+        "The role whose policy this account inherits.",
+        Choices::Roles,
+    ),
+    c(
+        "password",
+        Kind::Secret,
+        "A new password. Hashed here and stored as password_hash; never read back.",
+    ),
+    c(
+        "password_env",
+        Kind::Text,
+        "An environment variable holding the hash instead of the file.",
+    ),
+    c(
+        "discord_id",
+        Kind::Text,
+        "The Discord account bound to this one, for /fork.",
+    ),
+    c(
+        "overrides",
+        Kind::Map,
+        "Per-user narrowing of the role's policy: the same fields a role has.",
+    ),
 ];
 
 const PROFILE_COLUMNS: &[Column] = &[
     req("id", Kind::Text, "The profile's id, named when delegating."),
     c("label", Kind::Text, "Shown where the profile is offered."),
-    c("description", Kind::Text, "What this kind of sub-agent is for."),
-    cc("model", Kind::ModelId, "The model the child runs on. Must be a configured model.", Choices::Models),
-    cc("mode", Kind::ModeId, "The mode the child runs in. Must be a configured mode.", Choices::Modes),
-    c("prompt", Kind::LongText, "Appended to the child's system prompt."),
+    c(
+        "description",
+        Kind::Text,
+        "What this kind of sub-agent is for.",
+    ),
+    cc(
+        "model",
+        Kind::ModelId,
+        "The model the child runs on. Must be a configured model.",
+        Choices::Models,
+    ),
+    cc(
+        "mode",
+        Kind::ModeId,
+        "The mode the child runs in. Must be a configured mode.",
+        Choices::Modes,
+    ),
+    c(
+        "prompt",
+        Kind::LongText,
+        "Appended to the child's system prompt.",
+    ),
 ];
 
 pub const TABLES: &[TableSection] = &[
@@ -480,7 +720,11 @@ pub fn table(id: &str) -> Option<&'static TableSection> {
 
 /// Sections that hold scalars, in the order the panel shows them.
 pub const SECTIONS: &[(&str, &str, &str)] = &[
-    ("server", "Server", "The listener, the gateway that serves the UI, and the recovery console."),
+    (
+        "server",
+        "Server",
+        "The listener, the gateway that serves the UI, and the recovery console.",
+    ),
     ("auth", "Authentication", "Accounts and sign-in."),
     ("llm", "Language model", "The default endpoint and model."),
     ("agent", "Agent", "Identity, prompt and turn limits."),
@@ -501,8 +745,16 @@ pub const SECTIONS: &[(&str, &str, &str)] = &[
     ("build", "Build", "How guests are compiled."),
     ("watchdog", "Watchdog", "Failure detection and rollback."),
     ("control", "Control", "Restarting."),
-    ("paths", "Paths", "Where things live. Moving data or artifacts orphans what is already there."),
-    ("tools", "Tool settings", "Free-form per-tool blocks, handed to each tool as its configuration."),
+    (
+        "paths",
+        "Paths",
+        "Where things live. Moving data or artifacts orphans what is already there.",
+    ),
+    (
+        "tools",
+        "Tool settings",
+        "Free-form per-tool blocks, handed to each tool as its configuration.",
+    ),
 ];
 
 pub fn section_label(id: &str) -> &'static str {

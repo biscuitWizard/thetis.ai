@@ -95,17 +95,22 @@ makes of the id.
 **Models.** A per-conversation override, chosen from `THETIS_MODELS`. Empty
 means the grip default.
 
-**Skills.** Named instruction sets, one markdown file each in `skills/`, with a
-short frontmatter block for the title and description and the body as the
+**Skills.** Named instruction sets, one `SKILL.md` file per skill in `skills/`,
+with TOML frontmatter for retrieval metadata and a Markdown body for the
 instructions. Attach them per conversation from the **Skills** panel; attached
 skills are appended to the system prompt. Editing a file takes effect on the
 next turn — nothing to restart, nothing to register.
 
 ```markdown
 ---
-name: Concise replies
-description: Answer in as few words as the question needs.
+name = "Concise replies"
+brief = "Answer in as few words as the question needs."
+when_to_use = "Use when the user asks for a direct or concise answer."
+tags = ["concise", "writing"]
+children = "none"
 ---
+
+# Concise replies
 
 Lead with the answer. Do not restate the question.
 ```
@@ -335,6 +340,12 @@ Anything in the file can be overridden per run. The common ones:
 Budget and limit values have `THETIS_`-prefixed overrides too, named after
 their keys — `THETIS_TURN_BUDGET_SECS`, `THETIS_MAX_ITERATIONS`, and so on.
 
+**Tabletop RPG campaign work.** The repository contains the canonical
+`rpg/rules` source tree for shared campaign rules and state, plus operating
+guides under [`skills/rpg`](skills/rpg). This work is still being assembled: the
+presence of a source module or guide does not mean its campaign tools, system
+data, or `/play` experience are available in the running build.
+
 ## Layout
 
 ```
@@ -343,7 +354,8 @@ wit/thetis.wit          the host/guest contract — changing it rebuilds every g
 crates/thetis           the kernel: loader, pipeline, revisions, watchdogs, web
 agents/agent-core        the agent's own source, which it can rewrite
 gateways/gateway-web     chat UI and wire protocol
-skills/<name>.md         instruction sets you can attach to a conversation
+rpg/rules                shared tabletop campaign rules and state crate
+skills/<id>/SKILL.md      instruction sets retrieved or attached to a conversation
 tools/<name>             tools the agent scaffolds for itself
 templates/tool-template  what new_tool starts from
 artifacts/               immutable revisions (component + source snapshot)

@@ -25,10 +25,14 @@ async fn watch_a_session() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect");
     socket
         .send(Message::Text(
-            serde_json::json!({ "type": "open", "id": session }).to_string().into(),
+            serde_json::json!({ "type": "open", "id": session })
+                .to_string()
+                .into(),
         ))
         .await
         .unwrap();
@@ -43,11 +47,19 @@ async fn watch_a_session() {
         let Ok(next) = tokio::time::timeout(remaining, socket.next()).await else {
             break;
         };
-        let Some(Ok(Message::Text(text))) = next else { continue };
-        let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+        let Some(Ok(Message::Text(text))) = next else {
+            continue;
+        };
+        let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
         let ty = frame["type"].as_str().unwrap_or("?").to_string();
         let kind = frame["kind"].as_str().unwrap_or("").to_string();
-        let label = if kind.is_empty() { ty } else { format!("{ty}/{kind}") };
+        let label = if kind.is_empty() {
+            ty
+        } else {
+            format!("{ty}/{kind}")
+        };
         *counts.entry(label.clone()).or_default() += 1;
         if counts[&label] <= 2 && label != "event/delta" {
             let short: String = text.chars().take(220).collect();

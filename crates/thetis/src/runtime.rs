@@ -15,8 +15,8 @@ use wasmtime::{
     Config as WasmConfig, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline,
 };
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
+use wasmtime_wasi_http::WasiHttpCtx;
 
 use crate::bindings;
 use crate::config::Config;
@@ -240,11 +240,9 @@ impl Runtime {
         let ticker = engine.clone();
         std::thread::Builder::new()
             .name("thetis-epoch".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(EPOCH_TICK);
-                    ticker.increment_epoch();
-                }
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                ticker.increment_epoch();
             })
             .context("spawning epoch ticker")?;
 

@@ -9,7 +9,7 @@
 //! that marker appears. The marker is what turns an endless stream back into
 //! request and response.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};

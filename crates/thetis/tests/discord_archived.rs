@@ -70,7 +70,10 @@ fn an_archived_discord_conversation_is_replaced_rather_than_continued() {
     store.archive_session(&first, true).unwrap();
 
     let second = session_for(&store, key);
-    assert_ne!(second, first, "an archived conversation must not be continued");
+    assert_ne!(
+        second, first,
+        "an archived conversation must not be continued"
+    );
 
     // The new one is live, reused from then on, and the mapping has moved.
     assert!(!store.get_session(&second).unwrap().unwrap().archived);

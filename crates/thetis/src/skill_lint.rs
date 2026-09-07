@@ -458,7 +458,7 @@ fn check_legacy_see_also(skill: &Skill, push: &mut impl FnMut(Severity, String))
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::{ChildSpec, discover};
+    use crate::skills::{discover, ChildSpec};
 
     fn tree_from(files: &[(&str, &str)]) -> (tempfile::TempDir, SkillTree) {
         let dir = tempfile::tempdir().unwrap();

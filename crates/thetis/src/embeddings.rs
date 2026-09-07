@@ -10,7 +10,7 @@
 //! answers by falling back to BM25. Skills must keep working with the network
 //! unplugged, so nothing in this module is allowed to be load-bearing.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::sync::Arc;
 

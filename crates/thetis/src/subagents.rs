@@ -24,10 +24,10 @@
 //! cancellation semantics and the UI all comprehensible, and the parent stays
 //! identifiable as the thing responsible for the work.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Store, now_ms};
+use crate::store::{now_ms, Store};
 
 /// Where a sub-agent is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,17 +348,15 @@ mod tests {
             subs.register("p", &format!("c{i}"), "c", "t", "", "", "agent", 2)
                 .unwrap();
         }
-        assert!(
-            subs.register("p", "c2", "c", "t", "", "", "agent", 2)
-                .is_err()
-        );
+        assert!(subs
+            .register("p", "c2", "c", "t", "", "", "agent", 2)
+            .is_err());
         // Settling one frees a slot: the cap is on concurrency, not on how many
         // a turn may delegate in total.
         subs.settle("c0", "an answer", 0.0, "stop").unwrap();
-        assert!(
-            subs.register("p", "c2", "c", "t", "", "", "agent", 2)
-                .is_ok()
-        );
+        assert!(subs
+            .register("p", "c2", "c", "t", "", "", "agent", 2)
+            .is_ok());
     }
 
     // A child orphaned by a restart is not running and never will be again.

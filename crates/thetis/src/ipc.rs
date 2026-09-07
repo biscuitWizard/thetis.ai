@@ -13,20 +13,20 @@
 //! spend). Unknown fields are ignored everywhere, because a branch worker may
 //! be running a *modified* kernel that has learned new tricks.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, oneshot};
+use tokio::net::UnixStream;
+use tokio::sync::{oneshot, Mutex};
 
 /// Bumped when the protocol changes shape incompatibly. The handshake rejects
 /// a mismatch, and the supervisor falls back to the trunk kernel — a branch

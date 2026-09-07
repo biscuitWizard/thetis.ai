@@ -483,6 +483,12 @@ pub fn run(session_id: &str, plan: Plan, policy: &Policy) -> (Option<Compaction>
     )
 }
 
+fn drop_hidden_jobs(jobs: Vec<SpanJob>, hidden: &crate::hidden::Hidden) -> Vec<SpanJob> {
+    jobs.into_iter()
+        .filter(|job| !hidden.intersects(job.first_seq, job.last_seq))
+        .collect()
+}
+
 /// Works out what to shed, without summarizing any of it.
 ///
 /// `origins` maps each message to the log sequence it came from, so the result
@@ -494,6 +500,7 @@ pub fn plan(
     origins: &[u64],
     context_tokens: u32,
     policy: &Policy,
+    hidden: &crate::hidden::Hidden,
 ) -> Option<Plan> {
     // The two lists are indexed together below. Drifting apart would mean
     // recording a summary against the wrong part of the log, so refuse rather
@@ -564,15 +571,21 @@ pub fn plan(
         return None;
     }
 
-    let jobs: Vec<SpanJob> = spans
-        .into_iter()
-        .map(|span| SpanJob {
-            transcript: transcript(messages, span),
-            first_seq: origins[span.start],
-            last_seq: origins[span.end],
-            messages: (span.end - span.start + 1) as u32,
-        })
-        .collect();
+    let jobs = drop_hidden_jobs(
+        spans
+            .into_iter()
+            .map(|span| SpanJob {
+                transcript: transcript(messages, span),
+                first_seq: origins[span.start],
+                last_seq: origins[span.end],
+                messages: (span.end - span.start + 1) as u32,
+            })
+            .collect(),
+        hidden,
+    );
+    if jobs.is_empty() {
+        return None;
+    }
 
     Some(Plan {
         jobs,
@@ -622,6 +635,18 @@ mod tests {
             assert!(has_tool_calls(&msgs[round.start]));
             assert_eq!(role_of(&msgs[round.end]), "tool");
         }
+    }
+
+    #[test]
+    fn a_span_that_intersects_a_hidden_range_is_dropped() {
+        let jobs = vec![
+            SpanJob { transcript: String::new(), first_seq: 2, last_seq: 4, messages: 3 },
+            SpanJob { transcript: String::new(), first_seq: 6, last_seq: 7, messages: 2 },
+        ];
+        let hidden = crate::hidden::Hidden::parse(r#"{"ranges":[[3,3]]}"#);
+        let jobs = drop_hidden_jobs(jobs, &hidden);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].first_seq, jobs[0].last_seq), (6, 7));
     }
 
     #[test]

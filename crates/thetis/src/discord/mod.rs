@@ -22,7 +22,7 @@ pub mod commands;
 pub mod policy;
 pub mod split;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1307,7 +1307,11 @@ async fn fork_for(grip: &Grip, key: &str) -> Result<Option<(String, String)>> {
              `/fork` again to make a new one."
         );
     }
-    let owner = grip.persist.owner_of_root(&existing).await?.unwrap_or_default();
+    let owner = grip
+        .persist
+        .owner_of_root(&existing)
+        .await?
+        .unwrap_or_default();
     Ok(Some((existing, owner)))
 }
 

@@ -4,14 +4,14 @@
 //! wire protocol and hands plain events upward, which keeps the routing and
 //! authorization policy in `mod.rs` testable without a socket.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
+    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 
 pub const API_BASE: &str = "https://discord.com/api/v10";
@@ -1215,13 +1215,11 @@ mod tests {
         // Type 1 is Discord's PING and 3 is a message component. Treating
         // either as a command would invent a name out of nothing.
         for kind in [1, 3, 5] {
-            assert!(
-                parse_interaction(&json!({
-                    "id": "i", "token": "t", "type": kind, "channel_id": "c",
-                    "user": { "id": "u", "username": "sam" },
-                }))
-                .is_none()
-            );
+            assert!(parse_interaction(&json!({
+                "id": "i", "token": "t", "type": kind, "channel_id": "c",
+                "user": { "id": "u", "username": "sam" },
+            }))
+            .is_none());
         }
     }
 

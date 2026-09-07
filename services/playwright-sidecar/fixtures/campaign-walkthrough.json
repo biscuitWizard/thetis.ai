@@ -1,0 +1,109 @@
+[
+  {
+    "when": "(?i)build this d20 tabletop campaign",
+    "reply": {
+      "text": "The Lantern Stair is ready beneath the town.",
+      "tool_calls": [
+        {
+          "name": "rpg-world-create",
+          "arguments": {
+            "kind": "location",
+            "id": "lantern-stair",
+            "name": "The Lantern Stair",
+            "details": "A sealed stair descending beneath the inn.",
+            "scale": "minor"
+          }
+        },
+        {
+          "name": "ask_user",
+          "arguments": {
+            "intro": "The initial campaign location is registered.",
+            "questions": [
+              {"id":"continue","question":"Continue to character creation?","type":"choice","options":["Continue"]}
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)begin the campaign",
+    "reply": {
+      "text": "Rain ticks against the inn windows. Beneath the floorboards, the old stair waits.",
+      "tool_calls": [
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": ["The sealed stair beneath the inn has opened."],
+            "beats": [],
+            "choices": [
+              {"id": "enter", "label": "Enter the ruin", "skill": "perception"}
+            ],
+            "input_mode": "both",
+            "phase": "narrative"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)action:\\s*start combat with the sentinel",
+    "reply": {
+      "text": "A stone sentinel unfolds from the wall, then its old binding gutters out.",
+      "tool_calls": [
+        {
+          "name": "rpg-combat-start",
+          "arguments": {
+            "actors": [
+              {"id":"pc","name":"Wren","hp":12,"hp_max":12,"armor":1,"initiative":0,"attack":4,"defense":12,"damage":"1d8","npc":false},
+              {"id":"sentinel","name":"Ruin Sentinel","hp":8,"hp_max":8,"armor":0,"initiative":0,"attack":2,"defense":10,"damage":"1d4","npc":true}
+            ]
+          }
+        },
+        {
+          "name": "rpg-combat-end",
+          "arguments": {"summary":"The sentinel's binding fails before it can strike."}
+        },
+        {
+          "name": "ask_user",
+          "arguments": {
+            "intro": "The combat exchange is resolved.",
+            "questions": [
+              {"id":"continue","question":"Continue the campaign?","type":"choice","options":["Continue"]}
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": "(?is)action:\\s*visit the lantern shop",
+    "reply": {
+      "text": "Mara opens a narrow cabinet of expedition supplies.",
+      "tool_calls": [
+        {
+          "name": "rpg-shop-open",
+          "arguments": {
+            "vendor_id": "mara",
+            "items": ["dagger", "shortbow"],
+            "multiplier": 1.0
+          }
+        },
+        {
+          "name": "ask_user",
+          "arguments": {
+            "intro": "The shop is open.",
+            "questions": [
+              {"id":"continue","question":"Review the shop?","type":"choice","options":["Continue"]}
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "when": ".*",
+    "reply": {"text":"The lantern flame leans toward the stair."}
+  }
+]

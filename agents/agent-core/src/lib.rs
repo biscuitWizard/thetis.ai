@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 mod compaction;
 mod groups;
+mod hidden;
 mod plan;
 mod todos;
 mod tools;
@@ -75,6 +76,114 @@ impl Guest for Component {
 
 fn config_str(key: &str, fallback: &str) -> String {
     sys::config_get(key).unwrap_or_else(|| fallback.to_string())
+}
+
+// --- conversation projection ------------------------------------------------
+
+struct Projection {
+    covered: Vec<(u64, u64)>,
+    hidden: hidden::Hidden,
+    notes: Vec<(u64, Value)>,
+    usage_is_current: bool,
+    attribute: bool,
+}
+
+impl Projection {
+    fn skips(&self, seq: u64) -> bool {
+        self.hidden.contains(seq)
+            || self.covered.iter().any(|&(from, through)| seq >= from && seq <= through)
+    }
+}
+
+fn plan_projection(records: &[EventRecord], hidden: hidden::Hidden) -> Projection {
+    let mut covered = Vec::new();
+    let mut notes = Vec::new();
+    let mut last_compaction_seq = 0;
+    let mut last_usage_seq = 0;
+    for record in records {
+        if !hidden.contains(record.seq)
+            && matches!(record.event, SessionEvent::AssistantMessage(ref m) if m.usage.is_some())
+        {
+            last_usage_seq = record.seq;
+        }
+        // Compactions describe the shared prefix and remain authoritative even
+        // when their bookkeeping event happens to be hidden.
+        if let SessionEvent::ContextCompacted(c) = &record.event {
+            last_compaction_seq = record.seq;
+            if let (Some(first), Some(last)) = (c.spans.first(), c.spans.last()) {
+                covered.extend(c.spans.iter().map(|s| (s.from_seq, s.through_seq)));
+                notes.push((
+                    first.from_seq,
+                    compaction::note(
+                        &c.summary,
+                        c.messages_replaced,
+                        first.from_seq,
+                        last.through_seq,
+                    ),
+                ));
+            }
+        }
+    }
+    Projection {
+        covered,
+        hidden,
+        notes,
+        usage_is_current: last_usage_seq > last_compaction_seq,
+        attribute: needs_attribution(records),
+    }
+}
+
+fn project(
+    records: Vec<EventRecord>,
+    mut projection: Projection,
+    base_len: usize,
+) -> (Vec<(Value, u64)>, Option<(u32, usize)>) {
+    let mut out = Vec::new();
+    let mut billing = None;
+    projection.notes.sort_by_key(|(seq, _)| *seq);
+    for record in records {
+        if projection.skips(record.seq) {
+            continue;
+        }
+        while projection.notes.first().is_some_and(|(seq, _)| *seq <= record.seq) {
+            let (seq, note) = projection.notes.remove(0);
+            out.push((note, seq));
+        }
+        let seq = record.seq;
+        let message = match record.event {
+            SessionEvent::UserMessage(msg) => {
+                let prefix = projection.attribute.then(|| author_prefix(msg.author.as_ref())).flatten();
+                Some(json!({ "role": "user", "content": user_content(&msg, prefix.as_deref()) }))
+            }
+            SessionEvent::Nudge(text) => Some(json!({ "role": "user", "content": text })),
+            SessionEvent::AssistantMessage(msg) => {
+                if projection.usage_is_current {
+                    if let Some(usage) = &msg.usage {
+                        billing = Some((usage.prompt_tokens, base_len + out.len()));
+                    }
+                }
+                Some(assistant_message(&Reply {
+                    text: msg.content,
+                    tool_calls: msg.tool_calls,
+                    model: msg.model,
+                    usage: msg.usage,
+                }))
+            }
+            SessionEvent::ToolResult(result) => Some(json!({
+                "role": "tool", "tool_call_id": result.call_id,
+                "content": result.content, "thetis_tool_ok": result.ok,
+            })),
+            SessionEvent::SystemNote(text) => {
+                Some(json!({ "role": "user", "content": format!("[system note] {text}") }))
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            out.push((message, seq));
+        }
+    }
+    out.extend(projection.notes.into_iter().map(|(seq, note)| (note, seq)));
+    (out, billing)
 }
 
 // --- the turn ---------------------------------------------------------------
@@ -296,9 +405,9 @@ impl Turn {
             // button was pressed, because the only checkpoint was past the end
             // of the loop — which is precisely the case the button is for.
             let mut stopped_at = None;
-            // Set when a question really reached the user, which ends the turn
-            // once the batch is done.
-            let mut asked = false;
+            // Set when a successful call declares that it hands control back to
+            // the user, which ends the turn once the whole batch is done.
+            let mut ended = false;
             for (i, call) in reply.tool_calls.iter().enumerate() {
                 if matches!(self.drain_inbox(), Interrupt::Cancelled) {
                     stopped_at = Some(i);
@@ -307,9 +416,8 @@ impl Turn {
                 // Only a successful call counts: a malformed one was rejected
                 // and never shown, so pausing for an answer nobody was asked
                 // for would hang the conversation on the model's own mistake.
-                if self.dispatch(call) && call.name == tools::ASK_USER {
-                    asked = true;
-                }
+                let ok = self.dispatch(call);
+                ended |= after_call(ok, tools::ends_turn(&call.name));
             }
 
             if let Some(i) = stopped_at {
@@ -326,7 +434,7 @@ impl Turn {
             // Any remaining calls in the batch have already run and been
             // answered above, so the log is complete and the next turn — begun
             // by the user's answers — rehydrates cleanly.
-            if asked {
+            if ended {
                 self.stopped_by = "asked";
                 // The inbox is deliberately *not* drained here. Anything the
                 // user typed while the questions were being posed is left in it,
@@ -417,128 +525,14 @@ impl Turn {
         );
 
         let records = host::events(&self.session_id, 0);
-
-        // Which sequences a summary now stands for, and where each note goes.
-        let mut covered: Vec<(u64, u64)> = Vec::new();
-        let mut notes: Vec<(u64, Value)> = Vec::new();
-        // The newest compaction, and the newest completion that reported a
-        // context size. Compared below: a count taken before a compaction
-        // describes a conversation that no longer exists.
-        let mut last_compaction_seq = 0u64;
-        let mut last_usage_seq = 0u64;
-        for record in &records {
-            if matches!(record.event, SessionEvent::AssistantMessage(ref m) if m.usage.is_some()) {
-                last_usage_seq = record.seq;
-            }
-            if let SessionEvent::ContextCompacted(c) = &record.event {
-                last_compaction_seq = record.seq;
-                let (Some(first), Some(last)) = (c.spans.first(), c.spans.last()) else {
-                    continue;
-                };
-                for span in &c.spans {
-                    covered.push((span.from_seq, span.through_seq));
-                }
-                notes.push((
-                    first.from_seq,
-                    compaction::note(
-                        &c.summary,
-                        c.messages_replaced,
-                        first.from_seq,
-                        last.through_seq,
-                    ),
-                ));
-            }
+        let projection = plan_projection(&records, hidden::Hidden::load(&self.session_id));
+        let (messages, billing) = project(records, projection, self.messages.len());
+        for (message, seq) in messages {
+            self.push(message, seq);
         }
-
-        // A provider count only describes this message list if it was taken
-        // after the last compaction. One taken before it is a measurement of a
-        // conversation that has since been summarized away, and trusting it
-        // would re-trigger compaction on every check until a completion
-        // refreshed the figure — the compaction loop this guards against.
-        let usage_is_current = last_usage_seq > last_compaction_seq;
-
-        // Decided once for the whole conversation, so attribution cannot come
-        // and go between messages — and computed over every record, including
-        // ones already summarised away, because a conversation does not stop
-        // being multi-party when its opening is compacted.
-        let attribute = needs_attribution(&records);
-
-        for record in records {
-            if let Some(i) = notes.iter().position(|(seq, _)| *seq == record.seq) {
-                let (_, note) = notes.remove(i);
-                self.push(note, record.seq);
-            }
-            if covered
-                .iter()
-                .any(|(from, through)| record.seq >= *from && record.seq <= *through)
-            {
-                continue;
-            }
-            let seq = record.seq;
-            match record.event {
-                SessionEvent::UserMessage(msg) => {
-                    let prefix = if attribute {
-                        author_prefix(msg.author.as_ref())
-                    } else {
-                        None
-                    };
-                    self.push(
-                        json!({
-                            "role": "user",
-                            "content": user_content(&msg, prefix.as_deref()),
-                        }),
-                        seq,
-                    );
-                }
-                SessionEvent::Nudge(text) => {
-                    self.push(json!({ "role": "user", "content": text }), seq);
-                }
-                SessionEvent::AssistantMessage(msg) => {
-                    // The last one wins: this ends up holding what the provider
-                    // charged for the most recent request, and the boundary it
-                    // was charged at.
-                    if let Some(usage) = &msg.usage {
-                        if usage_is_current {
-                            self.context_tokens = usage.prompt_tokens;
-                            self.billed_to = self.messages.len();
-                        }
-                    }
-                    let reply = Reply {
-                        text: msg.content,
-                        tool_calls: msg.tool_calls,
-                        model: msg.model,
-                        usage: msg.usage,
-                    };
-                    self.push(assistant_message(&reply), seq);
-                }
-                SessionEvent::ToolResult(out) => {
-                    self.push(
-                        json!({
-                            "role": "tool",
-                            "tool_call_id": out.call_id,
-                            "content": out.content,
-                            // Host request preparation removes failed call/result
-                            // pairs before choosing prompt-cache checkpoints.
-                            "thetis_tool_ok": out.ok,
-                        }),
-                        seq,
-                    );
-                }
-                SessionEvent::SystemNote(text) => {
-                    // Deliberately not a `system` message. A note is appended
-                    // wherever the log happens to be - after a tool result, or
-                    // between two user turns - and a `system` message that
-                    // neither precedes an assistant turn nor ends the array is
-                    // rejected outright by Anthropic. The marker keeps it from
-                    // reading as something the user said.
-                    self.push(
-                        json!({ "role": "user", "content": format!("[system note] {text}") }),
-                        seq,
-                    );
-                }
-                // Bookkeeping events carry no conversational meaning.
-                _ => {}
-            }
+        if let Some((tokens, billed_to)) = billing {
+            self.context_tokens = tokens;
+            self.billed_to = billed_to;
         }
     }
 
@@ -584,12 +578,14 @@ impl Turn {
             return;
         }
 
+        let hidden = hidden::Hidden::load(&self.session_id);
         let Some(plan) = compaction::plan(
             &self.session_id,
             &self.messages,
             &self.origins,
             context_tokens,
             &policy,
+            &hidden,
         ) else {
             // The protected head/tail can leave nothing eligible. Retrying the
             // same selection before the context has grown materially is a hot
@@ -867,7 +863,11 @@ impl Turn {
 
     /// The text of the first thing the user said in this conversation.
     fn first_user_message(&self) -> Option<String> {
+        let hidden = hidden::Hidden::load(&self.session_id);
         host::events(&self.session_id, 0).into_iter().find_map(|r| {
+            if hidden.contains(r.seq) {
+                return None;
+            }
             if let SessionEvent::UserMessage(msg) = r.event {
                 Some(msg.text)
             } else {
@@ -1104,6 +1104,82 @@ impl Turn {
 
     fn note(&self, text: &str) -> u64 {
         host::append(&self.session_id, &SessionEvent::SystemNote(text.to_string()))
+    }
+}
+
+fn after_call(ok: bool, ends: bool) -> bool {
+    ok && ends
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::thetis::grip::types::{Compaction, SeqSpan};
+
+    fn event(seq: u64, event: SessionEvent) -> EventRecord {
+        EventRecord { seq, ts_ms: 0, event }
+    }
+    fn user(seq: u64, text: &str) -> EventRecord {
+        event(seq, SessionEvent::UserMessage(UserMsg {
+            text: text.into(), attachments: vec![], author: None,
+        }))
+    }
+    fn assistant(seq: u64, text: &str, usage: Option<TokenUsage>) -> EventRecord {
+        event(seq, SessionEvent::AssistantMessage(AssistantMsg {
+            content: text.into(), tool_calls: vec![], model: "test".into(), usage,
+        }))
+    }
+
+    #[test]
+    fn a_hidden_node_is_not_projected_and_origins_stay_in_step() {
+        let records = vec![
+            user(1, "u1"), assistant(3, "a3", None), user(5, "u5"),
+            assistant(7, "a7", None), user(9, "u9"),
+        ];
+        let projection = plan_projection(
+            &records,
+            hidden::Hidden::parse(r#"{"ranges":[[5,8]]}"#),
+        );
+        let (shown, _) = project(records, projection, 1);
+        assert_eq!(shown.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(), vec![1, 3, 9]);
+        assert_eq!(shown.len(), 3);
+    }
+
+    #[test]
+    fn a_note_survives_its_anchor_being_hidden_and_hidden_usage_is_ignored() {
+        let hidden_usage = TokenUsage {
+            prompt_tokens: 999, completion_tokens: 1, cost_usd: 0.0,
+            cached_tokens: 0, cache_write_tokens: 0,
+        };
+        let records = vec![
+            user(1, "old"),
+            event(4, SessionEvent::ContextCompacted(Compaction {
+                spans: vec![SeqSpan { from_seq: 1, through_seq: 1 }],
+                summary: "summary".into(), messages_replaced: 1, tokens_before: 10,
+            })),
+            assistant(6, "hidden", Some(hidden_usage)),
+            user(8, "visible"),
+        ];
+        let projection = plan_projection(
+            &records,
+            hidden::Hidden::parse(r#"{"ranges":[[1,1],[6,6]]}"#),
+        );
+        let (shown, billing) = project(records, projection, 1);
+        assert_eq!(shown.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(), vec![1, 8]);
+        assert!(shown[0].0.to_string().contains("summary"));
+        assert_eq!(billing, None);
+    }
+}
+
+#[cfg(test)]
+mod turn_end_tests {
+    use super::after_call;
+
+    #[test]
+    fn only_a_successful_ending_call_ends_the_turn() {
+        assert!(after_call(true, true));
+        assert!(!after_call(false, true));
+        assert!(!after_call(true, false));
     }
 }
 

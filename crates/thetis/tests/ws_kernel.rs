@@ -18,7 +18,9 @@ use tokio_tungstenite::tungstenite::Message;
 async fn a_branch_built_kernel_is_probed_adopted_and_run() {
     let (Some(url), Some(root), Some(admin)) = (
         std::env::var("THETIS_WS_URL").ok(),
-        std::env::var("THETIS_SMOKE_ROOT").ok().map(std::path::PathBuf::from),
+        std::env::var("THETIS_SMOKE_ROOT")
+            .ok()
+            .map(std::path::PathBuf::from),
         std::env::var("THETIS_ADMIN_URL").ok(),
     ) else {
         eprintln!("skipped: set THETIS_WS_URL, THETIS_SMOKE_ROOT, THETIS_ADMIN_URL");
@@ -30,7 +32,9 @@ async fn a_branch_built_kernel_is_probed_adopted_and_run() {
         .expect("connecting");
 
     socket
-        .send(Message::Text(r#"{"type":"new","title":"ws-kernel smoke"}"#.into()))
+        .send(Message::Text(
+            r#"{"type":"new","title":"ws-kernel smoke"}"#.into(),
+        ))
         .await
         .unwrap();
     let session = wait_for(&mut socket, "a session id", 30, |f| {
@@ -38,13 +42,21 @@ async fn a_branch_built_kernel_is_probed_adopted_and_run() {
     })
     .await;
 
-    send(&mut socket, json!({ "type": "send", "id": session, "text": "hello" })).await;
+    send(
+        &mut socket,
+        json!({ "type": "send", "id": session, "text": "hello" }),
+    )
+    .await;
     wait_for(&mut socket, "first turn", 900, |f| {
         (f["type"] == "event" && f["kind"] == "turn-finished").then_some(())
     })
     .await;
 
-    send(&mut socket, json!({ "type": "branch-status", "id": session })).await;
+    send(
+        &mut socket,
+        json!({ "type": "branch-status", "id": session }),
+    )
+    .await;
     let branch = wait_for(&mut socket, "branch name", 60, |f| {
         (f["type"] == "branch-status" && f["materialized"] == true)
             .then(|| f["branch"].as_str().unwrap_or("").to_string())
@@ -85,10 +97,7 @@ async fn a_branch_built_kernel_is_probed_adopted_and_run() {
     let mut adopted = false;
     while std::time::Instant::now() < deadline {
         let page = reqwest_get(&admin).await;
-        if let Some(row) = page
-            .lines()
-            .find(|l| l.contains(&branch))
-        {
+        if let Some(row) = page.lines().find(|l| l.contains(&branch)) {
             if !row.contains(">trunk<") {
                 adopted = true;
                 break;

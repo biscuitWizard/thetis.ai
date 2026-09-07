@@ -33,7 +33,10 @@ fn the_registration_payload_is_well_formed() {
         assert!(!commands.is_empty());
         // Discord allows 100 global CHAT_INPUT commands.
         assert!(commands.len() <= 100);
-        let names: Vec<&str> = commands.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(
             unique.len(),

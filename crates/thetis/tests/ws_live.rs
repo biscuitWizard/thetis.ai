@@ -83,10 +83,13 @@ async fn a_message_round_trips_through_gateway_and_worker() {
     let finished = wait_for(&mut socket, "the end of the turn", |frame| {
         (frame["type"] == "event"
             && (frame["kind"] == "turn-finished" || frame["kind"] == "incident"))
-        .then(|| frame["kind"] == "turn-finished")
+            .then(|| frame["kind"] == "turn-finished")
     })
     .await;
-    assert!(finished, "the turn should finish rather than end in an incident");
+    assert!(
+        finished,
+        "the turn should finish rather than end in an incident"
+    );
 }
 
 /// Reads frames until `pick` accepts one, failing loudly on timeout so a hang

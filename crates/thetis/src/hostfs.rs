@@ -10,7 +10,7 @@
 //! it stops the system from deleting its own database by accident, and is not
 //! a security control, because a terminal session can reach those paths anyway.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::{Component, Path, PathBuf};
 
 use crate::bindings::types::FsEntry;
@@ -1203,12 +1203,10 @@ mod tests {
             ws.join("note.md")
         );
         assert_eq!(read_file(&cfg, "/shared-ws/note.md").unwrap(), "shared");
-        assert!(
-            list_dir(&cfg, "/shared-ws")
-                .unwrap()
-                .iter()
-                .any(|e| e.name == "note.md")
-        );
+        assert!(list_dir(&cfg, "/shared-ws")
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "note.md"));
     }
 
     /// Whatever a listing or a search result calls a file, feeding that name
@@ -1262,7 +1260,10 @@ mod tests {
         assert!(is_workspace_path(&cfg, "/shared-ws"));
         assert!(is_workspace_path(&cfg, "/shared-ws/note.md"));
         // The host spelling of the very same file.
-        assert!(is_workspace_path(&cfg, ws.join("note.md").to_str().unwrap()));
+        assert!(is_workspace_path(
+            &cfg,
+            ws.join("note.md").to_str().unwrap()
+        ));
         // A file that does not exist yet is still workspace-bound, or the
         // create case would slip past the write capability.
         assert!(is_workspace_path(&cfg, "/shared-ws/not-yet.md"));
@@ -1270,7 +1271,10 @@ mod tests {
         // And the project's own files are not the workspace, so an account
         // denied the workspace keeps ordinary filesystem access.
         assert!(!is_workspace_path(&cfg, "src/main.rs"));
-        assert!(!is_workspace_path(&cfg, project.join("Cargo.toml").to_str().unwrap()));
+        assert!(!is_workspace_path(
+            &cfg,
+            project.join("Cargo.toml").to_str().unwrap()
+        ));
     }
 
     /// Traversal must not be able to launder a project path into a workspace
@@ -1391,7 +1395,10 @@ mod tests {
     fn a_read_bounded_by_bytes_still_says_how_to_continue() {
         let (cfg, _d) = fixture();
         let wide = "a".repeat(290);
-        let body: String = std::iter::repeat(wide).take(400).collect::<Vec<_>>().join("\n");
+        let body: String = std::iter::repeat(wide)
+            .take(400)
+            .collect::<Vec<_>>()
+            .join("\n");
         write_file(&cfg, "wide.txt", &body).expect("write");
 
         let out = read_file_range(&cfg, "wide.txt", 0, 0).expect("reads");

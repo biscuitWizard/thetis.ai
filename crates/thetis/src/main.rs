@@ -100,7 +100,14 @@ async fn main() -> Result<()> {
         Some("check-config") => {
             let cfg = thetis::config::Config::load()?;
             println!("configuration loads.");
-            println!("  auth mode:     {}", if cfg.auth.users_mode { "users" } else { "local" });
+            println!(
+                "  auth mode:     {}",
+                if cfg.auth.users_mode {
+                    "users"
+                } else {
+                    "local"
+                }
+            );
             if cfg.auth.users_mode {
                 println!("  users:         {}", cfg.auth.users.len());
                 for u in &cfg.auth.users {

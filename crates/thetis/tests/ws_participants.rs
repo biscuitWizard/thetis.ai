@@ -46,7 +46,9 @@ struct Env {
 }
 
 fn env() -> Option<Env> {
-    let ws_url = std::env::var("THETIS_WS_URL").ok().filter(|v| !v.trim().is_empty())?;
+    let ws_url = std::env::var("THETIS_WS_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
     let authority = ws_url.strip_prefix("ws://")?.split('/').next()?.to_string();
     let pair = |key: &str| -> Option<(String, String)> {
         let raw = std::env::var(key).ok()?;
@@ -97,8 +99,14 @@ fn urlencode(s: &str) -> String {
 }
 
 async fn login(env: &Env, user: &str, password: &str) -> Reply {
-    let body = format!("user={}&password={}&next=%2F", urlencode(user), urlencode(password));
-    let mut stream = tokio::net::TcpStream::connect(&env.authority).await.expect("connect");
+    let body = format!(
+        "user={}&password={}&next=%2F",
+        urlencode(user),
+        urlencode(password)
+    );
+    let mut stream = tokio::net::TcpStream::connect(&env.authority)
+        .await
+        .expect("connect");
     let req = format!(
         "POST /login HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
@@ -127,14 +135,21 @@ type Socket =
 
 async fn connect(env: &Env, cookie: &str) -> Socket {
     let mut req = env.ws_url.as_str().into_client_request().unwrap();
-    req.headers_mut()
-        .insert("Cookie", format!("thetis_session={cookie}").parse().unwrap());
-    let (socket, _) = tokio_tungstenite::connect_async(req).await.expect("a socket");
+    req.headers_mut().insert(
+        "Cookie",
+        format!("thetis_session={cookie}").parse().unwrap(),
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("a socket");
     socket
 }
 
 async fn send(socket: &mut Socket, frame: Value) {
-    socket.send(Message::Text(frame.to_string().into())).await.unwrap();
+    socket
+        .send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
 }
 
 async fn wait_for<T>(
@@ -160,16 +175,22 @@ async fn wait_for<T>(
 
 /// Waits for the next `participants` frame, or the refusal of one.
 async fn roster(socket: &mut Socket) -> Result<Value, String> {
-    wait_for(socket, "a participants frame", |f| match f["type"].as_str() {
-        Some("participants") => Some(Ok(f.clone())),
-        Some("error") => Some(Err(f["message"].as_str().unwrap_or("").to_string())),
-        _ => None,
+    wait_for(socket, "a participants frame", |f| {
+        match f["type"].as_str() {
+            Some("participants") => Some(Ok(f.clone())),
+            Some("error") => Some(Err(f["message"].as_str().unwrap_or("").to_string())),
+            _ => None,
+        }
     })
     .await
 }
 
 async fn ask_roster(socket: &mut Socket, id: &str) -> Result<Value, String> {
-    send(socket, serde_json::json!({ "type": "participants", "id": id })).await;
+    send(
+        socket,
+        serde_json::json!({ "type": "participants", "id": id }),
+    )
+    .await;
     roster(socket).await
 }
 
@@ -197,10 +218,12 @@ async fn listed(socket: &mut Socket) -> Vec<String> {
 /// success looks like.
 async fn opened_by(socket: &mut Socket, id: &str) -> Result<String, String> {
     send(socket, serde_json::json!({ "type": "open", "id": id })).await;
-    wait_for(socket, "a history frame or a refusal", |f| match f["type"].as_str() {
-        Some("history") => Some(Ok(f["session"].as_str().unwrap_or("").to_string())),
-        Some("error") => Some(Err(f["message"].as_str().unwrap_or("").to_string())),
-        _ => None,
+    wait_for(socket, "a history frame or a refusal", |f| {
+        match f["type"].as_str() {
+            Some("history") => Some(Ok(f["session"].as_str().unwrap_or("").to_string())),
+            Some("error") => Some(Err(f["message"].as_str().unwrap_or("").to_string())),
+            _ => None,
+        }
     })
     .await
 }
@@ -274,7 +297,9 @@ async fn a_conversation_can_be_shared_and_unshared() {
     // roster that omitted them would be technically accurate and useless: it
     // is what tells a reader whose conversation this is, and therefore whether
     // the invite and remove controls belong to them.
-    let r = ask_roster(&mut a, &convo).await.expect("the owner gets a roster");
+    let r = ask_roster(&mut a, &convo)
+        .await
+        .expect("the owner gets a roster");
     assert_eq!(r["session"], convo.as_str());
     let seats = people(&r);
     assert_eq!(seats.len(), 1, "just the owner to begin with: {seats:?}");
@@ -283,7 +308,10 @@ async fn a_conversation_can_be_shared_and_unshared() {
 
     // --- 2. invitable-accounts offers the other account ---------------------
     let offered = invitable(&r);
-    assert!(offered.contains(&guest_id), "the other account can be invited: {offered:?}");
+    assert!(
+        offered.contains(&guest_id),
+        "the other account can be invited: {offered:?}"
+    );
     assert!(!offered.contains(&owner_id), "you cannot invite yourself");
 
     // Someone with no connection to the conversation is refused the *frame*,
@@ -308,10 +336,15 @@ async fn a_conversation_can_be_shared_and_unshared() {
         serde_json::json!({ "type": "participant-add", "id": convo, "account": guest_id }),
     )
     .await;
-    let after = roster(&mut a).await.expect("the invite is confirmed with a roster");
+    let after = roster(&mut a)
+        .await
+        .expect("the invite is confirmed with a roster");
     let seats = people(&after);
     assert_eq!(seats.len(), 2, "owner and guest: {seats:?}");
-    assert!(listed(&mut b).await.contains(&convo), "the invitee can now see it");
+    assert!(
+        listed(&mut b).await.contains(&convo),
+        "the invitee can now see it"
+    );
 
     // --- 4. the roster shows each person's own standing ----------------------
     //
@@ -319,12 +352,18 @@ async fn a_conversation_can_be_shared_and_unshared() {
     // the per-speaker rule is visible to a human. `effective = policy(speaker)
     // ∩ ceiling`, and the read-only account stays read-only in an admin's
     // conversation — which is the property the whole design was built for.
-    let guest_seat = seats.iter().find(|(id, _, _)| id == &guest_id).expect("the guest");
+    let guest_seat = seats
+        .iter()
+        .find(|(id, _, _)| id == &guest_id)
+        .expect("the guest");
     assert!(
         guest_seat.2,
         "the read-only account must be shown as read-only here, not inherit the owner's write access"
     );
-    let owner_seat = seats.iter().find(|(id, _, _)| id == &owner_id).expect("the owner");
+    let owner_seat = seats
+        .iter()
+        .find(|(id, _, _)| id == &owner_id)
+        .expect("the owner");
     assert!(!owner_seat.2, "the owner is not read-only");
 
     // Now that the guest is in, the real non-owner case is reachable: they get
@@ -332,7 +371,9 @@ async fn a_conversation_can_be_shared_and_unshared() {
     // list, which is what hides the invite control rather than offering one
     // that would be refused. It is also not an account directory — only the
     // owner learns which accounts exist.
-    let theirs = ask_roster(&mut b, &convo).await.expect("a participant sees the roster");
+    let theirs = ask_roster(&mut b, &convo)
+        .await
+        .expect("a participant sees the roster");
     assert_eq!(people(&theirs).len(), 2, "the guest sees both seats");
     assert!(
         invitable(&theirs).is_empty(),
@@ -363,11 +404,13 @@ async fn a_conversation_can_be_shared_and_unshared() {
         serde_json::json!({ "type": "participant-add", "id": convo, "account": owner_id }),
     )
     .await;
-    let refused = wait_for(&mut b, "a refusal of the invite", |f| match f["type"].as_str() {
-        Some("error") => Some(true),
-        // A participants frame would mean it went through.
-        Some("participants") => Some(false),
-        _ => None,
+    let refused = wait_for(&mut b, "a refusal of the invite", |f| {
+        match f["type"].as_str() {
+            Some("error") => Some(true),
+            // A participants frame would mean it went through.
+            Some("participants") => Some(false),
+            _ => None,
+        }
     })
     .await;
     assert!(refused, "a non-owner must not be able to invite");
@@ -401,9 +444,13 @@ async fn a_conversation_can_be_shared_and_unshared() {
         // and the next read picks up that stale one — which is how a later
         // assertion can pass against a roster from before the change it is
         // meant to be checking.
-        let seated = roster(&mut a).await.expect("a roster after the second invite");
+        let seated = roster(&mut a)
+            .await
+            .expect("a roster after the second invite");
         assert!(
-            people(&seated).iter().any(|(account, _, _)| account == &third_id),
+            people(&seated)
+                .iter()
+                .any(|(account, _, _)| account == &third_id),
             "the second guest was seated"
         );
 
@@ -436,7 +483,10 @@ async fn a_conversation_can_be_shared_and_unshared() {
             .cookie()
             .expect("the third account logged in");
         let mut c = connect(&env, &third_cookie).await;
-        wait_for(&mut c, "the user frame", |f| (f["type"] == "user").then_some(())).await;
+        wait_for(&mut c, "the user frame", |f| {
+            (f["type"] == "user").then_some(())
+        })
+        .await;
         assert!(
             listed(&mut c).await.contains(&convo),
             "one guest must not be able to evict another: {third_id} lost access \
@@ -518,13 +568,18 @@ async fn a_conversation_can_be_shared_and_unshared() {
     // own access, so a roster is no longer theirs to read and asking for one
     // would be refused — which, for a guest import, means trapping in the
     // middle of a mutation that had already succeeded.
-    let left = wait_for(&mut b, "the result of leaving", |f| match f["type"].as_str() {
-        Some("sessions") => Some(Ok(())),
-        Some("error") => Some(Err(f["message"].as_str().unwrap_or("").to_string())),
-        _ => None,
+    let left = wait_for(&mut b, "the result of leaving", |f| {
+        match f["type"].as_str() {
+            Some("sessions") => Some(Ok(())),
+            Some("error") => Some(Err(f["message"].as_str().unwrap_or("").to_string())),
+            _ => None,
+        }
     })
     .await;
-    assert!(left.is_ok(), "a participant may remove themselves: {left:?}");
+    assert!(
+        left.is_ok(),
+        "a participant may remove themselves: {left:?}"
+    );
 
     // --- 8. and the conversation is gone from their sidebar and locked ------
     assert!(
@@ -537,7 +592,9 @@ async fn a_conversation_can_be_shared_and_unshared() {
     );
 
     // The owner still has it, with the roster back to one seat.
-    let back = ask_roster(&mut a, &convo).await.expect("the owner still has their roster");
+    let back = ask_roster(&mut a, &convo)
+        .await
+        .expect("the owner still has their roster");
     assert_eq!(people(&back).len(), 1, "the owner is unaffected");
     assert!(listed(&mut a).await.contains(&convo));
 

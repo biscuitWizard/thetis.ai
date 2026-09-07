@@ -481,6 +481,9 @@ pub struct SkillSettings {
     pub retrieval_enabled: bool,
     /// How many L1 cards to inject for a conversation.
     pub retrieve_limit: usize,
+    /// Dense contribution to reciprocal-rank fusion with BM25. Zero preserves
+    /// dense-only ranking; one ignores lexical rank.
+    pub fusion_weight: f64,
     /// Embedding model. Must honour the `dimensions` parameter.
     pub embedding_model: String,
     /// Which provider serves embeddings. Empty routes by the model id, exactly
@@ -499,6 +502,7 @@ impl Default for SkillSettings {
         Self {
             retrieval_enabled: true,
             retrieve_limit: 10,
+            fusion_weight: 0.0,
             embedding_model: "openai/text-embedding-3-small".into(),
             embedding_provider: String::new(),
             embedding_dimensions: 1536,
@@ -1266,6 +1270,7 @@ mod spec {
     pub struct Skills {
         pub retrieval_enabled: bool,
         pub retrieve_limit: usize,
+        pub fusion_weight: f64,
         pub embedding_model: String,
         pub embedding_provider: String,
         pub embedding_dimensions: u32,
@@ -1278,6 +1283,7 @@ mod spec {
             Self {
                 retrieval_enabled: d.retrieval_enabled,
                 retrieve_limit: d.retrieve_limit,
+                fusion_weight: d.fusion_weight,
                 embedding_model: d.embedding_model,
                 embedding_provider: d.embedding_provider,
                 embedding_dimensions: d.embedding_dimensions,
@@ -2647,6 +2653,7 @@ impl Config {
                 // A limit of zero would disable the L1 block by accident; use
                 // `retrieval_enabled = false` to mean that on purpose.
                 retrieve_limit: file.skills.retrieve_limit.clamp(1, 50),
+                fusion_weight: file.skills.fusion_weight.clamp(0.0, 1.0),
                 embedding_model: env
                     .string("THETIS_EMBEDDING_MODEL")
                     .unwrap_or(file.skills.embedding_model),
@@ -2941,7 +2948,11 @@ fn builtin_models() -> Vec<ModelSpec> {
 
 /// PowerShell on Windows, a POSIX shell elsewhere.
 fn default_shell() -> &'static str {
-    if cfg!(windows) { "powershell" } else { "sh" }
+    if cfg!(windows) {
+        "powershell"
+    } else {
+        "sh"
+    }
 }
 
 fn default_shell_args() -> Vec<String> {
@@ -3090,7 +3101,10 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFz
     fn an_id_that_is_not_lowercase_is_refused_with_the_rule() {
         let err = from_toml(&one_user("bitMuse")).unwrap_err().to_string();
         assert!(err.contains("invalid user id"), "{err}");
-        assert!(err.contains("lowercase"), "the message has to say why: {err}");
+        assert!(
+            err.contains("lowercase"),
+            "the message has to say why: {err}"
+        );
     }
 
     #[test]
@@ -3168,7 +3182,10 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFz
         let bob = cfg.auth.user("bob").unwrap();
         assert!(!bob.policy.admin, "reader is not an administrator");
         assert!(bob.policy.read_only);
-        assert!(bob.policy.see_all_sessions, "an override can still grant see-all");
+        assert!(
+            bob.policy.see_all_sessions,
+            "an override can still grant see-all"
+        );
         assert!(!bob.policy.denied.is_empty() || bob.policy.denies(crate::policy::Cap::Terminal));
         assert!(cfg.auth.user("alice").unwrap().policy.admin);
         // The local-mode principal keeps its authority.
@@ -3505,6 +3522,7 @@ endpoint = 0
 [skills]
 retrieval_enabled = false
 retrieve_limit = 7
+fusion_weight = 0.7
 embedding_model = "test/model"
 embedding_dimensions = 256
 max_query_chars = 99
@@ -3518,6 +3536,7 @@ max_universal = 3
         );
         assert!(!file.skills.retrieval_enabled);
         assert_eq!(file.skills.retrieve_limit, 7);
+        assert_eq!(file.skills.fusion_weight, 0.7);
         assert_eq!(file.skills.embedding_model, "test/model");
         assert_eq!(file.skills.embedding_dimensions, 256);
         assert_eq!(file.skills.max_query_chars, 99);
@@ -4052,19 +4071,15 @@ version = "2025-09-03"
 
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
-        assert!(
-            seen["private_key_contents"]
-                .as_str()
-                .unwrap()
-                .contains("BEGIN RSA PRIVATE KEY")
-        );
+        assert!(seen["private_key_contents"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN RSA PRIVATE KEY"));
         // The path itself is still visible, for error messages that name it.
-        assert!(
-            seen["private_key_path"]
-                .as_str()
-                .unwrap()
-                .ends_with("app.pem")
-        );
+        assert!(seen["private_key_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("app.pem"));
 
         // A path that cannot be read reports why, rather than looking unset.
         let missing: spec::File =
@@ -4090,12 +4105,10 @@ version = "2025-09-03"
         let seen: serde_json::Value =
             serde_json::from_str(&cfg.tool_config_json("zzkeysvc")).unwrap();
         assert!(seen.get("private_key_contents").is_none());
-        assert!(
-            seen["private_key_contents_error"]
-                .as_str()
-                .unwrap()
-                .contains("inside the project root")
-        );
+        assert!(seen["private_key_contents_error"]
+            .as_str()
+            .unwrap()
+            .contains("inside the project root"));
 
         // A relative path resolves against the shared overlay's directory too,
         // not just the project root. This is the worktree case: a conversation

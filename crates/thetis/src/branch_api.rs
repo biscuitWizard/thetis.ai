@@ -7,13 +7,13 @@
 //! is also broadcast to every tab watching the session.
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::bindings::branch::BranchState;
 use crate::branches::Branches;
 use crate::grip::{Grip, RenderedFrame, Role};
-use crate::workers::{PENDING_BASE_KEY, WorkerRouter, call_session};
+use crate::workers::{call_session, WorkerRouter, PENDING_BASE_KEY};
 
 /// True when this frame type belongs to the branch protocol.
 pub fn handles(frame_type: &str) -> bool {
@@ -37,18 +37,16 @@ pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
         Ok(replies) => replies,
         Err(e) => {
             let op = frame_type.trim_start_matches("branch-").to_string();
-            vec![
-                json!({
-                    "type": "branch-result",
-                    "session": session,
-                    "op": op,
-                    "ok": false,
-                    "state": "error",
-                    "conflicts": [],
-                    "message": format!("{e:#}"),
-                })
-                .to_string(),
-            ]
+            vec![json!({
+                "type": "branch-result",
+                "session": session,
+                "op": op,
+                "ok": false,
+                "state": "error",
+                "conflicts": [],
+                "message": format!("{e:#}"),
+            })
+            .to_string()]
         }
     }
 }
@@ -114,14 +112,12 @@ async fn dispatch(
                     None => json!([]),
                 }
             };
-            Ok(vec![
-                json!({
-                    "type": "branch-log",
-                    "session": session,
-                    "commits": commits,
-                })
-                .to_string(),
-            ])
+            Ok(vec![json!({
+                "type": "branch-log",
+                "session": session,
+                "commits": commits,
+            })
+            .to_string()])
         }
 
         // Everything a commit graph needs, computed from shared refs alone —
@@ -168,18 +164,16 @@ async fn dispatch(
                 })
             };
 
-            Ok(vec![
-                json!({
-                    "type": "branch-graph",
-                    "session": session,
-                    "trunk_name": trunk_name,
-                    "branch_name": branch_name,
-                    "base": base,
-                    "trunk": trunk_commits.iter().map(commit_json).collect::<Vec<_>>(),
-                    "branch": branch_commits.iter().map(commit_json).collect::<Vec<_>>(),
-                })
-                .to_string(),
-            ])
+            Ok(vec![json!({
+                "type": "branch-graph",
+                "session": session,
+                "trunk_name": trunk_name,
+                "branch_name": branch_name,
+                "base": base,
+                "trunk": trunk_commits.iter().map(commit_json).collect::<Vec<_>>(),
+                "branch": branch_commits.iter().map(commit_json).collect::<Vec<_>>(),
+            })
+            .to_string()])
         }
 
         "branch-trunk-log" => {
@@ -443,6 +437,7 @@ async fn broadcast_status(grip: &Arc<Grip>, router: &Arc<WorkerRouter>, session:
             let _ = grip.frames_tx.send(RenderedFrame {
                 session_id: session.to_string(),
                 frame: frame.clone(),
+                gateway: None,
             });
             frame
         }

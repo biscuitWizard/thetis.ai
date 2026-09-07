@@ -152,8 +152,9 @@ fn verify(db_path: &Path, cache_root: &Path) -> Result<(usize, usize)> {
             for row in table.iter()? {
                 let (k, v) = row?;
                 let (aspect_key, revision) = k.value();
-                serde_json::from_slice::<thetis::revisions::RevisionRow>(v.value())
-                    .with_context(|| format!("revision {aspect_key}#{revision} still does not decode"))?;
+                serde_json::from_slice::<thetis::revisions::RevisionRow>(v.value()).with_context(
+                    || format!("revision {aspect_key}#{revision} still does not decode"),
+                )?;
                 rows += 1;
             }
         }
@@ -225,7 +226,10 @@ fn repoint_branches(db_path: &Path, base: &str, root: &Path, apply: bool) -> Res
                 .and_then(|w| w.rsplit('/').next())
                 .map(|name| root.join("worktrees").join(name))
                 .map(|p| p.to_string_lossy().into_owned());
-            let stale_worktree = match (&wanted_worktree, object.get("worktree").and_then(Value::as_str)) {
+            let stale_worktree = match (
+                &wanted_worktree,
+                object.get("worktree").and_then(Value::as_str),
+            ) {
                 (Some(wanted), Some(current)) => wanted != current,
                 _ => false,
             };
@@ -316,13 +320,20 @@ fn main() -> Result<()> {
             .map(Path::to_path_buf)
             .context("the data directory has no parent")?;
         let n = repoint_branches(&db_path, base, &root, apply)?;
-        let verb = if apply { "re-pointed" } else { "would re-point" };
+        let verb = if apply {
+            "re-pointed"
+        } else {
+            "would re-point"
+        };
         println!("{verb} {n} conversation branches at {base}");
     }
 
     let verb = if apply { "migrated" } else { "would migrate" };
     println!("{verb} {revisions} revision rows in {}", db_path.display());
-    println!("{verb} {cache} build-cache entries under {}", artifacts.display());
+    println!(
+        "{verb} {cache} build-cache entries under {}",
+        artifacts.display()
+    );
     if !apply {
         println!("\nnothing was written — re-run with --apply");
         return Ok(());

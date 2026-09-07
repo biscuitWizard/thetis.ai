@@ -15,8 +15,8 @@
 //! reaped after a quiet period — their branch state is all on disk and in the
 //! gateway's database, so nothing is lost by stopping one.
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::os::fd::IntoRawFd;
 use std::sync::Arc;
@@ -648,6 +648,14 @@ pub struct GatewayHandler {
     ready: tokio::sync::watch::Sender<bool>,
 }
 
+fn frame_gateway(params: &Value, primary: &str) -> String {
+    params
+        .get("gateway")
+        .and_then(Value::as_str)
+        .unwrap_or(primary)
+        .to_string()
+}
+
 impl ipc::Handler for GatewayHandler {
     fn handle(
         self: Arc<Self>,
@@ -735,6 +743,7 @@ impl ipc::Handler for GatewayHandler {
             }
             // A frame the worker rendered for one of its session's events.
             "frame" => {
+                let gateway = frame_gateway(&params, &grip.primary_gateway_name());
                 let session = params
                     .get("session")
                     .and_then(Value::as_str)
@@ -749,10 +758,13 @@ impl ipc::Handler for GatewayHandler {
                     // Fold it into the conversation's live state first, so the
                     // `activity` push and the frame itself leave in that order
                     // and a sidebar never learns of a step after the transcript.
-                    grip.activity.note(&session, &frame);
+                    if gateway == grip.primary_gateway_name() {
+                        grip.activity.note(&session, &frame);
+                    }
                     let _ = grip.frames_tx.send(RenderedFrame {
                         session_id: session,
                         frame,
+                        gateway: Some(gateway),
                     });
                 }
             }
@@ -771,6 +783,7 @@ impl ipc::Handler for GatewayHandler {
                     let _ = grip.frames_tx.send(RenderedFrame {
                         session_id: self.session_id.clone(),
                         frame: text,
+                        gateway: None,
                     });
                 }
             }
@@ -795,8 +808,11 @@ impl ipc::Handler for GatewayHandler {
                     // A fresh deployment serves the fallback page until some
                     // worker's first build lands in the cache; a branch at
                     // trunk's head keys identically to trunk, so try again.
-                    let ui = crate::aspect::Aspect::gateway(&grip.cfg().primary_gateway);
-                    if grip.loader.get(&ui).is_none() {
+                    let missing = grip
+                        .gateway_aspects()
+                        .iter()
+                        .any(|aspect| grip.loader.get(aspect).is_none());
+                    if missing {
                         crate::roles::gateway::load_ui_gateway(&grip).await;
                     }
                     reconcile_session(&grip, &session_id).await;
@@ -1029,7 +1045,12 @@ async fn adopt_branch_kernel(grip: &Arc<Grip>, session_id: &str, kernel: &str) -
 
     // Keyed by the branch's current commit: the kernel is a build of it.
     let commit = crate::gitctl::GitCtl::new(&row.worktree).head().await?;
-    let dir = grip.cfg().paths.artifacts.join("cache/kernel").join(&commit);
+    let dir = grip
+        .cfg()
+        .paths
+        .artifacts
+        .join("cache/kernel")
+        .join(&commit);
     std::fs::create_dir_all(&dir)?;
     let cached = dir.join("thetis");
 
@@ -1156,4 +1177,19 @@ fn spawn_worker_process(
     ours.set_nonblocking(true)?;
     let stream = tokio::net::UnixStream::from_std(ours)?;
     Ok((stream, child))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_gateway;
+    use serde_json::json;
+
+    #[test]
+    fn a_frame_from_an_older_worker_belongs_to_the_primary() {
+        assert_eq!(frame_gateway(&json!({ "frame": "{}" }), "web"), "web");
+        assert_eq!(
+            frame_gateway(&json!({ "gateway": "campaign" }), "web"),
+            "campaign"
+        );
+    }
 }

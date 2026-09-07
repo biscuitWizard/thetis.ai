@@ -7,7 +7,7 @@
 //! the database because it never opens it.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
@@ -117,8 +117,11 @@ impl Persist {
     ) -> Result<crate::policy::EffectivePolicy> {
         match self {
             Persist::Remote(peer) => {
-                peer.call_as("store.session_policy", json!({"id": id, "speaker": speaker}))
-                    .await
+                peer.call_as(
+                    "store.session_policy",
+                    json!({"id": id, "speaker": speaker}),
+                )
+                .await
             }
             Persist::Local(_) => anyhow::bail!("session policy is resolved from gateway config"),
         }
@@ -136,7 +139,11 @@ impl Persist {
 
     /// Stamps a conversation's ceiling. Gateway-side only in practice: the
     /// callers are session creation and `/fork`, never a guest.
-    pub async fn set_ceiling(&self, id: &str, policy: &crate::policy::EffectivePolicy) -> Result<()> {
+    pub async fn set_ceiling(
+        &self,
+        id: &str,
+        policy: &crate::policy::EffectivePolicy,
+    ) -> Result<()> {
         delegate!(
             self,
             "store.set_ceiling",
@@ -765,9 +772,9 @@ fn serve_store_call_inner(
             )?;
             to_value(store.set_ceiling(get_str(&params, "id")?, &policy)?)
         }
-        "store.is_participant" => to_value(
-            store.is_participant(get_str(&params, "id")?, get_str(&params, "account")?)?,
-        ),
+        "store.is_participant" => {
+            to_value(store.is_participant(get_str(&params, "id")?, get_str(&params, "account")?)?)
+        }
         "store.participants" => {
             let id = get_str(&params, "id")?;
             let scoped = serde_json::json!({ "session": id });
@@ -1281,9 +1288,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
         let cfg = two_account_config();
-        let convo = store
-            .create_session(None, "chat", "writer")
-            .unwrap();
+        let convo = store.create_session(None, "chat", "writer").unwrap();
 
         let mut narrow = cfg.auth.local_policy.as_ref().clone();
         narrow.read_only = true;
@@ -1355,10 +1360,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
         let cfg = two_account_config();
-        let convo = store
-            .create_session(None, "agent", "writer")
+        let convo = store.create_session(None, "agent", "writer").unwrap();
+        store
+            .add_participant(&convo.id, "reader", "writer")
             .unwrap();
-        store.add_participant(&convo.id, "reader", "writer").unwrap();
 
         let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
         // Unscoped: the gateway acting for a browser, which is the only way a
@@ -1578,7 +1583,10 @@ mod tests {
             .append_event(&bob.id, SessionEvent::Nudge("the zebra password".into()))
             .unwrap();
         store
-            .append_event(&alice.id, SessionEvent::Nudge("nothing about zebras".into()))
+            .append_event(
+                &alice.id,
+                SessionEvent::Nudge("nothing about zebras".into()),
+            )
             .unwrap();
 
         // A worker running Alice's conversation.
@@ -1594,19 +1602,35 @@ mod tests {
 
         // Listing, by either name the wire knows.
         let listed = remote.list_sessions(true).await.unwrap();
-        assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![alice.id.as_str()]);
+        assert_eq!(
+            listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec![alice.id.as_str()]
+        );
         let listed = remote.list_sessions_owned(None, true).await.unwrap();
-        assert_eq!(listed.len(), 1, "asking for everyone's still gets only the owner's");
+        assert_eq!(
+            listed.len(),
+            1,
+            "asking for everyone's still gets only the owner's"
+        );
         // A worker cannot name an owner at all: the remote arm drops the
         // argument and the gateway lists for the caller's owner, so asking
         // for bob's gets alice's.
         let listed = remote.list_sessions_owned(Some("bob"), true).await.unwrap();
-        assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![alice.id.as_str()]);
+        assert_eq!(
+            listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec![alice.id.as_str()]
+        );
 
         // Fetching by id.
         assert!(remote.get_session(&alice.id).await.unwrap().is_some());
-        assert!(remote.get_session(&bob.id).await.is_err(), "bob's is refused, not None");
-        assert_eq!(remote.owner_of_root(&alice.id).await.unwrap().as_deref(), Some("alice"));
+        assert!(
+            remote.get_session(&bob.id).await.is_err(),
+            "bob's is refused, not None"
+        );
+        assert_eq!(
+            remote.owner_of_root(&alice.id).await.unwrap().as_deref(),
+            Some("alice")
+        );
 
         // Recall: the catalogue, a read and a search.
         let convs = remote.conversations(true, false, 0).await.unwrap();
@@ -1655,7 +1679,10 @@ mod tests {
         remote.kv_put("user:alice", "k", "mine").await.unwrap();
         assert!(remote.kv_put("user:bob", "k", "theirs").await.is_err());
         assert!(remote.kv_get("user:bob", "k").await.is_err());
-        assert_eq!(store.kv_get("user:alice", "k").unwrap().as_deref(), Some("mine"));
+        assert_eq!(
+            store.kv_get("user:alice", "k").unwrap().as_deref(),
+            Some("mine")
+        );
     }
 
     /// The transcript arms must work through the *remote* arm specifically.
@@ -1734,14 +1761,12 @@ mod tests {
 
         // A bad pattern is an error on the far side, not a panic or an empty
         // result that reads as "no matches".
-        assert!(
-            remote
-                .search_transcripts(&crate::transcripts::SearchQuery {
-                    pattern: "[unclosed".into(),
-                    ..Default::default()
-                })
-                .await
-                .is_err()
-        );
+        assert!(remote
+            .search_transcripts(&crate::transcripts::SearchQuery {
+                pattern: "[unclosed".into(),
+                ..Default::default()
+            })
+            .await
+            .is_err());
     }
 }

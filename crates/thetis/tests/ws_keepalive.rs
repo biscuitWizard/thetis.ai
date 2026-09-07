@@ -24,7 +24,9 @@ async fn keep_workers_alive() {
         .unwrap_or(600);
     let sessions: Vec<String> = sessions.split(',').map(str::to_string).collect();
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     while tokio::time::Instant::now() < deadline {
         for session in &sessions {

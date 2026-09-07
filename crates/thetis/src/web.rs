@@ -6,13 +6,13 @@
 //! control surface that must keep working when every guest is broken.
 
 use anyhow::{Context, Result};
-use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Form, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,9 +21,10 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::bindings::gateway::GatewayAction;
 use crate::gateway;
 use crate::grip::{Grip, RenderedFrame};
+use crate::mounts::GatewayMount;
 
 pub async fn serve(grip: Arc<Grip>) -> Result<()> {
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
@@ -49,7 +50,13 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
             ),
         )
         .route("/", get(root_asset))
-        .route("/{*path}", get(path_asset))
+        .route("/{*path}", get(path_asset));
+
+    for mount in grip.mounts().iter().cloned() {
+        app = mount_routes(app, Arc::new(mount));
+    }
+
+    let app = app
         // Identity and authorization live in this native router. The outer
         // origin guard preserves same-origin/Host protection; authentication
         // then attaches a principal before any user-facing handler runs.
@@ -163,7 +170,8 @@ async fn authenticate(State(grip): State<Arc<Grip>>, mut req: Request, next: Nex
             if req.uri().path() == "/login" && grip.cfg().auth.users_mode {
                 return Redirect::to("/").into_response();
             }
-            if req.uri().path().starts_with("/admin") && (!grip.cfg().admin_enabled || !p.is_admin())
+            if req.uri().path().starts_with("/admin")
+                && (!grip.cfg().admin_enabled || !p.is_admin())
             {
                 return (StatusCode::FORBIDDEN, "admin console unavailable").into_response();
             }
@@ -257,7 +265,8 @@ async fn login_submit(
     let Some(u) = user.filter(|_| ok) else {
         crate::auth::login_failed(&typed, &g.cfg());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        return crate::auth::page(&g.cfg(), Some("Wrong user or password."), &f.next).into_response();
+        return crate::auth::page(&g.cfg(), Some("Wrong user or password."), &f.next)
+            .into_response();
     };
     crate::auth::login_succeeded(&typed);
     let t = crate::auth::new_token();
@@ -279,7 +288,10 @@ async fn login_submit(
         Some(s) => {
             if let Err(e) = s.put_login(&crate::auth::token_hash(&t), &row) {
                 tracing::error!(error = %e, user = %u.id, "could not record a login");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "could not record the login")
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not record the login",
+                )
                     .into_response();
             }
         }
@@ -345,6 +357,72 @@ async fn bind_with_retry(addr: std::net::SocketAddr) -> Result<tokio::net::TcpLi
 // Events render in the worker that produced them (with that worker's own
 // build of the UI), arriving here as ready-made frames — so there is no
 // render loop on this side. See `roles::worker::spawn_render_loop`.
+
+fn mount_routes(app: Router<Arc<Grip>>, mount: Arc<GatewayMount>) -> Router<Arc<Grip>> {
+    let root = mount.path.clone();
+    let slash = format!("{}/", mount.path);
+    let ws = format!("{}/ws", mount.path);
+    let wildcard = format!("{}/{{*path}}", mount.path);
+    let redirect = slash.clone();
+    app.route(
+        &root,
+        get(move || async move { Redirect::permanent(&redirect) }),
+    )
+    .route(
+        &slash,
+        get({
+            let mount = mount.clone();
+            move |State(grip)| mount_asset_response(grip, mount.clone(), "/".into())
+        }),
+    )
+    .route(
+        &ws,
+        get({
+            let mount = mount.clone();
+            move |ws: WebSocketUpgrade,
+                  State(grip): State<Arc<Grip>>,
+                  Extension(principal): Extension<Arc<crate::auth::Principal>>| {
+                let gateway = Arc::from(mount.gateway.clone());
+                async move { upgrade_for(ws, grip, principal, gateway) }
+            }
+        }),
+    )
+    .route(
+        &wildcard,
+        get({
+            let mount = mount.clone();
+            move |State(grip), Path(path): Path<String>| {
+                mount_asset_response(grip, mount.clone(), format!("/{path}"))
+            }
+        }),
+    )
+}
+
+async fn mount_asset_response(grip: Arc<Grip>, mount: Arc<GatewayMount>, path: String) -> Response {
+    match gateway::serve_asset_of(&grip, &mount.aspect(), &path).await {
+        Ok(Some(mut asset)) => {
+            if asset.mime.starts_with("text/html") {
+                asset.bytes = rewrite_prefixed_html(&asset.bytes, &mount.path);
+            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, asset.mime)],
+                asset.bytes,
+            )
+                .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(fallback_page(&format!("{e:#}"))),
+        )
+            .into_response(),
+    }
+}
+
+fn rewrite_prefixed_html(bytes: &[u8], prefix: &str) -> Vec<u8> {
+    rewrite_asset_urls(bytes, prefix)
+}
 
 // --- assets ----------------------------------------------------------------
 
@@ -863,10 +941,14 @@ async fn preview_response(grip: &Arc<Grip>, session: &str, path: &str) -> Respon
 /// The scripts themselves import relatively (`./lib/dom.js`), so once the
 /// entry point is under the prefix the rest follows on its own.
 fn rewrite_preview_html(bytes: &[u8], session: &str) -> Vec<u8> {
+    rewrite_asset_urls(bytes, &format!("/preview/{session}"))
+}
+
+fn rewrite_asset_urls(bytes: &[u8], prefix: &str) -> Vec<u8> {
     let Ok(html) = std::str::from_utf8(bytes) else {
         return bytes.to_vec();
     };
-    let prefix = format!("/preview/{session}");
+    let prefix = prefix.to_string();
     let mut out = String::with_capacity(html.len() + 128);
     let mut rest = html;
     loop {
@@ -909,6 +991,16 @@ async fn ws_upgrade(
     State(grip): State<Arc<Grip>>,
     Extension(principal): Extension<Arc<crate::auth::Principal>>,
 ) -> Response {
+    let name = grip.primary_gateway_name();
+    upgrade_for(ws, grip, principal, Arc::from(name))
+}
+
+fn upgrade_for(
+    ws: WebSocketUpgrade,
+    grip: Arc<Grip>,
+    principal: Arc<crate::auth::Principal>,
+    gateway: Arc<str>,
+) -> Response {
     // The protocol is small JSON frames; the one bulky payload is a
     // `workspace-write` of an edited text file (bounded well under this once
     // JSON-escaped), and raw bytes go over HTTP, not here. Capping the frame
@@ -916,14 +1008,19 @@ async fn ws_upgrade(
     const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| connection(socket, grip, principal))
+        .on_upgrade(move |socket| connection(socket, grip, principal, gateway))
 }
 
 /// How many outbound frames may be queued for one browser before the reader
 /// starts waiting. A slow tab throttles itself; it never stalls the gateway.
 const OUTBOUND_QUEUE: usize = 256;
 
-async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::auth::Principal>) {
+async fn connection(
+    socket: WebSocket,
+    grip: Arc<Grip>,
+    principal: Arc<crate::auth::Principal>,
+    gateway: Arc<str>,
+) {
     let client_id = uuid::Uuid::new_v4().to_string();
     let (sink, mut incoming) = socket.split();
     let frames = grip.frames_tx.subscribe();
@@ -948,6 +1045,7 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
         client_id.clone(),
         grip.clone(),
         principal.clone(),
+        gateway.clone(),
     ));
 
     tracing::debug!(%client_id, "websocket connected");
@@ -977,7 +1075,11 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
         // simply gets more rows. Someone without `see_all_sessions` can send
         // this all day: the switch is inert for them.
         if frame_type == "list" {
-            if let Some(all) = frame.as_ref().and_then(|f| f.get("all")).and_then(|v| v.as_bool()) {
+            if let Some(all) = frame
+                .as_ref()
+                .and_then(|f| f.get("all"))
+                .and_then(|v| v.as_bool())
+            {
                 principal.set_view_all(all);
                 if all && !principal.may_see_all() {
                     let _ = out_tx
@@ -1118,23 +1220,30 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
             }
         }
 
-        let actions =
-            match gateway::on_client_message(&grip, &client_id, &text, principal.clone()).await {
-                Ok(actions) => actions,
-                Err(e) => {
-                    // Show the whole chain: the outer context alone ("gateway
-                    // on-client-message") says nothing about what went wrong.
-                    let detail = format!("{e:#}");
-                    tracing::warn!(error = %detail, "gateway rejected a client message");
-                    // Naming the frame this answers lets the client tell an
-                    // incidental error from the refusal of the thing it is
-                    // waiting on — a `send` whose worker would not start arrives
-                    // here, and the composer stays locked behind an optimistic
-                    // message until it knows.
-                    let _ = out_tx.send(error_frame(&detail, inbound_type(&text))).await;
-                    continue;
-                }
-            };
+        let actions = match gateway::on_client_message_of(
+            &grip,
+            &crate::aspect::Aspect::gateway(gateway.as_ref()),
+            &client_id,
+            &text,
+            principal.clone(),
+        )
+        .await
+        {
+            Ok(actions) => actions,
+            Err(e) => {
+                // Show the whole chain: the outer context alone ("gateway
+                // on-client-message") says nothing about what went wrong.
+                let detail = format!("{e:#}");
+                tracing::warn!(error = %detail, "gateway rejected a client message");
+                // Naming the frame this answers lets the client tell an
+                // incidental error from the refusal of the thing it is
+                // waiting on — a `send` whose worker would not start arrives
+                // here, and the composer stays locked behind an optimistic
+                // message until it knows.
+                let _ = out_tx.send(error_frame(&detail, inbound_type(&text))).await;
+                continue;
+            }
+        };
 
         for action in actions {
             match action {
@@ -1148,6 +1257,7 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
                     let _ = grip.frames_tx.send(RenderedFrame {
                         session_id: b.session_id,
                         frame: b.frame,
+                        gateway: Some(gateway.to_string()),
                     });
                 }
                 GatewayAction::Subscribe(session_id) => {
@@ -1162,7 +1272,10 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
                         Err(e) => {
                             tracing::warn!(user = %principal.user_id, session = %session_id, error = %e, "refused a subscription");
                             let _ = out_tx
-                                .send(error_frame("that conversation is not yours", Some("open".into())))
+                                .send(error_frame(
+                                    "that conversation is not yours",
+                                    Some("open".into()),
+                                ))
                                 .await;
                         }
                     }
@@ -1207,8 +1320,12 @@ fn decorate_sessions(grip: &Grip, principal: &crate::auth::Principal, frame: Str
     let activity = grip.activity.all();
     if let Some(rows) = value.get_mut("sessions").and_then(|s| s.as_array_mut()) {
         for row in rows.iter_mut() {
-            let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
-            let Some(snap) = activity.get(id) else { continue };
+            let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(snap) = activity.get(id) else {
+                continue;
+            };
             if let (Some(obj), Ok(snap)) = (row.as_object_mut(), serde_json::to_value(snap)) {
                 obj.insert("activity".into(), snap);
             }
@@ -1231,13 +1348,20 @@ fn decorate_sessions(grip: &Grip, principal: &crate::auth::Principal, frame: Str
     };
     if let Some(rows) = value.get_mut("sessions").and_then(|s| s.as_array_mut()) {
         for row in rows.iter_mut() {
-            let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
-            let Some(owner) = owners.get(id).cloned() else { continue };
+            let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(owner) = owners.get(id).cloned() else {
+                continue;
+            };
             let mine = owner == principal.user_id;
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("mine".into(), serde_json::Value::Bool(mine));
                 if !mine {
-                    obj.insert("owner_name".into(), serde_json::Value::from(name_of(&owner)));
+                    obj.insert(
+                        "owner_name".into(),
+                        serde_json::Value::from(name_of(&owner)),
+                    );
                     obj.insert("owner".into(), serde_json::Value::from(owner));
                 }
             }
@@ -1272,6 +1396,7 @@ async fn write_loop(
     client_id: String,
     grip: Arc<Grip>,
     principal: Arc<crate::auth::Principal>,
+    gateway: Arc<str>,
 ) {
     let mut visible: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     loop {
@@ -1309,7 +1434,8 @@ async fn write_loop(
             broadcast = frames.recv() => {
                 match broadcast {
                     Ok(rendered) => {
-                        if watching.read().await.contains(&rendered.session_id)
+                        if frame_for_socket(rendered.gateway.as_deref(), &gateway)
+                            && watching.read().await.contains(&rendered.session_id)
                             && sink.send(Message::Text(rendered.frame.into())).await.is_err()
                         {
                             return;
@@ -1340,6 +1466,10 @@ async fn write_loop(
     }
 }
 
+fn frame_for_socket(frame_gateway: Option<&str>, socket_gateway: &str) -> bool {
+    frame_gateway.map_or(true, |gateway| gateway == socket_gateway)
+}
+
 fn error_frame(detail: &str, replying_to: Option<String>) -> String {
     serde_json::json!({
         "type": "error",
@@ -1359,11 +1489,35 @@ fn inbound_type(text: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod mount_tests {
+    use super::frame_for_socket;
+
+    #[test]
+    fn host_frames_reach_every_socket_but_gateway_frames_are_filtered() {
+        assert!(frame_for_socket(None, "web"));
+        assert!(frame_for_socket(None, "campaign"));
+        assert!(frame_for_socket(Some("campaign"), "campaign"));
+        assert!(!frame_for_socket(Some("web"), "campaign"));
+    }
+}
+
+#[cfg(test)]
 mod preview_tests {
-    use super::rewrite_preview_html;
+    use super::{rewrite_prefixed_html, rewrite_preview_html};
 
     fn rewrite(html: &str) -> String {
         String::from_utf8(rewrite_preview_html(html.as_bytes(), "abc123")).unwrap()
+    }
+
+    #[test]
+    fn mounted_assets_are_pointed_under_the_mount() {
+        let out = String::from_utf8(rewrite_prefixed_html(
+            br#"<link href="/app.css"><script src="/app.js"></script>"#,
+            "/play",
+        ))
+        .unwrap();
+        assert!(out.contains(r#"href="/play/app.css""#), "{out}");
+        assert!(out.contains(r#"src="/play/app.js""#), "{out}");
     }
 
     #[test]
@@ -1430,7 +1584,10 @@ mod guard_tests {
         assert!(!authority_allowed(Some(&p), "thetis.example.com:8443"));
         assert!(!authority_allowed(Some(&p), "evil.example.com"));
         assert!(!authority_allowed(Some(&p), "thetis.example.com.evil.com"));
-        assert!(authority_allowed(Some(&p), "127.0.0.1:7777"), "loopback still works behind a proxy");
+        assert!(
+            authority_allowed(Some(&p), "127.0.0.1:7777"),
+            "loopback still works behind a proxy"
+        );
         assert!(origin_allowed(Some(&p), "https://thetis.example.com"));
         // The scheme is not part of the check: TLS is the proxy's business
         // and the origin guard is about *which site* the request is from.

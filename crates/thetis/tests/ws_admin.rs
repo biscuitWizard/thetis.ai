@@ -31,12 +31,10 @@ struct Env {
 }
 
 fn env() -> Option<Env> {
-    let ws_url = std::env::var("THETIS_WS_URL").ok().filter(|v| !v.trim().is_empty())?;
-    let authority = ws_url
-        .strip_prefix("ws://")?
-        .split('/')
-        .next()?
-        .to_string();
+    let ws_url = std::env::var("THETIS_WS_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
+    let authority = ws_url.strip_prefix("ws://")?.split('/').next()?.to_string();
     let pair = |key: &str| -> Option<(String, String)> {
         let raw = std::env::var(key).ok()?;
         let (u, p) = raw.split_once(':')?;
@@ -78,11 +76,20 @@ impl Reply {
 
 /// One plain HTTP/1.1 exchange. Hand-rolled because the crate has no HTTP
 /// client dependency and this is four lines of protocol.
-async fn http(env: &Env, method: &str, path: &str, cookie: Option<&str>, form: Option<&str>) -> Reply {
+async fn http(
+    env: &Env,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    form: Option<&str>,
+) -> Reply {
     let mut stream = tokio::net::TcpStream::connect(&env.authority)
         .await
         .expect("connecting to the gateway");
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n", env.authority);
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\n",
+        env.authority
+    );
     if let Some(c) = cookie {
         req.push_str(&format!("Cookie: thetis_session={c}\r\n"));
     }
@@ -112,7 +119,11 @@ async fn http(env: &Env, method: &str, path: &str, cookie: Option<&str>, form: O
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect();
-    Reply { status, headers, body: body.to_string() }
+    Reply {
+        status,
+        headers,
+        body: body.to_string(),
+    }
 }
 
 fn urlencode(s: &str) -> String {
@@ -128,13 +139,16 @@ fn urlencode(s: &str) -> String {
 }
 
 async fn login(env: &Env, user: &str, password: &str) -> Reply {
-    let form = format!("user={}&password={}&next=%2F", urlencode(user), urlencode(password));
+    let form = format!(
+        "user={}&password={}&next=%2F",
+        urlencode(user),
+        urlencode(password)
+    );
     http(env, "POST", "/login", None, Some(&form)).await
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect(env: &Env, cookie: Option<&str>) -> Result<Socket, u16> {
     let mut req = env.ws_url.as_str().into_client_request().unwrap();
@@ -157,7 +171,11 @@ async fn send(socket: &mut Socket, frame: Value) {
 }
 
 /// Reads frames until `pick` returns something, or gives up after a while.
-async fn wait_for<T>(socket: &mut Socket, what: &str, mut pick: impl FnMut(&Value) -> Option<T>) -> T {
+async fn wait_for<T>(
+    socket: &mut Socket,
+    what: &str,
+    mut pick: impl FnMut(&Value) -> Option<T>,
+) -> T {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -173,7 +191,6 @@ async fn wait_for<T>(socket: &mut Socket, what: &str, mut pick: impl FnMut(&Valu
         }
     }
 }
-
 
 async fn admin_socket(env: &Env) -> Socket {
     let login = login(env, &env.admin.0, &env.admin.1).await;
@@ -210,42 +227,90 @@ async fn an_administrator_sees_the_whole_panel_and_a_user_sees_nothing() {
     // --- the administrator -------------------------------------------------
     let mut admin = admin_socket(&env).await;
 
-    send(&mut admin, serde_json::json!({ "type": "admin", "op": "overview" })).await;
+    send(
+        &mut admin,
+        serde_json::json!({ "type": "admin", "op": "overview" }),
+    )
+    .await;
     let overview = admin_reply(&mut admin, "admin-overview").await;
-    assert!(overview["trunk_head"].as_str().unwrap_or("").len() >= 12, "{overview}");
+    assert!(
+        overview["trunk_head"].as_str().unwrap_or("").len() >= 12,
+        "{overview}"
+    );
     let actions = overview["actions"].as_array().expect("the action table");
     for id in ["trunk-reset", "stop-worker", "push-public", "pull-public"] {
-        assert!(actions.iter().any(|a| a["id"] == id), "action {id} missing from {actions:?}");
+        assert!(
+            actions.iter().any(|a| a["id"] == id),
+            "action {id} missing from {actions:?}"
+        );
     }
     assert!(
-        actions.iter().filter(|a| a["destructive"] == true).all(|a| !a["confirm"].as_str().unwrap_or("").is_empty()),
+        actions
+            .iter()
+            .filter(|a| a["destructive"] == true)
+            .all(|a| !a["confirm"].as_str().unwrap_or("").is_empty()),
         "a destructive action must say what it asks"
     );
     assert_eq!(overview["local_mode"], false);
-    assert!(overview["accounts"].as_array().unwrap().iter().any(|a| a["id"] == env.admin.0));
+    assert!(overview["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["id"] == env.admin.0));
 
-    send(&mut admin, serde_json::json!({ "type": "admin", "op": "waits" })).await;
+    send(
+        &mut admin,
+        serde_json::json!({ "type": "admin", "op": "waits" }),
+    )
+    .await;
     let waits = admin_reply(&mut admin, "admin-waits").await;
     assert!(waits["uptime_s"].is_number(), "{waits}");
 
-    send(&mut admin, serde_json::json!({ "type": "admin", "op": "fields" })).await;
+    send(
+        &mut admin,
+        serde_json::json!({ "type": "admin", "op": "fields" }),
+    )
+    .await;
     let fields = admin_reply(&mut admin, "admin-fields").await;
     let rows = fields["fields"].as_array().expect("fields");
-    assert!(rows.len() > 100, "every setting is described: {}", rows.len());
-    let model = rows.iter().find(|f| f["key"] == "llm.model").expect("llm.model");
+    assert!(
+        rows.len() > 100,
+        "every setting is described: {}",
+        rows.len()
+    );
+    let model = rows
+        .iter()
+        .find(|f| f["key"] == "llm.model")
+        .expect("llm.model");
     assert_eq!(model["kind"], "model");
     assert!(model["choices"].as_array().unwrap().len() > 0, "{model}");
     assert!(["default", "file", "local", "env"].contains(&model["source"].as_str().unwrap()));
-    let key = rows.iter().find(|f| f["key"] == "llm.api_key").expect("llm.api_key");
+    let key = rows
+        .iter()
+        .find(|f| f["key"] == "llm.api_key")
+        .expect("llm.api_key");
     assert_eq!(key["secret"], true);
-    assert!(key["value"] == "***" || key["value"] == "", "a secret is never read back: {key}");
     assert!(
-        !rows.iter().any(|f| f["value"].as_str().unwrap_or("").starts_with("sk-")),
+        key["value"] == "***" || key["value"] == "",
+        "a secret is never read back: {key}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|f| f["value"].as_str().unwrap_or("").starts_with("sk-")),
         "a key leaked into the field list"
     );
-    assert!(fields["sections"].as_array().unwrap().iter().any(|s| s["id"] == "llm"));
+    assert!(fields["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["id"] == "llm"));
 
-    send(&mut admin, serde_json::json!({ "type": "admin", "op": "entries", "section": "users" })).await;
+    send(
+        &mut admin,
+        serde_json::json!({ "type": "admin", "op": "entries", "section": "users" }),
+    )
+    .await;
     let entries = admin_reply(&mut admin, "admin-entries").await;
     let users = entries["entries"].as_array().unwrap();
     assert!(users.iter().any(|u| u["id"] == env.admin.0), "{entries}");
@@ -255,10 +320,17 @@ async fn an_administrator_sees_the_whole_panel_and_a_user_sees_nothing() {
     }
     let tables = entries["tables"].as_array().unwrap();
     let users_table = tables.iter().find(|t| t["id"] == "users").unwrap();
-    assert!(users_table["columns"].as_array().unwrap().iter().any(|c| c["key"] == "password"));
+    assert!(users_table["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["key"] == "password"));
 
     // --- a live setting round-trips and is applied at once ----------------------
-    let iterations = rows.iter().find(|f| f["key"] == "agent.max_iterations").unwrap();
+    let iterations = rows
+        .iter()
+        .find(|f| f["key"] == "agent.max_iterations")
+        .unwrap();
     assert_eq!(iterations["restart_required"], false, "{iterations}");
     let before = iterations["value"].as_str().unwrap().to_string();
     let bumped = (before.parse::<i64>().unwrap() + 1).to_string();
@@ -268,13 +340,25 @@ async fn an_administrator_sees_the_whole_panel_and_a_user_sees_nothing() {
     assert_eq!(result["op"], "set-field");
     let message = result["message"].as_str().unwrap();
     assert!(message.contains("written to"), "{result}");
-    assert!(message.contains("applied agent.max_iterations immediately"), "{result}");
+    assert!(
+        message.contains("applied agent.max_iterations immediately"),
+        "{result}"
+    );
     let fresh = admin_reply(&mut admin, "admin-fields").await;
     assert_eq!(fresh["prefix"], "agent");
-    let now = fresh["fields"].as_array().unwrap().iter().find(|f| f["key"] == "agent.max_iterations").unwrap();
+    let now = fresh["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["key"] == "agent.max_iterations")
+        .unwrap();
     assert_eq!(now["value"], bumped);
     let after = admin_reply(&mut admin, "admin-overview").await;
-    assert_eq!(after["pending_restart"].as_array().unwrap().len(), 0, "a live change never waits: {after}");
+    assert_eq!(
+        after["pending_restart"].as_array().unwrap().len(),
+        0,
+        "a live change never waits: {after}"
+    );
     // Put it back.
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "agent.max_iterations", "value": before })).await;
     assert_eq!(admin_reply(&mut admin, "admin-result").await["ok"], true);
@@ -282,37 +366,75 @@ async fn an_administrator_sees_the_whole_panel_and_a_user_sees_nothing() {
     let _ = admin_reply(&mut admin, "admin-overview").await;
 
     // --- a boot-bound setting waits for a restart, until it is put back ------------
-    let memory = rows.iter().find(|f| f["key"] == "limits.agent_memory_mb").unwrap();
+    let memory = rows
+        .iter()
+        .find(|f| f["key"] == "limits.agent_memory_mb")
+        .unwrap();
     assert_eq!(memory["restart_required"], true, "{memory}");
     let was = memory["value"].as_str().unwrap().to_string();
     let more = (was.parse::<i64>().unwrap() + 1).to_string();
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "limits.agent_memory_mb", "value": more })).await;
     let result = admin_reply(&mut admin, "admin-result").await;
     assert_eq!(result["ok"], true, "{result}");
-    assert!(result["message"].as_str().unwrap().contains("need a restart") || result["message"].as_str().unwrap().contains("needs a restart"), "{result}");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("need a restart")
+            || result["message"]
+                .as_str()
+                .unwrap()
+                .contains("needs a restart"),
+        "{result}"
+    );
     let _ = admin_reply(&mut admin, "admin-fields").await;
     let pending = admin_reply(&mut admin, "admin-overview").await;
-    assert_eq!(pending["pending_restart"], serde_json::json!(["limits.agent_memory_mb"]), "{pending}");
+    assert_eq!(
+        pending["pending_restart"],
+        serde_json::json!(["limits.agent_memory_mb"]),
+        "{pending}"
+    );
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "limits.agent_memory_mb", "value": was })).await;
     assert_eq!(admin_reply(&mut admin, "admin-result").await["ok"], true);
     let _ = admin_reply(&mut admin, "admin-fields").await;
     let cleared = admin_reply(&mut admin, "admin-overview").await;
-    assert_eq!(cleared["pending_restart"].as_array().unwrap().len(), 0, "putting the value back clears it: {cleared}");
+    assert_eq!(
+        cleared["pending_restart"].as_array().unwrap().len(),
+        0,
+        "putting the value back clears it: {cleared}"
+    );
 
     // --- reload from disk reports rather than refuses --------------------------
-    send(&mut admin, serde_json::json!({ "type": "admin", "op": "reload" })).await;
+    send(
+        &mut admin,
+        serde_json::json!({ "type": "admin", "op": "reload" }),
+    )
+    .await;
     let reloaded = admin_reply(&mut admin, "admin-result").await;
     assert_eq!(reloaded["ok"], true, "{reloaded}");
-    assert!(reloaded["message"].as_str().unwrap().contains("nothing changed"), "{reloaded}");
+    assert!(
+        reloaded["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing changed"),
+        "{reloaded}"
+    );
 
     // --- a value the loader refuses is refused ------------------------------
     send(&mut admin, serde_json::json!({ "type": "admin", "op": "set-field", "key": "server.bind", "value": "not-an-address" })).await;
     let refused = admin_reply(&mut admin, "admin-result").await;
     assert_eq!(refused["ok"], false, "{refused}");
-    assert!(refused["message"].as_str().unwrap().contains("invalid"), "{refused}");
+    assert!(
+        refused["message"].as_str().unwrap().contains("invalid"),
+        "{refused}"
+    );
 
     // --- an unknown op is refused, not trapped --------------------------------
-    send(&mut admin, serde_json::json!({ "type": "admin", "op": "explode" })).await;
+    send(
+        &mut admin,
+        serde_json::json!({ "type": "admin", "op": "explode" }),
+    )
+    .await;
     let unknown = admin_reply(&mut admin, "admin-result").await;
     assert_eq!(unknown["ok"], false);
 
@@ -326,6 +448,10 @@ async fn an_administrator_sees_the_whole_panel_and_a_user_sees_nothing() {
     }
     send(&mut user, serde_json::json!({ "type": "admin", "op": "set-field", "key": "agent.max_iterations", "value": "1" })).await;
     assert_eq!(admin_reply(&mut user, "admin-result").await["ok"], false);
-    send(&mut user, serde_json::json!({ "type": "admin", "op": "entries", "section": "users" })).await;
+    send(
+        &mut user,
+        serde_json::json!({ "type": "admin", "op": "entries", "section": "users" }),
+    )
+    .await;
     assert_eq!(admin_reply(&mut user, "admin-result").await["ok"], false);
 }

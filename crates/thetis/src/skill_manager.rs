@@ -9,7 +9,7 @@
 //! and `host_api` maps them, which keeps the whole thing testable without
 //! standing up a component.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -209,6 +209,18 @@ impl SkillManager {
     /// fills; the lexical fallback drops skills sharing no term with the query,
     /// which means a short result rather than a padded one.
     pub async fn search(&self, query: &str, limit: usize) -> Vec<Card> {
+        self.search_in(query, limit, "", true).await
+    }
+
+    /// Ranks only skills at or below `prefix`. Filtering happens before vectors
+    /// are loaded and before the small-corpus shortcut in the ranker.
+    pub async fn search_in(
+        &self,
+        query: &str,
+        limit: usize,
+        prefix: &str,
+        absorb: bool,
+    ) -> Vec<Card> {
         // A limit of 0 means the configured default. This is resolved here,
         // the lowest point every caller passes through, because when only
         // `retrieve` did it a direct `search(q, 0)` silently returned nothing.
@@ -223,7 +235,21 @@ impl SkillManager {
             return Vec::new();
         }
 
-        let all = tree.all();
+        let all: Vec<&Skill> = tree
+            .all()
+            .into_iter()
+            .filter(|skill| {
+                prefix.is_empty()
+                    || skill.id == prefix
+                    || skill
+                        .id
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .collect();
+        if all.is_empty() {
+            return Vec::new();
+        }
         let (vectors, stats) = self.embedder.vectors_for(&all).await;
         let query_vector = match self.embedder.embed_query(query).await {
             Ok(v) => Some(v),
@@ -252,7 +278,15 @@ impl SkillManager {
             })
             .collect();
 
-        let ranked = skill_index::rank(&tree, &corpus, query, query_vector.as_deref(), limit);
+        let ranked = skill_index::rank(
+            &tree,
+            &corpus,
+            query,
+            query_vector.as_deref(),
+            limit,
+            absorb,
+            self.cfg.skills.fusion_weight,
+        );
 
         ranked
             .into_iter()
@@ -796,6 +830,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_in_filters_to_the_requested_subtree() {
+        let (mgr, _d) = fixture();
+        mgr.upsert("rules", "", &skill_md("Rules", "Umbrella rules."))
+            .unwrap();
+        mgr.upsert(
+            "rules/combat",
+            "",
+            &skill_md("Combat", "Armor combat rule."),
+        )
+        .unwrap();
+        mgr.upsert("lore", "", &skill_md("Lore", "Armor lore."))
+            .unwrap();
+
+        let hits = mgr.search_in("armor", 10, "rules", false).await;
+        assert_eq!(
+            hits.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["rules", "rules/combat"]
+        );
+    }
+
+    #[tokio::test]
     async fn a_zero_limit_means_the_configured_default() {
         // `search` used to return nothing for limit 0 while `retrieve` resolved
         // it, so the documented default held only when entering via `retrieve`.
@@ -1063,11 +1118,10 @@ mod tests {
         let (mgr, _d) = fixture();
         mgr.upsert("a", "", &skill_md("A", "First.")).unwrap();
 
-        assert!(
-            mgr.pin("s1", &["a".to_string(), "ghost".to_string()])
-                .await
-                .is_err()
-        );
+        assert!(mgr
+            .pin("s1", &["a".to_string(), "ghost".to_string()])
+            .await
+            .is_err());
         // Nothing was stored: a partial pin would be worse than none.
         assert!(mgr.pinned("s1").await.is_empty());
     }

@@ -1,0 +1,2 @@
+cargo:rustc-link-lib=static=wit_bindgen_cabi0_60_0
+cargo:rustc-link-search=native=/opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-sample/wasm32-wasip2/release/build/wit-bindgen-bdb25b77c6166d4c/out

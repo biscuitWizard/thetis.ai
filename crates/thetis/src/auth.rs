@@ -1,9 +1,9 @@
 //! Native authentication and ownership checks.
 use crate::{config::Config, grip::Grip, policy::EffectivePolicy};
-use anyhow::{Context, Result, bail};
-use argon2::password_hash::{SaltString, rand_core::OsRng};
+use anyhow::{bail, Context, Result};
+use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::http::{HeaderMap, header};
+use axum::http::{header, HeaderMap};
 use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -39,7 +39,12 @@ pub struct Principal {
 pub const LOCAL_OWNER: &str = "local";
 
 impl Principal {
-    pub fn new(user_id: String, display_name: String, role: String, policy: Arc<EffectivePolicy>) -> Self {
+    pub fn new(
+        user_id: String,
+        display_name: String,
+        role: String,
+        policy: Arc<EffectivePolicy>,
+    ) -> Self {
         // Administrators land on the installation-wide conversation list. They
         // can still use the sidebar control to narrow the tab back to their own.
         let view_all = policy.admin;
@@ -249,7 +254,11 @@ pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
         return None;
     };
     if now.saturating_sub(row.last_seen_ms) > 60_000 {
-        let _ = st.touch_login(&hash, now, now + g.cfg().auth.session_ttl.as_millis() as u64);
+        let _ = st.touch_login(
+            &hash,
+            now,
+            now + g.cfg().auth.session_ttl.as_millis() as u64,
+        );
     }
     Some(Principal::from_user(u))
 }
@@ -403,7 +412,12 @@ mod tests {
     #[test]
     fn the_cookie_is_found_among_others_and_across_headers() {
         let mut h = HeaderMap::new();
-        h.append(header::COOKIE, "theme=dark; thetis_session=abc123; other=1".parse().unwrap());
+        h.append(
+            header::COOKIE,
+            "theme=dark; thetis_session=abc123; other=1"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(cookie_value(&h).as_deref(), Some("abc123"));
 
         let mut h = HeaderMap::new();
@@ -412,7 +426,12 @@ mod tests {
         assert_eq!(cookie_value(&h).as_deref(), Some("xyz"));
 
         let mut h = HeaderMap::new();
-        h.append(header::COOKIE, "thetis_session_old=nope; x=thetis_session=1".parse().unwrap());
+        h.append(
+            header::COOKIE,
+            "thetis_session_old=nope; x=thetis_session=1"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(cookie_value(&h), None);
     }
 
@@ -422,7 +441,9 @@ mod tests {
         let b = new_token();
         assert_ne!(a, b);
         assert!(a.len() >= 40, "{a}");
-        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
         assert_eq!(token_hash(&a).len(), 64);
         assert_ne!(token_hash(&a), token_hash(&b));
     }
@@ -442,12 +463,18 @@ mod tests {
         assert!(!lockout::is_locked(&table, "bob", 3, window));
         lockout::record_failure(&table, "bob", window);
         lockout::record_failure(&table, "bob", window);
-        assert!(!lockout::is_locked(&table, "bob", 3, window), "two of three");
+        assert!(
+            !lockout::is_locked(&table, "bob", 3, window),
+            "two of three"
+        );
         lockout::record_failure(&table, "bob", window);
         assert!(lockout::is_locked(&table, "bob", 3, window));
         assert!(!lockout::is_locked(&table, "alice", 3, window), "per user");
         lockout::clear(&table, "bob");
-        assert!(!lockout::is_locked(&table, "bob", 3, window), "success clears");
+        assert!(
+            !lockout::is_locked(&table, "bob", 3, window),
+            "success clears"
+        );
 
         // An expired window is forgotten, not carried forward.
         let short = Duration::from_millis(1);
@@ -480,9 +507,15 @@ mod tests {
         assert!(html.contains("value=\"/a?b=&lt;c&gt;\""));
         assert!(!html.contains("<x>"));
         let quiet = page_html("T", "", None, "");
-        assert!(!quiet.contains("role=\"alert\""), "no banner without a message");
+        assert!(
+            !quiet.contains("role=\"alert\""),
+            "no banner without a message"
+        );
         assert!(quiet.contains("value=\"/\""), "an empty next goes home");
-        assert!(quiet.contains("<svg class=\"mark\""), "no avatar means the mark");
+        assert!(
+            quiet.contains("<svg class=\"mark\""),
+            "no avatar means the mark"
+        );
         // The avatar is used when it is a picture, and never when it is a script.
         let pic = page_html("T", "data:image/png;base64,AAAA", None, "");
         assert!(pic.contains("<img class=\"mark\" src=\"data:image/png;base64,AAAA\""));
@@ -510,7 +543,12 @@ mod tests {
         p.set_view_all(true);
         assert_eq!(p.describe()["viewing_all"], true);
         assert_eq!(p.list_owner(), None);
-        let denied: Vec<String> = d["denied"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let denied: Vec<String> = d["denied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         assert!(denied.contains(&"terminal".to_string()));
         assert!(denied.contains(&"workspace_write".to_string()));
         assert!(!denied.contains(&"workspace".to_string()));

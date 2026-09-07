@@ -1,6 +1,6 @@
 //! Per-user authorization policy.
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -157,10 +157,9 @@ impl EffectivePolicy {
             .cloned()
             .collect();
 
-        let default_model = first_allowed(
-            &[&self.default_model, &other.default_model],
-            |id| self.allows_model(id) && other.allows_model(id),
-        )
+        let default_model = first_allowed(&[&self.default_model, &other.default_model], |id| {
+            self.allows_model(id) && other.allows_model(id)
+        })
         .or_else(|| models.first().cloned())
         .unwrap_or_default();
         let default_mode = first_allowed(&[&self.default_mode, &other.default_mode], |id| {
@@ -697,7 +696,10 @@ mod tests {
 
         let mut undenied = narrow.clone();
         undenied.denied.remove(&Cap::Transcripts);
-        assert!(!undenied.is_subset_of(&narrow), "a dropped capability denial");
+        assert!(
+            !undenied.is_subset_of(&narrow),
+            "a dropped capability denial"
+        );
 
         let mut tools = narrow.clone();
         tools.deny_tools.clear();
@@ -750,15 +752,13 @@ mod tests {
             deny_groups: Some(vec!["core".into()]),
             ..Default::default()
         };
-        assert!(
-            resolve(
-                &base(),
-                &[&l],
-                "x",
-                &["a".into(), "b".into()],
-                &["agent".into()]
-            )
-            .is_err()
-        );
+        assert!(resolve(
+            &base(),
+            &[&l],
+            "x",
+            &["a".into(), "b".into()],
+            &["agent".into()]
+        )
+        .is_err());
     }
 }

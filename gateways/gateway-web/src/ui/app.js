@@ -170,6 +170,18 @@ const centre = stage.mountStage({
   onRevealInline: (id) => revealInlineAgent(id),
 });
 
+/* Campaign exports link back here with `?open=<workspace path>`. Open that
+ * path in the ordinary stage editor, then consume the parameter so a reload
+ * does not unexpectedly reopen a tab the reader closed. */
+const openPath = new URLSearchParams(location.search).get("open");
+if (openPath) {
+  const path = openPath.replace(/^\/workspace\/file\//, "").replace(/^\/workspace\//, "");
+  if (path && !path.split("/").includes("..")) centre.openFile(path);
+  const url = new URL(location.href);
+  url.searchParams.delete("open");
+  history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
 /* Shows a sub-agent's work in the conversation itself, rather than in its tab.
  *
  * Goes through the transcript instead of querying the DOM for the block: the

@@ -35,6 +35,7 @@ pub mod llm;
 pub mod loader;
 pub mod manifest;
 pub mod merge;
+pub mod mounts;
 pub mod offload;
 pub mod persist;
 pub mod pipeline;

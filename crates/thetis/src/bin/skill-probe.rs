@@ -9,8 +9,8 @@
 //! ```
 
 use anyhow::Result;
-use thetis::{config::Config, embeddings::Embedder, skill_index, skills, store::Store};
 use std::sync::Arc;
+use thetis::{config::Config, embeddings::Embedder, skill_index, skills, store::Store};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,9 +19,17 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(Config::load()?);
     let tree = skills::discover(&cfg.paths.skills)?;
 
-    println!("corpus: {} skills from {}", tree.len(), cfg.paths.skills.display());
+    println!(
+        "corpus: {} skills from {}",
+        tree.len(),
+        cfg.paths.skills.display()
+    );
     for s in tree.all() {
-        let kind = if s.universal { "universal" } else { "         " };
+        let kind = if s.universal {
+            "universal"
+        } else {
+            "         "
+        };
         let kids = tree.children(&s.id).len();
         println!(
             "  {kind}  {:<40} depth {}  {} child(ren)  {} resource(s)",
@@ -56,7 +64,9 @@ async fn main() -> Result<()> {
 
     println!(
         "embedding: model={} dims={} available={}",
-        cfg.skills.embedding_model, cfg.skills.embedding_dimensions, embedder.available()
+        cfg.skills.embedding_model,
+        cfg.skills.embedding_dimensions,
+        embedder.available()
     );
 
     let all = tree.all();
@@ -92,13 +102,27 @@ async fn main() -> Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(cfg.skills.retrieve_limit);
 
-        let ranked = skill_index::rank(&tree, &corpus, query, qv.as_deref(), limit);
+        let ranked = skill_index::rank(
+            &tree,
+            &corpus,
+            query,
+            qv.as_deref(),
+            limit,
+            true,
+            cfg.skills.fusion_weight,
+        );
 
         if ranked.is_empty() {
             println!("  no matches");
         }
         for (i, r) in ranked.iter().enumerate() {
-            println!("  {}. {:<40} {:.4}  {}", i + 1, r.id, r.score, r.how.label());
+            println!(
+                "  {}. {:<40} {:.4}  {}",
+                i + 1,
+                r.id,
+                r.score,
+                r.how.label()
+            );
         }
 
         if std::env::var("SKILL_PROBE_CARDS").is_ok() {

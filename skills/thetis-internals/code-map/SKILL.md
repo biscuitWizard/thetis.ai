@@ -5,7 +5,7 @@ when_to_use = "Use when you must find the file that owns a behaviour, before you
 universal = false
 tags = ["source map", "repository layout", "files", "modules", "orchestrator", "crates", "where is", "host_api", "pipeline", "tool-group:selfmod"]
 related = ["careful-surgery"]
-version = 4
+version = 5
 ---
 
 # Where to find things in the source
@@ -21,7 +21,10 @@ confirm a path with `list_config` if it is not where you expect it.
 | `crates/thetis` | The native kernel. |
 | `agents/agent-core` | Your own source. `target: self` in the dev kit. |
 | `gateways/gateway-web` | The chat UI and the wire protocol. |
-| `tools/<name>` | One tool each. |
+| `rpg/rules` | Canonical source tree for shared tabletop campaign rules and state; inspect the current tree before assuming a module or system is complete. |
+| `rpg/systems` | System data packs consumed by `rpg/rules`, when present. |
+| `skills/rpg` | Operator and role craft for campaigns; separate from generated or installed rules knowledge. |
+| `tools/<name>` | One tool each. Campaign operations use `tools/rpg-*` when those components are present. |
 | `templates/tool-template` | What `new_tool` starts from. |
 | `skills/<id>/SKILL.md` | The skill corpus. |
 | `artifacts/cache/` | Built components and kernels, keyed by the source tree that produced them. Shared across every branch. |

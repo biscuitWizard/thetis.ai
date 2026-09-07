@@ -5,7 +5,7 @@
 //! instances stay disposable: a crash, a hot swap, or an orchestrator restart
 //! loses nothing.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
@@ -1665,7 +1665,10 @@ mod tests {
         // Alice's own list is unchanged: inviting someone does not add their
         // conversations to yours.
         assert_eq!(
-            store.list_sessions_owned(Some("alice"), false).unwrap().len(),
+            store
+                .list_sessions_owned(Some("alice"), false)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -1712,17 +1715,44 @@ mod tests {
         assert_eq!(store.get_login("token").unwrap().unwrap().expires_ms, 30);
         // A second device for alice and one for bob; the count is per user
         // and leaves out anything already expired.
-        store.put_login("token2", &LoginRow { expires_ms: 30, ..row.clone() }).unwrap();
         store
-            .put_login("stale", &LoginRow { user_id: "bob".into(), expires_ms: 5, ..row.clone() })
+            .put_login(
+                "token2",
+                &LoginRow {
+                    expires_ms: 30,
+                    ..row.clone()
+                },
+            )
+            .unwrap();
+        store
+            .put_login(
+                "stale",
+                &LoginRow {
+                    user_id: "bob".into(),
+                    expires_ms: 5,
+                    ..row.clone()
+                },
+            )
             .unwrap();
         let counts = store.active_logins_by_user(20).unwrap();
         assert_eq!(counts.get("alice"), Some(&2));
         assert_eq!(counts.get("bob"), None);
         assert_eq!(store.remove_logins_for("alice").unwrap(), 2);
         assert!(store.get_login("token2").unwrap().is_none());
-        store.put_login("token", &LoginRow { expires_ms: 30, ..row.clone() }).unwrap();
-        assert_eq!(store.prune_expired_logins(31).unwrap(), 2, "alice's and bob's stale one");
+        store
+            .put_login(
+                "token",
+                &LoginRow {
+                    expires_ms: 30,
+                    ..row.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.prune_expired_logins(31).unwrap(),
+            2,
+            "alice's and bob's stale one"
+        );
         assert!(store.get_login("token").unwrap().is_none());
 
         assert_eq!(store.add_user_spend("alice", 1.25).unwrap(), 1.25);
@@ -2143,11 +2173,11 @@ mod tests {
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
         }
 
-        assert!(
-            store.events(&id, 0).unwrap().iter().any(
-                |r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))
-            )
-        );
+        assert!(store
+            .events(&id, 0)
+            .unwrap()
+            .iter()
+            .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))));
     }
 
     #[test]

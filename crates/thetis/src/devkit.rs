@@ -10,11 +10,11 @@
 //! files that decide what code runs at *build* time — `Cargo.toml`, `build.rs`,
 //! `.cargo/` — are off limits, because a host-side build executes them.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::aspect::{Aspect, validate_component_name};
+use crate::aspect::{validate_component_name, Aspect};
 use crate::bindings::types::{CompileReport, ModTarget};
 use crate::grip::Grip;
 use crate::pipeline;

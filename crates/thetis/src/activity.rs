@@ -75,8 +75,14 @@ impl Snapshot {
     /// step flips to `writing`, and never again until something else happens.
     fn apply(&mut self, frame: &Value) -> bool {
         let before = self.clone();
-        let kind = frame.get("kind").and_then(Value::as_str).unwrap_or_default();
-        let ts = frame.get("ts").and_then(Value::as_u64).unwrap_or_else(crate::store::now_ms);
+        let kind = frame
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let ts = frame
+            .get("ts")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(crate::store::now_ms);
         let is_child = frame.get("agent").is_some();
 
         if is_child {
@@ -129,8 +135,8 @@ impl Snapshot {
                 // A turn that ended in `ask_user` is waiting on a person, and
                 // the sidebar should say so: it is the one state where the
                 // conversation is blocked on the reader rather than the agent.
-                let asked = stopped_by == "asked"
-                    || (stopped_by == "stop" && self.step == ASK_TOOL);
+                let asked =
+                    stopped_by == "asked" || (stopped_by == "stop" && self.step == ASK_TOOL);
                 self.state = match stopped_by {
                     _ if asked => "waiting",
                     "stop" | "cancelled" | "restarted" | "" => "idle",
@@ -138,7 +144,11 @@ impl Snapshot {
                 };
                 self.step.clear();
                 self.since_ms = ts;
-                self.outcome = if asked { "asked".into() } else { stopped_by.to_string() };
+                self.outcome = if asked {
+                    "asked".into()
+                } else {
+                    stopped_by.to_string()
+                };
                 // Children still running after the parent stopped keep their
                 // count; their own turn-finished frames retire them.
             }
@@ -299,11 +309,20 @@ mod tests {
         a.note("s", &ev("delta", json!({"text": "hel"})));
         a.note("s", &ev("delta", json!({"text": "lo"})));
         assert_eq!(a.get("s").unwrap().step, "writing");
-        a.note("s", &ev("tool-call", json!({"name": "web-search", "id": "c1", "arguments": "{}"})));
+        a.note(
+            "s",
+            &ev(
+                "tool-call",
+                json!({"name": "web-search", "id": "c1", "arguments": "{}"}),
+            ),
+        );
         let snap = a.get("s").unwrap();
         assert_eq!(snap.step, "web-search");
         assert_eq!(snap.steps, 1);
-        a.note("s", &ev("assistant", json!({"text": "x", "usage": {"cost": 0.25}})));
+        a.note(
+            "s",
+            &ev("assistant", json!({"text": "x", "usage": {"cost": 0.25}})),
+        );
         assert!((a.get("s").unwrap().cost - 0.25).abs() < 1e-9);
     }
 
@@ -352,7 +371,10 @@ mod tests {
         assert_eq!(a.get("s").unwrap().state, "waiting");
 
         a.note("s", &ev("turn-started", json!({})));
-        a.note("s", &ev("turn-finished", json!({"stopped_by": "llm-error"})));
+        a.note(
+            "s",
+            &ev("turn-finished", json!({"stopped_by": "llm-error"})),
+        );
         let snap = a.get("s").unwrap();
         assert_eq!(snap.state, "failed");
         assert_eq!(snap.outcome, "llm-error");
@@ -370,15 +392,37 @@ mod tests {
         let a = Activity::new();
         a.note("s", &ev("turn-started", json!({})));
         a.note("s", &ev("tool-call", json!({"name": "spawn_agent"})));
-        a.note("s", &ev("turn-started", json!({"agent": "k1", "agent_label": "research"})));
-        a.note("s", &ev("tool-call", json!({"agent": "k1", "name": "web-search"})));
+        a.note(
+            "s",
+            &ev(
+                "turn-started",
+                json!({"agent": "k1", "agent_label": "research"}),
+            ),
+        );
+        a.note(
+            "s",
+            &ev("tool-call", json!({"agent": "k1", "name": "web-search"})),
+        );
         let snap = a.get("s").unwrap();
         assert_eq!(snap.agents, 1);
-        assert_eq!(snap.step, "spawn_agent", "the child's tool is not the parent's step");
+        assert_eq!(
+            snap.step, "spawn_agent",
+            "the child's tool is not the parent's step"
+        );
         assert_eq!(snap.steps, 1);
-        a.note("s", &ev("turn-finished", json!({"agent": "k1", "stopped_by": "stop"})));
+        a.note(
+            "s",
+            &ev(
+                "turn-finished",
+                json!({"agent": "k1", "stopped_by": "stop"}),
+            ),
+        );
         assert_eq!(a.get("s").unwrap().agents, 0);
-        assert_eq!(a.get("s").unwrap().state, "working", "the parent is still mid-turn");
+        assert_eq!(
+            a.get("s").unwrap().state,
+            "working",
+            "the parent is still mid-turn"
+        );
     }
 
     #[test]
@@ -393,7 +437,11 @@ mod tests {
     fn the_wire_frame_names_the_session() {
         let change = Change {
             session_id: "abc".into(),
-            snapshot: Snapshot { state: "working", step: "thinking".into(), ..Snapshot::default() },
+            snapshot: Snapshot {
+                state: "working",
+                step: "thinking".into(),
+                ..Snapshot::default()
+            },
         };
         let v: Value = serde_json::from_str(&Activity::frame(&change)).unwrap();
         assert_eq!(v["type"], "activity");

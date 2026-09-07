@@ -1,0 +1,14 @@
+/opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/deps/serde-38511be2164ff372.d: /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/build/serde-41cc9b7a663ca33c/out/private.rs
+
+/opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/deps/libserde-38511be2164ff372.rlib: /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/build/serde-41cc9b7a663ca33c/out/private.rs
+
+/opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/deps/libserde-38511be2164ff372.rmeta: /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/build/serde-41cc9b7a663ca33c/out/private.rs
+
+/home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/home/bitmuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/build/serde-41cc9b7a663ca33c/out/private.rs:
+
+# env-dep:OUT_DIR=/opt/thetis/worktrees/conv-430504d2/target-wasm-rpg-all/wasm32-wasip2/release/build/serde-41cc9b7a663ca33c/out

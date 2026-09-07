@@ -25,13 +25,13 @@ fn err(msg: impl Into<String>) -> wasmtime::Error {
 
 use crate::bindings::types::{
     Account, Attachment, CompactionProgress, CompileReport, ConfigEntry, Dependency, EventRecord,
-    ExecResult, FsEntry, InboxItem, LlmError, LogLevel, ModTarget, ModeInfo, ModelInfo, Participant,
-    SessionEvent, SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen,
+    ExecResult, FsEntry, InboxItem, LlmError, LogLevel, ModTarget, ModeInfo, ModelInfo,
+    Participant, SessionEvent, SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen,
     TerminalOutput, ToolManifest,
 };
 use crate::bindings::{
-    admin, branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session,
-    sys, terminal, tooling, transcripts,
+    admin, branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, sys,
+    terminal, tooling, transcripts,
 };
 use crate::grip::Grip;
 use crate::runtime::HostState;
@@ -616,7 +616,8 @@ impl session::Host for HostState {
                     let Some(store) = grip.local_store() else {
                         return;
                     };
-                    let branches = crate::branches::Branches::new(grip.cfg().clone(), store.clone());
+                    let branches =
+                        crate::branches::Branches::new(grip.cfg().clone(), store.clone());
                     if let Ok(Some(mut row)) = branches.get(&session_id) {
                         row.state = crate::branches::BranchState::Archived;
                         let _ = branches.update(&row);
@@ -650,11 +651,14 @@ impl session::Host for HostState {
         // supplies: a guest that could name an author could name a better one.
         // `surface` is `web` because this import exists for the browser's
         // gateway; nothing else reaches it.
-        let author = self.principal.as_ref().map(|p| crate::bindings::types::Author {
-            id: p.user_id.clone(),
-            display: p.display_name.clone(),
-            surface: "web".into(),
-        });
+        let author = self
+            .principal
+            .as_ref()
+            .map(|p| crate::bindings::types::Author {
+                id: p.user_id.clone(),
+                display: p.display_name.clone(),
+                surface: "web".into(),
+            });
         grip.submit(&session_id, message, attachments, author)
             .await
             .wt()?;
@@ -724,17 +728,18 @@ impl session::Host for HostState {
             .wt()?
             .unwrap_or_default();
         let auth = &self.grip().cfg().auth;
-        let describe = |account: String, added_by: String, added_ms: i64, owner: bool| Participant {
-            display: auth
-                .user(&account)
-                .map(|u| u.name.clone())
-                .unwrap_or_else(|| account.clone()),
-            read_only: auth.policy_for(&account).read_only,
-            account,
-            added_by,
-            added_ms,
-            owner,
-        };
+        let describe =
+            |account: String, added_by: String, added_ms: i64, owner: bool| Participant {
+                display: auth
+                    .user(&account)
+                    .map(|u| u.name.clone())
+                    .unwrap_or_else(|| account.clone()),
+                read_only: auth.policy_for(&account).read_only,
+                account,
+                added_by,
+                added_ms,
+                owner,
+            };
         // The owner leads the list. They hold no participant row — ownership
         // is its own table — so they are described from the owner id rather
         // than read out of `participants`.
@@ -814,7 +819,9 @@ impl session::Host for HostState {
         self.budget.entered_host("remove_participant");
         self.may_access(&session_id)?;
         let Some(me) = self.principal.as_ref().map(|p| p.user_id.clone()) else {
-            return Ok(Err("only a signed-in account may remove a participant".into()));
+            return Ok(Err(
+                "only a signed-in account may remove a participant".into()
+            ));
         };
         // The owner may remove anyone; anyone may remove themselves. Enforced
         // here for the same reason as `add_participant`: the matching IPC guard
@@ -2194,7 +2201,13 @@ impl terminal::Host for HostState {
         let grip = self.grip.clone();
         let result = grip
             .terminals
-            .send(&grip.cfg(), &id, &text, submit, grip.cfg().terminal.send_settle)
+            .send(
+                &grip.cfg(),
+                &id,
+                &text,
+                submit,
+                grip.cfg().terminal.send_settle,
+            )
             .await
             .map(|out| grip.truncate(out))
             .map_err(|e| format!("{e:#}"));
@@ -2571,6 +2584,27 @@ impl skills::Host for HostState {
         Ok(cards(out))
     }
 
+    async fn search_in(
+        &mut self,
+        query: String,
+        limit: u32,
+        options: skills::SearchOptions,
+    ) -> Result<Vec<SkillCard>> {
+        self.budget.entered_host("search-in");
+        let mgr = self.grip().skills.clone();
+        self.yielded();
+        let out = mgr
+            .search_in(
+                &query,
+                limit as usize,
+                &options.prefix,
+                options.absorb_parents,
+            )
+            .await;
+        self.yielded();
+        Ok(cards(out))
+    }
+
     async fn pinned(&mut self, session_id: String) -> Result<Vec<SkillCard>> {
         self.budget.entered_host("pinned");
         self.scope_ok(&session_id)?;
@@ -2695,6 +2729,44 @@ impl skills_view::Host for HostState {
         Ok(out)
     }
 
+    async fn search(
+        &mut self,
+        query: String,
+        limit: u32,
+        options: skills_view::SearchOptions,
+    ) -> Result<Vec<SkillCard>> {
+        self.budget.entered_host("search");
+        let mgr = self.grip().skills.clone();
+        self.yielded();
+        let out = mgr
+            .search_in(
+                &query,
+                limit as usize,
+                &options.prefix,
+                options.absorb_parents,
+            )
+            .await;
+        self.yielded();
+        Ok(cards(out))
+    }
+
+    async fn fetch(
+        &mut self,
+        id: String,
+        file: String,
+        offset: u32,
+        limit: u32,
+    ) -> Result<std::result::Result<SkillBody, String>> {
+        self.budget.entered_host("fetch");
+        let mgr = self.grip().skills.clone();
+        let out = mgr
+            .fetch(&id, &file, offset as usize, limit as usize)
+            .map(body)
+            .map_err(|e| e.to_string());
+        self.yielded();
+        Ok(out)
+    }
+
     async fn lint(&mut self) -> Result<Vec<SkillDiagnostic>> {
         self.budget.entered_host("lint");
         let mgr = self.grip().skills.clone();
@@ -2703,7 +2775,6 @@ impl skills_view::Host for HostState {
         Ok(out)
     }
 }
-
 
 // --- admin ------------------------------------------------------------------
 //
@@ -2737,7 +2808,9 @@ async fn applied(
     let message = written.map_err(|e| format!("{e:#}"))?;
     Ok(match grip.reload_config().await {
         Ok(report) => format!("{message}; {}", report.describe()),
-        Err(e) => format!("{message}; not applied — reloading failed: {e:#}. Restart Thetis to apply it."),
+        Err(e) => {
+            format!("{message}; not applied — reloading failed: {e:#}. Restart Thetis to apply it.")
+        }
     })
 }
 
@@ -2864,7 +2937,11 @@ impl admin::Host for HostState {
             return Ok(Err(format!("unknown action '{action}'")));
         }
         let grip = self.grip.clone();
-        let who = self.principal.as_ref().map(|p| p.user_id.clone()).unwrap_or_default();
+        let who = self
+            .principal
+            .as_ref()
+            .map(|p| p.user_id.clone())
+            .unwrap_or_default();
         tracing::warn!(action = %action, target = %target, user = %who, "admin action from the control panel");
         let result = crate::admin::act(&grip, &action, &target).await;
         self.yielded();
@@ -2902,9 +2979,11 @@ impl admin::Host for HostState {
         if let Err(why) = self.require_admin() {
             return Ok(Err(why));
         }
-        Ok(crate::settings::describe(&self.grip().cfg(), prefix.as_deref())
-            .map(|all| all.into_iter().map(admin_field).collect())
-            .map_err(|e| format!("{e:#}")))
+        Ok(
+            crate::settings::describe(&self.grip().cfg(), prefix.as_deref())
+                .map(|all| all.into_iter().map(admin_field).collect())
+                .map_err(|e| format!("{e:#}")),
+        )
     }
 
     async fn set_field(
@@ -3025,7 +3104,11 @@ impl admin::Host for HostState {
             return Ok(Err(why));
         }
         let grip = self.grip.clone();
-        let who = self.principal.as_ref().map(|p| p.user_id.clone()).unwrap_or_default();
+        let who = self
+            .principal
+            .as_ref()
+            .map(|p| p.user_id.clone())
+            .unwrap_or_default();
         tracing::warn!(user = %who, reason = %reason, "restart requested from the control panel");
         Ok(crate::admin::restart(&grip, &reason)
             .await
@@ -3262,68 +3345,101 @@ mod tests {
     fn every_guarded_import_requires_its_capability() {
         let src = include_str!("host_api.rs");
         let matrix: &[(&str, &[(&str, &str)])] = &[
-            ("impl hostfs::Host for HostState {", &[
-                ("async fn read_file(", "FilesystemRead"),
-                ("async fn read_file_range(", "FilesystemRead"),
-                ("async fn list_dir(", "FilesystemRead"),
-                ("async fn search_files(", "FilesystemRead"),
-                ("async fn find_files(", "FilesystemRead"),
-                ("async fn write_file(", "FilesystemWrite"),
-                ("async fn edit_file(", "FilesystemWrite"),
-                ("async fn delete_path(", "FilesystemDelete"),
-            ]),
-            ("impl terminal::Host for HostState {", &[
-                ("async fn open(", "Terminal"),
-                ("async fn run(", "Terminal"),
-                ("async fn read(", "Terminal"),
-                ("async fn send(", "Terminal"),
-                ("async fn signal(", "Terminal"),
-                ("async fn close(", "Terminal"),
-                ("async fn sessions(", "Terminal"),
-                ("async fn ssh_hosts(", "Ssh"),
-                ("async fn ssh_host_set(", "Ssh"),
-                ("async fn ssh_host_remove(", "Ssh"),
-                ("async fn ssh_host_rename(", "Ssh"),
-            ]),
-            ("impl control::Host for HostState {", &[("async fn restart(", "Control")]),
-            ("impl configuration::Host for HostState {", &[("async fn set(", "ConfigWrite")]),
-            ("impl devkit::Host for HostState {", &[
-                ("async fn new_tool(", "Devkit"),
-                ("async fn write_file(", "Devkit"),
-                ("async fn patch_file(", "Devkit"),
-                ("async fn add_dependency(", "Devkit"),
-                ("async fn remove_dependency(", "Devkit"),
-            ]),
-            ("impl branch::Host for HostState {", &[
-                ("async fn update_from_trunk(", "BranchWrite"),
-                ("async fn reset_to(", "BranchWrite"),
-                ("async fn complete_merge(", "BranchWrite"),
-                ("async fn abort_merge(", "BranchWrite"),
-            ]),
-            ("impl delegation::Host for HostState {", &[("async fn spawn(", "Delegation")]),
-            ("impl skills::Host for HostState {", &[
-                ("async fn upsert(", "SkillsWrite"),
-                ("async fn remove(", "SkillsWrite"),
-            ]),
-            ("impl transcripts::Host for HostState {", &[
-                ("async fn conversations(", "Transcripts"),
-                ("async fn conversation(", "Transcripts"),
-                ("async fn subagents(", "Transcripts"),
-                ("async fn read(", "Transcripts"),
-                ("async fn search(", "Transcripts"),
-            ]),
-            ("impl tooling::Host for HostState {", &[("async fn invoke(", "ComponentTools")]),
+            (
+                "impl hostfs::Host for HostState {",
+                &[
+                    ("async fn read_file(", "FilesystemRead"),
+                    ("async fn read_file_range(", "FilesystemRead"),
+                    ("async fn list_dir(", "FilesystemRead"),
+                    ("async fn search_files(", "FilesystemRead"),
+                    ("async fn find_files(", "FilesystemRead"),
+                    ("async fn write_file(", "FilesystemWrite"),
+                    ("async fn edit_file(", "FilesystemWrite"),
+                    ("async fn delete_path(", "FilesystemDelete"),
+                ],
+            ),
+            (
+                "impl terminal::Host for HostState {",
+                &[
+                    ("async fn open(", "Terminal"),
+                    ("async fn run(", "Terminal"),
+                    ("async fn read(", "Terminal"),
+                    ("async fn send(", "Terminal"),
+                    ("async fn signal(", "Terminal"),
+                    ("async fn close(", "Terminal"),
+                    ("async fn sessions(", "Terminal"),
+                    ("async fn ssh_hosts(", "Ssh"),
+                    ("async fn ssh_host_set(", "Ssh"),
+                    ("async fn ssh_host_remove(", "Ssh"),
+                    ("async fn ssh_host_rename(", "Ssh"),
+                ],
+            ),
+            (
+                "impl control::Host for HostState {",
+                &[("async fn restart(", "Control")],
+            ),
+            (
+                "impl configuration::Host for HostState {",
+                &[("async fn set(", "ConfigWrite")],
+            ),
+            (
+                "impl devkit::Host for HostState {",
+                &[
+                    ("async fn new_tool(", "Devkit"),
+                    ("async fn write_file(", "Devkit"),
+                    ("async fn patch_file(", "Devkit"),
+                    ("async fn add_dependency(", "Devkit"),
+                    ("async fn remove_dependency(", "Devkit"),
+                ],
+            ),
+            (
+                "impl branch::Host for HostState {",
+                &[
+                    ("async fn update_from_trunk(", "BranchWrite"),
+                    ("async fn reset_to(", "BranchWrite"),
+                    ("async fn complete_merge(", "BranchWrite"),
+                    ("async fn abort_merge(", "BranchWrite"),
+                ],
+            ),
+            (
+                "impl delegation::Host for HostState {",
+                &[("async fn spawn(", "Delegation")],
+            ),
+            (
+                "impl skills::Host for HostState {",
+                &[
+                    ("async fn upsert(", "SkillsWrite"),
+                    ("async fn remove(", "SkillsWrite"),
+                ],
+            ),
+            (
+                "impl transcripts::Host for HostState {",
+                &[
+                    ("async fn conversations(", "Transcripts"),
+                    ("async fn conversation(", "Transcripts"),
+                    ("async fn subagents(", "Transcripts"),
+                    ("async fn read(", "Transcripts"),
+                    ("async fn search(", "Transcripts"),
+                ],
+            ),
+            (
+                "impl tooling::Host for HostState {",
+                &[("async fn invoke(", "ComponentTools")],
+            ),
             // The sandbox family had no `require` anywhere at all: the
             // capability existed in the table, was reported to the browser,
             // and gated nothing. Stubbed out in this build, so the refusal is
             // currently invisible — which is exactly why it needs pinning
             // here rather than being left until the sandbox is implemented.
-            ("impl sandbox::Host for HostState {", &[
-                ("async fn exec(", "Sandbox"),
-                ("async fn write_file(", "Sandbox"),
-                ("async fn read_file(", "Sandbox"),
-                ("async fn list_files(", "Sandbox"),
-            ]),
+            (
+                "impl sandbox::Host for HostState {",
+                &[
+                    ("async fn exec(", "Sandbox"),
+                    ("async fn write_file(", "Sandbox"),
+                    ("async fn read_file(", "Sandbox"),
+                    ("async fn list_files(", "Sandbox"),
+                ],
+            ),
         ];
         for (marker, methods) in matrix {
             let block = src
@@ -3366,9 +3482,16 @@ mod tests {
                 "`available()` under `{marker}` does not consult `Cap::{cap}`"
             );
         }
-        let terminal = src.split("impl terminal::Host for HostState {").nth(1).unwrap();
+        let terminal = src
+            .split("impl terminal::Host for HostState {")
+            .nth(1)
+            .unwrap();
         let ssh = terminal.split("async fn ssh_available(").nth(1).unwrap();
-        assert!(ssh.split("    async fn ").next().unwrap().contains("Cap::Ssh"));
+        assert!(ssh
+            .split("    async fn ")
+            .next()
+            .unwrap()
+            .contains("Cap::Ssh"));
 
         // The shared workspace has its own two capabilities, and they were
         // enforced only in the browser's HTTP routes — so an agent denied
@@ -3376,7 +3499,10 @@ mod tests {
         // path is rewritten to its real location before any check saw it and
         // `FilesystemWrite` was the only gate. Every filesystem import that
         // takes a path must therefore ask where the path actually lands.
-        let fs = src.split("impl hostfs::Host for HostState {").nth(1).unwrap();
+        let fs = src
+            .split("impl hostfs::Host for HostState {")
+            .nth(1)
+            .unwrap();
         let fs = fs.split("\nimpl ").next().unwrap();
         for (method, write) in [
             ("async fn read_file(", false),
@@ -3403,14 +3529,40 @@ mod tests {
         // Catalogues and the model gate.
         let sys = src.split("impl sys::Host for HostState {").nth(1).unwrap();
         let sys = sys.split("\nimpl ").next().unwrap();
-        assert!(sys.split("async fn list_models(").nth(1).unwrap().split("    async fn ").next().unwrap().contains("allows_model"));
-        assert!(sys.split("async fn list_modes(").nth(1).unwrap().split("    async fn ").next().unwrap().contains("allows_mode"));
+        assert!(sys
+            .split("async fn list_models(")
+            .nth(1)
+            .unwrap()
+            .split("    async fn ")
+            .next()
+            .unwrap()
+            .contains("allows_model"));
+        assert!(sys
+            .split("async fn list_modes(")
+            .nth(1)
+            .unwrap()
+            .split("    async fn ")
+            .next()
+            .unwrap()
+            .contains("allows_mode"));
         let llm = src.split("impl llm::Host for HostState {").nth(1).unwrap();
         let llm = llm.split("\nimpl ").next().unwrap();
         for method in ["async fn chat(", "async fn stream_open("] {
-            let body = llm.split(method).nth(1).unwrap().split("    async fn ").next().unwrap();
-            assert!(body.contains("check_model("), "`{method}` does not gate the model");
-            assert!(body.contains("check_budget("), "`{method}` does not gate spend");
+            let body = llm
+                .split(method)
+                .nth(1)
+                .unwrap()
+                .split("    async fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("check_model("),
+                "`{method}` does not gate the model"
+            );
+            assert!(
+                body.contains("check_budget("),
+                "`{method}` does not gate spend"
+            );
         }
     }
 

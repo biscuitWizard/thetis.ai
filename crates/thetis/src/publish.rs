@@ -803,10 +803,14 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(is_pull_commit(&subject), "{subject:?}");
-        assert!(is_pull_commit("Take in 100 commit(s) published to origin/main"));
+        assert!(is_pull_commit(
+            "Take in 100 commit(s) published to origin/main"
+        ));
         assert!(!is_pull_commit("Take in the view"));
         assert!(!is_pull_commit("checkpoint: end of turn"));
-        assert!(!is_pull_commit(" Take in 1 commit(s) published to origin/main"));
+        assert!(!is_pull_commit(
+            " Take in 1 commit(s) published to origin/main"
+        ));
     }
 
     async fn repo() -> (TempDir, GitCtl) {
@@ -1313,12 +1317,11 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), "v1 was public\n").unwrap();
         git.add_all_and_commit("public at first").await.unwrap();
         export_public(&git).await.unwrap();
-        assert!(
-            git.tree_files("public")
-                .await
-                .unwrap()
-                .contains(&"skills/notes/SKILL.md".to_string())
-        );
+        assert!(git
+            .tree_files("public")
+            .await
+            .unwrap()
+            .contains(&"skills/notes/SKILL.md".to_string()));
 
         // Now mark it private and change it.
         std::fs::write(dir.join(PRIVATE_MARKER), "").unwrap();

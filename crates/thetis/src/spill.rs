@@ -113,10 +113,7 @@ fn write_spill(cfg: &Config, label: &str, text: &str) -> anyhow::Result<String> 
 pub fn cap(cfg: &Config, label: &str, text: String) -> Spilled {
     let limit = cfg.max_tool_output_bytes;
     if text.len() <= limit {
-        return Spilled {
-            path: None,
-            text,
-        };
+        return Spilled { path: None, text };
     }
 
     let total = text.len();
@@ -304,8 +301,7 @@ mod tests {
             assert!(out.path.is_some(), "large input should spill");
             // The spilled file must be byte-identical, and the returned excerpt
             // must be valid UTF-8 whose pieces really came from the input.
-            let resolved =
-                crate::hostfs::resolve(&cfg, &out.path.unwrap()).expect("resolves");
+            let resolved = crate::hostfs::resolve(&cfg, &out.path.unwrap()).expect("resolves");
             assert_eq!(
                 std::fs::read(resolved).expect("readable"),
                 body.as_bytes(),

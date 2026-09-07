@@ -20,7 +20,7 @@
 //! Merging is user-only. The agent can prepare (update from trunk, resolve
 //! conflicts), but nothing in the agent's tool surface reaches this module.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ use crate::bindings::branch::BranchState;
 use crate::branches::Branches;
 use crate::grip::Grip;
 use crate::pipeline;
-use crate::workers::{WorkerRouter, call_session};
+use crate::workers::{call_session, WorkerRouter};
 
 /// The result of asking for a merge: either trunk moved, or the branch is
 /// left holding conflicts for someone to resolve.

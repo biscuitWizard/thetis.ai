@@ -22,7 +22,9 @@ async fn send_frames() {
     };
     let frames: Vec<Value> = serde_json::from_str(&frames).expect("frames must be a JSON array");
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect");
     for frame in &frames {
         socket
             .send(Message::Text(frame.to_string().into()))

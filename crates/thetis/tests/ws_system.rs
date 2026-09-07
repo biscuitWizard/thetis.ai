@@ -21,10 +21,14 @@ async fn system_status_answers_with_real_facts() {
         return;
     };
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect");
     socket
         .send(Message::Text(
-            serde_json::json!({ "type": "system-status" }).to_string().into(),
+            serde_json::json!({ "type": "system-status" })
+                .to_string()
+                .into(),
         ))
         .await
         .unwrap();
@@ -40,7 +44,9 @@ async fn system_status_answers_with_real_facts() {
         else {
             continue;
         };
-        let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
+        let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
         if frame["type"] == "system-status" {
             break frame;
         }
@@ -70,7 +76,10 @@ async fn system_status_answers_with_real_facts() {
     // Trunk: a real 40-hex commit and a branch name, or this is not a checkout.
     let rev = frame["trunk"]["rev"].as_str().unwrap_or_default();
     assert_eq!(rev.len(), 40, "trunk rev is not a full commit id: {rev:?}");
-    assert!(!frame["trunk"]["name"].as_str().unwrap_or_default().is_empty());
+    assert!(!frame["trunk"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
 
     // Which UI build is serving, judged against trunk's cache key.
     let serving = frame["ui"]["serving"].as_str().unwrap_or_default();
@@ -80,7 +89,9 @@ async fn system_status_answers_with_real_facts() {
     );
 
     // The machine. These come from /proc and are what the memory meter divides.
-    let total = frame["host"]["mem_total_kb"].as_u64().expect("mem_total_kb");
+    let total = frame["host"]["mem_total_kb"]
+        .as_u64()
+        .expect("mem_total_kb");
     let available = frame["host"]["mem_available_kb"]
         .as_u64()
         .expect("mem_available_kb");

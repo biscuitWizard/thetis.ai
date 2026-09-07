@@ -4,7 +4,7 @@
 //! only at startup — takes effect. Guest code cannot be trusted to do this
 //! sensibly on its own, so it is rate limited by uptime and can be turned off.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -594,8 +594,7 @@ fn kernel_is_stale(cfg: &crate::config::Config) -> bool {
 /// build failure telling the agent to fix something and ask again, seconds
 /// before the first build succeeded and restarted the process. Two
 /// contradictory verdicts for one request, the wrong one first.
-static RESTART_BUILDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static RESTART_BUILDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Clears the flag it claimed however the build ends, panic included. A flag
 /// left set would make the process unrestartable, which is a worse failure

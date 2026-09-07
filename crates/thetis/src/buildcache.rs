@@ -12,7 +12,7 @@
 //! Entries are write-once: a key names exactly one build output, so nothing
 //! is ever overwritten, and concurrent writers of the same key are benign.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};

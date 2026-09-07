@@ -21,7 +21,7 @@
 //! a single breakpoint at the end would sail straight past the previous entry
 //! and re-read the entire conversation at full price.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::config::{CacheSettings, CacheStrategy};
 
