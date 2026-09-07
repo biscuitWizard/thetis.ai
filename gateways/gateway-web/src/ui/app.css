@@ -420,24 +420,54 @@ body { display: flex; flex-direction: column; }
   padding: 0 4px;
   line-height: 15px;
 }
-/* Whose it is, when the sidebar shows everyone's. A pill before the title,
- * because the owner is the first thing that matters about a row that is
- * not yours. */
-.session-owner {
+/* In the installation-wide view, a user's name is the collapsible field. The
+ * summary has the same quiet hierarchy as recency headings, but remains
+ * sentence case so account names are not visually rewritten. */
+.session-owner-group { margin-top: var(--gap-2); }
+.session-owner-group > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  list-style: none;
+  border-radius: var(--r-md);
+}
+.session-owner-group > summary::-webkit-details-marker { display: none; }
+.session-owner-group > summary:hover { color: var(--text); background: var(--surface-2); }
+.session-owner-group > summary::before {
+  content: "";
+  width: 6px; height: 6px;
   flex: none;
-  max-width: 9ch;
+  border-right: 1.4px solid currentColor;
+  border-bottom: 1.4px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--med) var(--ease);
+}
+.session-owner-group[open] > summary::before { transform: rotate(45deg); }
+.session-owner-name {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 10.5px;
+  white-space: nowrap;
+  font-size: var(--text-sm);
   font-weight: 600;
-  letter-spacing: .02em;
-  color: var(--accent);
-  background: var(--accent-wash);
-  border: 1px solid var(--accent-edge);
-  border-radius: var(--r-pill);
-  padding: 0 6px;
-  line-height: 16px;
 }
+.session-owner-you {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--accent);
+}
+.session-owner-group > .session-group { padding-top: var(--gap-2); padding-left: 25px; }
+.session-owner-group > .session,
+.session-owner-group > .session-agent,
+.session-owner-group > .session-archived { margin-left: var(--gap-2); }
+.session-owner-group > .session { width: calc(100% - var(--gap-2)); }
+.session-owner-group > .session-agent { width: calc(100% - 12px - var(--gap-2)); }
+.session-owner-group > .session-archived { width: calc(100% - var(--gap-2)); }
+
 .session-everyone {
   margin: var(--gap-2) var(--gap-3) 0;
   padding: 6px 10px;

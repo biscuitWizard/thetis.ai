@@ -379,31 +379,43 @@ impl Persist {
         model: &str,
         mode: &str,
         max_children: usize,
+        ceiling: Option<&crate::policy::EffectivePolicy>,
     ) -> Result<SubagentRow> {
-        delegate!(
-            self,
-            "store.register_subagent",
-            |s| crate::subagents::Subagents::new(s).register(
-                parent_id,
-                child_id,
-                label,
-                task,
-                agent_aspect,
-                model,
-                mode,
-                max_children
-            ),
-            json!({
-                "session": parent_id,
-                "child": child_id,
-                "label": label,
-                "task": task,
-                "agent": agent_aspect,
-                "model": model,
-                "mode": mode,
-                "max_children": max_children,
-            })
-        )
+        match self {
+            Persist::Local(store) => crate::offload::blocking(|| {
+                let row = crate::subagents::Subagents::new(store).register(
+                    parent_id,
+                    child_id,
+                    label,
+                    task,
+                    agent_aspect,
+                    model,
+                    mode,
+                    max_children,
+                )?;
+                if let Some(policy) = ceiling {
+                    store.set_ceiling(child_id, policy)?;
+                }
+                Ok(row)
+            }),
+            Persist::Remote(peer) => {
+                peer.call_as(
+                    "store.register_subagent",
+                    json!({
+                        "session": parent_id,
+                        "child": child_id,
+                        "label": label,
+                        "task": task,
+                        "agent": agent_aspect,
+                        "model": model,
+                        "mode": mode,
+                        "max_children": max_children,
+                        "ceiling": ceiling,
+                    }),
+                )
+                .await
+            }
+        }
     }
 
     pub async fn get_subagent(&self, child_id: &str) -> Result<Option<SubagentRow>> {
@@ -738,8 +750,9 @@ fn serve_store_call_inner(
         }
         "store.ceiling_of" => to_value(store.ceiling_of(get_str(&params, "id")?)?),
         "store.set_ceiling" => {
-            // A worker must never raise its own conversation's ceiling, and a
-            // worker is the only kind of caller that arrives here scoped.
+            // A worker must never set any conversation ceiling. Delegation
+            // stamps a child atomically in `store.register_subagent`; ordinary
+            // session and fork creation happen in the trusted gateway.
             anyhow::ensure!(
                 caller_session.is_empty(),
                 "a conversation cannot set its own ceiling"
@@ -957,21 +970,26 @@ fn serve_store_call_inner(
                 .get("max_children")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            to_value(
-                crate::subagents::Subagents::new(store).register(
-                    parent,
-                    get_str(&params, "child")?,
-                    params.get("label").and_then(Value::as_str).unwrap_or(""),
-                    params.get("task").and_then(Value::as_str).unwrap_or(""),
-                    params.get("agent").and_then(Value::as_str).unwrap_or(""),
-                    params.get("model").and_then(Value::as_str).unwrap_or(""),
-                    params
-                        .get("mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("agent"),
-                    max,
-                )?,
-            )
+            let child_id = get_str(&params, "child")?;
+            let row = crate::subagents::Subagents::new(store).register(
+                parent,
+                child_id,
+                params.get("label").and_then(Value::as_str).unwrap_or(""),
+                params.get("task").and_then(Value::as_str).unwrap_or(""),
+                params.get("agent").and_then(Value::as_str).unwrap_or(""),
+                params.get("model").and_then(Value::as_str).unwrap_or(""),
+                params
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("agent"),
+                max,
+            )?;
+            if let Some(value) = params.get("ceiling").filter(|v| !v.is_null()) {
+                let ceiling: crate::policy::EffectivePolicy =
+                    serde_json::from_value(value.clone())?;
+                store.set_ceiling(child_id, &ceiling)?;
+            }
+            to_value(row)
         }
         "store.get_subagent" => to_value(store.get_subagent(get_str(&params, "child")?)?),
         "store.subagents_of" => {
@@ -1299,6 +1317,31 @@ mod tests {
 
         // And the stored ceiling is untouched.
         assert!(store.ceiling_of(&convo.id).unwrap().unwrap().read_only);
+
+        // Delegation stamps the child's ceiling as part of registration. The
+        // separate set-ceiling RPC remains forbidden to every worker.
+        let child = store.create_session(None, "plan", "writer").unwrap();
+        remote
+            .register_subagent(
+                &convo.id,
+                &child.id,
+                "review",
+                "Review the guide as a novice and report confusing parts.",
+                "scout",
+                "test-model",
+                "plan",
+                8,
+                Some(&narrow),
+            )
+            .await
+            .unwrap();
+        assert!(store.ceiling_of(&child.id).unwrap().unwrap().read_only);
+
+        let unrelated = store.create_session(None, "plan", "writer").unwrap();
+        assert!(
+            remote.set_ceiling(&unrelated.id, &narrow).await.is_err(),
+            "a worker cannot use the separate RPC on any conversation"
+        );
     }
 
     /// Removal is guarded the same way inviting is.

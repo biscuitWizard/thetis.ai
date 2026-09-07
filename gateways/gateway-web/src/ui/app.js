@@ -231,7 +231,9 @@ connection
     setHidden($("admin-link"), !frame.admin);
     setHidden($("logout"), Boolean(frame.local));
     setHidden($("see-all"), !frame.see_all);
-    applyViewAll(Boolean(frame.see_all && frame.viewing_all));
+    // Admins land on the all-conversations view. For other roles with the
+    // explicit grant, the remembered per-connection choice still applies.
+    applyViewAll(Boolean(frame.see_all && (frame.admin || frame.viewing_all)));
     // A tab for something the role withholds is not offered. The host refuses
     // the frames anyway; this is so the refusal is never the first thing seen.
     rail.setTabHidden("workspace", frame.workspace === "none");
