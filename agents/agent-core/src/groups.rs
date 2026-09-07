@@ -341,6 +341,32 @@ pub fn all() -> &'static [ToolGroup] {
             ],
         },
         ToolGroup {
+            id: "transcripts",
+            brief: "Reading and searching past conversations and sub-agent logs.",
+            // The words that mean someone is asking about the past of this
+            // system specifically. "history" is deliberately absent: it is a
+            // `branch` tag and means git far more often here. "search" and
+            // "grep" are absent for the same reason — they belong to `files`
+            // and mean the source tree, which is the commoner intent by a wide
+            // margin. The distinctive signal is a word about *conversations*.
+            //
+            // Not always-on: four long descriptions in every conversation is
+            // exactly the cost `groups` exists to avoid, and the recovery is
+            // cheap — a session that wants recall says so in words this matches,
+            // or calls `tool_search`.
+            tags: &[
+                "conversation", "conversations", "transcript", "transcripts", "chat", "chats",
+                "recall", "earlier", "previously", "before", "remember", "discussed", "decided",
+            ],
+            always_on: false,
+            members: &[
+                "conversation_list",
+                "conversation_read",
+                "conversation_grep",
+                "subagent_list",
+            ],
+        },
+        ToolGroup {
             id: "sandbox",
             brief: "The isolated sandbox: running a command, reading and writing its files.",
             // Kept narrow on purpose: these three tools shadow the host

@@ -51,6 +51,7 @@ pub mod store;
 pub mod subagents;
 pub mod system_api;
 pub mod terminal;
+pub mod transcripts;
 pub mod watchdog;
 pub mod watcher;
 pub mod web;

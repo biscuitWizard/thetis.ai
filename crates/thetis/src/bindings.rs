@@ -77,7 +77,7 @@ pub use agent::thetis::grip::types;
 #[allow(unused_imports)]
 pub use agent::thetis::grip::{
     branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, skills,
-    sys, terminal, tooling,
+    sys, terminal, tooling, transcripts,
 };
 
 /// The gateway's read-only view of the skill corpus. It lives in the gateway

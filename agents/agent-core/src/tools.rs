@@ -11,7 +11,7 @@ use crate::thetis::grip::types::{
 };
 use crate::thetis::grip::{
     branch, configuration, control, delegation, devkit, hostfs, sandbox, skills, sys, terminal,
-    tooling,
+    tooling, transcripts,
 };
 use crate::groups;
 use crate::plan;
@@ -340,6 +340,160 @@ fn subagent_tools() -> Vec<ToolDef> {
                  longest a wait may block, and how much of an answer reaches you.",
             mutating: false,
             parameters: obj(json!({}), &[]),
+        },
+    ]
+}
+
+/// Recall: reading and searching past conversations and sub-agents.
+///
+/// Every one of these is read-only, and that is what justifies their reach.
+/// Unlike the rest of the tool surface they see conversations this session did
+/// not write — the host grants that precisely because nothing here can change
+/// one. Say so in the descriptions, because a caller cannot tell from a schema
+/// whose data it is about to read.
+///
+/// There are no separate sub-agent read/grep tools. A sub-agent *is* a session,
+/// so its id goes straight into `conversation_read`, and one `include_subagents`
+/// flag covers it in search. `agent_status` and `agent_transcript` remain a
+/// different job: live supervision of the children this turn started.
+fn transcript_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "conversation_list",
+            description:
+                "List conversations in this Thetis instance, most recently active first: id, \
+                 title, mode, when it was last active, and a preview. Use it to find the \
+                 conversation you want before reading or grepping it — and prefer \
+                 `conversation_grep` when you know what you are looking for but not where.\n\n\
+                 This sees every conversation, not only your own. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Include archived conversations. Defaults to false.",
+                    },
+                    "include_subagents": {
+                        "type": "boolean",
+                        "description": "Include sub-agent sessions. Defaults to false: there \
+                                        are usually far more of them than conversations. Use \
+                                        subagent_list to see one conversation's children.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many to return, newest first. Omit for all of them.",
+                    },
+                }),
+                &[],
+            ),
+        },
+        ToolDef {
+            name: "conversation_read",
+            description:
+                "Read a conversation's transcript by id — messages, tool calls, tool failures, \
+                 notes and incidents, oldest first. Works on any conversation and on any \
+                 sub-agent session, since a sub-agent is just a session: pass the child id from \
+                 `subagent_list` or from a grep hit.\n\n\
+                 Long entries arrive clipped, and the reply says how much was cut, so raise \
+                 `max_chars` when you need a full message rather than assuming you have it. \
+                 Page with `from_seq` set to the last seq you saw. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "session_id": string_prop(
+                        "The conversation or sub-agent session id, from conversation_list, \
+                         subagent_list or a conversation_grep hit."
+                    ),
+                    "from_seq": {
+                        "type": "integer",
+                        "description": "Skip events at or before this sequence number. Omit to \
+                                        start at the beginning; set it to the last seq you saw \
+                                        to page forward.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many entries to return. Omit for the default (200).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Characters per entry before clipping. Omit for the \
+                                        default (600); raise it to read a long message in full.",
+                    },
+                }),
+                &["session_id"],
+            ),
+        },
+        ToolDef {
+            name: "conversation_grep",
+            description:
+                "Search transcripts for a regular expression and get back the matching lines \
+                 with the conversation and sequence number each came from. This is the tool for \
+                 recall: whether you have hit a problem before, what was decided about something \
+                 and where, which conversation a piece of work happened in.\n\n\
+                 Searches every conversation by default — pass `session_id` to search just one. \
+                 Successful tool output is skipped unless you ask for it, because file contents \
+                 and command output are most of the bytes in a transcript and would bury the \
+                 discussion; failed tool results are always searched, so error messages are \
+                 findable. Newest conversation first, and the reply says plainly when the answer \
+                 was capped. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "pattern": string_prop(
+                        "Regular expression, Rust regex syntax. Prefix with (?i) to ignore case."
+                    ),
+                    "session_id": string_prop(
+                        "Search only this conversation or sub-agent session. Omit to search all \
+                         of them."
+                    ),
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Search archived conversations too. Defaults to false.",
+                    },
+                    "include_subagents": {
+                        "type": "boolean",
+                        "description": "Search sub-agent logs too. Defaults to false. Worth \
+                                        turning on when the work you are looking for was \
+                                        delegated.",
+                    },
+                    "include_tool_output": {
+                        "type": "boolean",
+                        "description": "Also search successful tool output — file contents, \
+                                        command output, other searches' results. Defaults to \
+                                        false; it is a lot of noise, and a pattern matching a \
+                                        file's text matches it in every conversation that ever \
+                                        read that file.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Hits to return. Omit for the default (100).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Characters per hit before clipping. Omit for the default.",
+                    },
+                }),
+                &["pattern"],
+            ),
+        },
+        ToolDef {
+            name: "subagent_list",
+            description:
+                "List the sub-agents spawned under a conversation — label, brief, state, when it \
+                 last ran, and the child's session id, which `conversation_read` will open. Works for any \
+                 conversation and reports the whole tree.\n\n\
+                 For the children *you* started in this turn, `agent_status` is the better tool: \
+                 it is live supervision, and `wait` blocks on it. This one is for looking at what \
+                 some other conversation delegated. Read-only.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "session_id": string_prop(
+                        "The conversation whose sub-agents to list. Omit for this conversation."
+                    ),
+                }),
+                &[],
+            ),
         },
     ]
 }
@@ -694,6 +848,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     if delegation_available() {
         tools.extend(subagent_tools());
     }
+    // No capability flag: the event log is always there, and these only read it.
+    // A sub-agent gets them too — it is refused `subagent_tools` because it may
+    // not *spawn*, which says nothing about whether it may read. A child sent to
+    // investigate something is exactly the session most likely to need recall,
+    // and it cannot ask its parent for context mid-turn.
+    tools.extend(transcript_tools());
     tools.extend(configuration_tools());
     if restart_available() {
         tools.extend(restart_tools());
@@ -1764,6 +1924,58 @@ pub fn invoke(
             }
         }
 
+        // Recall. No `delegation_available` gate and no capability flag: these
+        // only read, and a sub-agent needs them as much as a parent does.
+        "conversation_list" => {
+            let rows = transcripts::conversations(
+                flag(&args, "include_archived"),
+                flag(&args, "include_subagents"),
+                args.get("limit").and_then(Value::as_u64).unwrap_or(0),
+            )?;
+            Ok(format_conversations(&rows, now_ms()))
+        }
+        "conversation_read" => {
+            let id = req_str(&args, "session_id")?;
+            let entries = transcripts::read(
+                &id,
+                args.get("from_seq").and_then(Value::as_u64).unwrap_or(0),
+                args.get("limit").and_then(Value::as_u64).unwrap_or(0),
+                args.get("max_chars").and_then(Value::as_u64).unwrap_or(0),
+            )?;
+            let header = transcripts::conversation(&id)
+                .map(|c| format_conversation_header(&c, now_ms()))
+                .unwrap_or_else(|_| format!("`{id}`"));
+            Ok(format_transcript_entries(&header, &entries))
+        }
+        "conversation_grep" => {
+            let report = transcripts::search(&transcripts::SearchQuery {
+                pattern: req_str(&args, "pattern")?,
+                session_id: opt_str(&args, "session_id"),
+                include_archived: flag(&args, "include_archived"),
+                include_subagents: flag(&args, "include_subagents"),
+                include_tool_output: flag(&args, "include_tool_output"),
+                max_results: args.get("max_results").and_then(Value::as_u64).unwrap_or(0),
+                max_chars: args.get("max_chars").and_then(Value::as_u64).unwrap_or(0),
+            })?;
+            Ok(format_search_report(&report))
+        }
+        "subagent_list" => {
+            // Defaulting to this conversation makes the common call argument-
+            // free, and is why `session_id` is optional.
+            let root = match opt_str(&args, "session_id") {
+                s if s.is_empty() => session_id.to_string(),
+                s => s,
+            };
+            let rows = transcripts::subagents(&root)?;
+            if rows.is_empty() {
+                return Ok(format!(
+                    "no sub-agents under `{root}`. If you meant the children you spawned in \
+                     this turn, agent_status is the tool for that."
+                ));
+            }
+            Ok(format_conversations(&rows, now_ms()))
+        }
+
         "exec" => {
             let command = req_str(&args, "command")?;
             let timeout = args
@@ -2682,6 +2894,220 @@ fn format_transcript(events: &[EventRecord]) -> String {
     out.join("\n\n")
 }
 
+// --- rendering transcripts for the model ------------------------------------
+//
+// These land in a tool result, so they are prose to be skimmed rather than a
+// structure to be parsed. Two things they must always do: carry the session id
+// and seq for every line, because those are what the next call needs as
+// arguments, and say plainly when an answer is partial. A silently truncated
+// recall result reads as a complete one and gets believed.
+
+/// How long ago, in the coarsest unit that is still informative.
+///
+/// Relative rather than absolute, because "yesterday" is what a reader wants
+/// from a conversation list, and an epoch millisecond timestamp is not
+/// something either of us can read at a glance.
+///
+/// `now` is passed in rather than read from `sys::now_ms()` here, for the same
+/// reason `wait_plan` is split from `wait_for`: the host imports do not exist on
+/// the host test target, so a formatter that calls one cannot be tested at all —
+/// it traps with `entered unreachable code`. The clock read happens once, at the
+/// edge, in [`now_ms`].
+fn ago(ts_ms: u64, now: u64) -> String {
+    // A timestamp from the future means the clocks disagree, which is not worth
+    // a branch of its own.
+    if ts_ms == 0 || ts_ms >= now {
+        return "just now".to_string();
+    }
+    let secs = (now - ts_ms) / 1000;
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// The clock, read once per rendered result.
+fn now_ms() -> u64 {
+    sys::now_ms()
+}
+
+/// One conversation as a heading line: what it is, and the id to pass next.
+fn format_conversation_header(c: &transcripts::ConversationSummary, now: u64) -> String {
+    let title = if c.is_subagent && !c.label.is_empty() {
+        // A sub-agent's own title is auto-derived from its brief and so repeats
+        // the task; the label is what the parent actually called it.
+        format!("{} (sub-agent)", c.label)
+    } else if c.title.trim().is_empty() {
+        "untitled".to_string()
+    } else {
+        c.title.clone()
+    };
+
+    let mut facts: Vec<String> = vec![ago(c.updated_ms, now)];
+    if !c.state.is_empty() {
+        facts.push(c.state.clone());
+    }
+    if !c.mode.is_empty() && c.mode != DEFAULT_MODE {
+        facts.push(format!("{} mode", c.mode));
+    }
+    facts.push(format!("{} events", c.event_count));
+    if c.archived {
+        facts.push("archived".to_string());
+    }
+    format!("### {title}\n`{}` · {}", c.id, facts.join(" · "))
+}
+
+fn format_conversations(rows: &[transcripts::ConversationSummary], now: u64) -> String {
+    if rows.is_empty() {
+        return "no conversations match.".to_string();
+    }
+    let mut out = vec![format!(
+        "{} conversation(s), most recently active first:",
+        rows.len()
+    )];
+    for c in rows {
+        let mut block = format_conversation_header(c, now);
+        // The brief for a sub-agent, the last thing said for a conversation:
+        // whichever is more use in deciding whether to open it.
+        let gist = if c.is_subagent && !c.task.trim().is_empty() {
+            &c.task
+        } else {
+            &c.preview
+        };
+        if !gist.trim().is_empty() {
+            block.push_str(&format!("\n{}", one_line(gist, 160)));
+        }
+        out.push(block);
+    }
+    out.join("\n\n")
+}
+
+/// Collapses text to a single clipped line, for a preview.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    format!("{}…", flat.chars().take(max_chars).collect::<String>())
+}
+
+/// Marks what kind of line this is, compactly enough to sit in front of every
+/// entry without becoming most of the output.
+fn kind_marker(kind: &str) -> &'static str {
+    match kind {
+        "user" => "user:",
+        "assistant" => "said:",
+        "tool-call" => "→",
+        "tool-result" => "←",
+        "tool-failed" => "← FAILED",
+        "note" => "note:",
+        "nudge" => "nudge:",
+        "incident" => "INCIDENT:",
+        "modification" => "changed:",
+        "branch-op" => "branch:",
+        "turn-finished" => "turn:",
+        "compacted" => "summary:",
+        // A kind the host added and this build has not learned yet. Showing it
+        // raw beats dropping the line: the text is still the answer.
+        other => {
+            debug_assert!(false, "unknown transcript kind {other}");
+            "·"
+        }
+    }
+}
+
+fn format_transcript_entries(header: &str, entries: &[transcripts::TranscriptEntry]) -> String {
+    if entries.is_empty() {
+        return format!(
+            "{header}\n\nNothing to show in that range — either the conversation is empty or \
+             `from_seq` is past its end."
+        );
+    }
+    let mut out = vec![header.to_string()];
+    for e in entries {
+        let mut line = format!("[{}] {} {}", e.seq, kind_marker(&e.kind), e.text);
+        if e.elided > 0 {
+            // Say what was cut, so a clipped line is never quoted back as if it
+            // were the whole record.
+            line.push_str(&format!(" …[{} more chars]", e.elided));
+        }
+        out.push(line);
+    }
+    let last = entries.last().map(|e| e.seq).unwrap_or(0);
+    out.push(format!(
+        "_{} entries, through seq {last}. Page on with from_seq={last}._",
+        entries.len()
+    ));
+    out.join("\n\n")
+}
+
+fn format_search_report(report: &transcripts::SearchReport) -> String {
+    if report.hits.is_empty() {
+        let mut msg = format!(
+            "no matches in {} conversation(s) searched.",
+            report.scanned_conversations
+        );
+        if report.incomplete {
+            msg.push_str(
+                " The scan did not reach every conversation, so try a narrower pattern or name \
+                 a session_id.",
+            );
+        } else {
+            msg.push_str(
+                " Try a looser pattern, `(?i)` for case-insensitivity, or \
+                 include_tool_output=true if what you want was in a tool result.",
+            );
+        }
+        return msg;
+    }
+
+    let mut out = vec![format!(
+        "{} match(es) in {} conversation(s), from {} searched:",
+        report.total_matches, report.matched_conversations, report.scanned_conversations
+    )];
+
+    // Grouped by conversation, because the useful next action is "open that
+    // one", and a flat list makes the reader do the grouping themselves.
+    let mut current = String::new();
+    for hit in &report.hits {
+        if hit.session_id != current {
+            current = hit.session_id.clone();
+            let who = if hit.is_subagent && !hit.label.is_empty() {
+                format!("{} (sub-agent)", hit.label)
+            } else if hit.title.trim().is_empty() {
+                "untitled".to_string()
+            } else {
+                hit.title.clone()
+            };
+            out.push(format!("**{who}** · `{}`", hit.session_id));
+        }
+        out.push(format!(
+            "  [{}] {} {}",
+            hit.seq,
+            kind_marker(&hit.kind),
+            one_line(&hit.text, 300)
+        ));
+    }
+
+    if report.capped {
+        out.push(format!(
+            "_Stopped at the first {} hits of {}. Narrow the pattern, or name a session_id._",
+            report.hits.len(),
+            report.total_matches
+        ));
+    } else if report.incomplete {
+        out.push(
+            "_A scan bound was reached before every conversation was read; the oldest are \
+             missing. Narrow the pattern to be sure._"
+                .to_string(),
+        );
+    }
+    out.push("_Read any of these with conversation_read, passing the id above._".to_string());
+    out.join("\n")
+}
+
 // --- formatting -------------------------------------------------------------
 
 /// One sub-agent, as prose the model reads.
@@ -2800,6 +3226,15 @@ fn opt_str(args: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// An optional boolean argument, absent meaning false.
+///
+/// Every flag on this surface is written so that false is the conservative
+/// reading — narrower search, fewer conversations, less noise — so a model that
+/// omits one gets the safe behaviour rather than the expensive one.
+fn flag(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 /// An optional string argument where absent and blank mean the same thing.
@@ -3149,6 +3584,230 @@ fn format_exec(result: ExecResult) -> String {
         out.push_str("[no output]");
     }
     out
+}
+
+/// Tests for the recall tools' rendering.
+///
+/// The formatters are the whole of the agent-side logic here — the searching
+/// itself is the host's, and is tested in `crates/thetis/src/transcripts.rs`.
+/// What these pin is the part a model acts on: that an id it needs for the next
+/// call is present, and that a partial answer says so.
+#[cfg(test)]
+mod recall_tests {
+    use super::{
+        ago, flag, format_conversations, format_search_report, format_transcript_entries, one_line,
+    };
+    use crate::thetis::grip::transcripts;
+    use serde_json::json;
+
+    /// A fixed "now", so the rendered ages are the same on every run. The
+    /// formatters take the clock as an argument precisely so this is possible.
+    /// Large enough that subtracting a few days from it stays positive.
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn conversation(id: &str, title: &str) -> transcripts::ConversationSummary {
+        transcripts::ConversationSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            mode: "agent".into(),
+            model: String::new(),
+            preview: "the last thing said".into(),
+            created_ms: 1_000,
+            updated_ms: 1_000,
+            event_count: 12,
+            archived: false,
+            is_subagent: false,
+            parent_id: String::new(),
+            root_id: String::new(),
+            label: String::new(),
+            state: String::new(),
+            task: String::new(),
+        }
+    }
+
+    fn hit(session: &str, seq: u64, text: &str) -> transcripts::TranscriptHit {
+        transcripts::TranscriptHit {
+            session_id: session.to_string(),
+            title: "some conversation".into(),
+            is_subagent: false,
+            label: String::new(),
+            seq,
+            ts_ms: 1_000,
+            kind: "user".into(),
+            text: text.to_string(),
+        }
+    }
+
+    fn report(hits: Vec<transcripts::TranscriptHit>) -> transcripts::SearchReport {
+        let n = hits.len() as u64;
+        transcripts::SearchReport {
+            hits,
+            matched_conversations: 1,
+            total_matches: n,
+            scanned_conversations: 3,
+            capped: false,
+            incomplete: false,
+        }
+    }
+
+    #[test]
+    fn every_listed_conversation_carries_the_id_the_next_call_needs() {
+        // The one thing a catalogue must not omit. A pretty listing with no ids
+        // in it leaves the model unable to act on what it just found.
+        let out = format_conversations(&[conversation("abc-123", "Fixing the build")], NOW);
+        assert!(out.contains("abc-123"), "{out}");
+        assert!(out.contains("Fixing the build"), "{out}");
+        assert!(out.contains("12 events"), "{out}");
+    }
+
+    #[test]
+    fn a_sub_agent_is_labelled_as_one_and_shows_its_brief() {
+        let mut child = conversation("child-1", "");
+        child.is_subagent = true;
+        child.label = "scout".into();
+        child.task = "go and read the parser".into();
+        child.state = "done".into();
+
+        let out = format_conversations(&[child], NOW);
+        assert!(out.contains("scout"), "{out}");
+        assert!(out.contains("sub-agent"), "the kind must be visible: {out}");
+        assert!(out.contains("done"), "{out}");
+        // The brief, not the auto-derived title, is what says what a child was
+        // for — so it is what the row shows.
+        assert!(out.contains("go and read the parser"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_listing_is_a_sentence_not_an_empty_string() {
+        let out = format_conversations(&[], NOW);
+        assert!(!out.trim().is_empty());
+        assert!(out.contains("no conversations"), "{out}");
+    }
+
+    #[test]
+    fn a_transcript_read_says_how_to_page_on() {
+        let entries = vec![
+            transcripts::TranscriptEntry {
+                seq: 4,
+                ts_ms: 1_000,
+                kind: "user".into(),
+                text: "do the thing".into(),
+                elided: 0,
+            },
+            transcripts::TranscriptEntry {
+                seq: 7,
+                ts_ms: 1_001,
+                kind: "tool-failed".into(),
+                text: "no such target".into(),
+                elided: 0,
+            },
+        ];
+        let out = format_transcript_entries("### head", &entries);
+        assert!(out.contains("[4]") && out.contains("[7]"), "{out}");
+        assert!(out.contains("FAILED"), "a failure must look like one: {out}");
+        // Paging is only possible if the reply says where it stopped.
+        assert!(out.contains("from_seq=7"), "{out}");
+    }
+
+    #[test]
+    fn a_clipped_entry_admits_what_was_cut() {
+        // Otherwise a half-sentence gets quoted back as though it were whole.
+        let entries = vec![transcripts::TranscriptEntry {
+            seq: 1,
+            ts_ms: 1,
+            kind: "assistant".into(),
+            text: "the beginning of a long answer".into(),
+            elided: 4_000,
+        }];
+        let out = format_transcript_entries("head", &entries);
+        assert!(out.contains("4000 more chars"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_range_distinguishes_itself_from_an_empty_conversation() {
+        let out = format_transcript_entries("head", &[]);
+        assert!(out.contains("from_seq") || out.contains("empty"), "{out}");
+    }
+
+    #[test]
+    fn a_capped_search_says_so_and_says_what_to_do() {
+        // The failure this guards against is silent: a capped result reads
+        // exactly like a complete one, and gets trusted as exhaustive.
+        let mut r = report(vec![hit("s1", 1, "needle")]);
+        r.capped = true;
+        r.total_matches = 900;
+        let out = format_search_report(&r);
+        assert!(out.contains("Stopped at the first"), "{out}");
+        assert!(out.contains("900"), "{out}");
+        assert!(out.contains("Narrow"), "it must say what to do: {out}");
+    }
+
+    #[test]
+    fn an_incomplete_scan_is_distinguished_from_a_capped_one() {
+        // Different causes needing different remedies: too many hits versus too
+        // many conversations to have opened them all.
+        let mut r = report(vec![hit("s1", 1, "needle")]);
+        r.incomplete = true;
+        let out = format_search_report(&r);
+        assert!(out.contains("oldest are"), "{out}");
+        assert!(!out.contains("Stopped at the first"), "{out}");
+    }
+
+    #[test]
+    fn hits_are_grouped_under_the_conversation_they_came_from() {
+        let out = format_search_report(&report(vec![
+            hit("session-aaa", 1, "first hit"),
+            hit("session-aaa", 9, "second hit"),
+            hit("session-bbb", 2, "third hit"),
+        ]));
+        // Once per conversation, not once per hit: the id is the expensive part
+        // of the output and repeating it per line is most of the tokens.
+        assert_eq!(out.matches("session-aaa").count(), 1, "{out}");
+        assert_eq!(out.matches("session-bbb").count(), 1, "{out}");
+        assert!(out.contains("conversation_read"), "say how to open one: {out}");
+    }
+
+    #[test]
+    fn no_matches_suggests_a_way_to_widen_the_search() {
+        // An empty result is where a model most needs a next move, and the two
+        // flags that would have found the answer are not obvious from a schema.
+        let out = format_search_report(&transcripts::SearchReport {
+            hits: vec![],
+            matched_conversations: 0,
+            total_matches: 0,
+            scanned_conversations: 5,
+            capped: false,
+            incomplete: false,
+        });
+        assert!(out.contains("no matches"), "{out}");
+        assert!(out.contains("include_tool_output"), "{out}");
+    }
+
+    #[test]
+    fn a_multiline_hit_is_flattened_so_one_hit_looks_like_one_hit() {
+        let out = one_line("first line\n\nsecond line", 100);
+        assert_eq!(out, "first line second line");
+    }
+
+    #[test]
+    fn an_age_is_rendered_in_the_coarsest_useful_unit() {
+        assert_eq!(ago(NOW - 30_000, NOW), "just now");
+        assert_eq!(ago(NOW - 600_000, NOW), "10m ago");
+        assert_eq!(ago(NOW - 7_200_000, NOW), "2h ago");
+        assert_eq!(ago(NOW - 172_800_000, NOW), "2d ago");
+        // A zero timestamp and a clock that disagrees must not render as
+        // "1971220d ago" or underflow.
+        assert_eq!(ago(0, NOW), "just now");
+        assert_eq!(ago(NOW + 5_000, NOW), "just now");
+    }
+
+    #[test]
+    fn an_absent_flag_reads_as_the_conservative_default() {
+        let args = json!({ "include_subagents": true });
+        assert!(flag(&args, "include_subagents"));
+        assert!(!flag(&args, "include_tool_output"));
+        assert!(!flag(&json!({}), "include_archived"));
+    }
 }
 
 /// Tests for the delegation tools' own logic: the brief-length gate, the wait

@@ -400,6 +400,15 @@ fn build_linker(engine: &Engine, caps: Caps) -> Result<Linker<HostState>> {
             // import no guest asks for is harmless — an unused entry in the
             // linker's table.
             bindings::delegation::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
+            // Transcript recall. Registered here while the interface is still
+            // staged, for the same reason delegation was: an import no guest
+            // asks for yet is a harmless entry in the linker's table, and
+            // having it answered first is what lets the contract change land
+            // without a window where the agent cannot instantiate.
+            //
+            // Agent-only. The chat surface already receives the event log
+            // through its own frames and has no use for a second route to it.
+            bindings::transcripts::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;
         }
         Caps::Gateway => {
             bindings::session::add_to_linker::<_, HasSelf<_>>(&mut linker, host_state)?;

@@ -32,7 +32,7 @@ use crate::bindings::types::{
 };
 use crate::bindings::{
     branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, sys,
-    terminal, tooling,
+    terminal, tooling, transcripts,
 };
 use crate::grip::Grip;
 use crate::runtime::HostState;
@@ -1204,6 +1204,180 @@ fn info_from_row(
         cost_usd: row.cost_usd,
         created_ms: row.created_ms,
         finished_ms: row.finished_ms,
+    }
+}
+
+// --- transcripts ------------------------------------------------------------
+
+/// Reading and searching conversation logs across the whole database.
+///
+/// This is the one host interface that reads a conversation the calling session
+/// did not write, and it is unscoped on purpose: recall — "have I solved this
+/// before", "what did that sub-agent find" — cannot be answered from one log.
+/// `scope_ok` is therefore *not* called here, and the justification is that
+/// nothing reachable from this impl can write. Every function routes into
+/// `crate::transcripts`, which holds no write path at all; a test in that module
+/// pins the property, because the read was widened on precisely that promise.
+///
+/// Ordinary session mutation is untouched: `session.append`, `submit`,
+/// `rename` and the rest still refuse a session that is not the caller's, both
+/// here and again at the gateway's `own_session` check.
+///
+/// Every call is redb work on whatever runtime thread the guest's import landed
+/// on, and a search walks many logs, so all of them are offloaded and marked as
+/// having yielded — a scan is host time, not the agent spinning.
+impl transcripts::Host for HostState {
+    async fn conversations(
+        &mut self,
+        include_archived: bool,
+        include_subagents: bool,
+        limit: u64,
+    ) -> Result<std::result::Result<Vec<transcripts::ConversationSummary>, String>> {
+        self.budget.entered_host("conversations");
+        let grip = self.grip.clone();
+        let out = grip
+            .persist
+            .conversations(include_archived, include_subagents, limit as usize)
+            .await
+            .map(|rows| rows.iter().map(summary_to_wit).collect())
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn conversation(
+        &mut self,
+        session_id: String,
+    ) -> Result<std::result::Result<transcripts::ConversationSummary, String>> {
+        self.budget.entered_host("conversation");
+        let grip = self.grip.clone();
+        // Served through the catalogue rather than a dedicated call: one
+        // conversation is the same query with a filter, and adding an IPC arm
+        // for it would be a second thing to keep in step with the first.
+        let out = grip
+            .persist
+            .conversations(true, true, 0)
+            .await
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|c| c.id == session_id)
+                    .map(summary_to_wit)
+                    .ok_or_else(|| format!("no conversation with id `{session_id}`"))
+            });
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn subagents(
+        &mut self,
+        root_id: String,
+    ) -> Result<std::result::Result<Vec<transcripts::ConversationSummary>, String>> {
+        self.budget.entered_host("subagents");
+        let grip = self.grip.clone();
+        let out = grip
+            .persist
+            .conversation_subagents(&root_id)
+            .await
+            .map(|rows| rows.iter().map(summary_to_wit).collect())
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn read(
+        &mut self,
+        session_id: String,
+        from_seq: u64,
+        limit: u64,
+        max_chars: u64,
+    ) -> Result<std::result::Result<Vec<transcripts::TranscriptEntry>, String>> {
+        self.budget.entered_host("read");
+        let grip = self.grip.clone();
+        let out = grip
+            .persist
+            .read_transcript(&session_id, from_seq, limit as usize, max_chars as usize)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|e| transcripts::TranscriptEntry {
+                        seq: e.seq,
+                        ts_ms: e.ts_ms,
+                        kind: e.kind,
+                        text: e.text,
+                        elided: e.elided,
+                    })
+                    .collect()
+            })
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn search(
+        &mut self,
+        query: transcripts::SearchQuery,
+    ) -> Result<std::result::Result<transcripts::SearchReport, String>> {
+        self.budget.entered_host("search");
+        let grip = self.grip.clone();
+        let out = grip
+            .persist
+            .search_transcripts(&crate::transcripts::SearchQuery {
+                pattern: query.pattern,
+                session_id: query.session_id,
+                include_archived: query.include_archived,
+                include_subagents: query.include_subagents,
+                include_tool_output: query.include_tool_output,
+                max_results: query.max_results as usize,
+                max_chars: query.max_chars as usize,
+            })
+            .await
+            .map(|r| transcripts::SearchReport {
+                hits: r
+                    .hits
+                    .into_iter()
+                    .map(|h| transcripts::TranscriptHit {
+                        session_id: h.session_id,
+                        title: h.title,
+                        is_subagent: h.is_subagent,
+                        label: h.label,
+                        seq: h.seq,
+                        ts_ms: h.ts_ms,
+                        kind: h.kind,
+                        text: h.text,
+                    })
+                    .collect(),
+                matched_conversations: r.matched_conversations,
+                total_matches: r.total_matches,
+                scanned_conversations: r.scanned_conversations,
+                capped: r.capped,
+                incomplete: r.incomplete,
+            })
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+}
+
+fn summary_to_wit(
+    c: &crate::transcripts::ConversationSummary,
+) -> transcripts::ConversationSummary {
+    transcripts::ConversationSummary {
+        id: c.id.clone(),
+        title: c.title.clone(),
+        mode: c.mode.clone(),
+        model: c.model.clone(),
+        preview: c.preview.clone(),
+        created_ms: c.created_ms,
+        updated_ms: c.updated_ms,
+        event_count: c.event_count,
+        archived: c.archived,
+        is_subagent: c.is_subagent,
+        parent_id: c.parent_id.clone(),
+        root_id: c.root_id.clone(),
+        label: c.label.clone(),
+        state: c.state.clone(),
+        task: c.task.clone(),
     }
 }
 
