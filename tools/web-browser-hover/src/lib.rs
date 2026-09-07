@@ -1,9 +1,4 @@
-//! Move the mouse over an element on the current page, to reveal a menu or tooltip.
-//!
-//! A Thetis tool component. `describe` tells the model what this tool is and
-//! what arguments it takes; `invoke` does the work. Edit this file with
-//! `write_code` or `patch_code` — every edit rebuilds and reloads immediately,
-//! and the compiler's output comes back in the tool result.
+//! Move the pointer over an element.
 
 wit_bindgen::generate!({
     world: "tool",
@@ -11,11 +6,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// `tool-manifest` is already in scope from the world's own `use types.{...}`;
-// anything else has to be imported from the types interface.
-use thetis::grip::sys;
-use thetis::grip::types::LogLevel;
-use serde_json::{json, Value};
+mod client;
+
+use serde_json::json;
 
 struct Component;
 
@@ -23,48 +16,43 @@ impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
             name: "web-browser-hover".to_string(),
-            description: "Move the mouse over an element on the current page, to reveal a menu or tooltip.".to_string(),
-            // Must be a JSON Schema object: it becomes the tool's parameter
-            // definition in the model's tool list.
+            description: "Hover the mouse over an element, to bring out what only appears \
+                          under the pointer: a dropdown menu, a tooltip, a row's action \
+                          buttons. Take a snapshot afterwards to see what appeared. Address \
+                          the element by a `[ref=eN]` handle from the latest snapshot, a CSS \
+                          selector, or x/y coordinates."
+                .to_string(),
             args_schema_json: json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "target": {
                         "type": "string",
-                        "description": "What to work on."
-                    }
+                        "description": "What to hover: a ref like 'e7' from a snapshot, or a CSS selector. Omit only when giving x and y."
+                    },
+                    "x": { "type": "number", "description": "Viewport x coordinate, when there is no ref or selector to use." },
+                    "y": { "type": "number", "description": "Viewport y coordinate, paired with x." }
                 },
-                "required": ["input"],
                 "additionalProperties": false
             })
             .to_string(),
-            // Host capabilities this tool needs, e.g. "sandbox".
-            capabilities: vec![],
+            capabilities: vec![
+                "http".to_string(),
+                "read-only".to_string(),
+                "group:browser".to_string(),
+            ],
         }
     }
 
-    /// `config_json` is this tool's own `[tools.web-browser-hover]` block from
-    /// thetis.toml, or `{}` when it has none. Settings a tool needs — an API
-    /// key, an endpoint, a default — belong there rather than hardcoded here.
-    fn invoke(
-        _session_id: String,
-        args_json: String,
-        config_json: String,
-    ) -> Result<String, String> {
-        let args: Value = serde_json::from_str(&args_json)
-            .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
-        let config: Value = serde_json::from_str(&config_json).unwrap_or(json!({}));
-        let _ = &config;
-
-        let input = args
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or("missing required argument 'input'")?;
-
-        sys::log(LogLevel::Debug, &format!("web-browser-hover invoked with: {input}"));
-
-        // Replace this with the real implementation.
-        Ok(format!("web-browser-hover is a stub; it received: {input}"))
+    fn invoke(session_id: String, args_json: String, config_json: String) -> Result<String, String> {
+        let args = client::args(&args_json)?;
+        let has_target = args.get("target").and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+        let has_coords = args.contains_key("x") && args.contains_key("y");
+        if !has_target && !has_coords {
+            return Err("nothing to hover: give `target` (a ref like 'e7' from a snapshot, or \
+                        a CSS selector), or both `x` and `y`."
+                .to_string());
+        }
+        client::call("hover", &session_id, args, &config_json)
     }
 }
 

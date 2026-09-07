@@ -1,9 +1,4 @@
-//! Read the console messages and page errors the current page has produced.
-//!
-//! A Thetis tool component. `describe` tells the model what this tool is and
-//! what arguments it takes; `invoke` does the work. Edit this file with
-//! `write_code` or `patch_code` — every edit rebuilds and reloads immediately,
-//! and the compiler's output comes back in the tool result.
+//! What the page logged.
 
 wit_bindgen::generate!({
     world: "tool",
@@ -11,11 +6,9 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// `tool-manifest` is already in scope from the world's own `use types.{...}`;
-// anything else has to be imported from the types interface.
-use thetis::grip::sys;
-use thetis::grip::types::LogLevel;
-use serde_json::{json, Value};
+mod client;
+
+use serde_json::json;
 
 struct Component;
 
@@ -23,48 +16,36 @@ impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
             name: "web-browser-console".to_string(),
-            description: "Read the console messages and page errors the current page has produced.".to_string(),
-            // Must be a JSON Schema object: it becomes the tool's parameter
-            // definition in the model's tool list.
+            description: "Read the console messages and uncaught page errors collected since \
+                          the last navigation. This is where the reason a page looks broken \
+                          usually is — a failed import, a thrown exception, a framework \
+                          warning — so check it before theorising about a blank screen. \
+                          Filter with `level` to cut the noise; navigating to a new URL \
+                          clears the history."
+                .to_string(),
             args_schema_json: json!({
                 "type": "object",
                 "properties": {
-                    "input": {
+                    "level": {
                         "type": "string",
-                        "description": "What to work on."
+                        "enum": ["debug", "log", "info", "warning", "error", "pageerror"],
+                        "description": "Only messages at this level or more severe. 'error' is the usual choice."
                     }
                 },
-                "required": ["input"],
                 "additionalProperties": false
             })
             .to_string(),
-            // Host capabilities this tool needs, e.g. "sandbox".
-            capabilities: vec![],
+            capabilities: vec![
+                "http".to_string(),
+                "read-only".to_string(),
+                "group:browser".to_string(),
+            ],
         }
     }
 
-    /// `config_json` is this tool's own `[tools.web-browser-console]` block from
-    /// thetis.toml, or `{}` when it has none. Settings a tool needs — an API
-    /// key, an endpoint, a default — belong there rather than hardcoded here.
-    fn invoke(
-        _session_id: String,
-        args_json: String,
-        config_json: String,
-    ) -> Result<String, String> {
-        let args: Value = serde_json::from_str(&args_json)
-            .map_err(|e| format!("arguments were not valid JSON: {e}"))?;
-        let config: Value = serde_json::from_str(&config_json).unwrap_or(json!({}));
-        let _ = &config;
-
-        let input = args
-            .get("input")
-            .and_then(Value::as_str)
-            .ok_or("missing required argument 'input'")?;
-
-        sys::log(LogLevel::Debug, &format!("web-browser-console invoked with: {input}"));
-
-        // Replace this with the real implementation.
-        Ok(format!("web-browser-console is a stub; it received: {input}"))
+    fn invoke(session_id: String, args_json: String, config_json: String) -> Result<String, String> {
+        let args = client::args(&args_json)?;
+        client::call("console", &session_id, args, &config_json)
     }
 }
 
