@@ -3,7 +3,7 @@ name = "Verifying a UI change on a branch"
 brief = "Prove a UI change works before merging, by running your branch's own gateway on a spare port and driving headless Chrome over CDP."
 when_to_use = "Use when a UI edit under gateways/gateway-web/src/ui builds green but the running page does not show it, when curl on the live port 404s a file you just added to assets.rs, or when a change needs real browser evidence — layout geometry, console errors, responsive behaviour — before it is merged to trunk. Also use when playwright MCP tools are unavailable and there is no node on the box. Not for reasoning about CSS or picking tokens; that is the parent skill."
 tags = ["ui", "verify", "browser", "headless", "chrome", "cdp", "gateway", "branch", "404", "stale"]
-version = 1
+version = 2
 ---
 
 # Verifying a UI change on a branch
@@ -14,8 +14,19 @@ times the guest builds green — and that is correct behaviour, not a bug to
 chase. `curl -s http://127.0.0.1:7777/views/new.js` returning 404 while
 `branch_status` says "15 ahead of trunk" is exactly this.
 
-So to see a UI change before merging, run **your branch's own gateway** beside
-the real one.
+## Try `/preview/` first
+
+**`/preview/<your session id>/` serves your branch's build against the real
+running system.** Rebuild `gateway:web`, then open it. That is the sanctioned
+route, it needs no second instance, and it costs seconds rather than the ~5
+minutes a cold bootstrap takes.
+
+Only fall through to a second gateway when `/preview/` genuinely cannot answer
+the question, and say why. It starts another Thetis, which
+`thetis-internals/working-alongside-others` tells you not to do casually: the
+processes are detached, so nothing but you will clean them up, and forgetting
+leaves a stray instance holding a port. If you do start one, kill it by port in
+the same session — see Clean up below.
 
 ## 1. Clone the branch and start a second gateway
 
@@ -53,6 +64,37 @@ Confirm the guest is genuinely yours before drawing conclusions:
 curl -s http://127.0.0.1:7788/app.css | grep -c <a-new-class>
 ```
 
+### Survive your own restarts
+
+A shell session dies when Thetis restarts, and **it takes its children with it**
+— gateway and Chrome both. A foreground `terminal_run` that blocks for minutes
+is also cut off mid-flight. A cold bootstrap plus a full tool build is ~5
+minutes, so a restart landing in the middle is likely, not unlucky.
+
+So: launch every long-lived process with `setsid ... > log 2>&1 < /dev/null &`,
+run the probe itself detached to a file, and poll with short commands. `setsid`
+is the reason these survive — and equally the reason they are yours to kill, so
+do not end the session without the cleanup step.
+
+```
+setsid python3 cdp_probe.py http://127.0.0.1:7788 1440 > /tmp/p.txt 2>&1 </dev/null &
+# then, in a separate short call:
+cat /tmp/p.txt
+```
+
+After a restart, do not rebuild from scratch — check what is still up:
+
+```
+ss -ltn | grep -E '7788|9222'
+curl -s http://127.0.0.1:7788/app.css | grep -c <a-new-class>
+```
+
+Note also that `terminal_run` refuses a `cd` outside your own worktree, so drive
+the clone with `git -C /tmp/uitest ...` rather than changing directory into it.
+To move the test gateway onto a new commit, keep the warm data dir and
+`git -C /tmp/uitest fetch && reset --hard origin/HEAD`, then restart it — that
+is seconds, against minutes for a fresh clone.
+
 ## 2. Drive headless Chrome over CDP
 
 Playwright's chromium is on the box even when the MCP tools are not:
@@ -84,6 +126,19 @@ return {
 
 Collect `Runtime.consoleAPICalled`, `Log.entryAdded` and
 `Runtime.exceptionThrown` throughout. **Zero entries is the bar.**
+
+Two assertions that look right and are not:
+
+- **A closed `<details>` still reports a bounding box.** Its children have real
+  `getBoundingClientRect()` widths and heights, so "height === 0" fails on
+  content that is genuinely hidden. Ask `el.checkVisibility()` instead, and
+  check the group's own height equals its `summary`'s.
+- **Exact-equality width checks fail on subpixel layout.** A paragraph filling
+  its parent measures 551 against an inner box of 553. Allow ~3px.
+
+Give a panel fed by a live worker a long poll, not a fixed sleep: a fresh
+instance builds every tool component before the Tools frame answers, which is
+minutes. Poll for the selector you need, up to a few hundred iterations.
 
 Re-run at 1440 / 1200 / 1000 / 860 px. A gap of exactly ~10px between a bar's
 bottom and the viewport is a horizontal scrollbar from something overflowing —
@@ -128,3 +183,6 @@ helper script has to live in the worktree and be cleaned up after.
 | Bar reports "UI stale" about itself | Served artifact predates the branch head | It is right — restart the test gateway |
 | Chrome dies when you kill the gateway | `pkill -f` matched its `--user-data-dir` | Keep the profile outside the test root |
 | `HTTP 405` from `/json/new` | CDP wants PUT | `urllib.request.Request(..., method="PUT")` |
+| Gateway and Chrome vanish together | A Thetis restart killed the shell that owned them | Launch both with `setsid`, detached |
+| Probe never returns any output | Blocked in the foreground and cut off by a restart | Redirect to a file, detached; poll with short calls |
+| Everything 404s and paths look wrong | The project root was renamed under you | Re-read `env | grep -i thetis` and relaunch |
