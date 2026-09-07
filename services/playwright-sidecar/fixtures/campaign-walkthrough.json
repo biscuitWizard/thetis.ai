@@ -12,7 +12,7 @@
               "mara"
             ],
             "beats": [],
-            "narration": "Mara leans over the counter. \u201cSomeone came through yesterday carrying a lantern with blue glass. Try the observatory.\u201d",
+            "narration": "Mara leans over the counter. “Someone came through yesterday carrying a lantern with blue glass. Try the observatory.”",
             "dialogue": [
               {
                 "speaker_id": "mara",
@@ -167,7 +167,7 @@
             "id": "lantern-stair",
             "name": "The Lantern Stair",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
-            "public_description": "A weathered place holding traces of earlier visitors.",
+            "public_description": "The Lantern Stair: a landmark locals mention when giving directions, quiet by day and busier after dark.",
             "known_to_player": false
           }
         },
@@ -178,7 +178,7 @@
             "id": "sealed-observatory",
             "name": "Sealed Observatory",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
-            "public_description": "A weathered place holding traces of earlier visitors.",
+            "public_description": "Sealed Observatory: a landmark locals mention when giving directions, quiet by day and busier after dark.",
             "known_to_player": false
           }
         },
@@ -189,7 +189,7 @@
             "id": "hidden-vault",
             "name": "The Buried Vault",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
-            "public_description": "A weathered place holding traces of earlier visitors.",
+            "public_description": "The Buried Vault: a landmark locals mention when giving directions, quiet by day and busier after dark.",
             "known_to_player": false
           }
         },
@@ -240,7 +240,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Mara is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": true
           }
         },
@@ -263,7 +263,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Ivo is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": true
           }
         },
@@ -286,7 +286,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Hidden Architect is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -309,7 +309,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 3 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -332,7 +332,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 4 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -355,7 +355,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 5 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -378,7 +378,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 6 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -401,7 +401,7 @@
             ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 7 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -420,7 +420,8 @@
             "conclusions": [
               "The player can expose or bargain with the rival"
             ],
-            "state": "dormant"
+            "state": "dormant",
+            "public_description": "Word about SECRET_CLOCKMAKER_BETRAYAL 0 travels through the district's bars and message boards."
           }
         },
         {
@@ -438,7 +439,8 @@
             "conclusions": [
               "The player can expose or bargain with the rival"
             ],
-            "state": "dormant"
+            "state": "dormant",
+            "public_description": "Word about SECRET_CLOCKMAKER_BETRAYAL 1 travels through the district's bars and message boards."
           }
         },
         {
@@ -456,7 +458,8 @@
             "conclusions": [
               "The player can expose or bargain with the rival"
             ],
-            "state": "dormant"
+            "state": "dormant",
+            "public_description": "Word about SECRET_CLOCKMAKER_BETRAYAL 2 travels through the district's bars and message boards."
           }
         },
         {
@@ -542,7 +545,7 @@
             "id": "lantern-stair",
             "name": "The Lantern Stair",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
-            "public_description": "A weathered place holding traces of earlier visitors.",
+            "public_description": "The Lantern Stair: a landmark locals mention when giving directions, quiet by day and busier after dark.",
             "known_to_player": false
           }
         },
@@ -553,7 +556,7 @@
             "id": "sealed-observatory",
             "name": "Sealed Observatory",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
-            "public_description": "A weathered place holding traces of earlier visitors.",
+            "public_description": "Sealed Observatory: a landmark locals mention when giving directions, quiet by day and busier after dark.",
             "known_to_player": false
           }
         },
@@ -564,7 +567,7 @@
             "id": "hidden-vault",
             "name": "The Buried Vault",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: a route used by the hidden conspiracy.",
-            "public_description": "A weathered place holding traces of earlier visitors.",
+            "public_description": "The Buried Vault: a landmark locals mention when giving directions, quiet by day and busier after dark.",
             "known_to_player": false
           }
         },
@@ -615,7 +618,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Mara is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": true
           }
         },
@@ -638,7 +641,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Ivo is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": true
           }
         },
@@ -661,7 +664,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Hidden Architect is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -684,7 +687,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 3 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -707,7 +710,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 4 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -730,7 +733,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 5 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -753,7 +756,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 6 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -776,7 +779,7 @@
             ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
-            "public_description": "A familiar face near the inn.",
+            "public_description": "Stranger 7 is known around the district by reputation more than by face; people speak of them carefully.",
             "known_to_player": false
           }
         },
@@ -795,7 +798,8 @@
             "conclusions": [
               "The player can expose or bargain with the rival"
             ],
-            "state": "dormant"
+            "state": "dormant",
+            "public_description": "Word about SECRET_CLOCKMAKER_BETRAYAL 0 travels through the district's bars and message boards."
           }
         },
         {
@@ -813,7 +817,8 @@
             "conclusions": [
               "The player can expose or bargain with the rival"
             ],
-            "state": "dormant"
+            "state": "dormant",
+            "public_description": "Word about SECRET_CLOCKMAKER_BETRAYAL 1 travels through the district's bars and message boards."
           }
         },
         {
@@ -831,7 +836,8 @@
             "conclusions": [
               "The player can expose or bargain with the rival"
             ],
-            "state": "dormant"
+            "state": "dormant",
+            "public_description": "Word about SECRET_CLOCKMAKER_BETRAYAL 2 travels through the district's bars and message boards."
           }
         },
         {
@@ -946,7 +952,7 @@
             "kind": "relationship",
             "interaction": {
               "id": "mara-opinion",
-              "summary": "Wren listened to Mara\u2019s warning.",
+              "summary": "Wren listened to Mara’s warning.",
               "reason": "Mara appreciates a careful visitor.",
               "deltas": {
                 "trust": 4,
@@ -965,7 +971,7 @@
             "location_id": "lantern-stair",
             "present": [],
             "beats": [],
-            "narration": "Rain taps against the windows of the Lantern Inn. The keeper slides a brass key across the table.\n\n\u201cSomeone lit the old lantern,\u201d she says. \u201cIt has been dark for thirty years.\u201d\n\nBeyond the cellar door, warm light spills up a stair that should have been sealed. Your next step is yours to choose.",
+            "narration": "Rain taps against the windows of the Lantern Inn. The keeper slides a brass key across the table.\n\n“Someone lit the old lantern,” she says. “It has been dark for thirty years.”\n\nBeyond the cellar door, warm light spills up a stair that should have been sealed. Your next step is yours to choose.",
             "choices": [
               {
                 "id": "enter",
@@ -1128,7 +1134,7 @@
             "location_id": "lantern-stair",
             "present": [],
             "beats": [],
-            "narration": "\u201cTake what you need,\u201d Mara says. \u201cThe stair is longer than it looks.\u201d",
+            "narration": "“Take what you need,” Mara says. “The stair is longer than it looks.”",
             "choices": [
               {
                 "id": "enter",
@@ -1179,7 +1185,7 @@
             "location_id": "lantern-stair",
             "present": [],
             "beats": [],
-            "narration": "\u201cTake what you need,\u201d Mara says. \u201cThe stair is longer than it looks.\u201d",
+            "narration": "“Take what you need,” Mara says. “The stair is longer than it looks.”",
             "choices": [
               {
                 "id": "enter",
