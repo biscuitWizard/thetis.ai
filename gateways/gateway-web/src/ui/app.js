@@ -55,6 +55,30 @@ store.watch("pending", (pending) => {
   }
 });
 
+// --- live activity ----------------------------------------------------------
+
+/* Folds activity snapshots into the store, keeping the newer of a held and an
+ * incoming one by the host's `rev`. A pushed change and a `sessions` reply
+ * travel on different paths and can arrive in either order; merging by arrival
+ * left a row saying "working" after the push that said it had finished. */
+function mergeActivity(entries) {
+  let changed = false;
+  const next = { ...store.activity };
+  for (const { session, ...snapshot } of entries) {
+    const held = next[session];
+    if (held && (held.rev ?? 0) > (snapshot.rev ?? 0)) continue;
+    next[session] = snapshot;
+    changed = true;
+  }
+  if (changed) store.set({ activity: next });
+}
+
+let listTimer = null;
+function scheduleList() {
+  clearTimeout(listTimer);
+  listTimer = setTimeout(() => connection.send({ type: "list" }), 250);
+}
+
 // --- connection -------------------------------------------------------------
 
 // A configured avatar is an arbitrary URL, so it can 404, be blocked, or point
@@ -98,6 +122,10 @@ const connection = new Connection({
 avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame }));
 
 connection.onOpen(() => {
+  // Live state held from before the socket dropped may describe a host that
+  // has since restarted, in which case every conversation is idle. The
+  // `sessions` reply to `hello` carries the current snapshots.
+  store.set({ activity: {} });
   connection.send({ type: "hello" });
   // The "everyone's conversations" switch lives on the socket's principal,
   // so a reconnect starts personal again; put it back before the sidebar
@@ -229,6 +257,9 @@ connection
 
   .on("sessions", (frame) => {
     store.set({ sessions: frame.sessions || [] });
+    mergeActivity(
+      store.sessions.filter((s) => s.activity).map((s) => ({ session: s.id, ...s.activity }))
+    );
 
     // The host names a conversation from its first message, so the header
     // follows whatever the list now says.
@@ -363,6 +394,21 @@ connection
   })
 
   .on("system-status", statusbar.onFrame)
+
+  // A conversation — any conversation this account may see, watched or not —
+  // changed what it is doing. The sidebar draws from this; the transcript
+  // still learns its own conversation's state from the event stream.
+  .on("activity", (frame) => {
+    const { type: _type, session, ...snapshot } = frame;
+    if (!session) return;
+    const before = store.activity[session]?.state;
+    mergeActivity([{ session, ...snapshot }]);
+    // A turn starting or ending is also when the row's title, preview and
+    // recency move — the first message names the conversation — and the list
+    // is the only carrier of those for a conversation this tab is not
+    // watching. Coalesced: a burst of children settling asks once.
+    if (before !== snapshot.state) scheduleList();
+  })
 
   // The user's stored picture, on `hello` and after any tab changes it.
   .on("user-avatar", avatars.onFrame)

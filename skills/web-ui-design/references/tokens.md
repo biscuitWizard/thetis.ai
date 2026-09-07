@@ -65,7 +65,7 @@ self-served.
 | Radii | `--r-sm` 7px · `--r-md` 10px · `--r-lg` 14px · `--r-xl` 18px · `--r-pill` 999px |
 | Space | `--gap-1` 4 · `--gap-2` 8 · `--gap-3` 12 · `--gap-4` 16 · `--gap-5` 24 · `--gap-6` 32 |
 | Shadow | `--shadow-sm` · `--shadow-md` · `--shadow-lg` — floating layers only |
-| Motion | `--ease` `cubic-bezier(.2,.7,.3,1)` · `--fast` 110ms · `--med` 180ms, both 0 under `prefers-reduced-motion` |
+| Motion | `--ease` `cubic-bezier(.2,.7,.3,1)` · `--fast` 110ms · `--med` 180ms, both 0 under `prefers-reduced-motion` · `--sheen` 2600ms, one pass of the working-row sheen (matches `SHEEN_MS` in `views/sessions.js`) |
 | Layout | `--sidebar-w` 272px · `--measure` 48rem · `--avatar-lg` 44px · `--avatar-gutter` 56px |
 
 Radius by role: `--r-sm` for inputs and small chips, `--r-md` for cards, buttons
@@ -352,7 +352,8 @@ resolved colour strings and cannot read a custom property itself.
 
 | File | Holds |
 |---|---|
-| `web.rs` | The websocket loop, host-frame routing, the loopback origin guard, the 16 MiB cap |
+| `web.rs` | The websocket loop, host-frame routing, the loopback origin guard, the 16 MiB cap; `decorate_sessions` and the `activity` push in `write_loop` |
+| `activity.rs` | Per-conversation live state folded from worker frames, published on change; the `activity` frame |
 | `branch_api.rs` | `branch-*` frames: status, graph, log, merge, update, reset |
 | `workspace_api.rs` | `workspace-*` frames, and the one `resolve()` traversal boundary |
 | `debug_api.rs` | `debug-request` and `turn-cancel` |
@@ -361,7 +362,7 @@ resolved colour strings and cannot read a custom property itself.
 
 ## Wire frames the UI consumes
 
-`catalog` · `sessions` · `history` · `settings` · `opened` · `accepted` · `event` (with
+`catalog` · `sessions` (each row may carry `activity`) · `activity` · `history` · `settings` · `opened` · `accepted` · `event` (with
 `kind`: user, delta, assistant, tool-call, tool-result, compacted, nudge, note,
 incident, modification, branch-op, turn-started, turn-finished) · `skills` ·
 `tools` · `branch-status` · `branch-graph` · `branch-log` · `branch-trunk-log` ·

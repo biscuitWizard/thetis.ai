@@ -96,6 +96,9 @@ pub struct Grip {
     pub events_tx: broadcast::Sender<OutboundEvent>,
     /// Rendered frames, consumed by websocket connections.
     pub frames_tx: broadcast::Sender<RenderedFrame>,
+    /// What each conversation is doing right now, folded from those frames,
+    /// for sidebars that are not watching it. See `activity.rs`.
+    pub activity: crate::activity::Activity,
     pub sessions: SessionActors,
     pub breakers: Breakers,
     pub terminals: crate::terminal::Terminals,
@@ -285,6 +288,7 @@ impl Grip {
             builder: Arc::new(Builder::new()),
             events_tx,
             frames_tx,
+            activity: crate::activity::Activity::new(),
             sessions: SessionActors::new(),
             terminals: crate::terminal::Terminals::new(),
             skills,

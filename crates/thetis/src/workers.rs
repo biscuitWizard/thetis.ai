@@ -746,6 +746,10 @@ impl ipc::Handler for GatewayHandler {
                     .unwrap_or_default()
                     .to_string();
                 if !session.is_empty() && !frame.is_empty() {
+                    // Fold it into the conversation's live state first, so the
+                    // `activity` push and the frame itself leave in that order
+                    // and a sidebar never learns of a step after the transcript.
+                    grip.activity.note(&session, &frame);
                     let _ = grip.frames_tx.send(RenderedFrame {
                         session_id: session,
                         frame,

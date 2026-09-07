@@ -393,6 +393,33 @@ body { display: flex; flex-direction: column; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .session-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* The clock at the row's right edge: how long a working turn has run, or how
+ * long since an idle conversation last moved. Mono because it is a quantity,
+ * and it takes the accent only while it is counting up. */
+.session-when {
+  flex: none;
+  margin-left: auto;
+  padding-left: var(--gap-2);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  font-weight: 400;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.session-when.is-elapsed { color: var(--accent); }
+/* Which mode a conversation runs in, when it is not the default. A quiet mono
+ * tag rather than a pill: information, not status. */
+.session-mode {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--text-faint);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 0 4px;
+  line-height: 15px;
+}
 /* Whose it is, when the sidebar shows everyone's. A pill before the title,
  * because the owner is the first thing that matters about a row that is
  * not yours. */
@@ -420,11 +447,125 @@ body { display: flex; flex-direction: column; }
   border: 1px solid var(--accent-edge);
   border-radius: var(--r-sm);
 }
-.session-preview {
+/* --- the row's second line: what the conversation is doing ---
+ *
+ * Idle rows show the last message's preview. A working row shows its current
+ * step — thinking, writing, or a tool by name — with a sheen gliding through
+ * the text (the effect editors use for an in-progress step), a pulsing accent
+ * dot, and the turn's tallies. A waiting row is the one state where the
+ * conversation is blocked on the reader, so it takes --warn; a failed one
+ * takes --err. Colour stays on the dot and the text, never the row (see the
+ * skill's rule on status). */
+.session-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
   font-size: var(--text-xs);
   color: var(--text-faint);
   line-height: 1.4;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session-line.is-noted { color: var(--text-dim); font-style: italic; }
+
+.session-dot {
+  flex: none;
+  width: 6px; height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--text-faint);
+}
+.session-line.is-working .session-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-wash);
+  animation: agent-pulse 1.6s var(--ease) infinite;
+  animation-delay: var(--phase, 0ms);
+}
+.session-line.is-waiting .session-dot { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-wash); }
+.session-line.is-failed .session-dot { background: var(--err); }
+
+/* The step is laid out first at its full width and the tallies take what is
+ * left, truncating: "web-search · 12 steps · 2 agents · $0.34" is wider than
+ * the line even at 272px, and with the tallies fixed the step shrank to "R…"
+ * while they ran off the edge — measured, not imagined. A zero flex basis on
+ * the tallies is what makes the step win. */
+.session-step {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-dim);
+}
+.session-line.is-waiting .session-step { color: var(--warn); }
+.session-line.is-failed .session-step { color: var(--err); }
+.session-tool { font-family: var(--mono); }
+.session-facts {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--mono);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.session-facts::before { content: "·"; margin-right: 6px; }
+
+/* The sheen. Two parts: a brighter band gliding through the step's text
+ * (the text is the gradient, clipped to its glyphs), and a fainter wash
+ * sweeping the whole row underneath. Both run off the same clock via
+ * --phase, set inline per row from wall time, so a redraw mid-pass does not
+ * snap them back to the start and every working row moves together. */
+.session-line.is-working .session-step {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    var(--text-dim) 0%,
+    var(--text-dim) 38%,
+    var(--text) 50%,
+    var(--text-dim) 62%,
+    var(--text-dim) 100%
+  );
+  background-size: 250% 100%;
+  background-repeat: no-repeat;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: sheen-text var(--sheen) linear infinite;
+  animation-delay: var(--phase, 0ms);
+}
+@keyframes sheen-text {
+  from { background-position: 100% 0; }
+  to   { background-position: 0% 0; }
+}
+.session.is-working::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(
+    100deg,
+    transparent 35%,
+    var(--accent-wash) 50%,
+    transparent 65%
+  );
+  background-size: 250% 100%;
+  background-repeat: no-repeat;
+  opacity: .55;
+  animation: sheen-row var(--sheen) linear infinite;
+  animation-delay: var(--phase, 0ms);
+}
+@keyframes sheen-row {
+  from { background-position: 100% 0; }
+  to   { background-position: 0% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-line.is-working .session-dot { animation: none; }
+  .session-line.is-working .session-step {
+    animation: none;
+    background-image: none;
+    color: var(--text);
+    -webkit-text-fill-color: currentColor;
+  }
+  .session.is-working::after { display: none; }
 }
 
 /* Group headings ("Today", "Archived") and the archived section. */
@@ -443,9 +584,17 @@ body { display: flex; flex-direction: column; }
   font-family: var(--mono);
   font-weight: 400;
   text-transform: none;
+  letter-spacing: 0;
   padding: 0 6px;
   border: 1px solid var(--hairline);
   border-radius: var(--r-pill);
+}
+/* How many in the group are mid-turn: tinted, so a glance at the heading says
+ * whether anything below is alive before reading the rows. */
+.session-count.is-working {
+  color: var(--accent);
+  border-color: var(--accent-edge);
+  background: var(--accent-wash);
 }
 .session-empty { padding: 10px 11px; font-size: var(--text-xs); color: var(--text-faint); }
 
