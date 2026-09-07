@@ -5,7 +5,7 @@
 //! tool handles both, and decodes the file so a model gets text rather than
 //! base64.
 //!
-//! Writing lives in git-commit, which can change several files atomically.
+//! Writing lives in github-commit, which can change several files atomically.
 //! Splitting them keeps this one read-only, so it survives a read-only mode.
 
 wit_bindgen::generate!({
@@ -26,10 +26,10 @@ struct Component;
 impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
-            name: "git-file".to_string(),
+            name: "github-file".to_string(),
             description: "Read a file's contents, or list a directory, from a GitHub repository \
-                          at any branch, tag or commit — without cloning it. Use git-commit \
-                          to change files, and git-repo to find repositories and branches."
+                          at any branch, tag or commit — without cloning it. Use github-commit \
+                          to change files, and github-repo to find repositories and branches."
                 .to_string(),
             args_schema_json: json!({
                 "type": "object",

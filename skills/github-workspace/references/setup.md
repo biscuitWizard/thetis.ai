@@ -62,7 +62,7 @@ Note the **App ID** from the app's General page — a number, not the client id
 Add to `thetis.local.toml`, which is gitignored:
 
 ```toml
-[tools.git]
+[tools.github]
 app_id = "123456"
 private_key_path = "secrets/github-app.pem"
 # installation_id = 12345678   # only if the app is installed on several accounts
@@ -80,7 +80,7 @@ Two things follow, both of which look like bugs and are not:
   branch-local value seems ignored, check the shared file for the same key.
 - `list_config` and `read_config` do not show values that came from an overlay,
   so a correctly configured `app_id` still reads as "no setting named …". Use
-  `git-whoami` to test the credential; the config tools cannot see it.
+  `github-whoami` to test the credential; the config tools cannot see it.
 
 The private key is read by the orchestrator, not by the tool: a tool has no
 filesystem import, so `*_path` keys are resolved host-side and inlined as
@@ -95,7 +95,7 @@ Config is read at startup:
 restart_orchestrator
 ```
 
-Then run `git-whoami`. Success prints the app, its slug, the `git config`
+Then run `github-whoami`. Success prints the app, its slug, the `git config`
 lines for the bot identity, every installation, and the reachable repositories —
 and confirms an installation token was minted.
 

@@ -155,7 +155,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-repo"
+name = "github-commit"
 version = "0.1.0"
 dependencies = [
  "base64",

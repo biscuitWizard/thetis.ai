@@ -511,6 +511,30 @@ impl GitCtl {
         Ok(commits)
     }
 
+    /// `git diff --stat` between two revisions, capped to `max_lines` so a
+    /// sprawling branch cannot flood a caller (or a model prompt). The final
+    /// summary line is always kept, because it carries the totals.
+    pub async fn diff_stat(&self, from: &str, to: &str, max_lines: usize) -> Result<String> {
+        let range = format!("{from}..{to}");
+        let out = self
+            .run(&["diff", "--stat=140,100", "--no-color", &range])
+            .await?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() <= max_lines {
+            return Ok(lines.join("\n"));
+        }
+        let mut kept: Vec<String> = lines[..max_lines.saturating_sub(1)]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        kept.push(format!("… {} more files", lines.len() - max_lines));
+        if let Some(totals) = lines.last() {
+            kept.push(totals.to_string());
+        }
+        Ok(kept.join("\n"))
+    }
+
     /// The common ancestor of two revisions — where a branch forked.
     pub async fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
         let out = self.run_ok(&["merge-base", a, b]).await?;
