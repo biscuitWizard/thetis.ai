@@ -16,7 +16,6 @@ pub mod branches;
 pub mod branchops;
 pub mod browser;
 pub mod buildcache;
-pub mod kb_sidecar;
 pub mod builder;
 pub mod cache;
 pub mod config;
