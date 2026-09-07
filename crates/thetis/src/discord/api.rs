@@ -92,6 +92,42 @@ impl Interaction {
     }
 }
 
+/// A button press, select-menu choice or modal submission.
+///
+/// These are the *other* two interaction types, and they are not commands: no
+/// command name arrives, and what identifies them is the `custom_id` the bot
+/// itself put on the component. They are kept separate from `Interaction` for
+/// that reason — conflating them would mean a struct whose `name` is sometimes
+/// a command and sometimes a made-up token.
+#[derive(Debug, Clone)]
+pub struct Component {
+    pub id: String,
+    pub token: String,
+    pub channel_id: String,
+    pub guild_id: Option<String>,
+    pub channel_type: Option<u64>,
+    pub user_id: String,
+    pub user_name: String,
+    /// The id the bot gave the component. This is the whole of the routing
+    /// information, so it has to encode everything the handler needs.
+    pub custom_id: String,
+    /// Select-menu selections, or a modal's text-input values in row order.
+    /// A button press has none.
+    pub values: Vec<String>,
+    /// The message the component sits on. Absent on a modal submission that
+    /// Discord did not attach one to, which is why a modal's `custom_id` also
+    /// carries the message id.
+    pub message_id: Option<String>,
+    /// True for a modal submission, false for a button or select menu.
+    pub from_modal: bool,
+}
+
+impl Component {
+    pub fn is_dm(&self) -> bool {
+        self.guild_id.is_none()
+    }
+}
+
 /// What the socket produced. `Resumed` and `Ready` are separate because only a
 /// fresh READY invalidates the session state we were holding.
 #[derive(Debug)]
@@ -103,6 +139,8 @@ pub enum Event {
     Message(Incoming),
     /// A slash command was invoked.
     Command(Interaction),
+    /// A component on one of the bot's own messages was used.
+    Interacted(Component),
     /// The socket ended; the caller reconnects.
     Disconnected(String),
     /// The socket ended for a reason reconnecting cannot fix.
@@ -182,29 +220,56 @@ fn parse_message(d: &Value) -> Option<Incoming> {
     })
 }
 
+/// The invoker of an interaction, whatever its type.
+///
+/// In a guild the user is nested under `member`; in a DM it is at the top
+/// level. Every interaction type shares that shape, so it is read once.
+fn interaction_user(d: &Value) -> Option<(String, String)> {
+    let user = d
+        .get("member")
+        .and_then(|m| m.get("user"))
+        .or_else(|| d.get("user"))?;
+    let id = user.get("id")?.as_str()?.to_string();
+    let name = user
+        .get("global_name")
+        .and_then(Value::as_str)
+        .or_else(|| user.get("username").and_then(Value::as_str))
+        .unwrap_or("someone")
+        .to_string();
+    Some((id, name))
+}
+
+/// Where an interaction happened. `channel_id` is top-level on older payloads
+/// and nested under `channel` on newer ones, so both are tried.
+fn interaction_channel(d: &Value) -> (String, Option<u64>) {
+    let id = d
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            d.get("channel")
+                .and_then(|c| c.get("id"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_string();
+    let kind = d
+        .get("channel")
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_u64);
+    (id, kind)
+}
+
 /// Reads an APPLICATION_COMMAND interaction, or `None` for any other type.
 ///
-/// Component and modal interactions share this dispatch and must be ignored
-/// rather than guessed at: only type 2 carries a command name.
+/// Component and modal interactions share this dispatch and are read by
+/// `parse_component` instead: only type 2 carries a command name.
 fn parse_interaction(d: &Value) -> Option<Interaction> {
     const APPLICATION_COMMAND: u64 = 2;
     if d.get("type").and_then(Value::as_u64) != Some(APPLICATION_COMMAND) {
         return None;
     }
     let data = d.get("data")?;
-
-    // In a guild the invoker is under `member`; in a DM it is at the top level.
-    let user = d
-        .get("member")
-        .and_then(|m| m.get("user"))
-        .or_else(|| d.get("user"))?;
-    let user_id = user.get("id")?.as_str()?.to_string();
-    let user_name = user
-        .get("global_name")
-        .and_then(Value::as_str)
-        .or_else(|| user.get("username").and_then(Value::as_str))
-        .unwrap_or("someone")
-        .to_string();
+    let (user_id, user_name) = interaction_user(d)?;
 
     // Option values are flattened in declaration order. Every command here
     // takes at most one string, so joining is enough and lets the handler stay
@@ -225,28 +290,79 @@ fn parse_interaction(d: &Value) -> Option<Interaction> {
         })
         .unwrap_or_default();
 
+    let (channel_id, channel_type) = interaction_channel(d);
     Some(Interaction {
         id: d.get("id")?.as_str()?.to_string(),
         token: d.get("token")?.as_str()?.to_string(),
-        channel_id: d
-            .get("channel_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                d.get("channel")
-                    .and_then(|c| c.get("id"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or_default()
-            .to_string(),
+        channel_id,
         guild_id: d.get("guild_id").and_then(Value::as_str).map(String::from),
-        channel_type: d
-            .get("channel")
-            .and_then(|c| c.get("type"))
-            .and_then(Value::as_u64),
+        channel_type,
         user_id,
         user_name,
         name: data.get("name")?.as_str()?.to_lowercase(),
         argument,
+    })
+}
+
+/// Reads a MESSAGE_COMPONENT (type 3) or MODAL_SUBMIT (type 5) interaction.
+///
+/// `None` for anything else, including a command: the two paths are disjoint,
+/// so a payload can never be read as both.
+///
+/// Modal values are nested two deep — `components[].components[].value` — one
+/// action row per input. They are flattened into `values` in row order, which is
+/// the order they were declared, so a caller reads them positionally.
+fn parse_component(d: &Value) -> Option<Component> {
+    const MESSAGE_COMPONENT: u64 = 3;
+    const MODAL_SUBMIT: u64 = 5;
+    let kind = d.get("type").and_then(Value::as_u64)?;
+    if kind != MESSAGE_COMPONENT && kind != MODAL_SUBMIT {
+        return None;
+    }
+    let data = d.get("data")?;
+    let (user_id, user_name) = interaction_user(d)?;
+    let (channel_id, channel_type) = interaction_channel(d);
+
+    let values = if kind == MODAL_SUBMIT {
+        data.get("components")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.get("components").and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(|c| c.get("value").and_then(Value::as_str))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        data.get("values")
+            .and_then(Value::as_array)
+            .map(|vals| {
+                vals.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    Some(Component {
+        id: d.get("id")?.as_str()?.to_string(),
+        token: d.get("token")?.as_str()?.to_string(),
+        channel_id,
+        guild_id: d.get("guild_id").and_then(Value::as_str).map(String::from),
+        channel_type,
+        user_id,
+        user_name,
+        custom_id: data.get("custom_id")?.as_str()?.to_string(),
+        values,
+        message_id: d
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .map(String::from),
+        from_modal: kind == MODAL_SUBMIT,
     })
 }
 
@@ -472,6 +588,12 @@ impl Shard {
                             if let Some(interaction) = parse_interaction(&d) {
                                 return Ok(Event::Command(interaction));
                             }
+                            // A button, select menu or modal. Disjoint from the
+                            // command path: only one of the two parsers can
+                            // match a given payload.
+                            if let Some(component) = parse_component(&d) {
+                                return Ok(Event::Interacted(component));
+                            }
                         }
                         _ => {}
                     }
@@ -593,14 +715,100 @@ impl Rest {
         if ephemeral {
             data["flags"] = json!(1 << 6);
         }
-        // Interaction callbacks are authenticated by the token in the path, so
-        // this endpoint takes no Authorization header.
+        self.interaction_callback(
+            interaction_id,
+            token,
+            json!({ "type": CHANNEL_MESSAGE_WITH_SOURCE, "data": data }),
+        )
+        .await
+    }
+
+    /// Answers a component interaction by rewriting the message it sits on.
+    ///
+    /// Type 7 is UPDATE_MESSAGE, which both acknowledges the interaction and
+    /// replaces the content and components in one request — so a used control
+    /// disappears rather than staying pressable. Passing an empty component list
+    /// is what removes the controls; omitting the field would leave them.
+    pub async fn update_interaction_message(
+        &self,
+        interaction_id: &str,
+        token: &str,
+        content: &str,
+        components: Value,
+    ) -> Result<()> {
+        const UPDATE_MESSAGE: u64 = 7;
+        self.interaction_callback(
+            interaction_id,
+            token,
+            json!({
+                "type": UPDATE_MESSAGE,
+                "data": {
+                    "content": truncate(content),
+                    "components": components,
+                    "allowed_mentions": Self::allowed_mentions(),
+                },
+            }),
+        )
+        .await
+    }
+
+    /// Answers an interaction by opening a modal.
+    ///
+    /// Type 9 is MODAL. A modal is the only way to collect free text on
+    /// Discord: text inputs are not allowed on a message, only inside a modal,
+    /// which is why a free-text answer needs a button or a menu entry to open
+    /// one rather than being typed in place.
+    ///
+    /// A modal response cannot be sent to a modal submission — Discord rejects
+    /// a modal from a modal — so this is only ever the answer to a command or a
+    /// component.
+    pub async fn open_modal(
+        &self,
+        interaction_id: &str,
+        token: &str,
+        modal: Value,
+    ) -> Result<()> {
+        const MODAL: u64 = 9;
+        self.interaction_callback(
+            interaction_id,
+            token,
+            json!({ "type": MODAL, "data": modal }),
+        )
+        .await
+    }
+
+    /// Acknowledges an interaction without changing anything on screen.
+    ///
+    /// Type 6 is DEFERRED_UPDATE_MESSAGE. Needed for a submission whose visible
+    /// effect is applied by a later edit: something must reach Discord inside
+    /// three seconds or the user is told the application did not respond.
+    pub async fn ack_interaction(&self, interaction_id: &str, token: &str) -> Result<()> {
+        const DEFERRED_UPDATE_MESSAGE: u64 = 6;
+        self.interaction_callback(
+            interaction_id,
+            token,
+            json!({ "type": DEFERRED_UPDATE_MESSAGE }),
+        )
+        .await
+    }
+
+    /// The one place an interaction callback is posted.
+    ///
+    /// Callbacks are authenticated by the token *in the path*, so this endpoint
+    /// must not carry an Authorization header — sending one gets the request
+    /// rejected, and the symptom is a 401 that looks like a bad bot token.
+    async fn interaction_callback(
+        &self,
+        interaction_id: &str,
+        token: &str,
+        body: Value,
+    ) -> Result<()> {
         let response = self
             .http
             .post(format!(
                 "{API_BASE}/interactions/{interaction_id}/{token}/callback"
             ))
-            .json(&json!({ "type": CHANNEL_MESSAGE_WITH_SOURCE, "data": data }))
+            .json(&body)
             .send()
             .await
             .context("answering an interaction")?;
@@ -614,16 +822,68 @@ impl Rest {
 
     /// Sends a message and returns its id, so it can be edited while streaming.
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<String> {
-        let body = json!({
+        self.send_with_components(channel_id, content, Value::Null)
+            .await
+    }
+
+    /// Sends a message carrying interactive components.
+    ///
+    /// Discord allows at most five action rows on a message, and the components
+    /// are the bot's own: a `custom_id` set here is what comes back on the
+    /// interaction, and it is the only routing information available, so it has
+    /// to encode everything the handler will need.
+    pub async fn send_with_components(
+        &self,
+        channel_id: &str,
+        content: &str,
+        components: Value,
+    ) -> Result<String> {
+        let mut body = json!({
             "content": truncate(content),
             "allowed_mentions": Self::allowed_mentions(),
         });
+        if !components.is_null() {
+            body["components"] = components;
+        }
         let created: CreatedMessage = serde_json::from_value(
             self.post(&format!("/channels/{channel_id}/messages"), body)
                 .await?,
         )
         .context("Discord returned a message without an id")?;
         Ok(created.id)
+    }
+
+    /// Edits a message's text and its components together.
+    ///
+    /// Used to retire controls after a modal submission, where the update had to
+    /// be deferred: an empty component array is what takes them away.
+    pub async fn edit_with_components(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        components: Value,
+    ) -> Result<()> {
+        let response = self
+            .http
+            .patch(format!(
+                "{API_BASE}/channels/{channel_id}/messages/{message_id}"
+            ))
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&json!({
+                "content": truncate(content),
+                "components": components,
+                "allowed_mentions": Self::allowed_mentions(),
+            }))
+            .send()
+            .await
+            .context("editing a message")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("Discord rejected an edit: {status} {text}"));
+        }
+        Ok(())
     }
 
     pub async fn edit_message(
