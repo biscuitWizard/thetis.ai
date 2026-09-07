@@ -804,13 +804,27 @@ fn dedupe_tool_results(body: &mut serde_json::Value) -> usize {
 /// this host-only marker is consumed here and never reaches a provider.
 ///
 /// A whole failed pair is removed so the remaining request is structurally
-/// valid. Successful/unknown results merely lose the private marker. If an
-/// assistant mixed failed and successful calls, only the failed calls go; an
-/// assistant message left with neither text nor calls is removed as well.
+/// valid, except that the most recent failed pair is always preserved: it is
+/// the feedback the model needs to correct its next action. Successful/unknown
+/// results merely lose the private marker. If an assistant mixed failed and
+/// successful calls, only the old failed calls go; an assistant message left
+/// with neither text nor calls is removed as well.
 fn trim_failed_tool_rounds(body: &mut serde_json::Value) -> usize {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return 0;
     };
+
+    // Keep the newest failure intact. It is the model's immediate feedback for
+    // the next completion; trimming it makes the failed call appear never to
+    // have happened and invites the exact same call again. Older failures are
+    // low-value history and may be removed before cache anchors are chosen.
+    let newest_failed = messages.iter().rev().find_map(|m| {
+        (m.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+            && m.get("thetis_tool_ok").and_then(serde_json::Value::as_bool) == Some(false))
+        .then(|| m.get("tool_call_id").and_then(serde_json::Value::as_str))
+        .flatten()
+        .map(str::to_string)
+    });
 
     let failed: std::collections::HashSet<String> = messages
         .iter()
@@ -819,6 +833,7 @@ fn trim_failed_tool_rounds(body: &mut serde_json::Value) -> usize {
                 && m.get("thetis_tool_ok").and_then(serde_json::Value::as_bool) == Some(false)
         })
         .filter_map(|m| m.get("tool_call_id").and_then(serde_json::Value::as_str))
+        .filter(|id| newest_failed.as_deref() != Some(*id))
         .map(str::to_string)
         .collect();
 
@@ -1195,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_tool_pairs_are_trimmed_before_caching() {
+    fn older_failed_tool_pairs_are_trimmed_before_caching() {
         let mut body = serde_json::json!({ "messages": [
             { "role": "system", "content": "prompt" },
             { "role": "assistant", "content": "", "tool_calls": [
@@ -1203,15 +1218,57 @@ mod tests {
                 { "id": "good", "function": { "name": "y", "arguments": "{}" } }
             ]},
             { "role": "tool", "tool_call_id": "bad", "content": "failed", "thetis_tool_ok": false },
-            { "role": "tool", "tool_call_id": "good", "content": "worked", "thetis_tool_ok": true }
+            { "role": "tool", "tool_call_id": "good", "content": "worked", "thetis_tool_ok": true },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "latest", "function": { "name": "z", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "latest", "content": "latest failure", "thetis_tool_ok": false }
+        ]});
+
+        assert_eq!(trim_failed_tool_rounds(&mut body), 2);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "good");
+        assert_eq!(messages[4]["tool_call_id"], "latest");
+        assert!(messages.iter().all(|m| m.get("thetis_tool_ok").is_none()));
+    }
+
+    #[test]
+    fn the_most_recent_failed_tool_pair_is_never_trimmed() {
+        let mut body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "prompt" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "old", "function": { "name": "git-whoami", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "old", "content": "old failure", "thetis_tool_ok": false },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "new", "function": { "name": "git-whoami", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "new", "content": "fix your credentials", "thetis_tool_ok": false }
         ]});
 
         assert_eq!(trim_failed_tool_rounds(&mut body), 2);
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "good");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "new");
+        assert_eq!(messages[2]["tool_call_id"], "new");
         assert!(messages[2].get("thetis_tool_ok").is_none());
+    }
+
+    #[test]
+    fn a_lone_failed_tool_pair_is_preserved() {
+        let mut body = serde_json::json!({ "messages": [
+            { "role": "system", "content": "prompt" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "only", "function": { "name": "git-whoami", "arguments": "{}" } }
+            ]},
+            { "role": "tool", "tool_call_id": "only", "content": "fix your credentials", "thetis_tool_ok": false }
+        ]});
+
+        assert_eq!(trim_failed_tool_rounds(&mut body), 0);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert!(body["messages"][2].get("thetis_tool_ok").is_none());
     }
 
     #[test]
