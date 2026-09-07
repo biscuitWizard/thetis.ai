@@ -221,16 +221,10 @@ pub async fn install_push_guard(git: &GitCtl) -> Result<()> {
 # the conversation branches can carry private tools and skills. Publish from
 # /admin, which exports and pushes it as `main` on the remote. Set
 # THETIS_ALLOW_PUSH=1 to override once.
-#
-# `bench-results` is also allowed. It is not a filtered view of any private
-# tree: every commit on it is built file by file from a staging directory that
-# the benchmark generator wrote, so it can only ever contain what that
-# generator put there — charts and one line of numbers. It carries no history
-# from trunk and shares no objects with it.
 if [ -n "$THETIS_ALLOW_PUSH" ]; then exit 0; fi
 while read local_ref local_sha remote_ref remote_sha; do
   case "$local_ref" in
-    refs/heads/public|refs/heads/bench-results|"") ;;
+    refs/heads/public|"") ;;
     *)
       echo "thetis: refusing to push $local_ref — only the filtered export leaves this machine." >&2
       echo "thetis: publish from /admin, or set THETIS_ALLOW_PUSH=1 to override." >&2
@@ -726,7 +720,7 @@ fn conflicted(paths: &[String]) -> String {
 }
 
 /// Whether a failed fetch means only that the remote has no such branch.
-pub(crate) fn missing_remote_branch(stderr: &str) -> bool {
+fn missing_remote_branch(stderr: &str) -> bool {
     stderr.contains("couldn't find remote ref")
 }
 
@@ -1334,19 +1328,6 @@ mod tests {
             !String::from_utf8_lossy(&published.stdout).trim().is_empty(),
             "the remote's main must now exist"
         );
-
-        // The benchmark results branch is allowed through too. It is not a
-        // filtered view of anything: `bench::publish_bench` builds each commit
-        // file by file from the generator's staging directory, so it carries no
-        // trunk history and shares no objects with it. If this is ever refused,
-        // publishing from /admin silently stops recording datapoints -- the
-        // failure is best-effort and only shows up as a line in the message.
-        git.run_raw(&["update-ref", crate::bench::BENCH_REF, "public"])
-            .await
-            .unwrap();
-        git.run_hooked(&["push", "origin", "bench-results:bench-results"], &[])
-            .await
-            .unwrap();
 
         // ...and the documented override works.
         git.run_hooked(&["push", "origin", "main"], &[("THETIS_ALLOW_PUSH", "1")])
