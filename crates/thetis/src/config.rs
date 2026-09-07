@@ -2142,13 +2142,19 @@ max_universal = 3
 
     #[test]
     fn a_hyphenated_tool_inherits_its_group_block() {
+        // The group is fictional on purpose. An earlier version of this test
+        // used `notion`, and a real `NOTION_TOKEN` in the environment then
+        // overrode the file it asserts on — correct behaviour, since the
+        // environment beats the file, but it made the test fail wherever a
+        // credential was configured. Every env-sensitive test here uses a
+        // `zz*` scope no real deployment sets.
         let cfg = from_toml(
             r#"
-[tools.notion]
+[tools.zzgroupsvc]
 token = "secret"
 version = "2026-03-11"
 
-[tools.notion-search]
+[tools.zzgroupsvc-search]
 page_size = 25
 version = "2025-09-03"
 "#,
@@ -2156,7 +2162,7 @@ version = "2025-09-03"
         .unwrap();
 
         let seen: serde_json::Value =
-            serde_json::from_str(&cfg.tool_config_json("notion-search")).unwrap();
+            serde_json::from_str(&cfg.tool_config_json("zzgroupsvc-search")).unwrap();
         // Group key inherited, and the specific block wins where both name one.
         assert_eq!(seen["token"], "secret");
         assert_eq!(seen["page_size"], 25);
@@ -2164,7 +2170,7 @@ version = "2025-09-03"
 
         // A sibling with no block of its own still gets the shared credential.
         let sibling: serde_json::Value =
-            serde_json::from_str(&cfg.tool_config_json("notion-comment-add")).unwrap();
+            serde_json::from_str(&cfg.tool_config_json("zzgroupsvc-comment-add")).unwrap();
         assert_eq!(sibling["token"], "secret");
         assert!(sibling.get("page_size").is_none());
 
