@@ -18,6 +18,13 @@ use crate::gitctl::GitCtl;
 /// The marker file. Uniform for tools, skills, and any other directory:
 /// it diffs, merges, and resets like any tracked file.
 pub const PRIVATE_MARKER: &str = ".thetis-private";
+/// The marker's name before the project was renamed.
+///
+/// Still honoured. A marker file is a safety mechanism, and quietly ceasing to
+/// recognise one because the project changed names is how a directory somebody
+/// deliberately marked private ends up published. Nothing in this repository
+/// used it, but a branch or an older checkout may.
+pub const LEGACY_PRIVATE_MARKER: &str = ".genesis-private";
 
 /// The branch the export writes and the only one the hook lets out.
 pub const PUBLIC_REF: &str = "refs/heads/public";
@@ -25,6 +32,14 @@ pub const PUBLIC_REF: &str = "refs/heads/public";
 const SOURCE_REF: &str = "refs/thetis/public-source";
 
 const HOOK_MARKER: &str = "# thetis publish guard";
+/// What the marker said before the project was renamed.
+///
+/// A hook carrying this is still ours — it is the same guard, written under
+/// the old name — so it is upgraded rather than treated as a stranger's and
+/// left in place. Without this the rename left every checkout warning that
+/// pushes were unguarded (they were guarded, by the stale copy) while the
+/// documented override variable no longer matched the one the hook read.
+const LEGACY_HOOK_MARKER: &str = "# genesis publish guard";
 
 /// Directories private as of `rev` — every ancestor directory of a marker.
 pub async fn private_dirs(git: &GitCtl, rev: &str) -> Result<Vec<String>> {
@@ -34,6 +49,7 @@ pub async fn private_dirs(git: &GitCtl, rev: &str) -> Result<Vec<String>> {
         .into_iter()
         .filter_map(|path| {
             path.strip_suffix(&format!("/{PRIVATE_MARKER}"))
+                .or_else(|| path.strip_suffix(&format!("/{LEGACY_PRIVATE_MARKER}")))
                 .map(str::to_string)
         })
         .collect())
@@ -174,7 +190,7 @@ exit 0
 
     if path.exists() {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if !existing.contains(HOOK_MARKER) {
+        if !existing.contains(HOOK_MARKER) && !existing.contains(LEGACY_HOOK_MARKER) {
             tracing::warn!(
                 path = %path.display(),
                 "a pre-push hook already exists and is not ours; leaving it — \
@@ -212,6 +228,31 @@ mod tests {
         std::fs::write(tmp.path().join("open.txt"), "public\n").unwrap();
         git.add_all_and_commit("base").await.unwrap();
         (tmp, git)
+    }
+
+    #[tokio::test]
+    async fn a_marker_written_before_the_rename_still_hides_its_directory() {
+        // A marker is a safety mechanism. Ceasing to honour one because the
+        // project changed names is how a directory somebody deliberately
+        // marked private gets published.
+        let (tmp, git) = repo().await;
+        let secret = tmp.path().join("tools/legacy-secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("lib.rs"), "private\n").unwrap();
+        std::fs::write(secret.join(LEGACY_PRIVATE_MARKER), "").unwrap();
+        std::fs::write(tmp.path().join("open.txt"), "public\n").unwrap();
+        git.add_all_and_commit("with a pre-rename marker").await.unwrap();
+
+        export_public(&git).await.unwrap();
+        let files = git.tree_files(PUBLIC_REF).await.unwrap();
+        assert!(
+            files.iter().any(|f| f == "open.txt"),
+            "public content must survive: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with("tools/legacy-secret")),
+            "the old marker must still hide its directory: {files:?}"
+        );
     }
 
     #[tokio::test]

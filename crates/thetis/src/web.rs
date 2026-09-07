@@ -418,8 +418,25 @@ async fn admin_branch_action(
         }
         "push-public" => {
             let root = branches.root_git();
+            // Export first. Pushing meant "publish where trunk is now", but the
+            // button only pushed whatever `public` already pointed at — and on
+            // a checkout that had never exported there was no such ref at all,
+            // so it failed with git's `src refspec public does not match any`,
+            // which says nothing about what to do. Exporting is idempotent, so
+            // doing it here costs nothing when the branch is already current.
+            let export = crate::publish::export_public(root).await?;
+            let Some(head) = export.public_head else {
+                anyhow::bail!(
+                    "there is nothing to publish yet: trunk has no commits that survive \
+                     the private-path filter, so no public branch was created."
+                );
+            };
             root.run_hooked(&["push", "origin", "public"], &[]).await?;
-            Ok("pushed the public branch to origin".to_string())
+            Ok(format!(
+                "exported {} commit(s) and pushed public ({}) to origin",
+                export.commits,
+                &head[..12.min(head.len())]
+            ))
         }
         other => anyhow::bail!("unknown action '{other}'"),
     }
