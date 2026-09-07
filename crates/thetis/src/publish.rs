@@ -669,9 +669,22 @@ async fn tree_of(git: &GitCtl, rev: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// How every commit `apply_pull` adds to trunk starts. One shape, on purpose:
+/// the watchdog reads trunk's history backwards looking for a green build to
+/// fall back to, and must not walk past a pull — the trees before it lack what
+/// the pull took in, so "resetting" onto one reverts another checkout's work.
+pub const PULL_SUBJECT_PREFIX: &str = "Take in ";
+
+/// Whether a commit subject is one `apply_pull` wrote.
+pub fn is_pull_commit(subject: &str) -> bool {
+    subject
+        .strip_prefix(PULL_SUBJECT_PREFIX)
+        .is_some_and(|rest| rest.contains(" published to origin/"))
+}
+
 fn pull_message(subjects: &[String]) -> String {
     let mut msg = format!(
-        "Take in {} commit(s) published to origin/{REMOTE_BRANCH}\n\n\
+        "{PULL_SUBJECT_PREFIX}{} commit(s) published to origin/{REMOTE_BRANCH}\n\n\
          Merged from what another checkout published. Only paths that leave this\n\
          machine are touched; anything marked private here is untouched.\n",
         subjects.len()
@@ -779,6 +792,22 @@ fn push_failure(stderr: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The watchdog stops its search for a green build at a pull, so the
+    /// message a pull writes and the check that recognises it must agree.
+    #[test]
+    fn the_pull_message_is_recognised_as_a_pull_and_nothing_else_is() {
+        let subject = pull_message(&["one".to_string()])
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(is_pull_commit(&subject), "{subject:?}");
+        assert!(is_pull_commit("Take in 100 commit(s) published to origin/main"));
+        assert!(!is_pull_commit("Take in the view"));
+        assert!(!is_pull_commit("checkpoint: end of turn"));
+        assert!(!is_pull_commit(" Take in 1 commit(s) published to origin/main"));
+    }
 
     async fn repo() -> (TempDir, GitCtl) {
         let tmp = TempDir::new().unwrap();

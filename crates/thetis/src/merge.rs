@@ -131,6 +131,13 @@ pub async fn merge_to_trunk(
         }
     }
 
+    // A watchdog reset on this branch put an aspect back at an older tree. If
+    // the branch still offers that tree, the merge would land the revert on
+    // trunk as this conversation's work — squashed under a subject that says
+    // nothing about it — and the next publish would carry it to every other
+    // checkout. That is how the web control panel was lost once.
+    refuse_live_watchdog_reverts(grip, &root, &row.branch_ref, &gated_tip, &trunk).await?;
+
     // Collapse the branch's own commits into one before trunk sees them. The
     // squashed commit carries the branch's tree unchanged, so the gate above
     // still describes exactly what lands.
@@ -208,6 +215,47 @@ pub async fn merge_to_trunk(
     refresh_trunk_kernel(grip, &from, session_id).await;
 
     Ok(MergeResult::Merged { from, to })
+}
+
+/// Refuses the merge while a watchdog reset is still what the branch has to
+/// offer for some aspect.
+///
+/// A reset is "still live" when the branch tip's tree for the aspect is the
+/// one the reset commit left, and trunk's differs — so landing the branch
+/// changes trunk's aspect to an older tree. A reset the conversation has since
+/// worked past (the aspect's tree moved on) or that only put the aspect back
+/// at what trunk already has is not a revert and passes.
+async fn refuse_live_watchdog_reverts(
+    grip: &Arc<Grip>,
+    root: &crate::gitctl::GitCtl,
+    branch_ref: &str,
+    tip: &str,
+    trunk: &str,
+) -> Result<()> {
+    let commits = root
+        .log_args(&[branch_ref, &format!("^{trunk}")], 200)
+        .await
+        .unwrap_or_default();
+    for commit in commits {
+        let Some((aspect, short)) = pipeline::parse_reset_commit(&commit.subject) else {
+            continue;
+        };
+        let Some(rel) = grip.cfg().aspect_source_rel(&aspect) else {
+            continue;
+        };
+        let reset_tree = root.tree_oid(&commit.rev, &rel).await?.unwrap_or_default();
+        let tip_tree = root.tree_oid(tip, &rel).await?.unwrap_or_default();
+        let trunk_tree = root.tree_oid(trunk, &rel).await?.unwrap_or_default();
+        if tip_tree == reset_tree && tip_tree != trunk_tree {
+            bail!(
+                "{aspect} on this branch is still at the tree the watchdog reset it to (green \
+                 {short}), and that is not what trunk has: merging would land the revert on \
+                 trunk as this conversation's work. Restore `{rel}` from trunk in the worktree \
+                 (or update from trunk), get it building green, and merge again."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Collapses everything the branch has of its own into one commit parented on
