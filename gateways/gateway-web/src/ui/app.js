@@ -86,7 +86,7 @@ const connection = new Connection({
   },
 });
 
-// The byline avatars and the sidebar's avatar button. Mounted before the frame
+// The turn avatars and the sidebar's avatar button. Mounted before the frame
 // handlers, which route `user-avatar` into it, and before the transcript, which
 // asks it for a tile per turn.
 // `id` is the open conversation on every frame on this socket, and the host

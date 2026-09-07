@@ -1,10 +1,14 @@
-/* Avatars: a face at the head of every turn.
+/* Avatars: a face per turn, in the gutter beside the conversation.
  *
- * Each turn's byline carries a small square tile — yours beside "you", the
- * agent's beside its name — so a long transcript can be skimmed by picture
+ * Each turn gets a square tile in the transcript's left gutter — yours on your
+ * rows, the agent's on its own — so a long transcript can be skimmed by picture
  * rather than by reading each label. The tiles are cloned from two <template>
  * elements in index.html, which is what keeps the markup for a face in one
  * place instead of spread across the renderers that build rows.
+ *
+ * Placing them is CSS's job, not this module's: a tile is appended to its row
+ * and lifted out of flow into the gutter by .turn-avatar. Nothing here measures
+ * or positions anything.
  *
  * The two avatars come from different places on purpose:
  *
@@ -34,7 +38,7 @@ import { toast } from "../lib/toast.js";
  *
  * The image is re-encoded in the browser before it goes anywhere. Two reasons
  * beyond politeness to the store: a phone photo is several megabytes of base64
- * on every page load of every tab, and a tile is displayed at 26 CSS pixels, so
+ * on every page load of every tab, and a tile is displayed at 44 CSS pixels, so
  * anything past this is bytes nobody can see. 256 leaves headroom for a 3x
  * display and for anywhere the picture might later be shown larger. */
 const MAX_EDGE = 256;
@@ -76,7 +80,7 @@ export function mountAvatars(sendFrame) {
 }
 
 /**
- * A byline tile for a turn, or null for a role that has no face.
+ * An avatar tile for a turn, or null for a role that has no face.
  *
  * Cloned rather than built, so the agent's serve-time `{agent_avatar}` and its
  * hidden-or-not decision are made once in the markup and every row inherits
@@ -85,7 +89,7 @@ export function mountAvatars(sendFrame) {
  * @param {string} role  the event's role: "user" and "assistant" have faces
  * @returns {Node|null}
  */
-export function bylineAvatar(role) {
+export function turnAvatar(role) {
   const id = role === "user" ? "user-avatar-template" : role === "assistant" ? "agent-avatar-template" : null;
   if (!id) return null;
   const template = $(id);
@@ -94,8 +98,8 @@ export function bylineAvatar(role) {
   const node = template.content.firstElementChild?.cloneNode(true);
   if (!node) return null;
 
-  const img = node.querySelector(".byline-img");
-  const mark = node.querySelector(".byline-mark");
+  const img = node.querySelector(".turn-img");
+  const mark = node.querySelector(".turn-mark");
   // The user's tile is filled in here rather than in the markup: unlike the
   // agent's, its source is not known when the page is served.
   if (role === "user") paint(img, mark, userAvatar);
@@ -116,13 +120,13 @@ export function request() {
 // --- drawing ------------------------------------------------------------------
 
 /* Shows a picture everywhere the user appears: the sidebar button, and every
- * byline tile already rendered. One function so no two places on screen can
+ * turn tile already rendered. One function so no two places on screen can
  * disagree about who you are. */
 function draw(url) {
   userAvatar = url || "";
   paint($("user-avatar-img"), $("user-avatar-mark"), userAvatar);
-  for (const tile of document.querySelectorAll(".byline-avatar.is-user")) {
-    paint(tile.querySelector(".byline-img"), tile.querySelector(".byline-mark"), userAvatar);
+  for (const tile of document.querySelectorAll(".turn-avatar.is-user")) {
+    paint(tile.querySelector(".turn-img"), tile.querySelector(".turn-mark"), userAvatar);
   }
 }
 
