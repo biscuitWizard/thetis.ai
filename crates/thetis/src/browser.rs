@@ -35,26 +35,85 @@ use crate::config::{BrowserSettings, Config};
 /// boot; handed to tools through their config block and never written to disk.
 static TOKEN: OnceLock<String> = OnceLock::new();
 
+/// Environment variable the sidecar reads its token from.
+pub const TOKEN_ENV: &str = "THETIS_PW_TOKEN";
+
+/// File under the shared data directory holding the running sidecar's token.
+const TOKEN_FILE: &str = "browser-token";
+
 /// The shared secret between the tools and the sidecar.
-pub fn token() -> &'static str {
-    TOKEN.get_or_init(|| {
-        // No crypto dependency needed for this: it only has to be unguessable
-        // by another process on the same box within one boot.
-        let seed = format!(
-            "{}-{}-{:p}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-            &TOKEN as *const _
-        );
-        let mut hash: u128 = 0xcbf2_9ce4_8422_2325;
-        for b in seed.as_bytes() {
-            hash = hash.wrapping_mul(0x100_0000_01b3) ^ u128::from(*b);
+///
+/// **Read from a file, not generated per process.** Only the gateway runs
+/// [`spawn`], so only the gateway's value is the one the sidecar was actually
+/// started with — but `tool_config_json` runs in a *worker*, a separate process
+/// with its own `OnceLock` and its own pid. Generating there produced a token
+/// the sidecar had never heard of and every `web-browser-*` call came back 403.
+///
+/// The channel has to be a file rather than an inherited environment variable,
+/// because a worker is spawned by whichever gateway is running — normally
+/// *trunk's* binary, not the one in a conversation's branch. A branch that adds
+/// an `.env()` call to `workers::spawn` therefore changes nothing about how its
+/// own workers are launched, and the mismatch survives. The data directory is
+/// shared by both processes and is already how they agree on state, so the
+/// gateway writes the token there when it starts the sidecar and a worker reads
+/// it back. `0600`, and no more secret than the loopback port it guards.
+pub fn token(cfg: &Config) -> &'static str {
+    TOKEN.get_or_init(|| resolve_token(read_token_file(&cfg.paths.data)))
+}
+
+/// Where the token lives, given the shared data directory.
+fn token_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(TOKEN_FILE)
+}
+
+fn read_token_file(data_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(token_path(data_dir)).ok()
+}
+
+/// Records the token for every other process that will need it.
+///
+/// Called by the gateway just before it starts a sidecar with this value.
+fn write_token_file(data_dir: &std::path::Path, token: &str) {
+    let path = token_path(data_dir);
+    if let Err(e) = std::fs::create_dir_all(data_dir).and_then(|()| std::fs::write(&path, token)) {
+        // Not fatal: the sidecar still starts, but tools in a worker process
+        // will 403 until this succeeds, so it is worth a loud line in the log.
+        tracing::warn!(path = %path.display(), error = %e, "could not record the browser token; tools in a worker will not authenticate");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// The token decision, split out so both branches are testable: a `OnceLock`
+/// latches on first use, so a test cannot exercise both paths in one process.
+fn resolve_token(existing: Option<String>) -> String {
+    // A sidecar is already running with this token; anything else is rejected.
+    if let Some(found) = existing {
+        let found = found.trim();
+        if !found.is_empty() {
+            return found.to_string();
         }
-        format!("{hash:032x}")
-    })
+    }
+    // No crypto dependency needed for this: it only has to be unguessable
+    // by another process on the same box within one boot.
+    let seed = format!(
+        "{}-{}-{:p}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        &TOKEN as *const _
+    );
+    let mut hash: u128 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.as_bytes() {
+        hash = hash.wrapping_mul(0x100_0000_01b3) ^ u128::from(*b);
+    }
+    format!("{hash:032x}")
 }
 
 /// Whether the sidecar answers a health check right now.
@@ -332,6 +391,11 @@ async fn start_once(cfg: &Config) -> Result<tokio::process::Child> {
     let b = &cfg.browser;
     tokio::fs::create_dir_all(&b.artifact_dir).await.ok();
 
+    // Publish before spawning: once the sidecar is up, a tool in any worker
+    // process may call it, and this file is how that worker learns the token.
+    let tok = token(cfg);
+    write_token_file(&cfg.paths.data, tok);
+
     let mut child = Command::new(b.node_bin())
         .arg("server.js")
         .current_dir(&b.service_dir)
@@ -339,7 +403,7 @@ async fn start_once(cfg: &Config) -> Result<tokio::process::Child> {
         // told otherwise, and cwd here is the service directory.
         .env("THETIS_PW_ARTIFACTS", &b.artifact_dir)
         .env("THETIS_PW_PORT", b.port.to_string())
-        .env("THETIS_PW_TOKEN", token())
+        .env(TOKEN_ENV, tok)
         .env("THETIS_PW_TIMEOUT_MS", b.default_timeout_ms.to_string())
         .env("THETIS_PW_IDLE_MS", (b.idle_timeout_secs * 1000).to_string())
         .env("THETIS_PW_SNAPSHOT_CHARS", b.snapshot_chars.to_string())
@@ -411,12 +475,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_is_stable_and_long_enough() {
-        let a = token();
-        let b = token();
-        assert_eq!(a, b, "the token must not change between calls");
-        assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    fn a_generated_token_is_hex_and_long_enough() {
+        let generated = resolve_token(None);
+        assert_eq!(generated.len(), 32);
+        assert!(generated.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The regression this guards: a worker generating its own token instead of
+    /// reading the gateway's made every `web-browser-*` call fail with 403,
+    /// because the sidecar only ever accepts the value the gateway started it
+    /// with. A recorded token must win over generating a new one.
+    #[test]
+    fn a_recorded_token_is_used_verbatim() {
+        assert_eq!(
+            resolve_token(Some("988f72a8056123cb0d624c7eefd08dec".to_string())),
+            "988f72a8056123cb0d624c7eefd08dec"
+        );
+        // A trailing newline from an editor or `echo` must not change the secret.
+        assert_eq!(resolve_token(Some("  abc123\n".to_string())), "abc123");
+    }
+
+    /// An empty or blank file is the same as no file: generate, rather than
+    /// authenticating with the empty string.
+    #[test]
+    fn a_blank_recorded_token_falls_back_to_generation() {
+        assert_eq!(resolve_token(Some(String::new())).len(), 32);
+        assert_eq!(resolve_token(Some("   ".to_string())).len(), 32);
+    }
+
+    /// The round trip that carries the secret across the process boundary: what
+    /// the gateway writes is exactly what a worker reads back.
+    #[test]
+    fn a_written_token_reads_back_from_the_data_dir() {
+        let dir = std::env::temp_dir().join(format!("thetis-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read_token_file(&dir), None, "nothing recorded yet");
+
+        write_token_file(&dir, "cafebabe00000000cafebabe00000000");
+        assert_eq!(
+            resolve_token(read_token_file(&dir)),
+            "cafebabe00000000cafebabe00000000"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(token_path(&dir)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the token must not be world-readable");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
