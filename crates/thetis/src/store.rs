@@ -554,6 +554,37 @@ impl Store {
         Ok(())
     }
 
+    /// Writes `value` only if the key currently holds `expected`. Reports
+    /// whether it did.
+    ///
+    /// The read and the write share one write transaction, and redb serializes
+    /// those, so two callers racing on the same key cannot both win. That is
+    /// what lets a caller own a state transition rather than merely perform
+    /// one: a read-modify-write through [`Self::kv_get`] and [`Self::kv_put`]
+    /// lets both racers load the same state and both save a successor, and the
+    /// loser's write silently wins.
+    ///
+    /// An absent key and an empty value are the same `""`, because there is no
+    /// delete: clearing a key writes empty, and a caller that wants "create
+    /// only if nothing is there" must be able to say so.
+    pub fn kv_swap(&self, scope: &str, key: &str, expected: &str, value: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let swapped = {
+            let mut t = txn.open_table(KV)?;
+            let current = t.get((scope, key))?.map(|v| v.value().to_string());
+            if current.unwrap_or_default() == expected {
+                t.insert((scope, key), value)?;
+                true
+            } else {
+                false
+            }
+        };
+        // Committed either way: an abort would be equivalent here, but a commit
+        // keeps the failure path from depending on redb's rollback behaviour.
+        txn.commit()?;
+        Ok(swapped)
+    }
+
     // --- spend accounting --------------------------------------------------
 
     pub fn get_spend(&self, session_id: &str) -> Result<f64> {
@@ -1277,6 +1308,84 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
         assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("g"));
         assert_eq!(store.kv_get("sess-1", "k").unwrap().as_deref(), Some("s"));
         assert_eq!(store.kv_get("other", "k").unwrap(), None);
+    }
+
+    #[test]
+    fn kv_swap_writes_only_when_the_current_value_matches() {
+        let (store, _d) = temp_store();
+        // An absent key reads as empty, which is how "create if nothing is
+        // there" is expressed — there is no delete, so empty and absent are one.
+        assert!(store.kv_swap("global", "k", "", "first").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("first"));
+
+        // The same claim a second time loses: this is what stops two readers of
+        // one ask_user call from both posting a form.
+        assert!(!store.kv_swap("global", "k", "", "second").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("first"));
+
+        // A transition from the value actually held succeeds.
+        assert!(store.kv_swap("global", "k", "first", "next").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("next"));
+        // And the same transition replayed does not, so a duplicated click
+        // cannot apply an answer twice.
+        assert!(!store.kv_swap("global", "k", "first", "next").unwrap());
+    }
+
+    #[test]
+    fn kv_swap_can_clear_a_key_and_only_the_first_caller_wins() {
+        let (store, _d) = temp_store();
+        store.kv_put("global", "form", "state").unwrap();
+        // Clearing through the swap is what makes "this click finished the form"
+        // observable by exactly one caller, and therefore what stops two
+        // callers from both submitting the answers.
+        assert!(store.kv_swap("global", "form", "state", "").unwrap());
+        assert!(!store.kv_swap("global", "form", "state", "").unwrap());
+        assert_eq!(store.kv_get("global", "form").unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn kv_swap_is_scoped_like_the_rest_of_the_table() {
+        let (store, _d) = temp_store();
+        assert!(store.kv_swap("global", "k", "", "g").unwrap());
+        // A different scope is a different key, so claiming in one does not
+        // block the other.
+        assert!(store.kv_swap("sess-1", "k", "", "s").unwrap());
+        assert_eq!(store.kv_get("global", "k").unwrap().as_deref(), Some("g"));
+        assert_eq!(store.kv_get("sess-1", "k").unwrap().as_deref(), Some("s"));
+    }
+
+    /// The property the fix rests on: under real concurrency exactly one
+    /// claimant wins. A read-then-write through `kv_get`/`kv_put` would let
+    /// several threads all see empty and all write, which is the bug.
+    #[test]
+    fn concurrent_claims_on_one_key_produce_exactly_one_winner() {
+        let (store, _d) = temp_store();
+        let store = std::sync::Arc::new(store);
+        let wins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                let wins = wins.clone();
+                std::thread::spawn(move || {
+                    if store
+                        .kv_swap("global", "call", "", &format!("form-{i}"))
+                        .unwrap()
+                    {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(
+            wins.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one claimant may win, or one question gets two forms"
+        );
     }
 
     #[test]

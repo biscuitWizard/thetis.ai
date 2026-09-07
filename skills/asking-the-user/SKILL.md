@@ -139,6 +139,57 @@ Interaction plumbing in `api.rs`:
   `ack_interaction` (type 6) then `edit_with_components`, versus
   `update_interaction_message` (type 7) for a component click.
 
+### Atomicity: one form, answered once
+
+Every step that changes a form is a claim, not an action, because more than one
+actor can reach the same step. Two ways this broke, both of which forked one
+conversation into two answer streams:
+
+1. **One call, two forms.** The Discord connector follows `events_tx`, and a
+   session can have more than one follower at a time — a message arriving
+   mid-turn starts a second `stream_reply`, and a reconnect can replay events.
+   Each follower saw the same `ToolInvocation` and posted its own form.
+2. **One question, two answers.** `handle_component` loaded the state, recorded
+   an answer, and saved. Two clicks arriving together both read index N, both
+   wrote N+1, and on the last question both called `submit`. The stale-index
+   check does *not* catch this: both racers compare against a state read before
+   the race, so both pass.
+3. **Two turns, two live forms.** Per-call claiming does not give one form per
+   session. A second turn asking again left the first form's controls clickable,
+   so two forms fed one conversation.
+
+The fix is `Store::kv_swap` — compare-and-set in a single redb write
+transaction, which redb serializes. Three keys, all in `ask.rs`:
+
+| Key | Holds | Claims |
+|---|---|---|
+| `claim_key(session, call_id)` | the form's state id | the right to post for one call |
+| `live_key(session)` | the live form's state id, or empty | which form a session may answer |
+| `key(state_id)` | the form state as JSON | each transition, via its own prior bytes |
+
+Rules that follow:
+
+- **Claim before doing.** `post_form` takes the per-call claim *before* building
+  the form; the loser returns `Posted::AlreadyPosted` and says nothing, because
+  from the user's side nothing failed.
+- **`load_form` returns the bytes it read** (`Loaded { state, raw }`), and
+  `advance_form` swaps against exactly those. Losing means **abandoning the
+  click**, not retrying: the winner's edit is about to make the message correct.
+- **Finishing is a compare-and-set too.** Clearing the state through the same
+  swap is what makes "this click finished the form" observable by exactly one
+  caller, and therefore what stops two callers both submitting.
+- **A failed write must not be acted on.** If the swap errors, do not edit the
+  message and do not submit — that would show an answer that was never stored.
+- **The call id is the identity.** Fall back to `ask::digest(arguments_json)`
+  when a provider omits one, so two readers of one event agree on one claim.
+- **Claims are never cleared.** A key per call is a few dozen bytes and buys
+  idempotence across restarts; one expiring with the form would not.
+- **`kv_swap` treats absent and empty as the same `""`**, because the KV
+  interface has no delete.
+
+Verified by `store::tests::concurrent_claims_on_one_key_produce_exactly_one_winner`,
+which races eight threads on one key and asserts exactly one wins.
+
 Rules `handle_component` in `mod.rs` must keep:
 
 - **Re-authorize.** Component interactions never pass through `policy::decide`,
@@ -160,7 +211,15 @@ Rules `handle_component` in `mod.rs` must keep:
 
 - Tool and Discord: `cargo test -p thetis --lib discord`. `ask.rs`'s tests cover
   custom_id round-trips, the option cap, control retirement, stale indices,
-  char-boundary truncation and the free-text/skip guarantee on both renderings.
+  char-boundary truncation, the free-text/skip guarantee on both renderings, the
+  three key namespaces being disjoint, and that state written before
+  `message_id` existed still deserializes.
+- Atomicity: `cargo test -p thetis --lib store::tests::kv_swap` and
+  `store::tests::concurrent`.
+- Two tests in `crates/thetis/src/lib.rs` fail on trunk for unrelated reasons —
+  `settings::tests::a_change_that_would_not_load_is_refused` (reproducible) and
+  `terminal::tests::a_signal_ends_the_command_but_not_the_session` (a flake).
+  Check them against a stash before blaming your change.
 - The tool's own validation: `cargo test` in `agents/agent-core`, module
   `ask_user_tests`. These pin the wire name and check that every malformed shape
   returns `Err`, which is what stops a rejected call from pausing the turn.
@@ -185,6 +244,10 @@ Rules `handle_component` in `mod.rs` must keep:
 | Discord click does nothing, no error | `parse_component` not reached — check the INTERACTION_CREATE dispatch order |
 | Discord replies 401 to a callback | An Authorization header on an interaction callback |
 | Form unanswerable after a restart | State kept in memory instead of KV |
+| Two forms posted for one set of questions | `post_form` not claiming `claim_key` first, or claiming after building |
+| Two forms live at once from different turns | `retire_live_form` not called, or `live_key` not cleared when a form finishes |
+| One question submits answers twice | `advance_form` not swapping against `loaded.raw`, or proceeding when it returns false |
+| An answer shows on screen but the model never sees it | Acting on a swap that errored instead of refusing the click |
 | Tool missing in a read-only mode | `mutating` set to true |
 | The model asks, then keeps working or answers itself | The loop is not breaking on `asked` — check `run()` still matches `tools::ASK_USER` |
 | A malformed call pauses the turn anyway | The `asked` flag is being set without checking `dispatch`'s return |

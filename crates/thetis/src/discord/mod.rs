@@ -555,28 +555,67 @@ fn form_id() -> String {
     id
 }
 
-async fn load_form(grip: &Grip, state_id: &str) -> Option<ask::State> {
+/// A form's state, with the exact bytes it was read as.
+///
+/// The bytes are what make the next write a compare-and-set: every transition
+/// of a form has to be claimed, not merely performed. Two clicks arriving
+/// together — a double tap, or two clients on one account — otherwise both load
+/// the same state, both record an answer over the top of it, and if that was
+/// the last question both submit. One question, two answers.
+struct Loaded {
+    state: ask::State,
+    raw: String,
+}
+
+async fn load_form(grip: &Grip, state_id: &str) -> Option<Loaded> {
     let raw = grip
         .persist
         .kv_get(ask::SCOPE, &ask::key(state_id))
         .await
         .ok()
         .flatten()?;
-    serde_json::from_str(&raw).ok()
+    let state = serde_json::from_str(&raw).ok()?;
+    Some(Loaded { state, raw })
 }
 
-async fn save_form(grip: &Grip, state_id: &str, state: &ask::State) -> Result<()> {
-    let raw = serde_json::to_string(state)?;
+/// Advances a form from the state it was read as to its successor, or reports
+/// that someone else got there first.
+///
+/// `finished` writes the empty value rather than the next state: the KV
+/// interface has no delete, and empty fails to deserialize, which `load_form`
+/// already reads as absent. Clearing through the same compare-and-set is the
+/// point — it is what makes "this click finished the form" a fact exactly one
+/// caller can observe, and therefore what stops two callers from both
+/// submitting the answers.
+async fn advance_form(
+    grip: &Grip,
+    state_id: &str,
+    from: &Loaded,
+    to: &ask::State,
+    finished: bool,
+) -> Result<bool> {
+    let next = if finished {
+        String::new()
+    } else {
+        serde_json::to_string(to)?
+    };
     grip.persist
-        .kv_put(ask::SCOPE, &ask::key(state_id), &raw)
+        .kv_swap(ask::SCOPE, &ask::key(state_id), &from.raw, &next)
         .await
         .map_err(Into::into)
 }
 
-/// Drops a finished form's state.
-///
-/// Written empty rather than deleted: the KV interface has no delete, and an
-/// empty value fails to deserialize, which `load_form` already reads as absent.
+/// Saves a form's first state, failing if something is already there.
+async fn create_form(grip: &Grip, state_id: &str, state: &ask::State) -> Result<bool> {
+    let raw = serde_json::to_string(state)?;
+    grip.persist
+        .kv_swap(ask::SCOPE, &ask::key(state_id), "", &raw)
+        .await
+        .map_err(Into::into)
+}
+
+/// Drops a form's state unconditionally, for a form that was never usable —
+/// one whose message failed to post, or one that has expired.
 async fn clear_form(grip: &Grip, state_id: &str) {
     let _ = grip
         .persist
@@ -584,32 +623,150 @@ async fn clear_form(grip: &Grip, state_id: &str) {
         .await;
 }
 
-/// Posts the first question of an `ask_user` call.
+/// Overwrites a form's state without a compare-and-set.
 ///
-/// Returns false when the call carried nothing askable, so the caller falls back
-/// to its ordinary "… ask_user" progress note rather than posting an empty form.
+/// Only for the window before the form is answerable: recording the message id
+/// on a form whose controls are already on screen would race with a click. It is
+/// safe there precisely because nobody can have loaded this state yet.
+async fn save_form_unconditionally(
+    grip: &Grip,
+    state_id: &str,
+    state: &ask::State,
+) -> Result<()> {
+    let raw = serde_json::to_string(state)?;
+    grip.persist
+        .kv_put(ask::SCOPE, &ask::key(state_id), &raw)
+        .await
+        .map_err(Into::into)
+}
+
+/// Takes away the controls of the form a session currently has outstanding, if
+/// any, so only one form is ever answerable per conversation.
+///
+/// The claim on the live pointer is a compare-and-set, so two turns posting at
+/// once cannot both decide they are retiring the same predecessor and race to
+/// edit it. Failing to edit the message is not fatal: the state is cleared
+/// either way, and a click on controls whose state is gone is already answered
+/// with "this question is no longer open".
+async fn retire_live_form(grip: &Grip, rest: &Rest, session_id: &str) {
+    let live = ask::live_key(session_id);
+    let Ok(Some(previous)) = grip.persist.kv_get(ask::SCOPE, &live).await else {
+        return;
+    };
+    if previous.is_empty() {
+        return;
+    }
+    // Claim the retirement. Losing means another poster is already doing it.
+    match grip.persist.kv_swap(ask::SCOPE, &live, &previous, "").await {
+        Ok(true) => {}
+        _ => return,
+    }
+
+    let form = load_form(grip, &previous).await;
+    clear_form(grip, &previous).await;
+
+    let Some(form) = form else { return };
+    let Some(message_id) = form.state.message_id.as_deref() else {
+        return;
+    };
+    tracing::info!(session = %session_id, form = %previous,
+        "retiring an unanswered ask_user form; a newer one supersedes it");
+    let text = format!(
+        "{}\n\n_Superseded by the questions below._",
+        ask::prompt_text(&form.state)
+    );
+    if let Err(e) = rest
+        .edit_with_components(&form.state.channel_id, message_id, &text, serde_json::json!([]))
+        .await
+    {
+        tracing::warn!(error = %format!("{e:#}"),
+            "could not take the controls off a superseded ask_user form");
+    }
+}
+
+/// What a reader of the event stream should do about an `ask_user` call.
+enum Posted {
+    /// This reader posted the form; it owns the questions from here.
+    Form,
+    /// Another reader already posted a form for this same call. Nothing to do,
+    /// and nothing to say: the questions are on screen once, which is right.
+    AlreadyPosted,
+    /// Nothing askable, or Discord refused the message. The caller falls back
+    /// to its ordinary "… ask_user" progress note rather than to silence.
+    Failed,
+}
+
+/// Posts the first question of an `ask_user` call, at most once per call.
+///
+/// The claim is taken *before* the form is built, and it is a compare-and-set on
+/// a key named by the call id, so concurrent readers of the same
+/// `tool-invocation` cannot both post. This is the atomicity that matters most:
+/// a duplicate form does not merely look wrong, it collects a second set of
+/// answers and submits them as a second user message, which is what forked the
+/// conversation.
 async fn post_form(
     grip: &Grip,
     rest: &Rest,
     channel_id: &str,
     session_id: &str,
     user_id: &str,
+    call_id: &str,
     arguments_json: &str,
-) -> bool {
+) -> Posted {
     let Some(parsed) = ask::parse(arguments_json) else {
         tracing::warn!("an ask_user call carried no answerable questions");
-        return false;
+        return Posted::Failed;
     };
 
     let state_id = form_id();
-    let state = ask::State::new(session_id, channel_id, user_id, parsed, now_ms());
+    // Claim the call first. Losing here means another reader of this same event
+    // is posting the form, so this one must stay quiet — including about the
+    // failure, since from the user's side nothing failed.
+    let claim = ask::claim_key(session_id, call_id);
+    match grip
+        .persist
+        .kv_swap(ask::SCOPE, &claim, "", &state_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(session = %session_id, call = %call_id,
+                "an ask_user form for this call is already posted; not posting a second");
+            return Posted::AlreadyPosted;
+        }
+        Err(e) => {
+            // Without a claim there is no way to know whether a second reader
+            // is about to post the same questions, and two live forms is the
+            // failure being prevented. The progress note is the safe fallback.
+            tracing::warn!(error = %format!("{e:#}"), session = %session_id,
+                "could not claim an ask_user call; not posting a form");
+            return Posted::Failed;
+        }
+    }
+
+    // At most one form per session may be answerable. A form left over from an
+    // earlier turn is retired *before* this one is posted, so the channel never
+    // holds two clickable forms feeding one conversation.
+    retire_live_form(grip, rest, session_id).await;
+
+    let mut state = ask::State::new(session_id, channel_id, user_id, parsed, now_ms());
 
     // State before message: a form whose buttons arrive before their state can
     // be answered, and the answer would find nothing. The reverse — state with
     // no message — is merely a row that expires unread.
-    if let Err(e) = save_form(grip, &state_id, &state).await {
-        tracing::warn!(error = %format!("{e:#}"), "could not persist an ask_user form");
-        return false;
+    match create_form(grip, &state_id, &state).await {
+        Ok(true) => {}
+        // The form id collided with a live form — two forms within the same
+        // nanosecond tick. Refusing is right: overwriting would silently
+        // destroy the other form's answers.
+        Ok(false) => {
+            tracing::warn!(form = %state_id, "an ask_user form id collided; not posting");
+            return Posted::Failed;
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not persist an ask_user form");
+            return Posted::Failed;
+        }
     }
 
     match rest
@@ -623,12 +780,26 @@ async fn post_form(
         Ok(id) => {
             tracing::info!(session = %session_id, form = %state_id, message = %id,
                 questions = state.ask.questions.len(), "posted an ask_user form");
-            true
+            // Record the message on the state, and mark this form as the
+            // session's live one, so a later form can find and retire it.
+            state.message_id = Some(id);
+            if let Err(e) = save_form_unconditionally(grip, &state_id, &state).await {
+                tracing::warn!(error = %format!("{e:#}"),
+                    "could not record an ask_user form's message id");
+            }
+            let _ = grip
+                .persist
+                .kv_put(ask::SCOPE, &ask::live_key(session_id), &state_id)
+                .await;
+            Posted::Form
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "could not post an ask_user form");
             clear_form(grip, &state_id).await;
-            false
+            // The claim stays. A call whose message Discord refused is not
+            // retried by a second reader: it would be posting questions whose
+            // turn has already ended, and the fallback note has said as much.
+            Posted::Failed
         }
     }
 }
@@ -644,7 +815,7 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
         return Ok(());
     };
 
-    let Some(mut state) = load_form(&grip, &route.state_id).await else {
+    let Some(loaded) = load_form(&grip, &route.state_id).await else {
         // The form is gone: answered already, expired, or from a build before a
         // restart. Say so rather than failing silently — the buttons are still
         // on screen and pressing them has to mean something.
@@ -675,7 +846,7 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
     // A form posted in a shared channel is addressed to the person whose turn
     // produced it. A bystander answering would put words in their mouth, and the
     // answer is submitted as *their* message.
-    if state.user_id != component.user_id {
+    if loaded.state.user_id != component.user_id {
         return rest
             .respond_to_interaction(
                 &component.id,
@@ -686,7 +857,7 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
             .await;
     }
 
-    if state.expired(now_ms()) {
+    if loaded.state.expired(now_ms()) {
         clear_form(&grip, &route.state_id).await;
         return retire(
             &rest,
@@ -699,7 +870,7 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
     // A stale row: the message was edited on to the next question, but a client
     // that had not caught up pressed the old one. Applying it would record an
     // answer against the wrong question.
-    if route.index != state.index {
+    if route.index != loaded.state.index {
         return rest
             .respond_to_interaction(
                 &component.id,
@@ -710,10 +881,14 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
             .await;
     }
 
-    let Some(question) = state.current().cloned() else {
+    let Some(question) = loaded.state.current().cloned() else {
         clear_form(&grip, &route.state_id).await;
         return retire(&rest, &component, "Every question is already answered.").await;
     };
+
+    // From here the click may record an answer, so work on a copy: `loaded.raw`
+    // has to keep the bytes the compare-and-set below is against.
+    let mut state = loaded.state.clone();
 
     // Free text is the one branch that does not record an answer yet: Discord
     // has no text input on a message, so it opens a modal and the answer arrives
@@ -774,10 +949,46 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
     let text = ask::prompt_text(&state);
     let components = ask::components(&state, &route.state_id);
 
-    if finished {
-        clear_form(&grip, &route.state_id).await;
-    } else if let Err(e) = save_form(&grip, &route.state_id, &state).await {
-        tracing::warn!(error = %format!("{e:#}"), "could not persist an ask_user answer");
+    /* The answer is committed by compare-and-set against the bytes the state was
+     * read as, and *losing* means abandoning this click entirely. Two clicks
+     * arriving together would otherwise both read index N, both write index N+1,
+     * and — on the last question — both call `submit`, which is exactly the
+     * forked conversation: one set of questions answered twice.
+     *
+     * The stale-index check above does not cover this. It compares against a
+     * state read before the race, so both racers pass it; only a write that
+     * fails on the value it expected can tell the loser it lost. */
+    match advance_form(&grip, &route.state_id, &loaded, &state, finished).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(form = %route.state_id, index = route.index,
+                "an ask_user answer lost the race for this question; dropping it");
+            // Ephemeral, and deliberately not an error: the other click is
+            // being applied and will edit the message, so the form on screen is
+            // about to be correct without this one doing anything.
+            return rest
+                .respond_to_interaction(
+                    &component.id,
+                    &component.token,
+                    "That question was just answered. The message above has the latest.",
+                    true,
+                )
+                .await;
+        }
+        Err(e) => {
+            // The answer is not stored, so it must not be acted on: proceeding
+            // would edit the message as though it had been recorded, and on the
+            // last question would submit answers no restart could recover.
+            tracing::warn!(error = %format!("{e:#}"), "could not persist an ask_user answer");
+            return rest
+                .respond_to_interaction(
+                    &component.id,
+                    &component.token,
+                    "I could not save that answer, so I have not taken it. Try again.",
+                    true,
+                )
+                .await;
+        }
     }
 
     /* A modal submission cannot be answered with an update to the message the
@@ -809,6 +1020,19 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
     // message — the same path the browser's form uses, and the same path typed
     // text uses. That is what puts them in the event log as something the model
     // simply reads.
+    // The form is finished, so the session has no outstanding one. Cleared
+    // before submitting: the next turn may ask again, and it must not find this
+    // form's pointer and try to retire a message that is already retired.
+    let _ = grip
+        .persist
+        .kv_swap(
+            ask::SCOPE,
+            &ask::live_key(&state.session_id),
+            &route.state_id,
+            "",
+        )
+        .await;
+
     let answers = ask::compose(&state);
     let events = grip.events_tx.subscribe();
     grip.submit(&state.session_id, answers, Vec::new()).await?;
@@ -959,12 +1183,22 @@ async fn stream_reply(
                     flush(&rest, &channel_id, &mut message_id, &buffer).await;
                     last_sent = buffer.clone();
                 }
-                if post_form(
+                // The call id is what makes posting idempotent. A provider that
+                // omitted one leaves the arguments as the next best stable
+                // handle: two readers of the same event agree on it, which is
+                // all the claim needs.
+                let call_id = if call.id.trim().is_empty() {
+                    ask::digest(&call.arguments_json)
+                } else {
+                    call.id.clone()
+                };
+                match post_form(
                     &grip,
                     &rest,
                     &channel_id,
                     &session_id,
                     &user_id,
+                    &call_id,
                     &call.arguments_json,
                 )
                 .await
@@ -972,13 +1206,20 @@ async fn stream_reply(
                     // The form carries the conversation now. Leaving the buffer
                     // in place would make `TurnFinished` post "I finished
                     // without saying anything" underneath the questions.
-                    asked = true;
-                } else if buffer.trim().is_empty() {
-                    // Nothing askable and nothing said: fall back to the note,
-                    // so a malformed call is not silence.
-                    let note = format!("_… {}_", call.name);
-                    flush(&rest, &channel_id, &mut message_id, &note).await;
-                    last_edit = std::time::Instant::now();
+                    Posted::Form => asked = true,
+                    // Another follower of this session posted the form. Treated
+                    // exactly like posting it: the questions are on screen, and
+                    // writing anything more would sit under them.
+                    Posted::AlreadyPosted => asked = true,
+                    Posted::Failed => {
+                        if buffer.trim().is_empty() {
+                            // Nothing askable and nothing said: fall back to the
+                            // note, so a malformed call is not silence.
+                            let note = format!("_… {}_", call.name);
+                            flush(&rest, &channel_id, &mut message_id, &note).await;
+                            last_edit = std::time::Instant::now();
+                        }
+                    }
                 }
             }
             SessionEvent::ToolInvocation(call) => {
