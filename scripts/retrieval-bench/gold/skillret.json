@@ -1,0 +1,225 @@
+{
+  "about": [
+    "Gold set for SkillRet: does skill retrieval surface the right card for a",
+    "real opening message?",
+    "",
+    "Rules this file is written under, because breaking them silently inflates",
+    "every number downstream:",
+    "",
+    "1. Queries are in a USER's voice, not the author's. An echoing query -- one",
+    "   that reuses the words of the brief it is meant to find -- scores 20-40",
+    "   points higher than a real one, so a corpus tested that way looks fine",
+    "   right up until someone uses it. Where a query names a real symbol",
+    "   ($mutex, verb_code, objdef) that is because a user would name it too.",
+    "",
+    "2. Relevance is graded, and a PARENT of a gold child scores 1, not 0.",
+    "   Parent absorption is deliberate: the ranker collapses a parent and its",
+    "   own children into the parent, whose card indexes the children, so the",
+    "   agent descends on its own. Scoring that as a miss would penalise the",
+    "   design rather than measure it. A child returned in its own right scores",
+    "   2 because it saves a fetch.",
+    "",
+    "3. No negative cases with empty gold. The ranker returns `limit` cards",
+    "   whatever is asked, so 'should return nothing' is not a behaviour it can",
+    "   exhibit, and grading it would only add noise.",
+    "",
+    "4. The near-miss pairs are the point. moor/* (the Rust engine) against",
+    "   torchship/* (the game database on top of it) is the confusion this",
+    "   corpus is actually prone to, and several cases below exist only to",
+    "   check that the two do not bleed into each other."
+  ],
+  "cases": [
+    {
+      "query": "I want to change how you build the prompt each turn. What is the safe way to go about editing your own loop?",
+      "relevant": { "careful-surgery": 2, "thetis-internals/turn-lifecycle": 1, "thetis-internals": 1 }
+    },
+    {
+      "query": "This worked before I touched it and now the tool just returns errors every time. I have already tried fixing it twice.",
+      "relevant": { "careful-surgery/recovering-a-revision": 2, "careful-surgery": 1 }
+    },
+    {
+      "query": "I added a function to the wit file and now every component dies at instantiation instead of failing to compile.",
+      "relevant": { "careful-surgery/contract-changes": 2, "careful-surgery": 1 }
+    },
+    {
+      "query": "This conversation has got very long and a summary note just appeared in the history. What is going on and can I tune it?",
+      "relevant": { "thetis-internals/compaction": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "I wrote a new skill yesterday and it never seems to end up in your prompt. Why not?",
+      "relevant": { "thetis-internals/skill-system": 2, "skill-creator": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "I need a new tool that calls an external HTTP service and needs an API key kept out of the repo.",
+      "relevant": { "thetis-internals/tool-authorship": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "Walk me through what actually happens between me pressing send and you starting to reply.",
+      "relevant": { "thetis-internals/turn-lifecycle": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "Which file should I be looking in for the thing that compiles components and swaps them in?",
+      "relevant": { "thetis-internals/code-map": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "Could you split this job up and have several of you work on the pieces at the same time?",
+      "relevant": { "thetis-internals/delegation": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "I edited a value in the toml and restarted, but the behaviour has not changed at all.",
+      "relevant": { "thetis-internals/config-and-recovery": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "The build has been sitting there for ten minutes and I think someone else is compiling at the same time.",
+      "relevant": { "thetis-internals/working-alongside-others": 2, "thetis-internals": 1 }
+    },
+    {
+      "query": "Add a row to our roadmap table and mark the status as shipped.",
+      "relevant": { "notion-workspace": 2 }
+    },
+    {
+      "query": "One of the notion tools is posting the wrong body and getting a validation error back. Go fix the crate.",
+      "relevant": { "notion-workspace/maintaining-the-tools": 2, "notion-workspace": 1 }
+    },
+    {
+      "query": "How many signups did we get last month, and roughly what will that scan cost us?",
+      "relevant": { "bigquery-toolset": 2 }
+    },
+    {
+      "query": "Commit this on a new branch and open a pull request against main.",
+      "relevant": { "github-workspace": 2 }
+    },
+    {
+      "query": "We want the bot to work in Slack as well. What would that involve, and is anything unsafe to expose over chat?",
+      "relevant": { "discord-connector": 2 }
+    },
+    {
+      "query": "Can you confirm the typing indicator really appears while you are thinking, against the actual API rather than from reading the code?",
+      "relevant": { "discord-connector/live-probing": 2, "discord-connector": 1 }
+    },
+    {
+      "query": "The little choice form in the transcript can be submitted twice and the second answer sticks.",
+      "relevant": { "asking-the-user": 2 }
+    },
+    {
+      "query": "I am adding a panel to the chat interface and I need to pick sizes and colours that match what is already there.",
+      "relevant": { "web-ui-design": 2 }
+    },
+    {
+      "query": "When I type an @ and pick a file from the menu, nothing gets attached to the message.",
+      "relevant": { "web-ui-design/file-mentions": 2, "web-ui-design": 1 }
+    },
+    {
+      "query": "My stylesheet edit compiles fine but the page in my browser looks exactly the same as before.",
+      "relevant": { "web-ui-design/verifying-on-a-branch": 2, "web-ui-design": 1 }
+    },
+    {
+      "query": "Write this procedure down somewhere you will find it again next time instead of working it out from scratch.",
+      "relevant": { "skill-creator": 2 }
+    },
+    {
+      "query": "Players keep seeing 'Transaction conflict' and their command runs twice. What is retrying and what does the retry undo?",
+      "relevant": { "moor/storage-and-state/transactions": 2, "moor/storage-and-state": 1, "moor": 1 }
+    },
+    {
+      "query": "A task that suspends never comes back, and a forked one seems to vanish after a restart.",
+      "relevant": { "moor/execution/task-scheduler": 2, "moor/execution": 1, "moor": 1 }
+    },
+    {
+      "query": "When someone types 'take the second lamp' the server grabs the wrong one.",
+      "relevant": { "moor/execution/command-parsing": 2, "moor/execution": 1, "moor": 1 }
+    },
+    {
+      "query": "verb_code is giving back source that is not what the programmer typed in, and the line numbers are off by one.",
+      "relevant": { "moor/language-and-compiler/compiler-pipeline": 2, "moor/language-and-compiler": 1, "moor": 1 }
+    },
+    {
+      "query": "The telnet front end will not register with the backend process and the handshake is rejected.",
+      "relevant": { "moor/services/daemon-and-rpc": 2, "moor/services": 1, "moor": 1 }
+    },
+    {
+      "query": "I need to add a field to one of the message definitions without breaking servers that are already deployed.",
+      "relevant": { "moor/services/wire-schema": 2, "moor/services": 1, "moor": 1 }
+    },
+    {
+      "query": "Should this new behaviour be covered by a Rust test or one of those .moot files?",
+      "relevant": { "moor/working-in-the-repo/testing": 2, "moor/working-in-the-repo": 1, "moor": 1 }
+    },
+    {
+      "query": "Get me a server up on this machine so I can connect over telnet and poke at it.",
+      "relevant": { "moor/working-in-the-repo/build-and-run": 2, "moor/working-in-the-repo": 1, "moor": 1 }
+    },
+    {
+      "query": "We have a database dump from an old LambdaMOO server from about 2003. Can it be brought across, and what will we lose?",
+      "relevant": { "moor/content-pipeline/textdump-compat": 2, "moor/content-pipeline": 1, "moor": 1 }
+    },
+    {
+      "query": "If a verb runs with the wizard bit set, does it skip the check on reading a property?",
+      "relevant": { "moor/execution/permissions-and-security": 2, "moor/execution": 1, "moor": 1 }
+    },
+    {
+      "query": "If the machine loses power right now, how much of what players just did is gone?",
+      "relevant": { "moor/storage-and-state/storage-engine": 2, "moor/storage-and-state": 1, "moor": 1 }
+    },
+    {
+      "query": "Fights are over in two shots. I want them to last longer without making everyone unkillable.",
+      "relevant": { "torchship/npc-and-life/combat-balance": 2, "torchship/npc-and-life": 1, "torchship": 1 }
+    },
+    {
+      "query": "I need a shopkeeper standing behind the counter in the new bar, fully kitted out.",
+      "relevant": { "torchship/npc-and-life/npc-factory": 2, "torchship/npc-and-life": 1, "torchship": 1 }
+    },
+    {
+      "query": "Prices at the station have been frozen for days and nothing is being produced.",
+      "relevant": { "torchship/world-simulation/cargo-economy": 2, "torchship/world-simulation": 1, "torchship": 1 }
+    },
+    {
+      "query": "Have a look at this verb I wrote, it is about forty lines and repeats the same check three times.",
+      "relevant": { "torchship/torchship-programming/verb-craft": 2, "torchship/torchship-programming": 1, "torchship": 1 }
+    },
+    {
+      "query": "Write up what changed this month as something we can post for the players to read.",
+      "relevant": { "torchship/patchnote-writing": 2, "torchship": 1 }
+    },
+    {
+      "query": "One of the characters has ended up with two different sets of genitals after going through setup.",
+      "relevant": { "torchship/npc-and-life/bodyparts-and-anatomy": 2, "torchship/npc-and-life": 1, "torchship": 1 }
+    },
+    {
+      "query": "I ran a mutating command against the live game, it timed out, and I cannot tell whether it took effect.",
+      "relevant": { "torchship/agent-environment": 2, "torchship": 1 }
+    },
+    {
+      "query": "There is no help text for the command we added last week.",
+      "relevant": { "torchship/help-authoring": 2, "torchship": 1 }
+    },
+    {
+      "query": "Payday is firing on the wrong day of the week once the clock speed is turned up.",
+      "relevant": { "torchship/world-simulation/game-time": 2, "torchship/world-simulation": 1, "torchship": 1 }
+    },
+    {
+      "query": "Output is showing literal angle-bracket tags to players instead of coming out coloured.",
+      "relevant": { "torchship/torchship-programming/ansi-color": 2, "torchship/torchship-programming": 1, "torchship": 1 }
+    },
+    {
+      "query": "A player has asked us to delete their scrollback. Can we, and what is it encrypted with?",
+      "relevant": { "moor/services/event-log-and-history": 2, "moor/services": 1, "moor": 1 }
+    },
+    {
+      "query": "I need named locks so two of these cannot run at once, plus a daily cap per player.",
+      "relevant": { "torchship/torchship-programming/mutex": 2, "torchship/torchship-programming": 1, "torchship": 1 }
+    },
+    {
+      "query": "A ship's range readout is wrong mid-burn and docking leaves stale contacts behind.",
+      "relevant": { "torchship/world-simulation/space-navigation": 2, "torchship/world-simulation": 1, "torchship": 1 }
+    },
+    {
+      "query": "Keep your answers short.",
+      "relevant": { "concise": 2 }
+    },
+    {
+      "query": "When you tell me a change is done, show me the actual output rather than just asserting it worked.",
+      "relevant": { "show-your-work": 2 }
+    }
+  ]
+}
