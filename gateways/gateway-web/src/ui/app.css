@@ -143,35 +143,45 @@ body { display: flex; flex-direction: column; }
 
 .sidebar-foot {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: var(--gap-2);
   padding: var(--gap-3) var(--gap-4);
   border-top: 1px solid var(--hairline);
   font-size: var(--text-xs);
 }
+.foot-row { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; }
 
-/* Name and logout read as one item: "bob · log out". */
-.foot-user {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--gap-2);
+/* Who: the face, the name, and the connection state at the far end. */
+.foot-identity .status { margin-left: auto; flex: none; }
+.foot-name {
   min-width: 0;
-}
-.foot-user:empty { display: none; }
-.foot-user #user-name {
-  max-width: 11ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+.foot-name:empty { display: none; }
+
+/* What: the control panel and the way out, as quiet icon-and-word buttons.
+   The row disappears when neither applies (a plain account in local mode),
+   so the footer never ends in an empty line. */
+.foot-actions { gap: var(--gap-3); }
+.foot-actions:not(:has(:not([hidden]))) { display: none; }
+.foot-actions form { display: inline-flex; margin: 0; }
+.foot-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 6px;
+  margin-left: -6px;
+  border-radius: var(--r-sm);
   color: var(--text-dim);
+  font-size: var(--text-xs);
 }
-.foot-user #user-name:empty { display: none; }
-.foot-user form { display: inline-flex; margin: 0; }
-.foot-user #user-name:not(:empty) + form:not([hidden])::before {
-  content: "·";
-  color: var(--text-faint);
-  margin-right: var(--gap-2);
-}
+.foot-action svg { width: 14px; height: 14px; flex: none; }
+.foot-action:hover { color: var(--text); background: var(--surface-3); }
+.foot-action.is-active { color: var(--accent); background: var(--accent-wash); }
 
 /* The "everyone's conversations" switch stays lit while it is on, so the
  * sidebar's contents are never a mystery. */
@@ -3509,3 +3519,177 @@ body { display: flex; flex-direction: column; }
 .term-chip { display: inline-flex; align-items: center; gap: 6px; }
 .term-chip.is-on { color: var(--accent); border-color: var(--accent-edge); }
 .term-chip.is-busy .term-dot.is-busy { background: var(--warn); }
+
+/* --- the control panel ---------------------------------------------------------
+ *
+ * Neither a rail panel nor a stage tab: while it is open it takes the place of
+ * the stage and the rail, and the sidebar stays as the way back. It is tables
+ * and forms, and wants the width; a section nav down the left, the section on
+ * the right. Every colour is a token; the only new shapes are the settings
+ * rows and the tables, which nothing else on the page had needed.
+ */
+
+.admin-panel {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+body.is-admin-open .main,
+body.is-admin-open .rail { display: none; }
+
+.admin-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-3);
+  padding: var(--gap-3) var(--gap-5);
+  border-bottom: 1px solid var(--hairline);
+}
+.admin-head-title { margin: 0; font-size: var(--text-lg); font-weight: 600; letter-spacing: -.01em; }
+.admin-head-sub { margin: 1px 0 0; font-size: var(--text-xs); color: var(--text-faint); }
+.admin-head-gap { flex: 1 1 auto; }
+
+.admin-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 12.5rem minmax(0, 1fr);
+}
+.admin-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--gap-3) var(--gap-2);
+  border-right: 1px solid var(--hairline);
+  background: var(--surface-1);
+  overflow-y: auto;
+}
+.admin-nav-btn {
+  text-align: left;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  padding: 6px var(--gap-2);
+  cursor: pointer;
+}
+.admin-nav-btn:hover { color: var(--text); background: var(--surface-3); }
+.admin-nav-btn.is-active { color: var(--accent); background: var(--accent-wash); border-color: var(--accent-edge); }
+
+.admin-main {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--gap-4) var(--gap-5) var(--gap-6);
+}
+.admin-main > * { max-width: 68rem; }
+.admin-title { margin: 0 0 var(--gap-4); font-size: var(--text-lg); font-weight: 600; letter-spacing: -.01em; }
+
+.admin-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--gap-3);
+  padding: var(--gap-2) var(--gap-5);
+  font-size: var(--text-sm);
+  border-bottom: 1px solid var(--hairline);
+}
+.admin-banner.is-warn { background: var(--warn-wash); color: var(--warn); }
+
+.admin-block { margin: 0 0 var(--gap-5); }
+.admin-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  margin-bottom: var(--gap-2);
+}
+.admin-section-head .panel-section-note { margin: 2px 0 0; }
+.admin-section-aside { display: flex; align-items: center; gap: var(--gap-2); flex: 0 0 auto; flex-wrap: wrap; }
+
+/* Outcomes sit beside the control that asked. */
+.admin-result { font-size: var(--text-xs); line-height: 1.5; }
+.admin-result.is-ok { color: var(--ok); }
+.admin-result.is-error { color: var(--err); }
+
+/* Tables: the one place the app draws a grid of data. */
+.admin-table-wrap { overflow-x: auto; border: 1px solid var(--hairline); border-radius: var(--r-md); background: var(--surface-2); }
+.admin-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.admin-table th {
+  text-align: left;
+  padding: var(--gap-2) var(--gap-3);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--hairline);
+}
+.admin-table td { padding: var(--gap-2) var(--gap-3); border-bottom: 1px solid var(--hairline); vertical-align: middle; }
+.admin-table tr:last-child td { border-bottom: none; }
+.admin-table td:last-child { white-space: nowrap; }
+.admin-table .mono { font-family: var(--mono); font-size: var(--text-xs); }
+.admin-table .quiet { color: var(--text-faint); }
+.admin-actions { display: inline-flex; gap: var(--gap-1); flex-wrap: wrap; }
+
+.admin-action-row { display: flex; align-items: center; gap: var(--gap-3); flex-wrap: wrap; margin: var(--gap-2) 0; }
+.admin-action-desc { font-size: var(--text-sm); color: var(--text-dim); flex: 1 1 20rem; }
+
+/* Settings rows: name and help on the left, control on the right. */
+.admin-fields { display: flex; flex-direction: column; border: 1px solid var(--hairline); border-radius: var(--r-md); background: var(--surface-2); }
+.admin-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(14rem, 1fr);
+  align-items: start;
+  gap: var(--gap-3) var(--gap-4);
+  padding: var(--gap-3);
+  border-bottom: 1px solid var(--hairline);
+}
+.admin-field:last-child { border-bottom: none; }
+.admin-field.is-locked .admin-field-control { opacity: .7; }
+.admin-field-copy { min-width: 0; }
+.admin-field-name { display: flex; align-items: center; gap: var(--gap-2); flex-wrap: wrap; }
+.admin-field-key { font-family: var(--mono); font-size: var(--text-sm); color: var(--text); }
+.admin-env { font-size: var(--text-xs); color: var(--text-faint); }
+.admin-field-help { margin: 3px 0 0; font-size: var(--text-sm); color: var(--text-dim); line-height: 1.5; }
+.admin-field-meta { margin: 3px 0 0; font-size: var(--text-xs); color: var(--text-faint); }
+.admin-field-control { display: flex; flex-direction: column; gap: var(--gap-1); min-width: 0; }
+.admin-field-control .field { width: 100%; }
+.admin-textarea { resize: vertical; min-height: 4.5em; line-height: 1.45; }
+.admin-control-stack { display: flex; flex-direction: column; gap: var(--gap-1); }
+.admin-control-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--gap-2); }
+.admin-toggle-row { display: inline-flex; align-items: center; gap: var(--gap-2); font-size: var(--text-sm); color: var(--text-dim); cursor: pointer; }
+.admin-toggle { accent-color: var(--accent); width: 16px; height: 16px; }
+
+/* Entry forms: a row per column, wider than the model form's two fields. */
+.admin-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  background: var(--surface-2);
+  border: 1px solid var(--accent-edge);
+  border-radius: var(--r-md);
+  padding: var(--gap-3);
+}
+.admin-form-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(14rem, 1.2fr); gap: var(--gap-3); align-items: start; }
+.admin-form-label { display: flex; flex-direction: column; gap: 2px; font-size: var(--text-sm); }
+.admin-form-label code { font-family: var(--mono); font-size: var(--text-sm); color: var(--text); }
+.admin-required { font-size: var(--text-xs); color: var(--warn); }
+.admin-form-help { font-size: var(--text-xs); color: var(--text-faint); line-height: 1.45; }
+.admin-checks { display: flex; flex-wrap: wrap; gap: var(--gap-1) var(--gap-3); }
+.admin-check { display: inline-flex; align-items: center; gap: var(--gap-1); font-size: var(--text-xs); cursor: pointer; }
+.admin-check input { accent-color: var(--accent); }
+.admin-add-key { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: var(--gap-2); align-items: center; }
+.admin-json summary { cursor: pointer; font-size: var(--text-sm); color: var(--text-dim); }
+.admin-json .card-pre { margin-top: var(--gap-2); }
+
+@media (max-width: 900px) {
+  .admin-shell { grid-template-columns: 1fr; }
+  .admin-nav { flex-direction: row; flex-wrap: wrap; border-right: none; border-bottom: 1px solid var(--hairline); }
+  .admin-field, .admin-form-row { grid-template-columns: 1fr; }
+}
