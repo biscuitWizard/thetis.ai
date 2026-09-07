@@ -1127,10 +1127,13 @@ impl delegation::Host for HostState {
         };
         let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
 
-        // Deliberately *not* wrapped in `interruptible`: `delegation::wait`
-        // races the stop signal itself, and needs to, because it must be able
-        // to report a partial result rather than have the wait abandoned from
-        // outside with nothing to say.
+        // `delegation::wait` races the stop signal itself so it can leave its
+        // child snapshot internally consistent. Unlike ordinary tool components,
+        // though, that means it returns through this dedicated host import rather
+        // than `tooling::invoke`'s `interruptible` wrapper. Carry the stop into the
+        // agent store's budget here as well: the wait result may be rendered as a
+        // tool error, but the stopped turn must not resume Wasm and issue another
+        // tool call if its inbox checkpoint is buggy or delayed.
         let out = crate::delegation::wait(&grip, &parent, &predicate, timeout)
             .await
             .map(|o| delegation::WaitResult {
@@ -1139,6 +1142,9 @@ impl delegation::Host for HostState {
                 children: o.children.iter().map(|r| info_from_row(r, cap)).collect(),
             })
             .map_err(|e| format!("{e:#}"));
+        if self.cancelled() {
+            self.budget.cancel();
+        }
         self.yielded();
         Ok(out)
     }
@@ -2062,6 +2068,26 @@ impl skills_view::Host for HostState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delegation_wait_propagates_a_web_stop_into_the_agent_budget() {
+        // `wait` is the one tool path that intentionally bypasses
+        // `HostState::interruptible`, so keep its equivalent cancellation
+        // handoff explicit. Otherwise a stopped wait can return to Wasm and let
+        // the turn continue running tools until its next inbox checkpoint.
+        let src = include_str!("host_api.rs");
+        let body = src
+            .split("async fn wait(")
+            .nth(1)
+            .expect("delegation wait moved")
+            .split("    async fn cancel_child(")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            body.contains("if self.cancelled()") && body.contains("self.budget.cancel()"),
+            "delegation wait no longer carries a web stop into the agent budget"
+        );
+    }
+
     /// Every function on the `session` interface that names a session and can
     /// change it must call `scope_ok`, so an agent turn cannot reach into a
     /// conversation that is not its own.
