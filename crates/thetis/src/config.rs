@@ -252,6 +252,43 @@ impl Default for SkillSettings {
     }
 }
 
+/// How the tool surface is scoped to a conversation.
+///
+/// Tools are grouped, and a group is admitted to a session's surface only when
+/// something indicates it is wanted: it is always-on, a retrieved skill points
+/// at it, or its tags match the opening message. The research this implements is
+/// consistent that a large flat tool list costs both tokens and *accuracy* —
+/// but also that a naive filter can lose, so the default is off and the
+/// measurement it needs is always on.
+#[derive(Debug, Clone)]
+pub struct ToolGroupSettings {
+    /// Master switch. Off means every tool is offered, exactly as before, and
+    /// only the per-turn accounting runs.
+    pub grouping_enabled: bool,
+    /// Log the token cost of the tool block and which tools were actually
+    /// called, each turn. Independent of `grouping_enabled` on purpose: the
+    /// baseline is what makes the change judgeable.
+    pub accounting_enabled: bool,
+    /// Groups admitted for every session regardless of routing, beyond the ones
+    /// that declare themselves always-on in code.
+    pub always_on: Vec<String>,
+    /// Minimum lexical score for the opening message to admit a group on tag
+    /// evidence alone. Deliberately generous: a group wrongly admitted costs
+    /// tokens, while one wrongly withheld costs a capability.
+    pub route_threshold: f64,
+}
+
+impl Default for ToolGroupSettings {
+    fn default() -> Self {
+        Self {
+            grouping_enabled: false,
+            accounting_enabled: true,
+            always_on: Vec::new(),
+            route_threshold: 0.15,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemSettings {
     pub enabled: bool,
@@ -465,6 +502,7 @@ pub struct Config {
     pub context: ContextSettings,
     pub cache: CacheSettings,
     pub skills: SkillSettings,
+    pub tool_groups: ToolGroupSettings,
     pub build: BuildSettings,
     pub wasi: WasiSettings,
     pub watchdog: WatchdogSettings,
@@ -739,6 +777,7 @@ mod spec {
         pub server: Server,
         pub paths: Paths,
         pub skills: Skills,
+        pub tool_groups: ToolGroups,
         pub llm: Llm,
         pub agent: Agent,
         pub models: Vec<Model>,
@@ -832,6 +871,26 @@ mod spec {
                 embedding_dimensions: d.embedding_dimensions,
                 max_query_chars: d.max_query_chars,
                 max_universal: d.max_universal,
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(default)]
+    pub struct ToolGroups {
+        pub grouping_enabled: bool,
+        pub accounting_enabled: bool,
+        pub always_on: Vec<String>,
+        pub route_threshold: f64,
+    }
+    impl Default for ToolGroups {
+        fn default() -> Self {
+            let d = super::ToolGroupSettings::default();
+            Self {
+                grouping_enabled: d.grouping_enabled,
+                accounting_enabled: d.accounting_enabled,
+                always_on: d.always_on,
+                route_threshold: d.route_threshold,
             }
         }
     }
@@ -1747,6 +1806,16 @@ impl Config {
                 max_universal: file.skills.max_universal.min(20),
             },
 
+            tool_groups: ToolGroupSettings {
+                grouping_enabled: env.parse(
+                    "THETIS_TOOL_GROUPING",
+                    file.tool_groups.grouping_enabled,
+                ),
+                accounting_enabled: file.tool_groups.accounting_enabled,
+                always_on: file.tool_groups.always_on,
+                route_threshold: file.tool_groups.route_threshold.clamp(0.0, 1.0),
+            },
+
             build: BuildSettings {
                 command: env.string("THETIS_BUILD_COMMAND").unwrap_or(file.build.command),
                 target: env.string("THETIS_BUILD_TARGET").unwrap_or(file.build.target),
@@ -2147,6 +2216,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.mode("agent").unwrap().prompt, "You are Ada in agent mode.");
+    }
+
+    /// Scoping must default to off. An empty config that silently narrowed the
+    /// tool surface would change every existing deployment's behaviour on
+    /// upgrade, which is exactly what the research says not to do blind.
+    #[test]
+    fn tool_grouping_is_off_by_default_but_accounting_is_on() {
+        let cfg = from_toml("").unwrap();
+        assert!(!cfg.tool_groups.grouping_enabled);
+        assert!(
+            cfg.tool_groups.accounting_enabled,
+            "the baseline measurement is what makes enabling grouping judgeable"
+        );
+        assert!(cfg.tool_groups.always_on.is_empty());
+        assert_eq!(cfg.tool_groups.route_threshold, 0.15);
+    }
+
+    #[test]
+    fn tool_group_settings_round_trip_from_toml() {
+        let cfg = from_toml(
+            r#"
+            [tool_groups]
+            grouping_enabled = true
+            accounting_enabled = false
+            always_on = ["shell", "web"]
+            route_threshold = 0.4
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.tool_groups.grouping_enabled);
+        assert!(!cfg.tool_groups.accounting_enabled);
+        assert_eq!(cfg.tool_groups.always_on, vec!["shell", "web"]);
+        assert_eq!(cfg.tool_groups.route_threshold, 0.4);
+    }
+
+    /// A threshold above 1.0 would admit nothing on tag evidence and a negative
+    /// one would admit everything; both are silent misconfigurations, so they
+    /// are clamped rather than trusted.
+    #[test]
+    fn an_out_of_range_route_threshold_is_clamped() {
+        let high = from_toml("[tool_groups]\nroute_threshold = 9.0\n").unwrap();
+        assert_eq!(high.tool_groups.route_threshold, 1.0);
+        let low = from_toml("[tool_groups]\nroute_threshold = -3.0\n").unwrap();
+        assert_eq!(low.tool_groups.route_threshold, 0.0);
     }
 
     #[test]

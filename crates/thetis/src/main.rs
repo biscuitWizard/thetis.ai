@@ -5,8 +5,12 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
+            // `guest=debug` matters: everything a guest component logs through
+            // `sys::log` arrives under the `guest` target, not `thetis`, so
+            // without this every guest Debug line was silently dropped and
+            // anything the agent measured about itself was unobservable.
             EnvFilter::try_from_env("THETIS_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("info,thetis=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,thetis=debug,guest=debug")),
         )
         .with_target(false)
         .init();

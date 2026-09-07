@@ -486,3 +486,39 @@ embedding_dimensions = 1536
 max_query_chars = 2000
 # Refuse to load more than this many universal skills, whatever the files say.
 max_universal = 20
+
+# Task-dependent scoping of the tool surface.
+#
+# Tools are grouped by task rather than by capability, and a group reaches the
+# model only on evidence: it is always-on, a retrieved skill carries a
+# `tool-group:<id>` tag, or its tags match the opening message. `tool_search` is
+# always offered so any withheld group can be pulled in mid-conversation, and a
+# tool called from outside the active set is honoured and its group admitted —
+# scoping is a token and attention optimisation, never a permission boundary.
+# Read-only modes remain the only thing that actually withholds a capability.
+#
+# The evidence for doing this is mixed, which is why it ships off. Naive tool
+# attachment cost 9.5% accuracy on average across six commercial models
+# (MCPGauge, arXiv 2508.12566) and tool-calling accuracy falls 7-85% as a
+# catalog grows from 8K to 120K tokens (LongFuncEval, 2505.10570) — but an
+# adaptive cut-off also scored 0% on hard queries that a larger fixed candidate
+# set got 16.7% on (2605.24660). Turn it on, read the `tool accounting:` log
+# line at the end of each turn either side, and decide from this deployment's own
+# numbers.
+[tool_groups]
+# Off means every tool is offered exactly as before, and only the accounting
+# runs. Also settable via THETIS_TOOL_GROUPING.
+grouping_enabled = false
+# Log, at the end of each turn, how many tool definitions were offered and how
+# many were actually called. Independent of `grouping_enabled`: the baseline is
+# what makes the change judgeable, so this is on even when nothing is scoped.
+accounting_enabled = true
+# Groups admitted for every conversation on top of those marked always-on in
+# code (core, skills, files, extra). Ids: core, skills, files, shell, ssh,
+# selfmod, branch, config, sandbox, bigquery, notion, web, github, extra.
+always_on = []
+# Minimum tag score for the opening message alone to admit a group. Scoring
+# saturates as m/(m+1), so one distinct tag match gives 0.50 and the default
+# threshold admits on a single match. Deliberately generous: a group admitted
+# needlessly costs tokens, one wrongly withheld costs a capability.
+route_threshold = 0.15
