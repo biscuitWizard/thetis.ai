@@ -212,28 +212,46 @@ read_only = false
 [[modes]]
 id = "plan"
 label = "Plan"
-description = "Reads and reasons, but makes no changes. Tools that would modify anything are withheld."
+description = "Reads and reasons, and writes a plan document you can review and execute. Tools that would modify anything are withheld."
 read_only = true
 # Appended to the system prompt while this mode is active. read_only decides
 # which tools are offered; this decides what the model does with them. Without
 # it the model just finds the tools missing and works around the gap.
+#
+# The instruction to put the plan in the document rather than in the reply is
+# the load-bearing part. A plan written as prose scrolls away under the
+# investigation that produced it, and each revision reads as another copy with
+# nothing to say which one is current. The document has one current version, it
+# opens in its own tab, and the Execute button there is what hands it to an
+# agent -- so a plan that stays in the transcript cannot be executed at all.
 prompt = """
 You are in Plan mode. Every tool that would change something is withheld, so \
 you cannot edit code, run commands, or modify the running system. Read and \
 reason only.
 
-Produce a plan, not an implementation:
+The plan belongs in the plan document, not in your reply. Write it with \
+`plan_write`, revise it with `plan_edit`, and add to it with `plan_append` as \
+each part of the shape becomes clear -- do not save it all for the end of the \
+turn. The user reads it in its own tab and presses Execute there, which hands \
+it to an agent; a plan left in the transcript cannot be executed. Your reply \
+should say what you found and what you decided, and let the document carry the \
+steps rather than repeating them.
+
+What the document should hold:
 - Investigate first with the read-only tools you do have. A plan written \
 without looking at the code is a guess.
-- Say what you would change, file by file, and why each change is needed.
-- Name the decisions that are the user's to make, and the risks worth checking \
-before starting.
-- Sketch the shape of code rather than writing it out in full. You cannot \
-compile it here, and untested code reads as more certain than it is.
+- Numbered steps, in the order they should be done, each naming the files it \
+touches. An agent will follow these literally.
+- The decisions that are the user's to make, called out as theirs, and the \
+risks worth checking before starting.
+- The shape of code rather than the code in full. You cannot compile it here, \
+and untested code reads as more certain than it is.
 
-If you find yourself wanting a tool that is not offered, say what you would \
+Prefer `plan_edit` to rewriting the whole document: a `plan_write` over a plan \
+the user has already read and approved silently discards the parts they agreed \
+to. If you find yourself wanting a tool that is not offered, say what you would \
 have done with it instead of quietly working around it. When the plan is ready, \
-say so plainly and stop; the user will switch to Agent mode to carry it out.
+say so plainly and stop.
 """
 
 [[modes]]

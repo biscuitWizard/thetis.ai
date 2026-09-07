@@ -165,7 +165,23 @@ pub fn all() -> &'static [ToolGroup] {
             // refused that group outright — it would otherwise be the one kind
             // of session that cannot sleep, despite being the kind most often
             // handed a long build to babysit.
-            members: &["remember", "recall", "ask_user", "tool_search", "wait"],
+            //
+            // The `plan_*` tools live here for the same reason `remember` does:
+            // a plan is this conversation's own artefact, and Plan mode — whose
+            // whole output is a plan — must never find them missing. They are
+            // also what Agent mode ticks off while executing, so there is no
+            // task shape that should scope them away.
+            members: &[
+                "remember",
+                "recall",
+                "ask_user",
+                "tool_search",
+                "wait",
+                "plan_write",
+                "plan_edit",
+                "plan_append",
+                "plan_read",
+            ],
         },
         ToolGroup {
             id: "skills",

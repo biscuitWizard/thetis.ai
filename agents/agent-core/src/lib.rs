@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 mod compaction;
 mod groups;
+mod plan;
 mod tools;
 mod workspace;
 

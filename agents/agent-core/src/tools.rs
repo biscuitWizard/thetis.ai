@@ -14,6 +14,7 @@ use crate::thetis::grip::{
     tooling,
 };
 use crate::groups;
+use crate::plan;
 use serde_json::{json, Value};
 
 /// The mode assumed when a session has not chosen one.
@@ -661,6 +662,12 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
     ];
 
+    // Offered in every mode, not only Plan. A plan written while reading is
+    // worth having in Agent mode too, and Agent mode is where it gets executed
+    // and ticked off — so gating these on the mode would mean the executing
+    // session could not record that a step was done.
+    tools.extend(plan_tools());
+
     if sandbox_available() {
         tools.extend(sandbox_tools());
     }
@@ -695,6 +702,84 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     }
 
     tools
+}
+
+/// The plan document: one editable artefact per conversation.
+///
+/// None of these is `mutating`, and that is the deliberate part. The mode filter
+/// asks "does this change something outside the conversation?", and a plan is
+/// this conversation's own notes — the same category as `remember`, which is
+/// declared the same way. Withholding them from Plan mode would leave the one
+/// mode whose entire output is a plan unable to write one down.
+///
+/// A named group rather than an inline block in `available`, so `all_builtins`
+/// can add them back for classification. See the note on `restart_tools`.
+fn plan_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "plan_write",
+            description:
+                "Create or replace this conversation's plan document. The plan opens in its own \
+                 tab, where the user can read it and press Execute to hand it to an agent — so \
+                 write it for that reader: numbered steps, the files each one touches, and the \
+                 decisions that are theirs to make. Prefer `plan_edit` for a revision; a whole \
+                 rewrite is how an approved section quietly disappears.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "body": string_prop(
+                        "The plan, in markdown. Headings and numbered steps render in the plan tab."
+                    ),
+                    "title": string_prop(
+                        "Short title for the tab. Omit to keep the existing one."
+                    ),
+                }),
+                &["body"],
+            ),
+        },
+        ToolDef {
+            name: "plan_edit",
+            description:
+                "Revise part of the plan by replacing an exact snippet — the same contract as \
+                 `edit_path`. Read the plan first: `old_text` must match byte for byte, \
+                 whitespace included, and an edit matching nothing or matching twice is refused \
+                 rather than guessed. This is the tool for reworking a step after the user \
+                 pushes back on it.",
+            mutating: false,
+            parameters: obj(
+                json!({
+                    "old_text": string_prop(
+                        "Exact text to find in the plan; must appear once unless replace_all is set."
+                    ),
+                    "new_text": string_prop("What to put in its place. Empty deletes the snippet."),
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence instead of requiring a unique one.",
+                    },
+                }),
+                &["old_text", "new_text"],
+            ),
+        },
+        ToolDef {
+            name: "plan_append",
+            description:
+                "Add a section to the end of the plan, without restating the rest of it. Use \
+                 this while investigating, as each part of the shape becomes clear.",
+            mutating: false,
+            parameters: obj(
+                json!({ "text": string_prop("Markdown to add at the end.") }),
+                &["text"],
+            ),
+        },
+        ToolDef {
+            name: "plan_read",
+            description:
+                "Read this conversation's plan back, with its revision number. Do this before \
+                 editing: another turn may have revised it, and `plan_edit` matches exact text.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
+        },
+    ]
 }
 
 /// Reading and writing files on the machine Thetis is running on, confined to
@@ -1527,6 +1612,44 @@ pub fn invoke(
                 return Ok("lint clean".to_string());
             }
             Ok(format_skill_diagnostics(&diags))
+        }
+
+        "plan_write" => plan::write(
+            session_id,
+            args.get("title").and_then(Value::as_str).map(str::to_string),
+            &req_str(&args, "body")?,
+        )
+        .map(|p| {
+            format!(
+                "plan saved at revision {}. It is open in the Plan tab; the user can press \
+                 Execute there to hand it to an agent.\n\n{}",
+                p.revision,
+                plan::describe(&p)
+            )
+        }),
+        "plan_edit" => plan::edit(
+            session_id,
+            &req_str(&args, "old_text")?,
+            &req_str(&args, "new_text")?,
+            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+        )
+        .map(|e| {
+            format!(
+                "plan edited in {} place(s), now revision {}.\n\n{}",
+                e.replacements,
+                e.plan.revision,
+                plan::describe(&e.plan)
+            )
+        }),
+        "plan_append" => plan::append(session_id, &req_str(&args, "text")?)
+            .map(|p| format!("appended, now revision {}.\n\n{}", p.revision, plan::describe(&p))),
+        "plan_read" => {
+            let p = plan::load(session_id);
+            if p.body.trim().is_empty() {
+                Ok("no plan yet for this conversation. Write one with plan_write.".to_string())
+            } else {
+                Ok(plan::describe(&p))
+            }
         }
 
         // `wait` is not in this arm: it is a core tool, reachable by a
