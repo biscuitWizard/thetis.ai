@@ -258,6 +258,16 @@ impl LlmClient {
             );
         }
 
+        let orphans = answer_orphaned_tool_calls(&mut body);
+        if orphans > 0 {
+            tracing::warn!(
+                count = orphans,
+                "answered tool calls the log left unresolved; a turn was interrupted \
+                 between a call and its result, and a request carrying one is not merely \
+                 rejected — the provider accepts it and never replies"
+            );
+        }
+
         // Only the private marker goes. The prefix is deliberately left
         // append-only: mutating it mid-array is what used to invalidate the
         // prompt cache on every turn a tool failed. See `strip_private_markers`.
@@ -934,6 +944,79 @@ fn dedupe_tool_results(body: &mut serde_json::Value) -> usize {
         seen.insert(id.to_string())
     });
     before - messages.len()
+}
+
+/// What an interrupted call is told, when nothing else ever told it.
+const ORPHANED_CALL_RESULT: &str =
+    "Interrupted: this call never returned, because Thetis restarted while it was running. \
+     Run it again if the result still matters.";
+
+/// Gives every `tool_call` without a result one, returning how many it wrote.
+///
+/// The mirror of [`dedupe_tool_results`], and the more dangerous half. A tool
+/// call with *two* results is rejected with a 400 you can read; a tool call
+/// with *none* is accepted by OpenRouter and then never answered at all — the
+/// request is fully sent and acked, and not one byte comes back. Thetis sees a
+/// read timeout, retries the identical body three more times, and twelve
+/// minutes later fails the turn with "transport error". Nothing in that says
+/// what is wrong, and it repeats on every turn, forever, because the flaw is in
+/// the stored log rather than in anything the turn does.
+///
+/// One conversation reached that state exactly as you would expect: a kernel
+/// rebuild restarted the worker between a `wait` call and its result, the
+/// interrupted-turn repair that exists to synthesize the missing result was
+/// skipped, and the next user message landed straight after the unanswered
+/// call. Both of those are fixed at their sources. This is here because the
+/// cost of the shape reaching a provider is so far out of proportion to the
+/// mistake that makes it — and because no fix upstream can repair the logs
+/// already written.
+///
+/// The result is inserted immediately after the assistant message that made
+/// the call, which is the only position the schema allows.
+fn answer_orphaned_tool_calls(body: &mut serde_json::Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return 0;
+    };
+
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+        .filter_map(|m| m.get("tool_call_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    // Right to left, so an insertion never moves an index still to be visited.
+    let mut written = 0;
+    for i in (0..messages.len()).rev() {
+        if messages[i].get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let missing: Vec<String> = messages[i]
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|c| c.get("id").and_then(serde_json::Value::as_str))
+                    .filter(|id| !answered.contains(*id))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for id in missing.into_iter().rev() {
+            messages.insert(
+                i + 1,
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": ORPHANED_CALL_RESULT,
+                }),
+            );
+            written += 1;
+        }
+    }
+    written
 }
 
 /// Strips the host-only `thetis_tool_ok` marker, which the guest sets on every
@@ -2048,5 +2131,98 @@ mod tests {
         assert_eq!(call_1[0]["content"], "real result");
         // Untouched when already coherent.
         assert_eq!(dedupe_tool_results(&mut body), 0);
+    }
+
+    // The exact shape that hung a conversation: a restart landed between a
+    // `wait` call and its result, and the next user message went straight
+    // after the unanswered call. OpenRouter accepted that request and never
+    // answered it — 4 x 180s, then "transport error", on every turn forever.
+    #[test]
+    fn a_tool_call_the_log_never_answered_is_answered_here() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "s" },
+                { "role": "assistant", "tool_calls": [{ "id": "call_wait" }] },
+                { "role": "user", "content": "Continue" },
+            ]
+        });
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 1);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        // Immediately after the call that made it: the only position the
+        // schema allows.
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_wait");
+        assert_eq!(messages[3]["content"], "Continue");
+        // Idempotent, so it does not grow the prefix on every turn.
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 0);
+    }
+
+    #[test]
+    fn an_assistant_message_with_several_unanswered_calls_gets_one_result_each() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [
+                    { "id": "a" }, { "id": "b" }, { "id": "c" },
+                ]},
+                { "role": "tool", "tool_call_id": "b", "content": "b came back" },
+                { "role": "user", "content": "Continue" },
+            ]
+        });
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 2);
+        let messages = body["messages"].as_array().unwrap();
+        let ids: Vec<_> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3, "every call needs exactly one result: {ids:?}");
+        // The real result is untouched; only the gaps are filled.
+        assert!(messages
+            .iter()
+            .any(|m| m["tool_call_id"] == "b" && m["content"] == "b came back"));
+    }
+
+    // Two interrupted rounds far apart: inserting for the later one must not
+    // disturb the position of the earlier.
+    #[test]
+    fn results_land_next_to_their_own_call_however_many_there_are() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "first" }] },
+                { "role": "user", "content": "one" },
+                { "role": "assistant", "tool_calls": [{ "id": "second" }] },
+                { "role": "user", "content": "two" },
+            ]
+        });
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 2);
+        let m = body["messages"].as_array().unwrap();
+        let roles: Vec<_> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            ["assistant", "tool", "user", "assistant", "tool", "user"]
+        );
+        assert_eq!(m[1]["tool_call_id"], "first");
+        assert_eq!(m[4]["tool_call_id"], "second");
+    }
+
+    // A coherent log must come through completely untouched — this runs on
+    // every request, and moving a message would invalidate the prompt cache
+    // from that point on.
+    #[test]
+    fn a_coherent_conversation_is_left_exactly_as_it_was() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "s" },
+                { "role": "assistant", "tool_calls": [{ "id": "call_1" }] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "done" },
+                { "role": "assistant", "content": "all good" },
+                { "role": "user", "content": "next" },
+            ]
+        });
+        let before = body.clone();
+        assert_eq!(answer_orphaned_tool_calls(&mut body), 0);
+        assert_eq!(body, before);
     }
 }
