@@ -71,7 +71,7 @@ Grouped by concern.
 | `branches.rs` | The branch registry: which conversation runs which branch and checkout. |
 | `merge.rs` | Gateway-side merging. The branch is squashed to one commit, then trunk fast-forwards; only a human triggers it. |
 | `buildcache.rs` | Content-addressed artifacts plus smoke verdicts, keyed by tree oid. |
-| `publish.rs` | The publish boundary: the filtered `public` branch and the pre-push guard. |
+| `publish.rs` | The publish boundary: the filtered history that becomes `main` on the remote, and the pre-push guard. Local `main` is trunk and never leaves the machine. |
 | `revisions.rs` | The retired revision registry, kept read-only for migration. |
 | `watchdog.rs` | Liveness probes and the circuit breaker. Repeated traps reset an aspect's source to the branch's last green build. |
 | `watcher.rs` | Hot reload. A human edit goes through the same pipeline as your own. |
