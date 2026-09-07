@@ -663,6 +663,47 @@ impl BrowserSettings {
     }
 }
 
+/// The campaign knowledge sidecar behind the `rpg-kb-*` tools.
+///
+/// The same reasoning as the browser: a tool component cannot open SQLite or
+/// spawn a process, but it can speak HTTP to loopback. The kernel runs one
+/// Python process holding the system and campaign stores; the tools and the
+/// campaign gateway are clients to it. See `services/rpg-kb-sidecar/`.
+#[derive(Debug, Clone)]
+pub struct RpgKbSettings {
+    pub enabled: bool,
+    /// Loopback port. Never bound on a public interface.
+    pub port: u16,
+    /// Where the SQLite file lives. Gitignored; the verbatim rulebook
+    /// population goes here and nowhere else.
+    pub data_dir: PathBuf,
+    /// The Python interpreter. Empty means look on PATH.
+    pub python_bin: String,
+    /// Embedding model, an OpenAI-compatible id served through the default
+    /// provider. Part of the sidecar's vector cache key.
+    pub embedding_model: String,
+    /// The chat model that writes `rpg-kb-ask` answers.
+    pub ask_model: String,
+    /// The sidecar's directory, holding `server.py`. Always under the root.
+    pub service_dir: PathBuf,
+    pub startup_timeout: Duration,
+}
+
+impl RpgKbSettings {
+    /// The loopback base URL tools are told to call.
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    pub fn python_bin(&self) -> &str {
+        if self.python_bin.trim().is_empty() {
+            "python3"
+        } else {
+            self.python_bin.trim()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscordSettings {
     pub enabled: bool,
@@ -812,6 +853,7 @@ pub struct Config {
     pub control: ControlSettings,
     pub discord: DiscordSettings,
     pub browser: BrowserSettings,
+    pub rpg_kb: RpgKbSettings,
     pub sandbox_available: bool,
 }
 
@@ -1002,6 +1044,20 @@ impl Config {
                     .or_insert_with(|| toml::Value::Boolean(self.browser.enabled));
             }
         }
+        // The same for the knowledge sidecar behind `rpg-kb-search` and
+        // `rpg-kb-ask`: where it listens and the boot-time token it expects.
+        if tool.starts_with("rpg-kb-") {
+            let table = merged.get_or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            if let toml::Value::Table(t) = table {
+                t.entry("endpoint".to_string())
+                    .or_insert_with(|| toml::Value::String(self.rpg_kb.base_url()));
+                t.entry("token".to_string()).or_insert_with(|| {
+                    toml::Value::String(crate::kb_sidecar::token(self).to_string())
+                });
+                t.entry("enabled".to_string())
+                    .or_insert_with(|| toml::Value::Boolean(self.rpg_kb.enabled));
+            }
+        }
         merged
             .and_then(|v| serde_json::to_string(&v).ok())
             .unwrap_or_else(|| "{}".to_string())
@@ -1161,6 +1217,7 @@ mod spec {
         pub control: Control,
         pub discord: Discord,
         pub browser: Browser,
+        pub rpg_kb: RpgKb,
         pub wasi: Wasi,
         /// Free-form per-tool settings. Shapes are up to each tool, so this is
         /// carried as-is rather than being given a schema here.
@@ -1757,6 +1814,35 @@ mod spec {
                 snapshot_chars: 12_000,
                 // Inside `workspace` so the wasm guests' preopen can reach it.
                 artifact_dir: "workspace/browser".into(),
+            }
+        }
+    }
+
+    /// The campaign knowledge sidecar. See [`super::RpgKbSettings`].
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(default)]
+    pub struct RpgKb {
+        pub enabled: bool,
+        pub port: u16,
+        pub data_dir: String,
+        pub python_bin: String,
+        pub embedding_model: String,
+        pub ask_model: String,
+    }
+    impl Default for RpgKb {
+        fn default() -> Self {
+            Self {
+                // Off until a system store has been built: with nothing
+                // indexed the tools would only ever answer "nothing found".
+                enabled: false,
+                // Loopback only, next to the browser sidecar's port.
+                port: 39413,
+                // Gitignored. The verbatim rulebook population lives here.
+                data_dir: "services/rpg-kb-sidecar/data".into(),
+                // Empty means "find it on PATH".
+                python_bin: "python3".into(),
+                embedding_model: "openai/text-embedding-3-small".into(),
+                ask_model: "openai/gpt-4o-mini".into(),
             }
         }
     }
@@ -2848,6 +2934,19 @@ impl Config {
                 idle_timeout_secs: file.browser.idle_timeout_secs,
                 snapshot_chars: file.browser.snapshot_chars.max(500),
                 artifact_dir: resolve(&root, &file.browser.artifact_dir),
+            },
+
+            rpg_kb: RpgKbSettings {
+                enabled: env.parse("THETIS_RPG_KB_ENABLED", file.rpg_kb.enabled),
+                port: env.parse("THETIS_RPG_KB_PORT", file.rpg_kb.port),
+                data_dir: resolve(&root, &file.rpg_kb.data_dir),
+                python_bin: env
+                    .string("THETIS_RPG_KB_PYTHON")
+                    .unwrap_or(file.rpg_kb.python_bin),
+                embedding_model: file.rpg_kb.embedding_model,
+                ask_model: file.rpg_kb.ask_model,
+                service_dir: root.join("services/rpg-kb-sidecar"),
+                startup_timeout: Duration::from_secs(30),
             },
 
             sandbox_available: env.parse("THETIS_SANDBOX", file.sandbox.enabled),
