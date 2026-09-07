@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Synchronize the canonical RPG tool operation implementation into all 30
+# Synchronize the canonical RPG tool operation implementation into all 31
 # standalone tool crates.
 #
 # Each tool remains a standalone wasm package. Keeping the shared source inside
@@ -22,4 +22,4 @@ while IFS= read -r consumer; do
   seen=$((seen + 1))
 done < "$root/rpg/consumers.txt"
 
-[[ $seen -eq 30 ]] || { echo "expected 30 RPG consumers, found $seen" >&2; exit 1; }
+[[ $seen -eq 31 ]] || { echo "expected 31 RPG consumers, found $seen" >&2; exit 1; }
