@@ -1419,6 +1419,11 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
         for action in actions {
             match action {
                 GatewayAction::Reply(frame) => {
+                    let frame = if principal.viewing_all() {
+                        annotate_owners(&grip, &principal, frame)
+                    } else {
+                        frame
+                    };
                     if out_tx.send(frame).await.is_err() {
                         return;
                     }
@@ -1458,6 +1463,51 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
     drop(out_tx);
     writer.abort();
     tracing::debug!(%client_id, "websocket closed");
+}
+
+/// Adds `owner`, `owner_name` and `mine` to each row of a `sessions` frame,
+/// for the sidebar that is showing everyone's conversations. `SessionMeta`
+/// is a WIT record and cannot carry an owner, and the guest does not know
+/// who is asking, so the rows are decorated here on the way out. Any other
+/// frame passes through untouched.
+fn annotate_owners(grip: &Grip, principal: &crate::auth::Principal, frame: String) -> String {
+    if !frame.contains("\"type\":\"sessions\"") {
+        return frame;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&frame) else {
+        return frame;
+    };
+    if value.get("type").and_then(|t| t.as_str()) != Some("sessions") {
+        return frame;
+    }
+    let Some(owners) = grip.local_store().and_then(|s| s.owners_map().ok()) else {
+        return frame;
+    };
+    let name_of = |owner: &str| -> String {
+        if let Some(user) = grip.cfg.auth.user(owner) {
+            return user.name.clone();
+        }
+        match owner.strip_prefix("discord:") {
+            Some(_) => "Discord".to_string(),
+            None => owner.to_string(),
+        }
+    };
+    if let Some(rows) = value.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+        for row in rows.iter_mut() {
+            let Some(id) = row.get("id").and_then(|v| v.as_str()) else { continue };
+            let Some(owner) = owners.get(id).cloned() else { continue };
+            let mine = owner == principal.user_id;
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("mine".into(), serde_json::Value::Bool(mine));
+                if !mine {
+                    obj.insert("owner_name".into(), serde_json::Value::from(name_of(&owner)));
+                    obj.insert("owner".into(), serde_json::Value::from(owner));
+                }
+            }
+        }
+    }
+    value["everyone"] = serde_json::Value::Bool(true);
+    value.to_string()
 }
 
 fn user_frame(principal: &crate::auth::Principal) -> String {
