@@ -7,6 +7,17 @@
  * because re-parsing on every token buys nothing. The transcript also keeps
  * the session's usage ledger (spend, tokens per turn) in the store, since the
  * events flowing through here are the only place those numbers appear.
+ *
+ * Sub-agent rows are built lazily. A conversation that delegated heavily is
+ * mostly its children's output — four children accounted for 87% of one log's
+ * 3,315 events — and each child's stream has two homes, the folded inline block
+ * and the child's own stage tab. Rendering all of that on open cost a single
+ * 5.3-second blocking task to produce 13,000 nodes inside hidden panes. So a
+ * home queues events until something makes it visible, and `wake` drains the
+ * queue in arrival order. Anything that must be right whether or not a reader
+ * ever looks — the spend ledger, the sidebar's list of children, a block's
+ * finished state — is driven from `dispatch`, once per event, never from a
+ * home's render.
  */
 
 import { $, AGENT_NAME, clear, el } from "../lib/dom.js";
@@ -75,6 +86,15 @@ const RESULT_PREVIEW_CHARS = 4000;
  * into the parent's transcript. */
 const agents = new Map();
 
+/* True while `replay` is pushing a whole conversation through the renderers.
+ *
+ * A live frame and a replayed one are the same event, but the reader's
+ * relationship to them is not: live, a child's block is open in front of them
+ * and its rows should appear as they arrive; in a replay, hundreds of rows
+ * belonging to children that finished long ago arrive in one blocking task, and
+ * folded blocks make almost all of that work invisible. */
+let bulk = false;
+
 /* A block per sub-agent, minted on its first frame and reused after.
  *
  * Two homes, not one. The inline block stays where it always was — a child's
@@ -91,7 +111,16 @@ function agentBlock(id, label) {
   const body = el("div", { class: "agent-body" });
   const block = el(
     "details",
-    { class: "agent is-running", open: "", dataset: { agent: id } },
+    {
+      class: "agent is-running",
+      open: "",
+      dataset: { agent: id },
+      // Expanding a folded block is the moment its rows become worth building.
+      // `wake` is idempotent, so the toggle that folds it again costs nothing.
+      onToggle: () => {
+        if (block.open) wake(entry.homes[0]);
+      },
+    },
     el(
       "summary",
       {},
@@ -107,10 +136,21 @@ function agentBlock(id, label) {
   // Each child keeps its own streaming cursors and its own open-call map, so
   // concurrent children cannot corrupt each other's rows — and one set per
   // *home*, since the same stream is rendered twice.
+  // Live, the inline home starts awake: the block is minted open, the reader is
+  // watching the child work, and a running child's rows arrive a few at a time.
+  //
+  // In a bulk replay it starts asleep instead. Opening a conversation is the
+  // slow case precisely because every child's whole history arrives at once, and
+  // most of those children have finished — their blocks will be folded by
+  // `settleAgent` before anyone sees them, so building their rows is work for a
+  // reader who has not asked. `replay` wakes the ones still open at the end.
+  //
+  // The stage home always starts asleep: its tab is not on screen, and may
+  // never be opened at all.
   const entry = {
     block,
     body,
-    homes: [home(body, null), home(stage.openAgentPane(id, label), null)],
+    homes: [home(body, null, !bulk), home(null, null, false)],
     label: label || "sub-agent",
     state: "running",
     cost: 0,
@@ -118,7 +158,11 @@ function agentBlock(id, label) {
   // The stage pane's copy is read on its own, not as an aside in someone
   // else's narrative, so it keeps the scroll-following behaviour the main
   // transcript has.
-  entry.homes[1].scroller = entry.homes[1].body.parentElement;
+  const pane = stage.openAgentPane(id, label);
+  entry.homes[1].body = pane;
+  entry.homes[1].scroller = pane.parentElement;
+  // Opening the child's tab is what makes its copy worth building.
+  stage.onAgentPaneShown(id, () => wake(entry.homes[1]));
   agents.set(id, entry);
   publishAgents();
   return entry;
@@ -130,9 +174,63 @@ function agentBlock(id, label) {
  * All of it has to be per-home. `live` and `thinking` are the obvious ones, but
  * `open` (the call id → row map) matters just as much: the two copies mint two
  * rows for one call, and each result has to find the row in its own copy.
- * `compactNode` and `openAsks` are here for the same reason. */
-function home(body, scroller) {
-  return { body, scroller, live: null, thinking: null, open: new Map(), compactNode: null, openAsks: [] };
+ * `compactNode` and `openAsks` are here for the same reason.
+ *
+ * A home is asleep until something makes it visible. Asleep, it queues the
+ * events addressed to it and builds nothing; woken, it drains the queue in
+ * order and renders live from then on. This is what keeps opening a
+ * conversation cheap: a finished child's stage tab is hidden and its inline
+ * block is folded, so neither copy of its several hundred rows is worth
+ * building until someone looks. Draining in order is what makes it equivalent
+ * to having rendered all along — a tool result still finds the row its call
+ * opened, because the call is drained first. */
+function home(body, scroller, awake) {
+  return {
+    body,
+    scroller,
+    awake: !!awake,
+    queue: [],
+    live: null,
+    thinking: null,
+    open: new Map(),
+    compactNode: null,
+    openAsks: [],
+  };
+}
+
+/* Renders everything a sleeping home missed, then leaves it awake.
+ *
+ * The queue holds the events themselves rather than closures, so a drain is the
+ * same code path as a live frame — one renderer, not a second one that could
+ * drift from it. */
+function wake(spot) {
+  if (spot.awake) return;
+  spot.awake = true;
+  const missed = spot.queue;
+  spot.queue = [];
+  // Draining is one bulk build, not a stream: asking after the scroll position
+  // between every row would flush layout hundreds of times to answer a question
+  // whose answer cannot change while nothing is on screen yet. Suppress it, then
+  // land at the bottom once, which is where a freshly opened transcript belongs.
+  spot.draining = true;
+  try {
+    for (const ev of missed) renderInto(spot, ev);
+  } finally {
+    spot.draining = false;
+  }
+  // Jump, do not glide. The scroller inherits `scroll-behavior: smooth`, which
+  // is right for following a live turn and wrong here: a drained pane is tens of
+  // thousands of pixels tall, so an animated scroll to the end sweeps the whole
+  // of a child's history past the reader before settling.
+  // `scrollTo` is guarded the way `scrollIntoView` is elsewhere: the linkedom
+  // DOM the test harness runs against implements neither.
+  if (spot.scroller) {
+    if (typeof spot.scroller.scrollTo === "function") {
+      spot.scroller.scrollTo({ top: spot.scroller.scrollHeight, behavior: "instant" });
+    } else {
+      spot.scroller.scrollTop = spot.scroller.scrollHeight;
+    }
+  }
 }
 
 /* Mirrors the block map into the store, for the sidebar.
@@ -159,44 +257,95 @@ function publishAgents() {
  * conversation's own tab is scrolled to the delegation that spawned it. The
  * renderers are pure appends into `sink`, so running them again is cheap and
  * cannot disagree with itself. */
-function inAgent(ev, render) {
+function inAgent(ev) {
   const entry = agentBlock(ev.agent, ev.agent_label);
-
-  const outer = { sink, live, thinking, open, compactNode, openAsks };
   for (const spot of entry.homes) {
-    sink = spot.body;
-    live = spot.live;
-    thinking = spot.thinking;
-    open = spot.open;
-    compactNode = spot.compactNode;
-    openAsks = spot.openAsks;
+    if (spot.awake) renderInto(spot, ev);
+    // Asleep: remember the event and build nothing. `wake` replays the queue in
+    // arrival order, so a late render is indistinguishable from an eager one.
+    else spot.queue.push(ev);
+  }
+  return entry;
+}
 
-    // A home whose reader is following along stays at the bottom; one they have
-    // scrolled up in is left where they put it.
-    const follow = spot.scroller
+/* Runs one event's renderer against one home, with that home's cursors swapped
+ * into the module-level state the renderers read.
+ *
+ * Split out of `inAgent` so a drain and a live frame go through identical code.
+ * The swap is restore-on-finally rather than restore-at-the-end: a renderer that
+ * throws must not leave `sink` pointing into a child's block, or the parent's
+ * next row lands inside the child. */
+function renderInto(spot, ev) {
+  const outer = { sink, live, thinking, open, compactNode, openAsks };
+
+  sink = spot.body;
+  live = spot.live;
+  thinking = spot.thinking;
+  open = spot.open;
+  compactNode = spot.compactNode;
+  openAsks = spot.openAsks;
+
+  // A home whose reader is following along stays at the bottom; one they have
+  // scrolled up in is left where they put it. Reading the scroll geometry costs
+  // a layout flush, so it is only worth asking of a home that is on screen —
+  // during a drain of several hundred events it was the single largest cost.
+  const follow =
+    spot.scroller && !spot.draining && spot.scroller.offsetParent !== null
       ? spot.scroller.scrollHeight - spot.scroller.scrollTop - spot.scroller.clientHeight < 140
       : false;
 
-    try {
-      render(ev);
-    } finally {
-      // Whatever the renderer left mid-stream belongs to this home.
-      spot.live = live;
-      spot.thinking = thinking;
-      spot.open = open;
-      spot.compactNode = compactNode;
-      spot.openAsks = openAsks;
-    }
-    if (follow) spot.scroller.scrollTop = spot.scroller.scrollHeight;
-  }
+  try {
+    agentRender(ev);
+  } finally {
+    // Whatever the renderer left mid-stream belongs to this home.
+    spot.live = live;
+    spot.thinking = thinking;
+    spot.open = open;
+    spot.compactNode = compactNode;
+    spot.openAsks = openAsks;
 
-  sink = outer.sink;
-  live = outer.live;
-  thinking = outer.thinking;
-  open = outer.open;
-  compactNode = outer.compactNode;
-  openAsks = outer.openAsks;
-  return entry;
+    sink = outer.sink;
+    live = outer.live;
+    thinking = outer.thinking;
+    open = outer.open;
+    compactNode = outer.compactNode;
+    openAsks = outer.openAsks;
+  }
+  if (follow) spot.scroller.scrollTop = spot.scroller.scrollHeight;
+}
+
+/* What a child's event does to one copy of its transcript.
+ *
+ * A child's turn boundaries drive its own block's header, never the
+ * conversation's busy state or ledger — those are `dispatch`'s business, and
+ * they must happen once per event rather than once per home. Its streaming
+ * cursors still have to be closed off here, or a second turn in the same child
+ * would append to the previous turn's half-finished bubble. */
+function agentRender(ev) {
+  switch (ev.kind) {
+    case "turn-started":
+      break;
+    case "turn-finished":
+      settleReasoning();
+      live = null;
+      break;
+    default:
+      RENDERERS[ev.kind]?.(ev);
+  }
+}
+
+/* Opens a child's inline block, builds its rows if they were deferred, and hands
+ * the block back so the caller can scroll to it.
+ *
+ * Synchronous on purpose. Setting `open` fires `toggle` in a later task, so a
+ * caller that set the flag and scrolled immediately would measure a block whose
+ * rows did not exist yet and land in the wrong place. */
+export function revealAgent(id) {
+  const entry = agents.get(id);
+  if (!entry) return null;
+  entry.block.open = true;
+  wake(entry.homes[0]);
+  return entry.block;
 }
 
 /* Marks a child finished and folds it away.
@@ -941,22 +1090,7 @@ function dispatch(ev) {
 
   // `inAgent` swaps the compaction card and the open ask forms per home too, so
   // a child's own card stays in the child's copies and never in the parent's.
-  const entry = inAgent(ev, (child) => {
-    switch (child.kind) {
-      // A child's turn boundaries drive its own block's header, never the
-      // conversation's busy state or ledger. Its streaming cursors still have
-      // to be closed off, or a second turn in the same child would append to
-      // the previous turn's half-finished bubble.
-      case "turn-started":
-        break;
-      case "turn-finished":
-        settleReasoning();
-        live = null;
-        break;
-      default:
-        RENDERERS[child.kind]?.(child);
-    }
-  });
+  const entry = inAgent(ev);
 
   if (ev.kind === "turn-finished") {
     settleAgent(entry, ev);
@@ -992,7 +1126,18 @@ export function replay(events) {
     showEmpty("No messages yet.", "Say something to get started.");
     return;
   }
-  events.forEach(dispatch);
+  // Children's rows are queued rather than built while the log pours in. Only a
+  // block still open at the end — a child that was running when the snapshot
+  // was taken — has an audience, so only that one is drained.
+  bulk = true;
+  try {
+    events.forEach(dispatch);
+  } finally {
+    bulk = false;
+  }
+  for (const entry of agents.values()) {
+    if (entry.block.open) wake(entry.homes[0]);
+  }
   recomputeTotals();
   // A restored transcript should start at the end, without animating there.
   toBottom(true);
