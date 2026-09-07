@@ -102,7 +102,7 @@ pub struct GitHub {
 impl GitHub {
     /// Builds a client from the tool's own config block.
     ///
-    /// Every `github-*` tool inherits `[tools.github]`, so the credential is
+    /// Every `git-*` tool inherits `[tools.git]`, so the credential is
     /// named once rather than once per tool.
     pub fn from_config(config_json: &str) -> Result<Self, String> {
         let config: Value = serde_json::from_str(config_json).unwrap_or(json!({}));
@@ -149,11 +149,11 @@ impl GitHub {
         Err(match (app_id.is_empty(), private_key_pem.is_none()) {
             (false, true) => format!(
                 "app_id is set but no private key is. Add `private_key_path` (or \
-                 `private_key`) to [tools.github].\n\n{SETUP_HELP}"
+                 `private_key`) to [tools.git].\n\n{SETUP_HELP}"
             ),
             (true, false) => format!(
                 "a private key is set but app_id is not. Add `app_id` to \
-                 [tools.github].\n\n{SETUP_HELP}"
+                 [tools.git].\n\n{SETUP_HELP}"
             ),
             _ => format!("no GitHub credentials configured.\n\n{SETUP_HELP}"),
         })
@@ -296,7 +296,7 @@ impl GitHub {
                 }
                 Err(format!(
                     "the App has {} installations, so which one to act through is ambiguous. \
-                     Set `installation_id` in [tools.github]:{names}",
+                     Set `installation_id` in [tools.git]:{names}",
                     installations.len()
                 ))
             }
@@ -639,7 +639,7 @@ named by THETIS_LOCAL_CONFIG, normally <project>/thetis.local.toml at the top \
 level -- because it applies to every branch and is merged last, so it wins over \
 a copy inside a worktree:\n\
 \n\
-[tools.github]\n\
+[tools.git]\n\
 app_id = \"123456\"\n\
 private_key_path = \"secrets/github-app.pem\"\n\
 # installation_id = 12345678   # only needed if the App has several\n\
@@ -648,8 +648,8 @@ private_key_path is resolved against the project root and must stay inside it; \
 the host reads the file and passes the contents in. `private_key` inline works \
 too.\n\
 \n\
-Then restart the orchestrator. Every github-* tool inherits this block, so the \
-credential is set once. Run github-whoami to verify it.";
+Then restart the orchestrator. Every git-* tool inherits this block, so the \
+credential is set once. Run git-whoami to verify it.";
 
 pub const INSTALL_HELP: &str = "Install the App from \
 https://github.com/settings/apps/<your-app>/installations — choose the account \

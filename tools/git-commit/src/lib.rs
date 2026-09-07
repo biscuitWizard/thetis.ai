@@ -44,11 +44,11 @@ struct Component;
 impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
-            name: "github-commit".to_string(),
+            name: "git-commit".to_string(),
             description: "Commit file changes to a GitHub repository — create, update or delete \
                           several files in one atomic commit, authored by the app's own [bot] \
                           identity. Can also open a pull request for the branch it just wrote. \
-                          Reads go through github-file."
+                          Reads go through git-file."
                 .to_string(),
             args_schema_json: json!({
                 "type": "object",

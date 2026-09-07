@@ -1,6 +1,6 @@
 //! Verify the GitHub App credentials and report the identity they give.
 //!
-//! This is the diagnostic tool for the `github-*` group, and the first thing to
+//! This is the diagnostic tool for the `git-*` group, and the first thing to
 //! run after setting up the App. It exercises the whole authentication chain —
 //! sign a JWT, call `/app`, list installations, mint an installation token,
 //! resolve the bot user id — and reports which step failed rather than a bare
@@ -24,10 +24,10 @@ struct Component;
 impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
-            name: "github-whoami".to_string(),
+            name: "git-whoami".to_string(),
             description: "Check the GitHub App credentials and show what identity they give: \
                           the app, its bot user, every account it is installed on, and the git \
-                          author string to use for commits. Run this first when a github-* tool \
+                          author string to use for commits. Run this first when a git-* tool \
                           returns 401, 403 or 404, and after changing the App's permissions."
                 .to_string(),
             args_schema_json: json!({
@@ -152,7 +152,7 @@ impl Guest for Component {
             out.push_str("\nOne installation, so it is used automatically.\n");
         } else {
             out.push_str(
-                "\nSeveral installations: set `installation_id` in [tools.github] to choose, \
+                "\nSeveral installations: set `installation_id` in [tools.git] to choose, \
                  or pass it per call where a tool accepts it.\n",
             );
         }

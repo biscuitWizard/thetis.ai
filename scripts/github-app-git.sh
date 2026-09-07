@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Mints a GitHub App installation token and configures git to use it.
 #
-# The github-* tools cover commits, branches and PRs through the REST API, which
+# The git-* tools cover commits, branches and PRs through the REST API, which
 # needs no clone. This script is for the cases the API cannot do well: a real
 # `git clone`, a rebase, a bisect, running a test suite against a working tree,
-# or a commit series with exact parentage.
+# or a commit series with exact parentage. The `git_clone` built-in drives it.
 #
-# It reads the same credentials the tools use — [tools.github] in
+# It reads the same credentials the tools use — [tools.git] in
 # thetis.local.toml or thetis.toml — and mints the same kind of installation
 # token, using openssl for the RS256 signature.
 #
@@ -45,11 +45,13 @@ read_key() {
   local key="$1" file
   while read -r file; do
     [ -n "$file" ] && [ -f "$file" ] || continue
-    # The value from the [tools.github] section only: awk tracks the section so
+    # The value from the [tools.git] section only: awk tracks the section so
     # a same-named key in another table cannot be picked up by accident.
+    # `[tools.github]` is still accepted, because the tools were renamed from
+    # github-* to git-* and an existing local overlay predates that.
     local found
     found=$(awk -v k="$key" '
-      /^\[/ { in_section = ($0 ~ /^\[tools\.github\]/) ; next }
+      /^\[/ { in_section = ($0 ~ /^\[tools\.git(hub)?\]/) ; next }
       in_section && $0 ~ "^[[:space:]]*"k"[[:space:]]*=" {
         sub(/^[^=]*=[[:space:]]*/, "")
         # Order matters: strip the trailing comment first, then the quotes.
@@ -67,12 +69,14 @@ read_key() {
   return 0
 }
 
-APP_ID="${THETIS_TOOL_GITHUB_APP_ID:-$(read_key app_id)}"
-KEY_PATH="${THETIS_TOOL_GITHUB_PRIVATE_KEY_PATH:-$(read_key private_key_path)}"
-INSTALLATION_ID="${THETIS_TOOL_GITHUB_INSTALLATION_ID:-$(read_key installation_id)}"
+# THETIS_TOOL_GIT_* is the current spelling, matching the [tools.git] scope the
+# renamed tools read; the GITHUB form is still honoured for an older environment.
+APP_ID="${THETIS_TOOL_GIT_APP_ID:-${THETIS_TOOL_GITHUB_APP_ID:-$(read_key app_id)}}"
+KEY_PATH="${THETIS_TOOL_GIT_PRIVATE_KEY_PATH:-${THETIS_TOOL_GITHUB_PRIVATE_KEY_PATH:-$(read_key private_key_path)}}"
+INSTALLATION_ID="${THETIS_TOOL_GIT_INSTALLATION_ID:-${THETIS_TOOL_GITHUB_INSTALLATION_ID:-$(read_key installation_id)}}"
 
-[ -n "$APP_ID" ]   || die "no app_id found in [tools.github]. See thetis.toml for the block."
-[ -n "$KEY_PATH" ] || die "no private_key_path found in [tools.github]."
+[ -n "$APP_ID" ]   || die "no app_id found in [tools.git]. See thetis.toml for the block."
+[ -n "$KEY_PATH" ] || die "no private_key_path found in [tools.git]."
 
 # A relative key path is resolved against the project root *and* the shared
 # overlay's directory, matching Config::secret_roots in the kernel. Without the
@@ -128,7 +132,7 @@ if [ -z "$INSTALLATION_ID" ]; then
     0) die "the App has no installations. Install it on an account or org first." ;;
     1) INSTALLATION_ID=$(echo "$installations" | jq -r '.[0].id') ;;
     *) echo "$installations" | jq -r '.[] | "  \(.id)  \(.account.login)"' >&2
-       die "the App has $count installations; set installation_id in [tools.github]." ;;
+       die "the App has $count installations; set installation_id in [tools.git]." ;;
   esac
 fi
 

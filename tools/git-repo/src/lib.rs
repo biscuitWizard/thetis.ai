@@ -20,11 +20,11 @@ struct Component;
 impl Guest for Component {
     fn describe() -> ToolManifest {
         ToolManifest {
-            name: "github-repo".to_string(),
+            name: "git-repo".to_string(),
             description: "Inspect and manage GitHub repositories and branches: list the repos \
                           the app can reach, get one repo's details, create a repo, list \
                           branches, create or delete a branch, and read commit history. Use \
-                          github-file to read or write file contents."
+                          git-file to read or write file contents."
                 .to_string(),
             args_schema_json: json!({
                 "type": "object",
