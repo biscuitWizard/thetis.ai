@@ -24,6 +24,10 @@
 
 mod ablate;
 mod corpus;
+/// Routing at scale needs the lifted group table, which only exists when the
+/// table could be extracted at this revision.
+#[cfg(feature = "toolret")]
+mod routescale;
 mod embed;
 mod metrics;
 mod skillret;
@@ -43,9 +47,9 @@ mod lifted;
 pub use lifted::skill_lint;
 pub use lifted::skills;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct Datapoint {
@@ -87,6 +91,163 @@ fn main() {
 /// Reported as one row per arm with a delta against the baseline, plus the
 /// vector count each arm needed — quality and cost side by side, because the
 /// question being answered is whether a mechanism earns what it costs.
+/// Tool-group routing over the dataset-labelled corpus, swept across thresholds.
+#[cfg(feature = "toolret")]
+fn run_routescale(args: &[String]) -> Result<()> {
+    let corpus_path = flag(args, "--corpus")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus/toolret.json")
+        });
+    let json_out = flag(args, "--json").map(PathBuf::from);
+    let keep_worst: usize = flag(args, "--worst")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
+    if !corpus_path.exists() {
+        anyhow::bail!(
+            "no corpus at {}\n\nBuild it first:\n  ./fetch-toolret.py --out {}",
+            corpus_path.display(),
+            corpus_path.display()
+        );
+    }
+
+    // Read the file without the ranking-side transformation: routing needs the
+    // raw group membership, not a SkillTree.
+    let raw = std::fs::read_to_string(&corpus_path)
+        .with_context(|| format!("reading {}", corpus_path.display()))?;
+    let file: corpus::ToolRetFile =
+        serde_json::from_str(&raw).context("parsing the ToolRet corpus")?;
+
+    // Dense strategies need vectors. Without a key the tag baseline still runs
+    // and the strategy comparison is simply absent, rather than the whole
+    // measurement failing.
+    let lexical_only = args.iter().any(|a| a == "--lexical");
+    let cache_dir = flag(args, "--cache")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/opt/thetis/workspace/zero-retrieval-bench/cache"));
+    let mut embedder = if lexical_only {
+        None
+    } else {
+        embed::Embedder::new(&cache_dir, "openai/text-embedding-3-small", 1536)
+    };
+    if embedder.is_none() && !lexical_only {
+        eprintln!(
+            "note: no embeddings key, so only the tag baseline is measured; set OPENROUTER_API_KEY"
+        );
+    }
+
+    // `embed_all` persists the cache itself, so there is nothing to flush here.
+    let out = routescale::run(&file, keep_worst, embedder.as_mut())?;
+
+    println!("corpus  {}", corpus_path.display());
+    println!(
+        "routing {} queries over {} groups drawn from {} tools",
+        out.queries, out.groups, out.tools
+    );
+    if out.unlabelled > 0 {
+        println!(
+            "        {} queries unlabelled (no gold tool fell in any bucket)",
+            out.unlabelled
+        );
+    }
+    println!();
+    println!("  thresh   recall   spec     F1       groups/q  unrouted");
+    for p in &out.sweep {
+        let mark = if (p.threshold - out.shipped_threshold).abs() < 1e-9 {
+            " <- shipped"
+        } else if (p.threshold - out.best_threshold).abs() < 1e-9 {
+            " <- best F1"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<8.2} {:<8.4} {:<8.4} {:<8.4} {:<9.2} {:<8}{}",
+            p.threshold, p.recall, p.specificity, p.f1, p.mean_attached, p.unrouted, mark
+        );
+    }
+    println!();
+    if (out.best_threshold - out.shipped_threshold).abs() > 1e-9 {
+        println!(
+            "The shipped threshold {:.2} scores F1 {:.4}; the best swept value {:.2} scores {:.4}.",
+            out.shipped_threshold, out.at_shipped.f1, out.best_threshold, out.best_f1
+        );
+        println!(
+            "Treat that as a hint, not a setting: the buckets are synthesised, so the"
+        );
+        println!("optimum is fitted to my bucketing as much as to the queries.");
+    } else {
+        println!(
+            "The shipped threshold {:.2} is also the best swept value.",
+            out.shipped_threshold
+        );
+    }
+
+    if !out.strategies.is_empty() {
+        println!();
+        println!("Routing strategies, at the shipped threshold where applicable:");
+        println!(
+            "  {:<26} {:<8} {:<8} {:<8} {:<9} {:<9} {}",
+            "strategy", "recall", "spec", "F1", "groups/q", "unrouted", "cost"
+        );
+        for s in &out.strategies {
+            println!(
+                "  {:<26} {:<8.4} {:<8.4} {:<8.4} {:<9.2} {:<9} {}",
+                s.strategy, s.recall, s.specificity, s.f1, s.mean_attached, s.unrouted, s.cost
+            );
+        }
+    }
+
+    if let Some(worst) = &out.worst_cases {
+        println!();
+        println!("Worst cases at the shipped threshold:");
+        for c in worst.iter().take(5) {
+            println!("  F1 {:.2}  {}", c.f1, truncate(&c.query, 68));
+            if !c.missed.is_empty() {
+                println!("           missed: {}", c.missed.join(", "));
+            }
+            if !c.spurious.is_empty() {
+                println!("           spurious: {}", c.spurious.join(", "));
+            }
+        }
+    }
+
+    if let Some(path) = json_out {
+        let (commit, commit_date, subject) = git_facts(Path::new("."));
+        let doc = serde_json::json!({
+            "schema": 1,
+            "kind": "routescale",
+            "commit": commit,
+            "commit_date": commit_date,
+            "subject": subject,
+            "measured_at": now(),
+            "corpus": corpus_path.display().to_string(),
+            "source": file.source,
+            "labels": "derived: dataset per-tool relevance mapped through synthesised buckets",
+            "result": out,
+        });
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!();
+        println!("wrote {}", path.display());
+    }
+
+    Ok(())
+}
+
+/// Shorten a query for a fixed-width report without splitting a character.
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.chars().count() <= max {
+        return s;
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 fn run_ablation(args: &[String]) -> Result<()> {
     let corpus_path = flag(args, "--corpus")
         .map(PathBuf::from)
@@ -239,13 +400,27 @@ fn run_ablation(args: &[String]) -> Result<()> {
         let payload = serde_json::json!({
             "schema": 1,
             "kind": "ablation",
-            "corpus": corpus_path.display().to_string(),
+            // Report the corpus that was actually graded. `--skills` ignores
+            // corpus_path entirely, so printing it there labels the run with a
+            // file it never opened -- which is exactly the kind of mislabelling
+            // that makes a published chart untrustworthy.
+            "corpus": match &skills_dir {
+                Some(dir) => dir.display().to_string(),
+                None => corpus_path.display().to_string(),
+            },
+            "surface": if skills_dir.is_some() { "skills" } else { "toolret" },
             "source": file.source,
             "caveat": file.note,
             "docs": skills.len(),
             "queries": cases.len(),
             "groups": file.groups.len(),
-            "tree": if group_tree { "nested" } else { "flat" },
+            "tree": if skills_dir.is_some() {
+                "nested (real skill hierarchy)"
+            } else if group_tree {
+                "nested"
+            } else {
+                "flat"
+            },
             "limit": limit,
             "mode": mode.label(),
             "commit": git_facts(std::path::Path::new(".")).0,
@@ -272,6 +447,15 @@ fn run() -> Result<()> {
     // so a time series over it is flat by construction.
     if args.first().map(|a| a.as_str()) == Some("ablate") {
         return run_ablation(&args[1..]);
+    }
+
+    // `routescale` measures tool-group routing over ~1,600 dataset-labelled
+    // queries instead of 34 hand-written ones, and sweeps the threshold. Same
+    // reason as `ablate`: at n=34 one case is worth 3 points of recall, which is
+    // too coarse to see a regression in.
+    #[cfg(feature = "toolret")]
+    if args.first().map(|a| a.as_str()) == Some("routescale") {
+        return run_routescale(&args[1..]);
     }
 
     let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");

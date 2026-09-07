@@ -6,6 +6,7 @@
 //! gateways, the tools) are hot-swappable WebAssembly components that can be
 //! rebuilt, validated, and rolled back while the system keeps running.
 
+pub mod bench;
 pub mod bindings;
 pub mod branch_api;
 pub mod debug_api;
