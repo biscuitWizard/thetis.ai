@@ -17,6 +17,27 @@ pub mod agent {
     });
 }
 
+/// Interfaces the host implements ahead of the guest world that will import
+/// them. See `world host-staging` in the contract for why this exists: it lets
+/// the orchestrator answer a new import *before* any guest is compiled against
+/// it, which is the ordering that keeps a contract change recoverable.
+///
+/// Empty between contract additions, which is the normal state. To stage the
+/// next one: add `import <iface>;` to `world host-staging`, re-add a `with:`
+/// mapping here for any shared type the interface names (bindgen rejects a
+/// `with` entry the world does not reference, so it cannot be left behind),
+/// re-export the module below, implement the trait, build, restart — and only
+/// then move the import into `world agent`.
+pub mod staging {
+    wasmtime::component::bindgen!({
+        world: "host-staging",
+        path: "../../wit",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        additional_derives: [serde::Serialize, serde::Deserialize],
+    });
+}
+
 pub mod gateway {
     wasmtime::component::bindgen!({
         world: "gateway",
@@ -55,8 +76,8 @@ pub use agent::thetis::grip::types;
 /// implements and an `add_to_linker` used when building a linker.
 #[allow(unused_imports)]
 pub use agent::thetis::grip::{
-    branch, configuration, control, devkit, hostfs, llm, sandbox, session, skills, sys,
-    terminal, tooling,
+    branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, skills,
+    sys, terminal, tooling,
 };
 
 /// The gateway's read-only view of the skill corpus. It lives in the gateway

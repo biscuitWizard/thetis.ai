@@ -31,8 +31,8 @@ use crate::bindings::types::{
     ToolManifest,
 };
 use crate::bindings::{
-    branch, configuration, control, devkit, hostfs, llm, sandbox, session, sys, terminal,
-    tooling,
+    branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, sys,
+    terminal, tooling,
 };
 use crate::grip::Grip;
 use crate::runtime::HostState;
@@ -958,6 +958,223 @@ impl branch::Host for HostState {
             .map_err(|e| format!("{e:#}"));
         self.yielded();
         Ok(out)
+    }
+}
+
+// --- delegation --------------------------------------------------------------
+//
+// The agent's view of sub-agents. Every function here is scoped to the session
+// whose turn is running: a guest cannot spawn a child for somebody else, cannot
+// read another conversation's children, and cannot cancel a child that is not
+// its own. `delegation::spawn` and `cancel_child` enforce the last two; this
+// layer's job is to refuse a call that has no session at all, and to keep what
+// crosses back into the guest small.
+
+impl HostState {
+    /// Delegation acts on behalf of the conversation this turn belongs to. A
+    /// probe context has none, and a tool-listing probe must not be able to
+    /// spawn anything.
+    fn delegating_session(&self) -> Result<String> {
+        self.session_id
+            .clone()
+            .ok_or_else(|| err("delegation needs a session"))
+    }
+}
+
+impl delegation::Host for HostState {
+    async fn available(&mut self) -> Result<bool> {
+        self.budget.entered_host("available");
+        let cfg = &self.grip().cfg;
+        if !cfg.subagents.enabled {
+            return Ok(false);
+        }
+        // A sub-agent is told delegation is unavailable, not merely refused it
+        // at dispatch. Both are enforced, but this is the one that keeps the
+        // tools out of its prompt in the first place — the cheaper refusal,
+        // because a capability never offered is never attempted.
+        //
+        // With no session this is a probe — the chat surface asking what the
+        // tool surface looks like — and the honest answer is the configured
+        // one. Answering `false` here would hide delegation from the tool panel
+        // of a deployment that has it switched on.
+        let Some(session) = self.session_id.clone() else {
+            return Ok(true);
+        };
+        let grip = self.grip.clone();
+        let is_child = grip
+            .persist
+            .get_subagent(&session)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        self.yielded();
+        Ok(!is_child)
+    }
+
+    async fn profiles(&mut self) -> Result<Vec<delegation::AgentProfileInfo>> {
+        self.budget.entered_host("profiles");
+        Ok(self
+            .grip()
+            .cfg
+            .subagents
+            .profiles
+            .iter()
+            .map(|p| delegation::AgentProfileInfo {
+                id: p.id.clone(),
+                label: p.label.clone(),
+                description: p.description.clone(),
+                model: p.model.clone(),
+                mode: p.mode.clone(),
+            })
+            .collect())
+    }
+
+    async fn limits(&mut self) -> Result<delegation::DelegationLimits> {
+        self.budget.entered_host("limits");
+        let cfg = &self.grip().cfg;
+        Ok(delegation::DelegationLimits {
+            max_children: cfg.subagents.max_children as u32,
+            max_wait_secs: cfg.subagents.max_wait_secs,
+            max_result_bytes: cfg.subagents.max_result_bytes as u32,
+        })
+    }
+
+    async fn spawn(
+        &mut self,
+        req: delegation::SpawnRequest,
+    ) -> Result<std::result::Result<delegation::SubagentInfo, String>> {
+        self.budget.entered_host("spawn");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let out = crate::delegation::spawn(
+            &grip,
+            &parent,
+            crate::delegation::SpawnRequest {
+                label: req.label,
+                task: req.task,
+                profile: req.profile,
+                model: req.model,
+                mode: req.mode,
+            },
+        )
+        .await
+        .map(|row| info_from_row(&row, grip.cfg.subagents.max_result_bytes))
+        .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn children(&mut self) -> Result<Vec<delegation::SubagentInfo>> {
+        self.budget.entered_host("children");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let rows = grip.persist.subagents_of(&parent).await.unwrap_or_default();
+        let cap = grip.cfg.subagents.max_result_bytes;
+        self.yielded();
+        Ok(rows.iter().map(|r| info_from_row(r, cap)).collect())
+    }
+
+    /// Blocks the parent's turn until a predicate holds or the deadline passes.
+    ///
+    /// Returns the whole child list rather than only what the predicate
+    /// matched, because a parent that has just been woken almost always wants
+    /// to know the state of everything it started, and a second call to get it
+    /// would be a wasted round trip through the guest boundary.
+    async fn wait(
+        &mut self,
+        until: String,
+        children: Vec<String>,
+        timeout_secs: u64,
+    ) -> Result<std::result::Result<delegation::WaitResult, String>> {
+        self.budget.entered_host("wait");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let cap = grip.cfg.subagents.max_result_bytes;
+
+        let predicate = match crate::delegation::WaitFor::parse(&until, children) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(format!("{e:#}"))),
+        };
+        let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+
+        // Deliberately *not* wrapped in `interruptible`: `delegation::wait`
+        // races the stop signal itself, and needs to, because it must be able
+        // to report a partial result rather than have the wait abandoned from
+        // outside with nothing to say.
+        let out = crate::delegation::wait(&grip, &parent, &predicate, timeout)
+            .await
+            .map(|o| delegation::WaitResult {
+                reason: o.reason,
+                timed_out: o.timed_out,
+                children: o.children.iter().map(|r| info_from_row(r, cap)).collect(),
+            })
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    async fn cancel_child(
+        &mut self,
+        child_id: String,
+    ) -> Result<std::result::Result<delegation::SubagentInfo, String>> {
+        self.budget.entered_host("cancel_child");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let out = crate::delegation::cancel_child(&grip, &parent, &child_id)
+            .await
+            .map(|row| info_from_row(&row, grip.cfg.subagents.max_result_bytes))
+            .map_err(|e| format!("{e:#}"));
+        self.yielded();
+        Ok(out)
+    }
+
+    /// A child's transcript, for the rare case where the parent needs more than
+    /// the final answer — a failure it wants to diagnose, usually.
+    ///
+    /// Scoped to this session's own children on purpose: without the check this
+    /// would be a way to read any conversation in the database by id.
+    async fn child_transcript(
+        &mut self,
+        child_id: String,
+        from_seq: u64,
+    ) -> Result<std::result::Result<Vec<EventRecord>, String>> {
+        self.budget.entered_host("child_transcript");
+        let parent = self.delegating_session()?;
+        let grip = self.grip.clone();
+        let row = grip.persist.get_subagent(&child_id).await.ok().flatten();
+        let out = match row {
+            Some(row) if row.parent_id == parent => grip
+                .persist
+                .events(&child_id, from_seq)
+                .await
+                .map_err(|e| format!("{e:#}")),
+            _ => Err(format!("`{child_id}` is not one of this session's sub-agents")),
+        };
+        self.yielded();
+        Ok(out)
+    }
+}
+
+/// Wire form of a registry row, with the answer clamped to what the parent's
+/// context should carry.
+fn info_from_row(
+    row: &crate::subagents::SubagentRow,
+    max_result_bytes: usize,
+) -> delegation::SubagentInfo {
+    delegation::SubagentInfo {
+        id: row.child_id.clone(),
+        label: row.label.clone(),
+        task: row.task.clone(),
+        profile: row.agent_aspect.clone(),
+        model: row.model.clone(),
+        mode: row.mode.clone(),
+        state: row.state.as_str().to_string(),
+        answer: crate::delegation::clamp_result(&row.result, max_result_bytes),
+        detail: row.detail.clone(),
+        cost_usd: row.cost_usd,
+        created_ms: row.created_ms,
+        finished_ms: row.finished_ms,
     }
 }
 

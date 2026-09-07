@@ -167,6 +167,74 @@ pub struct ModeSpec {
     pub prompt: String,
 }
 
+/// A named kind of agent a parent may delegate to.
+///
+/// A profile is a *bundle* of the things that make one agent different from
+/// another — which model thinks, which mode constrains it, and what standing
+/// instruction it starts from. Bundling them is what makes delegation legible
+/// at the call site: `agent = "reviewer"` says what the child is for, where
+/// three separate overrides only say how it is configured.
+///
+/// Profiles are configuration rather than code because the useful ones are
+/// discovered by use. The research on orchestrator-worker systems is consistent
+/// that a cheap fast worker under an expensive lead is the arrangement that
+/// pays, and that is a two-line config change here.
+#[derive(Debug, Clone)]
+pub struct AgentProfile {
+    pub id: String,
+    pub label: String,
+    /// Shown to the spawning agent, so it can choose between profiles.
+    pub description: String,
+    /// Model id from `[[models]]`. Empty inherits the parent's.
+    pub model: String,
+    /// Mode id from `[[modes]]`. Empty inherits the grip default.
+    pub mode: String,
+    /// Prepended to the child's task briefing. This is the profile's character:
+    /// "you review, you do not edit", "you search widely and cite".
+    pub prompt: String,
+}
+
+/// Delegation policy: whether an agent may spawn sub-agents, and how far.
+#[derive(Debug, Clone)]
+pub struct SubagentSettings {
+    /// Master switch. Off withholds the delegation tools entirely.
+    pub enabled: bool,
+    /// Live children one parent may have at once. The multi-agent failure
+    /// literature names unbounded fan-out explicitly, and a cap on *live*
+    /// children rather than on total spawns is the one that bounds cost without
+    /// bounding usefulness.
+    pub max_children: usize,
+    /// Ceiling on a single `wait` call, in seconds. A parent that waits forever
+    /// is indistinguishable from a hung turn.
+    pub max_wait_secs: u64,
+    /// How much of a child's answer is spliced into the parent's tool result.
+    /// The point of delegation is that the parent pays for the conclusion, so
+    /// this is deliberately far smaller than a context window.
+    pub max_result_bytes: usize,
+    /// Mode a child runs in when neither the profile nor the call names one.
+    pub default_mode: String,
+    pub profiles: Vec<AgentProfile>,
+}
+
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_children: 8,
+            max_wait_secs: 1800,
+            max_result_bytes: 24_576,
+            default_mode: String::new(),
+            profiles: Vec::new(),
+        }
+    }
+}
+
+impl SubagentSettings {
+    pub fn profile(&self, id: &str) -> Option<&AgentProfile> {
+        self.profiles.iter().find(|p| p.id == id)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data: PathBuf,
@@ -607,6 +675,7 @@ pub struct Config {
     pub cache: CacheSettings,
     pub skills: SkillSettings,
     pub tool_groups: ToolGroupSettings,
+    pub subagents: SubagentSettings,
     pub build: BuildSettings,
     pub wasi: WasiSettings,
     pub watchdog: WatchdogSettings,
@@ -948,6 +1017,7 @@ mod spec {
         pub paths: Paths,
         pub skills: Skills,
         pub tool_groups: ToolGroups,
+        pub subagents: Subagents,
         pub llm: Llm,
         pub agent: Agent,
         pub providers: Vec<Provider>,
@@ -1169,6 +1239,45 @@ mod spec {
         pub description: String,
         #[serde(default)]
         pub read_only: bool,
+        #[serde(default)]
+        pub prompt: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(default)]
+    pub struct Subagents {
+        pub enabled: bool,
+        pub max_children: usize,
+        pub max_wait_secs: u64,
+        pub max_result_bytes: usize,
+        pub default_mode: String,
+        pub profiles: Vec<AgentProfile>,
+    }
+    impl Default for Subagents {
+        fn default() -> Self {
+            let d = super::SubagentSettings::default();
+            Self {
+                enabled: d.enabled,
+                max_children: d.max_children,
+                max_wait_secs: d.max_wait_secs,
+                max_result_bytes: d.max_result_bytes,
+                default_mode: d.default_mode,
+                profiles: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct AgentProfile {
+        pub id: String,
+        #[serde(default)]
+        pub label: String,
+        #[serde(default)]
+        pub description: String,
+        #[serde(default)]
+        pub model: String,
+        #[serde(default)]
+        pub mode: String,
         #[serde(default)]
         pub prompt: String,
     }
@@ -2011,6 +2120,49 @@ impl Config {
             );
         }
 
+        // Delegation profiles. Validated here rather than at spawn time: a
+        // profile naming a model or mode that does not exist is a typo in the
+        // config, and finding it at startup is far better than finding it when
+        // an agent tries to delegate mid-turn.
+        let mut profiles: Vec<AgentProfile> = Vec::new();
+        for p in file.subagents.profiles {
+            if p.id.is_empty() {
+                anyhow::bail!("every [[subagents.profiles]] entry needs an id");
+            }
+            if !p.model.is_empty() && !models.iter().any(|m| m.id == p.model) {
+                anyhow::bail!(
+                    "agent profile `{}` names model `{}`, which is not in [[models]]",
+                    p.id,
+                    p.model
+                );
+            }
+            if !p.mode.is_empty() && !modes.iter().any(|m| m.id == p.mode) {
+                anyhow::bail!(
+                    "agent profile `{}` names mode `{}`, which is not in [[modes]]",
+                    p.id,
+                    p.mode
+                );
+            }
+            profiles.push(AgentProfile {
+                label: if p.label.is_empty() { p.id.clone() } else { p.label },
+                id: p.id,
+                description: p.description,
+                model: p.model,
+                mode: p.mode,
+                prompt: p.prompt.replace(AGENT_NAME_PLACEHOLDER, &agent_name),
+            });
+        }
+        let subagent_default_mode = if file.subagents.default_mode.is_empty() {
+            default_mode.clone()
+        } else {
+            file.subagents.default_mode
+        };
+        if !modes.iter().any(|m| m.id == subagent_default_mode) {
+            anyhow::bail!(
+                "subagents.default_mode `{subagent_default_mode}` is not one of the configured modes"
+            );
+        }
+
         let config = Self {
             paths,
             bind_addr,
@@ -2114,6 +2266,18 @@ impl Config {
                 accounting_enabled: file.tool_groups.accounting_enabled,
                 always_on: file.tool_groups.always_on,
                 route_threshold: file.tool_groups.route_threshold.clamp(0.0, 1.0),
+            },
+
+            subagents: SubagentSettings {
+                enabled: env.parse("THETIS_SUBAGENTS", file.subagents.enabled),
+                // Zero would mean "no children at all", which is what
+                // `enabled = false` is for; clamped so a stray 0 cannot
+                // silently disable delegation.
+                max_children: file.subagents.max_children.clamp(1, 64),
+                max_wait_secs: file.subagents.max_wait_secs.clamp(1, 21_600),
+                max_result_bytes: file.subagents.max_result_bytes.clamp(1_024, 1_048_576),
+                default_mode: subagent_default_mode,
+                profiles,
             },
 
             build: BuildSettings {

@@ -5,7 +5,7 @@ when_to_use = "Use when you must find the file that owns a behaviour, before you
 universal = false
 tags = ["source map", "repository layout", "files", "modules", "orchestrator", "crates", "where is", "host_api", "pipeline", "tool-group:selfmod"]
 related = ["careful-surgery"]
-version = 3
+version = 4
 ---
 
 # Where to find things in the source
@@ -84,7 +84,9 @@ Grouped by concern.
 | File | Owns |
 |---|---|
 | `store.rs` | Sessions, event logs, the KV store, spend accounting, the branch registry. |
-| `session.rs` | One tokio task for each active session. This makes concurrent input safe. |
+| `session.rs` | One tokio task for each active session. This makes concurrent input safe. Also settles a sub-agent when its turn ends. |
+| `subagents.rs` | The sub-agent registry: parentage, state, the depth guard and the fan-out cap. See `thetis-internals/delegation`. |
+| `delegation.rs` | Spawning a child session, the wait predicates, cancellation, and tagging a child's frames. |
 | `llm.rs` | The chat-completions client, across every configured OpenAI-compatible provider. The request's `model` picks the endpoint via `Config::resolve_model`, and is rewritten to that provider's own name for it. Reassembles partial tool-call deltas, so you only see complete calls. |
 | `cache.rs` | Prompt cache breakpoints. Applied host-side, so you cannot break caching by rewriting your loop. |
 | `config.rs` | The three configuration layers and the `Secret` type. |

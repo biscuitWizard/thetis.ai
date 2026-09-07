@@ -263,6 +263,94 @@ this surface is read-only and what you would have needed, rather than working \
 around it or pretending it is done.
 """
 
+# Delegation: an agent spawning agents.
+#
+# A sub-agent is a child session. It has its own event log and its own context
+# window, but it shares the parent's worker process, branch and checkout. The
+# isolation that matters is of *context*: a child explores a subproblem and
+# hands back one answer, so the parent pays for the conclusion rather than for
+# every step that produced it. Sharing the checkout is what makes this useful
+# for code work -- a child editing files in a worktree of its own would leave
+# the parent unable to see, build or commit the result.
+#
+# Two rules are structural and not configurable:
+#   - A sub-agent cannot spawn sub-agents. One level keeps fan-out bounded and
+#     the transcript readable.
+#   - A sub-agent cannot ask a question. Its only correspondent is a parent
+#     that is itself mid-turn, so a question would wait forever.
+[subagents]
+# THETIS_SUBAGENTS overrides this. With it off, the delegation tools are not
+# offered at all rather than offered and refused.
+enabled = true
+# Ceiling on *live* children at once, not on children ever spawned: a parent
+# that fans out, waits, and fans out again is doing the right thing. This is the
+# bound against the "unbounded subagent spawn" failure mode -- an agent that can
+# start work faster than it can finish it.
+max_children = 8
+# Longest a single `wait` may block, whatever the caller asks for. A wait that
+# could run forever is indistinguishable from a hung turn, both to the person
+# watching the spinner and to the reaper deciding whether this worker is idle.
+max_wait_secs = 1800
+# A child's answer is clamped to this before it enters the parent's context.
+# The whole point of delegation is that the parent reads a conclusion rather
+# than a transcript; without a ceiling a verbose child undoes that. The parent
+# can still read the full log with `agent_transcript`.
+max_result_bytes = 24576
+# The mode children run in when neither the profile nor the spawn names one.
+# Empty falls back to agent.default_mode.
+default_mode = ""
+
+# Named agent profiles a parent may spawn. A profile bundles a model, a mode and
+# a prompt, so the parent picks a *role* rather than restating one every time.
+#
+# The parent may always override the model and the mode per spawn; a profile is
+# a default, never a restriction. Spawning with no profile gives a plain child
+# on the grip's own model and mode.
+#
+# `model` and `mode` must name entries in [[models]] and [[modes]] above, and
+# startup fails loudly if they do not -- a profile that silently fell back to
+# the default would be a slow, expensive surprise.
+#
+# The economics are the reason to bother. A cheaper model on a bounded,
+# well-specified subtask is the case where delegation pays for itself: a strong
+# model plans and reads the answers, weaker ones do the legwork in parallel.
+
+[[subagents.profiles]]
+id = "scout"
+label = "Scout"
+description = "Reads and searches. Answers a question about the code or the web without changing anything."
+model = "anthropic/claude-sonnet-5"
+mode = "plan"
+prompt = """
+You are a scout. Your job is to find something out and report it accurately.
+
+Search and read as widely as the question needs, then answer in prose with the \
+evidence attached: file paths with line numbers, URLs, quoted output. A claim \
+without a citation is a guess, and your parent cannot tell the difference from \
+where it is sitting.
+
+Say plainly what you could not find. An honest gap is useful; a confident \
+answer covering a gap is worse than nothing, because it will be acted on.
+"""
+
+[[subagents.profiles]]
+id = "worker"
+label = "Worker"
+description = "Full access. Carries out a bounded implementation task in the shared checkout."
+model = "anthropic/claude-sonnet-5"
+mode = "agent"
+prompt = """
+You are carrying out one bounded piece of implementation work.
+
+You share a checkout with your parent and with any sibling agents working \
+alongside you. Stay inside the files your task names. A change outside them may \
+collide with work you cannot see, and you are not the one who will notice.
+
+Verify before you report. Build it, run the test, quote the output that shows it \
+works -- your parent will act on your answer without re-checking it, so a \
+compile you did not run is a claim you should not make.
+"""
+
 # Summarizing a long conversation down, so it can keep going past the window.
 #
 # The trigger is the provider's own usage.prompt_tokens from the last turn - the
