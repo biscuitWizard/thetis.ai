@@ -26,10 +26,10 @@ the surface got sloppy the last time.
 | Main | `--measure` 48rem, centred | The conversation: transcript, composer | Get replaced by another view |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
 
-Inside Main, `.stage` flanks the transcript with an avatar column on each side —
-the user's left, the agent's right — in the slack a wide window already has. The
-text column is untouched: the portraits appear only above a derived container
-width and retract when a rail panel docks. See `references/tokens.md`.
+Inside Main, each turn's byline carries a small avatar tile beside the name —
+yours on your rows, the agent's on its own. It sits inside the row's `--measure`
+column, so it costs the conversation no width and needs no breakpoint. See
+`references/tokens.md`.
 
 **The one structural rule: an inspector is a rail tab, not a modal.** The rail
 docks — the chat reflows beside it and stays readable and typable with anything

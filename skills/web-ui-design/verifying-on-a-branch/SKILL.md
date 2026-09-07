@@ -90,7 +90,17 @@ curl -s http://127.0.0.1:7788/app.css | grep -c <a-new-class>
 ```
 
 Note also that `terminal_run` refuses a `cd` outside your own worktree, so drive
-the clone with `git -C /tmp/uitest ...` rather than changing directory into it.
+the clone with `git -C /tmp/uitest ...` rather than changing directory into it —
+and to edit a file in it (say, setting `agent.avatar` in its `thetis.toml` to
+exercise a configured-picture path), use a heredoc'd `python3 -` rather than
+`cd /tmp/uitest && sed -i`, which is refused for the same reason.
+
+The binary is `/opt/thetis/target/release/thetis`. A worktree has no
+`target/` of its own, so pointing at `<worktree>/target/release/thetis` fails
+with `No such file or directory`.
+
+Python buffers stdout when redirected to a file, so a detached probe looks like
+it produced nothing at all until it exits. Always `python3 -u`.
 To move the test gateway onto a new commit, keep the warm data dir and
 `git -C /tmp/uitest fetch && reset --hard origin/HEAD`, then restart it — that
 is seconds, against minutes for a fresh clone.
@@ -135,6 +145,17 @@ Two assertions that look right and are not:
   check the group's own height equals its `summary`'s.
 - **Exact-equality width checks fail on subpixel layout.** A paragraph filling
   its parent measures 551 against an inner box of 553. Allow ~3px.
+- **A fixture that fails the happy path proves nothing.** A hand-typed base64
+  PNG used to test avatar upload was malformed, so every assertion came back
+  "no image" — which is also what a broken feature looks like. It only showed up
+  because the toast read "Could not read face.png as an image." Generate binary
+  fixtures with a script, and assert the *success* branch was the one taken.
+
+There is no API key on a test gateway, so no assistant turn can be produced.
+Don't fake DOM to get one: `import()` the view module in the page and call its
+renderer. ES modules are cached per URL, so that is the very instance the app is
+running, and the row comes out of the real code path —
+`await import('/views/transcript.js')` then `applyEvent({kind: 'assistant', …})`.
 
 Give a panel fed by a live worker a long poll, not a fixed sleep: a fresh
 instance builds every tool component before the Tools frame answers, which is

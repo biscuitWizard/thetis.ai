@@ -66,7 +66,7 @@ self-served.
 | Space | `--gap-1` 4 · `--gap-2` 8 · `--gap-3` 12 · `--gap-4` 16 · `--gap-5` 24 · `--gap-6` 32 |
 | Shadow | `--shadow-sm` · `--shadow-md` · `--shadow-lg` — floating layers only |
 | Motion | `--ease` `cubic-bezier(.2,.7,.3,1)` · `--fast` 110ms · `--med` 180ms, both 0 under `prefers-reduced-motion` |
-| Layout | `--sidebar-w` 272px · `--measure` 48rem · `--portrait-w` 132px · `--portrait-w-lg` 208px |
+| Layout | `--sidebar-w` 272px · `--measure` 48rem · `--avatar-sm` 26px |
 
 Radius by role: `--r-sm` for inputs and small chips, `--r-md` for cards, buttons
 and panels' inner blocks, `--r-lg` for a message bubble, `--r-xl` for the
@@ -81,30 +81,36 @@ composer, `--r-pill` for pills and the send button.
 | Under 1100px | Panel goes `position: fixed`, floats over the chat, strip stays |
 | Under 860px | Sidebar narrows to 210px, composer hint hides |
 
-### The stage: avatars beside the conversation
+### Byline avatars
 
-`.stage` wraps the transcript in a row with a `.stage-avatar` column either
-side — the user's portrait left, the agent's right, matching the side each one's
-messages are attributed on. The transcript keeps `--measure` and stays centred;
-the columns only take slack the window already had.
+A `.byline-avatar` tile sits at the head of each turn, inside `.row-head`
+beside the name: `--avatar-sm` (26px) square, `--r-sm`, the image cropped
+`object-position: top center`. Squares, not portrait crops — at this size a 3:4
+tile reads as a sliver, and squares line up down the transcript's left edge.
 
-**Measure with a container query, not a media query.** `.main` is
-`container-type: inline-size`, and the thresholds are on `@container stage`.
-The space beside the transcript depends on the docked rail panel as well as the
-viewport, and a media query cannot see it — so a viewport rule would keep the
-portraits and crush the text the moment an inspector opened. Verified: at a
-1600px viewport `.main` is 1284px and the portraits show at 208px each; docking
-a panel drops `.main` to 924px and they retract to nothing, transcript back to
-full width.
+**Put avatars in the byline, not in a gutter beside the conversation.** Flanking
+columns were built first, at 132/208px with container-query thresholds, and were
+wrong: the ask was "next to the name on each turn", and a decorative portrait
+that appears only above 1116px is not the same feature as an attribution mark
+that is always there. The byline version costs the conversation no width, works
+at every size, and needs no breakpoint at all. If a per-turn face is what is
+wanted, the row is where it goes.
 
-Derive each threshold rather than picking a round number:
-`--measure` + 2 × `--gap-5` + 2 × (portrait width + `--gap-4`), rounded up.
-That is 1116px for the small portrait and 1268px for the large one. A guessed
-1150px looked reasonable and meant the portraits never appeared at 1440px,
-because `.main` is only 1124px there.
+Both roles come from `<template>` elements in `index.html`, cloned per row, so
+the markup for a face lives in one place rather than in each renderer.
 
-Both columns are laid out whenever either is, so the centre column cannot drift
-off-axis when only one side has a picture.
+**The two sources differ, and that asymmetry is the whole design.** The agent's
+is `agent.avatar` from config, substituted into its template at serve time, so
+it is right on the first paint. Yours lives in the host KV store and arrives on
+a `user-avatar` frame *after* rows are on screen — so `draw()` repaints every
+`.byline-avatar.is-user` already in the DOM as well as recording the value for
+tiles minted later. Without that, an upload appears only on subsequent turns and
+a replayed transcript keeps the blank mark. Verified: two rows rendered before
+the upload both picked it up, `tiles_showing_both: 0`, and a row rendered
+afterwards came out already filled.
+
+A role with no face (a system note, a tool row) gets a byline with no tile,
+rather than an empty square: `bylineAvatar()` returns null and `el()` skips it.
 
 ## Component markup
 
