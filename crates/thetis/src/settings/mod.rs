@@ -28,6 +28,14 @@
 //! `schema` describes every setting once — type, help, environment override —
 //! so the surfaces that edit them render from it rather than knowing the
 //! configuration themselves.
+//!
+//! A third kind of file joins those two: a module fragment under `conf.d/`
+//! (see [`crate::config::fragment_files`]). A key already set in one is written
+//! back there, because a fragment is merged over `thetis.toml` — so a write to
+//! the committed file would be overridden at the next boot — and because a
+//! private module's settings belong in the directory its marker covers.
+//! Validation judges the whole stack together for the same reason it judges
+//! two files together.
 
 pub mod schema;
 
@@ -195,17 +203,38 @@ pub fn get(cfg: &Config, key: &str) -> Result<Option<Setting>> {
 pub fn write_target(cfg: &Config, key: &str) -> PathBuf {
     let overlay = cfg.local_overlay();
     let path: Vec<&str> = key.split('.').collect();
-    let in_overlay = document_at(&overlay)
-        .ok()
-        .and_then(|doc| traverse(&doc, &path).map(|_| ()))
-        .is_some();
+    let in_overlay = has_key(&overlay, &path);
     let secret = is_secret(key) || schema::field(key).is_some_and(|f| f.kind == Kind::Secret);
     let account = matches!(path.first().copied(), Some("auth" | "roles" | "users"));
     if in_overlay || secret || account {
-        overlay
-    } else {
-        cfg.config_path.clone()
+        return overlay;
     }
+    // A module's own settings stay in the module's fragment, for the same
+    // reason a key already in the overlay stays there: a fragment is merged
+    // over `thetis.toml`, so a write that landed in the committed file would be
+    // overridden again at the next boot and appear to have done nothing. It
+    // also keeps a private module's configuration inside the directory its
+    // `.thetis-private` marker covers, instead of migrating it a setting at a
+    // time into the file that gets published.
+    if let Some(fragment) = fragments(cfg).into_iter().find(|f| has_key(f, &path)) {
+        return fragment;
+    }
+    cfg.config_path.clone()
+}
+
+/// The module fragments beside the config file, in merge order.
+fn fragments(cfg: &Config) -> Vec<PathBuf> {
+    crate::config::fragment_files(&cfg.config_path)
+}
+
+/// Whether `path` is set in the file at `at`. A file that will not parse
+/// answers "no": the write is validated against the whole stack afterwards,
+/// which is where a broken layer is reported properly.
+fn has_key(at: &Path, path: &[&str]) -> bool {
+    document_at(at)
+        .ok()
+        .and_then(|doc| traverse(&doc, path).map(|_| ()))
+        .is_some()
 }
 
 /// Validates the two files as they would load together, with `candidate`
@@ -219,15 +248,31 @@ fn write_validated(cfg: &Config, target: &Path, candidate: &str, what: &str) -> 
             Ok(String::new())
         }
     };
+    // Every layer as it would be after this write: the candidate stands in for
+    // whichever one `target` names, and the rest are read from disk. A module
+    // fragment is a layer like the other two, so a write into one is judged
+    // against the same whole-stack load.
+    let mut fragment_layers = Vec::new();
+    for path in fragments(cfg) {
+        let text = if path == target {
+            candidate.to_string()
+        } else {
+            other(&path)?
+        };
+        fragment_layers.push((path, text));
+    }
+    let writing_fragment = fragment_layers.iter().any(|(path, _)| path == target);
     let (file_text, overlay_text) = if target == overlay {
         (other(&cfg.config_path)?, candidate.to_string())
+    } else if writing_fragment {
+        (other(&cfg.config_path)?, other(&overlay)?)
     } else {
         (candidate.to_string(), other(&overlay)?)
     };
 
     // The whole point of the guard: a config Thetis cannot load leaves it
     // unable to start, and nothing in-band can fix that.
-    Config::validate_layers(&file_text, &overlay_text, &cfg.root)
+    Config::validate_stack(&file_text, &fragment_layers, &overlay_text, &cfg.root)
         .with_context(|| format!("{what} would make the configuration invalid"))?;
 
     std::fs::write(target, candidate).with_context(|| format!("writing {}", target.display()))
@@ -1337,6 +1382,36 @@ data = "data"
         assert_eq!(
             write_target(&cfg, "auth.session_ttl_hours"),
             cfg.local_overlay()
+        );
+    }
+
+    /// A module's setting must go back to the module's own file. Writing it to
+    /// `thetis.toml` would be overridden by the fragment at the next boot — the
+    /// edit would appear to do nothing — and would move a private module's
+    /// configuration into the file that gets published, one setting at a time.
+    #[test]
+    fn a_key_set_in_a_module_fragment_is_written_back_to_that_fragment() {
+        let (cfg, dir) = fixture();
+        let fragment = dir.path().join("conf.d/atlas/atlas.toml");
+        std::fs::create_dir_all(fragment.parent().unwrap()).unwrap();
+        std::fs::write(&fragment, "[atlas]\nenabled = false\nport = 39413\n").unwrap();
+
+        assert_eq!(write_target(&cfg, "atlas.port"), fragment);
+        set(&cfg, "atlas.port", "39414").unwrap();
+        assert!(std::fs::read_to_string(&fragment)
+            .unwrap()
+            .contains("port = 39414"));
+        assert!(
+            !std::fs::read_to_string(&cfg.config_path)
+                .unwrap()
+                .contains("atlas"),
+            "the published file must not acquire the module's settings"
+        );
+
+        // A key the module does not claim still goes to the committed file.
+        assert_eq!(
+            write_target(&cfg, "agent.max_iterations"),
+            cfg.config_path.clone()
         );
     }
 

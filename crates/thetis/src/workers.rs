@@ -1188,8 +1188,8 @@ mod tests {
     fn a_frame_from_an_older_worker_belongs_to_the_primary() {
         assert_eq!(frame_gateway(&json!({ "frame": "{}" }), "web"), "web");
         assert_eq!(
-            frame_gateway(&json!({ "gateway": "campaign" }), "web"),
-            "campaign"
+            frame_gateway(&json!({ "gateway": "extra" }), "web"),
+            "extra"
         );
     }
 }

@@ -1495,9 +1495,9 @@ mod mount_tests {
     #[test]
     fn host_frames_reach_every_socket_but_gateway_frames_are_filtered() {
         assert!(frame_for_socket(None, "web"));
-        assert!(frame_for_socket(None, "campaign"));
-        assert!(frame_for_socket(Some("campaign"), "campaign"));
-        assert!(!frame_for_socket(Some("web"), "campaign"));
+        assert!(frame_for_socket(None, "extra"));
+        assert!(frame_for_socket(Some("extra"), "extra"));
+        assert!(!frame_for_socket(Some("web"), "extra"));
     }
 }
 

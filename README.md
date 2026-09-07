@@ -340,25 +340,15 @@ Anything in the file can be overridden per run. The common ones:
 Budget and limit values have `THETIS_`-prefixed overrides too, named after
 their keys — `THETIS_TURN_BUDGET_SECS`, `THETIS_MAX_ITERATIONS`, and so on.
 
-**Tabletop RPG campaigns.** Open `/play` for campaign setup, character creation,
-branching stories, relationship memory, character advancement, combat and
-character fate, trading, task-specific models, rules lookup, and portable saves. Cyberpunk
-RED and the intentionally small D20 starter system share the canonical
-`rpg/rules` implementation. Operating guides live under [`skills/rpg`](skills/rpg).
-A campaign is judged by playing it: restart the service and play one at `/play`
-against a local model. See the
-[campaign review and verification report](docs/campaign-review.md) for coverage
-and implementation boundaries.
-
 ## Layout
 
 ```
 thetis.toml             configuration; every path below is one of its settings
+conf.d/<module>/        a module's own configuration, merged over thetis.toml
 wit/thetis.wit          the host/guest contract — changing it rebuilds every guest
 crates/thetis           the kernel: loader, pipeline, revisions, watchdogs, web
 agents/agent-core        the agent's own source, which it can rewrite
 gateways/gateway-web     chat UI and wire protocol
-rpg/rules                shared tabletop campaign rules and state crate
 skills/<id>/SKILL.md      instruction sets retrieved or attached to a conversation
 tools/<name>             tools the agent scaffolds for itself
 templates/tool-template  what new_tool starts from

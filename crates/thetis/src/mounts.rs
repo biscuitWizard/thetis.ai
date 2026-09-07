@@ -108,9 +108,9 @@ mod tests {
     #[test]
     fn valid_file_parses() {
         assert_eq!(
-            parse_mount("campaign", "mount = \"/play\"\n").unwrap(),
+            parse_mount("extra", "mount = \"/play\"\n").unwrap(),
             GatewayMount {
-                gateway: "campaign".into(),
+                gateway: "extra".into(),
                 path: "/play".into()
             }
         );

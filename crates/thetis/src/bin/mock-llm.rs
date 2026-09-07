@@ -464,7 +464,7 @@ mod tests {
             {
                 "when": "(?i)attack.*guard",
                 "reply": { "text": "first", "tool_calls": [{
-                    "name": "rpg-check",
+                    "name": "dice-check",
                     "arguments": { "skill": "melee", "difficulty": "hard" }
                 }] }
             },
@@ -477,7 +477,7 @@ mod tests {
             Script::Scripted { text, tool_calls } => {
                 assert_eq!(text.as_deref(), Some("first"));
                 assert_eq!(tool_calls.len(), 1);
-                assert_eq!(tool_calls[0].0, "rpg-check");
+                assert_eq!(tool_calls[0].0, "dice-check");
                 assert_eq!(tool_calls[0].1["skill"], "melee");
             }
             _ => panic!("expected scripted reply"),

@@ -2066,6 +2066,96 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+/// Where per-module configuration fragments live: `conf.d` beside the config
+/// file.
+///
+/// A module that is not part of every checkout — a private gateway, a tool
+/// suite somebody keeps to themselves — has nowhere to put its settings except
+/// the one committed file everybody shares, and a file cannot be half
+/// published. A directory can: the publish filter removes a directory carrying
+/// a `.thetis-private` marker whole (`crates/thetis/src/publish.rs`), so a
+/// module whose configuration lives in `conf.d/<module>/` leaves the export
+/// along with its code, through the one mechanism that already exists rather
+/// than a second one that understands TOML.
+pub fn fragment_dir(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("conf.d")
+}
+
+/// Every `*.toml` under [`fragment_dir`], deepest paths and all, sorted.
+///
+/// Sorted by full path so the merge order is a property of the tree and not of
+/// whatever order the filesystem hands directory entries back in: two machines
+/// with the same files must produce the same configuration. A module owns a
+/// directory rather than a file so its marker, its fragment and anything else
+/// it needs sit together.
+///
+/// A missing or empty directory yields nothing, which is the public build's
+/// normal state.
+pub fn fragment_files(config_path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_fragments(&fragment_dir(config_path), &mut out);
+    out.sort();
+    out
+}
+
+fn collect_fragments(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_fragments(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            out.push(path);
+        }
+    }
+}
+
+/// Deep-merges a module fragment into `base`.
+///
+/// [`merge_toml`] with one difference, and it is the whole point: an array of
+/// tables — the `[[modes]]`, `[[models]]` and `[[providers]]` lists — is
+/// *appended* to rather than replaced. A fragment exists to add a module's
+/// entries to lists the base file already fills, so replacing would mean the
+/// first fragment to declare one `[[modes]]` silently deleted every mode
+/// `thetis.toml` declares, and the default mode would then name a mode that no
+/// longer exists. Appending also keeps the base file's entries first, so a
+/// module's modes land after the ones everybody has.
+///
+/// Arrays of anything else are still replaced, as in an overlay. Those are
+/// settings — `tools.allow`, `cache.explicit_vendors` — and a module that sets
+/// one means to set it, not to grow it; appending would also make such a list
+/// impossible to shorten from a fragment.
+fn merge_fragment(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_fragment(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (toml::Value::Array(base), toml::Value::Array(overlay))
+            if is_array_of_tables(base) && is_array_of_tables(&overlay) =>
+        {
+            base.extend(overlay);
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+/// Whether a TOML array is one `[[section]]` writes: non-empty and all tables.
+///
+/// Empty is deliberately not one. `modes = []` in a fragment then replaces
+/// rather than appends, which is the only way a fragment can empty a list.
+fn is_array_of_tables(array: &[toml::Value]) -> bool {
+    !array.is_empty() && array.iter().all(toml::Value::is_table)
+}
+
 /// Config blocks a tool reads, least specific first.
 ///
 /// `notion-search` yields ["notion", "notion-search"]; `web-search` yields
@@ -2176,6 +2266,16 @@ impl Config {
 
         let mut merged = read_toml(&config_path)?;
 
+        // Per-module configuration: `conf.d/<module>/<module>.toml`. Merged
+        // after the base file, so a module adds to what everybody has, and
+        // before the local overlay, so an operator's own file still has the
+        // last word over a module the way it does over `thetis.toml`.
+        // See [`fragment_files`] for why a module owns a directory.
+        for fragment in fragment_files(&config_path) {
+            merge_fragment(&mut merged, read_toml(&fragment)?);
+            tracing::debug!(fragment = %fragment.display(), "applied config fragment");
+        }
+
         // `thetis.toml` is committed; the local overlay beside it is not.
         // Secrets that belong to a tool - an API key for a service it calls -
         // have nowhere else to go, since a tool's settings are read from the
@@ -2237,8 +2337,30 @@ impl Config {
     /// file can only be judged against the other: `thetis.toml` alone has no
     /// users, and a users-mode overlay alone has no models.
     pub fn validate_layers(file_text: &str, overlay_text: &str, root: &Path) -> Result<()> {
+        Self::validate_stack(file_text, &[], overlay_text, root)
+    }
+
+    /// Checks that the whole stack — base file, module fragments, local
+    /// overlay — loads together.
+    ///
+    /// The layers are passed as text rather than read here because the caller
+    /// is judging a *candidate* for one of them: the file about to be written
+    /// has to stand in for the one on disk, or the check answers a question
+    /// nobody asked. `fragments` are `(path, text)` in merge order; the path is
+    /// only ever used to say which one failed.
+    pub fn validate_stack(
+        file_text: &str,
+        fragments: &[(PathBuf, String)],
+        overlay_text: &str,
+        root: &Path,
+    ) -> Result<()> {
         let mut merged: toml::Value =
             toml::from_str(file_text).context("the file is not valid TOML")?;
+        for (path, text) in fragments {
+            let fragment: toml::Value = toml::from_str(text)
+                .with_context(|| format!("{} is not valid TOML", path.display()))?;
+            merge_fragment(&mut merged, fragment);
+        }
         let overlay: toml::Value =
             toml::from_str(overlay_text).context("the local overlay is not valid TOML")?;
         merge_toml(&mut merged, overlay);
@@ -4435,4 +4557,169 @@ prompt = "Plan only."
         let chat = cfg.mode("chat").expect("chat mode should be configured");
         assert!(chat.read_only, "chat mode must stay read-only");
     }
+
+    // --- module fragments ---------------------------------------------------
+
+    /// Builds a root with a config file and a set of `conf.d` fragments, and
+    /// loads it the way the process does.
+    fn with_fragments(base: &str, fragments: &[(&str, &str)]) -> Result<Config> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("thetis.toml"), base).unwrap();
+        for (rel, text) in fragments {
+            let path = root.join("conf.d").join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let config_path = root.join("thetis.toml");
+        let mut merged = read_toml(&config_path)?;
+        for fragment in fragment_files(&config_path) {
+            merge_fragment(&mut merged, read_toml(&fragment)?);
+        }
+        let (file, _) = parse_file(merged)?;
+        Config::assemble(root, config_path, file, Env::None)
+    }
+
+    /// The failure this whole mechanism turns on. A fragment declaring one
+    /// `[[modes]]` must *add* a mode: if arrays were replaced the way an
+    /// overlay replaces them, the base file's modes would vanish and
+    /// `default_mode` would name a mode that no longer exists.
+    #[test]
+    fn a_fragment_adds_to_the_lists_the_base_file_declares() {
+        let base = r#"
+[[modes]]
+id = "agent"
+label = "Agent"
+
+[[modes]]
+id = "plan"
+label = "Plan"
+read_only = true
+"#;
+        let fragment = r#"
+[[modes]]
+id = "atlas-run"
+label = "Atlas"
+prompt = "Run the atlas."
+"#;
+        let cfg = with_fragments(base, &[("campaign/campaign.toml", fragment)]).unwrap();
+        let ids: Vec<&str> = cfg.modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["agent", "plan", "atlas-run"],
+            "the module's mode is appended to the ones everybody has"
+        );
+        assert!(cfg.mode("plan").unwrap().read_only, "unchanged by a fragment");
+    }
+
+    /// A module owns a directory, and the directory can be nested. The order
+    /// has to come from the paths rather than from the filesystem, or two
+    /// machines with the same files could assemble different configurations.
+    #[test]
+    fn fragments_merge_in_sorted_path_order_at_any_depth() {
+        let cfg = with_fragments(
+            "[agent]\nmax_iterations = 1\n",
+            &[
+                ("zulu/z.toml", "[agent]\nmax_iterations = 26\n"),
+                ("alpha/nested/a.toml", "[agent]\nmax_iterations = 2\n"),
+                ("alpha/b.toml", "[agent]\nmax_iterations = 3\n"),
+                ("atlas/notes.md", "not TOML, not read"),
+            ],
+        )
+        .unwrap();
+        // alpha/b.toml, then alpha/nested/a.toml, then zulu/z.toml.
+        assert_eq!(cfg.max_iterations, 26);
+    }
+
+    /// The public build's normal state: no modules at all.
+    #[test]
+    fn the_kernel_loads_with_no_fragment_directory_and_with_an_empty_one() {
+        let none = with_fragments("[agent]\nmax_iterations = 9\n", &[]).unwrap();
+        assert_eq!(none.max_iterations, 9);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("conf.d/campaign")).unwrap();
+        assert!(
+            fragment_files(&tmp.path().join("thetis.toml")).is_empty(),
+            "an empty module directory contributes nothing"
+        );
+    }
+
+    /// Precedence: a fragment adds to `thetis.toml`, and the machine's own
+    /// overlay still has the last word over both.
+    #[test]
+    fn the_local_overlay_still_wins_over_a_module_fragment() {
+        let mut merged: toml::Value = toml::from_str("[agent]\nmax_iterations = 1\n").unwrap();
+        merge_fragment(
+            &mut merged,
+            toml::from_str("[agent]\nmax_iterations = 2\n").unwrap(),
+        );
+        merge_toml(
+            &mut merged,
+            toml::from_str("[agent]\nmax_iterations = 3\n").unwrap(),
+        );
+        let (file, _) = parse_file(merged).unwrap();
+        let cfg = Config::assemble(
+            PathBuf::from("/proj"),
+            PathBuf::from("/proj/thetis.toml"),
+            file,
+            Env::None,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_iterations, 3);
+    }
+
+    /// An array of scalars is a setting, not a registry: a fragment that sets
+    /// one means to set it. Appending would make it impossible to shorten.
+    #[test]
+    fn a_fragment_replaces_a_plain_array_rather_than_growing_it() {
+        let mut merged: toml::Value =
+            toml::from_str("[cache]\nexplicit_vendors = [\"a\", \"b\"]\n").unwrap();
+        merge_fragment(
+            &mut merged,
+            toml::from_str("[cache]\nexplicit_vendors = [\"c\"]\n").unwrap(),
+        );
+        assert_eq!(
+            merged["cache"]["explicit_vendors"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    /// The campaign module is the reason fragments exist, and its
+    /// configuration is not in `thetis.toml`. This checkout has it; a checkout
+    /// without the module has neither the directory nor the modes, and both
+    /// must load.
+    #[test]
+    fn this_checkouts_own_config_and_its_fragments_load_together() {
+        let config_path = std::path::Path::new("../../thetis.toml");
+        let mut merged = read_toml(config_path).unwrap();
+        let fragments = fragment_files(config_path);
+        for fragment in &fragments {
+            merge_fragment(&mut merged, read_toml(fragment).unwrap());
+        }
+        let (file, unknown) = parse_file(merged).unwrap();
+        assert!(unknown.is_empty(), "unrecognised keys: {unknown:?}");
+        let cfg = Config::assemble(
+            PathBuf::from("/proj"),
+            PathBuf::from("/proj/thetis.toml"),
+            file,
+            Env::None,
+        )
+        .unwrap();
+
+        // Whatever modules this checkout carries, the kernel's own modes are
+        // first and intact.
+        let ids: Vec<&str> = cfg.modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(&ids[..3], &["agent", "plan", "chat"], "got {ids:?}");
+        assert!(cfg.mode("chat").unwrap().read_only);
+
+        // And the base file alone — a checkout with no modules — still loads.
+        let bare = from_toml(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(
+            bare.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["agent", "plan", "chat"],
+            "thetis.toml must carry no module's modes"
+        );
+    }
 }
+

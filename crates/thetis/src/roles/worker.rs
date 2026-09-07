@@ -727,8 +727,8 @@ mod tests {
     #[test]
     fn a_frame_note_names_the_gateway_that_rendered_it() {
         assert_eq!(
-            frame_note("s", "{}".into(), "campaign")["gateway"],
-            "campaign"
+            frame_note("s", "{}".into(), "extra")["gateway"],
+            "extra"
         );
     }
 

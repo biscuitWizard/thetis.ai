@@ -1120,9 +1120,9 @@ mod fingerprint_tests {
     fn shared_build_inputs_are_relative_sorted_and_deduplicated() {
         let inputs = declared_build_inputs(
             r#"[package.metadata.thetis]
-build-inputs = ["rpg/systems", "../outside", "/absolute", "rpg/rules", "rpg/rules"]"#,
+build-inputs = ["shared/data", "../outside", "/absolute", "shared/lib", "shared/lib"]"#,
         );
-        assert_eq!(inputs, vec!["rpg/rules", "rpg/systems"]);
+        assert_eq!(inputs, vec!["shared/data", "shared/lib"]);
         let tmp = tempfile::tempdir().unwrap();
         let roots = inputs
             .iter()

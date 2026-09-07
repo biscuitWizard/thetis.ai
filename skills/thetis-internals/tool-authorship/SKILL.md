@@ -302,15 +302,9 @@ that copies it into the rest. This is deliberate, not an oversight; do not
 - **`git-*`** (`git-whoami`, `git-repo`, `git-commit`, `git-file`, …):
   `tools/git-whoami/src/github.rs` is canonical; `scripts/sync-github-client.sh`
   copies it to the rest.
-- **`rpg-*`** (25 crates): `tools/rpg-roll/src/lib.rs` is the canonical shared
-  operation implementation; `rpg/consumers.txt` lists every consumer crate and
-  `scripts/sync-rpg.sh` copies `tools/rpg-roll/src/lib.rs` into the other 24.
-  Edit `tools/rpg-roll`, then run the sync script, then rebuild the crates you
-  touched — a change made directly to a copy is overwritten the next sync.
-
 When you add a member to one of these families, add its path to the family's
-sync script (or its consumer list, for `rpg-*`) in the same change, or the new
-crate silently drifts from day one.
+sync script — or its consumer list, where the family keeps one — in the same
+change, or the new crate silently drifts from day one.
 
 ## Dependencies
 

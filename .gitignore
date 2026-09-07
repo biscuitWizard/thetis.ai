@@ -40,5 +40,13 @@ github-app.pem
 # kernel and UI build caches.
 *.local.toml.*
 
-# Cargo target directories created by the campaign test harnesses at the repo root.
+# Cargo target directories created by out-of-workspace test harnesses at the repo root.
 /target-*/
+
+# Per-conversation worktrees the agent harness keeps beside its settings. The
+# checkouts are disposable; only .claude/settings.local.json is tracked.
+/.claude/worktrees/
+
+# Scanned PDFs kept beside the checkout for reference. Large, and not ours to
+# redistribute — the point of the rule is that no `git add -A` can sweep one in.
+/manuals/

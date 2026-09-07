@@ -170,7 +170,8 @@ const centre = stage.mountStage({
   onRevealInline: (id) => revealInlineAgent(id),
 });
 
-/* Campaign exports link back here with `?open=<workspace path>`. Open that
+/* A gateway that writes a file into the workspace links back here with
+ * `?open=<workspace path>`. Open that
  * path in the ordinary stage editor, then consume the parameter so a reload
  * does not unexpectedly reopen a tab the reader closed. */
 const openPath = new URLSearchParams(location.search).get("open");
