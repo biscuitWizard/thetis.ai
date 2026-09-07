@@ -35,6 +35,19 @@ static TOKEN: OnceLock<String> = OnceLock::new();
 
 /// Environment variable the sidecar reads its token from.
 pub const TOKEN_ENV: &str = "THETIS_KB_TOKEN";
+/// Where rendered images land: inside the shared workspace, because the kernel
+/// already serves `GET /workspace/file/{*path}` and an `<img>` tag needs
+/// nothing else. Relative to it, a path is `<campaign>/<hash>.png`.
+pub const IMAGE_SUBDIR: &str = "rpg/portraits";
+
+pub fn image_dir(cfg: &Config) -> std::path::PathBuf {
+    cfg.wasi
+        .dirs
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .join(IMAGE_SUBDIR)
+}
 
 /// File under the shared data directory holding the running sidecar's token.
 /// Same channel as the browser's, for the same reason: a worker is a separate
@@ -196,6 +209,15 @@ async fn start_once(cfg: &Config) -> Result<tokio::process::Child> {
         .env("THETIS_KB_DATA_DIR", &k.data_dir)
         .env("THETIS_KB_EMBED_MODEL", &k.embedding_model)
         .env("THETIS_KB_ASK_MODEL", &k.ask_model)
+        // Portraits and backdrops (plan §10). The sidecar renders them because
+        // it already holds the provider key; the gateway only ever sees a path.
+        .env(
+            "THETIS_KB_IMAGES_ENABLED",
+            cfg.rpg_images.enabled.to_string(),
+        )
+        .env("THETIS_KB_IMAGE_MODEL", &cfg.rpg_images.model)
+        .env("THETIS_KB_IMAGE_SIZE", &cfg.rpg_images.size)
+        .env("THETIS_KB_IMAGE_DIR", image_dir(cfg))
         .env("THETIS_KB_EMBED_URL", &cfg.openrouter_base)
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())

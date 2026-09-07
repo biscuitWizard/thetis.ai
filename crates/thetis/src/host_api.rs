@@ -397,6 +397,13 @@ impl sys::Host for HostState {
                 serde_json::json!({
                     "endpoint": cfg.rpg_kb.base_url(),
                     "token": crate::kb_sidecar::token(cfg),
+                    // Whether portraits can be drawn at all, and how many a
+                    // campaign may spend. No key: the sidecar renders.
+                    "images": {
+                        "enabled": cfg.rpg_images.enabled,
+                        "limit": cfg.rpg_images.per_campaign_limit,
+                        "dir": crate::kb_sidecar::IMAGE_SUBDIR,
+                    },
                 })
                 .to_string()
             }),

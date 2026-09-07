@@ -669,6 +669,21 @@ impl BrowserSettings {
 /// spawn a process, but it can speak HTTP to loopback. The kernel runs one
 /// Python process holding the system and campaign stores; the tools and the
 /// campaign gateway are clients to it. See `services/rpg-kb-sidecar/`.
+/// Campaign portraits and scene backdrops. The images are rendered by the
+/// knowledge sidecar, which already holds the provider credentials, so no API
+/// key ever reaches a wasm guest. Off by default: unlike everything else in the
+/// campaign system, each call spends real money at an API.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpgImageSettings {
+    pub enabled: bool,
+    /// An OpenAI-compatible image model id, served through the same provider
+    /// the sidecar embeds and asks with.
+    pub model: String,
+    pub size: String,
+    /// Ceiling on images generated for one campaign, counted in `rpg.meta`.
+    pub per_campaign_limit: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct RpgKbSettings {
     pub enabled: bool,
@@ -854,6 +869,7 @@ pub struct Config {
     pub discord: DiscordSettings,
     pub browser: BrowserSettings,
     pub rpg_kb: RpgKbSettings,
+    pub rpg_images: RpgImageSettings,
     pub sandbox_available: bool,
 }
 
@@ -1218,6 +1234,8 @@ mod spec {
         pub discord: Discord,
         pub browser: Browser,
         pub rpg_kb: RpgKb,
+        #[serde(default)]
+        pub rpg_images: RpgImages,
         pub wasi: Wasi,
         /// Free-form per-tool settings. Shapes are up to each tool, so this is
         /// carried as-is rather than being given a schema here.
@@ -1814,6 +1832,28 @@ mod spec {
                 snapshot_chars: 12_000,
                 // Inside `workspace` so the wasm guests' preopen can reach it.
                 artifact_dir: "workspace/browser".into(),
+            }
+        }
+    }
+
+    /// Campaign portraits. See [`super::RpgImageSettings`].
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(default)]
+    pub struct RpgImages {
+        pub enabled: bool,
+        pub model: String,
+        pub size: String,
+        pub per_campaign_limit: u32,
+    }
+    impl Default for RpgImages {
+        fn default() -> Self {
+            Self {
+                // Every generated image costs money at an API, so this is the
+                // one campaign feature that stays off until asked for.
+                enabled: false,
+                model: "openai/gpt-image-1".into(),
+                size: "1024x1024".into(),
+                per_campaign_limit: 24,
             }
         }
     }
@@ -2947,6 +2987,13 @@ impl Config {
                 ask_model: file.rpg_kb.ask_model,
                 service_dir: root.join("services/rpg-kb-sidecar"),
                 startup_timeout: Duration::from_secs(30),
+            },
+
+            rpg_images: RpgImageSettings {
+                enabled: env.parse("THETIS_RPG_IMAGES_ENABLED", file.rpg_images.enabled),
+                model: file.rpg_images.model,
+                size: file.rpg_images.size,
+                per_campaign_limit: file.rpg_images.per_campaign_limit,
             },
 
             sandbox_available: env.parse("THETIS_SANDBOX", file.sandbox.enabled),

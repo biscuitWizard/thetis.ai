@@ -1033,6 +1033,20 @@ embedding_model = "openai/text-embedding-3-small"
 # Writes the three-to-five sentence `rpg-kb-ask` answers.
 ask_model = "openai/gpt-4o-mini"
 
+# Campaign portraits and scene backdrops (docs/plans/campaign-polish.md §10).
+# Rendered by the knowledge sidecar, which already holds the provider key, so
+# nothing here reaches a wasm guest. Off by default: unlike every other campaign
+# feature, each image costs real money at an API. Requires [rpg_kb] enabled.
+[rpg_images]
+enabled = false
+# An OpenAI-compatible image model, served through the same provider the
+# sidecar embeds and asks with.
+model = "openai/gpt-image-1"
+size = "1024x1024"
+# Ceiling per campaign. Portraits are drawn on demand, so this is the bound on
+# a campaign that keeps pressing regenerate.
+per_campaign_limit = 24
+
 [control]
 # Whether the agent may restart the orchestrator. A restart is how changes to
 # the native binary, or to settings only read at startup, take effect.
