@@ -28,9 +28,21 @@ gives the child nothing.
 
 Break one of these and the feature is unsafe, not merely wrong.
 
-1. **One level of nesting.** A sub-agent cannot delegate. Enforced twice:
-   `delegation::available()` returns false for a child so the tools are
-   withheld, and `spawn` refuses if the caller is already in the registry.
+1. **One level of nesting.** A sub-agent cannot delegate. The rule is decided by
+   one fact — membership of the `subagents` table — and enforced at three
+   layers: `delegation::available()` returns false for a child, so the tools are
+   withheld from its prompt; the guest re-checks and refuses at dispatch; and
+   `spawn` refuses if the caller is already in the registry.
+
+   Because membership is the whole rule, **any way to get an unregistered
+   session is a bypass**. That is why the `session` interface is scoped:
+   `submit` calls `scope_ok`, so a turn can only drive its own conversation, and
+   `create_session` refuses an agent outright. A session an agent minted itself
+   would have no parent, would not count against the fan-out cap, would never
+   settle a result, and — having no registry row — could delegate freely. Two
+   source-reading tests in `host_api.rs` pin both halves; if you add a method to
+   the `session` interface that names a session and changes it, add it to that
+   list.
 2. **Fan-out is capped on *live* children**, not on children ever spawned. A
    parent that has finished ten children in sequence is not near the cap.
 3. **A wait always has a deadline.** A wait that could run forever cannot be

@@ -470,21 +470,78 @@ fn walk(root: &Path, mut visit: impl FnMut(&Path) -> bool) -> bool {
     true
 }
 
-/// The directory a walk starts from, defaulting to the first root.
-fn walk_root(cfg: &Config, path: Option<&str>) -> Result<PathBuf> {
+/// Where a walk starts, and whether it is confined to a single file.
+///
+/// `search_files` and `find_files` both take a `path`. Callers very often pass
+/// a *file* there: it reads naturally, and the alternative spelling — `path`
+/// set to the directory and `glob` to the file's name — is not the obvious one.
+/// Refusing it used to be a dead end. The error said what was wrong but not
+/// what to write instead, and a caller with no memory of its previous attempt
+/// would try another spelling of the same thing and get the same rejection, so
+/// the mistake cost several turns rather than one. A file is therefore a legal
+/// scope now, meaning "look in just this one".
+struct WalkScope {
+    /// The directory relative paths are reported against. For a single file
+    /// this is its parent, so a `glob` still matches against the file's name
+    /// rather than against the empty string.
+    root: PathBuf,
+    /// The only file the walk may visit, when the scope named a file.
+    only: Option<PathBuf>,
+}
+
+impl WalkScope {
+    /// Hands every file in the scope to `visit`; reports whether the walk ran
+    /// to completion, as [`walk`] does.
+    fn walk(&self, mut visit: impl FnMut(&Path) -> bool) -> bool {
+        match &self.only {
+            // Not `walk` over the parent with a filter: the parent may hold
+            // thousands of files, and scanning them to discard all but one
+            // would burn the scan bound and then claim the result was partial.
+            Some(one) => {
+                visit(one);
+                true
+            }
+            None => walk(&self.root, visit),
+        }
+    }
+
+    /// What to name in a message about this scope.
+    fn target(&self) -> &Path {
+        self.only.as_deref().unwrap_or(&self.root)
+    }
+}
+
+/// The scope a walk covers, defaulting to the first configured root.
+fn walk_root(cfg: &Config, path: Option<&str>) -> Result<WalkScope> {
     match path.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => {
             let resolved = resolve(cfg, p)?;
-            if !resolved.is_dir() {
-                return Err(anyhow!("{} is not a directory", display(cfg, &resolved)));
+            if resolved.is_dir() {
+                return Ok(WalkScope {
+                    root: resolved,
+                    only: None,
+                });
             }
-            Ok(resolved)
+            if resolved.is_file() {
+                // Fall back to the file itself if it somehow has no parent, so
+                // a relative path stays computable either way.
+                let root = resolved
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| resolved.clone());
+                return Ok(WalkScope {
+                    root,
+                    only: Some(resolved),
+                });
+            }
+            Err(anyhow!("{} does not exist", display(cfg, &resolved)))
         }
         None => cfg
             .filesystem
             .roots
             .first()
             .cloned()
+            .map(|root| WalkScope { root, only: None })
             .ok_or_else(|| anyhow!("no filesystem roots are configured")),
     }
 }
@@ -663,8 +720,8 @@ pub fn search_files(
     let mut total_matches = 0usize;
     let mut hit_cap = false;
 
-    let complete = walk(&root, |file| {
-        if let (Some(g), Some(rel)) = (&glob_re, path_relative(&root, file)) {
+    let complete = root.walk(|file| {
+        if let (Some(g), Some(rel)) = (&glob_re, path_relative(&root.root, file)) {
             if !glob_matches(g, glob_target(glob.unwrap_or(""), &rel)) {
                 return true;
             }
@@ -722,7 +779,7 @@ pub fn search_files(
     if lines.is_empty() {
         return Ok(format!(
             "no matches for /{pattern}/ under {}{}",
-            display(cfg, &root),
+            display(cfg, root.target()),
             glob.map(|g| format!(" matching {g}")).unwrap_or_default()
         ));
     }
@@ -765,8 +822,8 @@ pub fn find_files(
     let cap = if max_results == 0 { 200 } else { max_results as usize };
 
     let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
-    let complete = walk(&root, |file| {
-        let Some(rel) = path_relative(&root, file) else {
+    let complete = root.walk(|file| {
+        let Some(rel) = path_relative(&root.root, file) else {
             return true;
         };
         if !glob_matches(&re, glob_target(glob, &rel)) {
@@ -782,7 +839,7 @@ pub fn find_files(
     if found.is_empty() {
         return Ok(format!(
             "nothing matching {glob} under {}",
-            display(cfg, &root)
+            display(cfg, root.target())
         ));
     }
 
@@ -885,6 +942,48 @@ mod tests {
         let deep = search_files(&cfg, "parse", Some("src/deep"), None, "content", 0).unwrap();
         assert!(deep.contains("src/deep/mod.rs"), "{deep}");
         assert!(!deep.contains("src/lib.rs"), "{deep}");
+    }
+
+    /// Passing a file as `path` is what callers actually write, so it has to
+    /// work. It used to be refused with "is not a directory" — an error that
+    /// named the problem but not the remedy, so a caller would rephrase the
+    /// same mistake instead of correcting it.
+    #[test]
+    fn a_file_is_a_legal_search_scope() {
+        let (cfg, _d) = searchable();
+
+        let one = search_files(&cfg, "parse", Some("src/lib.rs"), None, "content", 0).unwrap();
+        assert!(one.contains("src/lib.rs:1:"), "{one}");
+        assert!(one.contains("src/lib.rs:3:"), "{one}");
+        // Confinement is the point: a sibling that matches must not appear.
+        assert!(!one.contains("deep/mod.rs"), "{one}");
+
+        // And a glob still has a name to match against, not an empty string.
+        let globbed = search_files(&cfg, "parse", Some("src/lib.rs"), Some("*.rs"), "files", 0);
+        assert!(globbed.unwrap().contains("src/lib.rs"), "glob should match");
+
+        let missed = search_files(&cfg, "parse", Some("README.md"), Some("*.rs"), "files", 0);
+        assert!(missed.unwrap().starts_with("no matches"), "glob should filter");
+    }
+
+    #[test]
+    fn find_can_be_scoped_to_one_file() {
+        let (cfg, _d) = searchable();
+        let out = find_files(&cfg, "*.rs", Some("src/lib.rs"), 0).unwrap();
+        assert!(out.contains("src/lib.rs"), "{out}");
+        assert!(!out.contains("deep/mod.rs"), "{out}");
+    }
+
+    /// A path that is neither file nor directory is still an error — but one
+    /// that says what is actually wrong.
+    #[test]
+    fn a_path_that_does_not_exist_says_that_much() {
+        let (cfg, _d) = searchable();
+        let err = search_files(&cfg, "parse", Some("src/nope.rs"), None, "content", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!err.contains("not a directory"), "{err}");
     }
 
     #[test]

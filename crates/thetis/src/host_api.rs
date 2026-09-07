@@ -363,6 +363,20 @@ impl session::Host for HostState {
 
     async fn create_session(&mut self, title: Option<String>) -> Result<String> {
         self.budget.entered_host("create_session");
+        // Creating conversations is a gateway's job. An agent turn asking for
+        // one is the first half of a delegation bypass: a session minted this
+        // way is in nobody's sub-agent registry, so it has no parent, does not
+        // count against the fan-out cap, never settles a result back, is not
+        // hidden from the sidebar, and — because the one-level rule is decided
+        // by registry membership — could itself spawn children. `submit` below
+        // refuses to drive somebody else's session, which breaks the second
+        // half, but a capability that has no legitimate caller is better
+        // refused outright than left as half an exploit.
+        if self.session_id.is_some() {
+            return Err(err(
+                "an agent cannot create conversations; use spawn_agent to delegate",
+            ));
+        }
         let mode = self.grip().cfg.default_mode.clone();
         self.grip()
             .persist
@@ -374,12 +388,14 @@ impl session::Host for HostState {
 
     async fn rename_session(&mut self, session_id: String, title: String) -> Result<()> {
         self.budget.entered_host("rename_session");
+        self.scope_ok(&session_id)?;
         self.grip().persist.rename_session(&session_id, &title).await.wt()?;
         Ok(())
     }
 
     async fn archive_session(&mut self, session_id: String, archived: bool) -> Result<()> {
         self.budget.entered_host("archive_session");
+        self.scope_ok(&session_id)?;
         self.grip().persist.archive_session(&session_id, archived).await.wt()?;
         // An archived conversation's worker has nothing left to do, and its
         // checkout is disposable — the branch and every commit stay. All
@@ -419,6 +435,12 @@ impl session::Host for HostState {
         attachments: Vec<Attachment>,
     ) -> Result<()> {
         self.budget.entered_host("submit");
+        // Scoped like `append` and `events`: a turn may only drive its own
+        // session. Without this an agent could start turns in any conversation,
+        // which is both a way round the sub-agent registry and a way to talk
+        // into somebody else's chat. Delegation is the sanctioned path, and it
+        // routes through `spawn`, which registers what it starts.
+        self.scope_ok(&session_id)?;
         let grip = self.grip.clone();
         grip.submit(&session_id, message, attachments).await.wt()?;
         // Submitting can materialize a branch worker — worktree, spawn, aspect
@@ -429,6 +451,7 @@ impl session::Host for HostState {
 
     async fn set_session_mode(&mut self, session_id: String, mode: String) -> Result<()> {
         self.budget.entered_host("set_session_mode");
+        self.scope_ok(&session_id)?;
         // Only offered modes are accepted, so a guest cannot invent one the
         // agent has no handling for.
         let known = self.grip().cfg.mode(&mode).is_some();
@@ -449,6 +472,7 @@ impl session::Host for HostState {
 
     async fn set_session_model(&mut self, session_id: String, model: String) -> Result<()> {
         self.budget.entered_host("set_session_model");
+        self.scope_ok(&session_id)?;
         // Any model id is accepted. The configured list is what the picker
         // offers, not what the provider supports, so checking against it meant a
         // model had to be added to the config - and the process restarted -
@@ -1851,5 +1875,88 @@ impl skills_view::Host for HostState {
         let out = diags(mgr.lint(""));
         self.yielded();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every function on the `session` interface that names a session and can
+    /// change it must call `scope_ok`, so an agent turn cannot reach into a
+    /// conversation that is not its own.
+    ///
+    /// Checked by reading this file rather than by calling the functions:
+    /// `scope_ok` needs a whole `HostState`, which owns a WASI context, a grip,
+    /// a store and a budget, and standing one up would test the fixture more
+    /// than the rule. The rule is textual anyway — the bug it guards against is
+    /// a new method written without the line, and that is exactly what a source
+    /// check catches.
+    ///
+    /// Why it matters beyond privacy: an unscoped `submit` is half of a
+    /// delegation bypass. A session an agent creates itself is in no sub-agent
+    /// registry, so it has no parent, escapes the fan-out cap, and — since the
+    /// one-level rule is decided by registry membership — could delegate
+    /// further. `create_session` refuses an agent outright for the same reason,
+    /// and is checked here too.
+    #[test]
+    fn every_session_mutator_is_scoped_to_its_own_session() {
+        let src = include_str!("host_api.rs");
+        let session_impl = src
+            .split("impl session::Host for HostState {")
+            .nth(1)
+            .expect("the session host impl moved or was renamed");
+
+        // Functions that take a session id and mutate something. Read-only
+        // lookups are deliberately absent: `get_session` and `list_sessions`
+        // are how a conversation is named in a picker, and `available_tools`
+        // answers for whichever session the UI is showing.
+        for method in [
+            "async fn append(",
+            "async fn emit_output(",
+            "async fn emit_reasoning(",
+            "async fn emit_compaction_progress(",
+            "async fn poll_inbox(",
+            "async fn events(",
+            "async fn submit(",
+            "async fn rename_session(",
+            "async fn archive_session(",
+            "async fn set_session_mode(",
+            "async fn set_session_model(",
+        ] {
+            let body = session_impl
+                .split(method)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{method}` is gone from the session impl"));
+            // Up to the next method, so a later `scope_ok` cannot satisfy this.
+            let body = body.split("    async fn ").next().unwrap_or(body);
+            assert!(
+                body.contains("self.scope_ok(&session_id)?"),
+                "`{method}` does not call scope_ok, so an agent turn can use it \
+                 on another conversation's session. Add \
+                 `self.scope_ok(&session_id)?;` after the budget line, or — if \
+                 it genuinely must be unscoped — say why in a comment and \
+                 remove it from this list."
+            );
+        }
+    }
+
+    /// An agent must not be able to mint a conversation. `spawn_agent` is the
+    /// sanctioned path, and it registers what it starts.
+    #[test]
+    fn an_agent_cannot_create_a_conversation() {
+        let src = include_str!("host_api.rs");
+        let body = src
+            .split("async fn create_session(")
+            .nth(1)
+            .expect("create_session moved")
+            .split("    async fn ")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            body.contains("self.session_id.is_some()"),
+            "create_session no longer refuses an agent turn: a session made \
+             this way is in no sub-agent registry, so it has no parent, dodges \
+             the fan-out cap, and could itself delegate"
+        );
     }
 }

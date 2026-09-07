@@ -1293,6 +1293,20 @@ mountSessions({
     connection.send({ type: "unarchive", id });
     toast("Conversation restored.");
   },
+  /* Scrolls a sub-agent's block into view and opens it.
+   *
+   * No navigation and no host round trip: the child's output is already in this
+   * transcript, inside its own block, so the sidebar row is a jump link. It is
+   * opened on the way because a finished child folds itself away, and clicking
+   * a row that then showed nothing would read as broken. */
+  onRevealAgent: (id) => {
+    const block = document.querySelector(`details.agent[data-agent="${id}"]`);
+    if (!block) return toast("That sub-agent's output is no longer on screen.", { tone: "error" });
+    block.open = true;
+    block.scrollIntoView({ behavior: "smooth", block: "center" });
+    block.classList.add("is-flashed");
+    setTimeout(() => block.classList.remove("is-flashed"), 1200);
+  },
 });
 
 transcript.mountTranscript({

@@ -35,6 +35,20 @@ export const store = {
   skills: [],
   tools: [],
 
+  /* Sub-agents of the conversation on screen, in spawn order.
+   *
+   * Shape: {id, label, state, cost}, where state is "running" | "done" |
+   * whatever a failed turn stopped by. Published by the transcript, because the
+   * transcript is what learns of a child at all: children are deliberately
+   * absent from `list_sessions` — as top-level rows they would look like
+   * conversations you could talk into, and opening one would give a chat with
+   * no composer — so the only signal is their tagged frames.
+   *
+   * The consequence, worth knowing: this only ever describes the *current*
+   * conversation. A child running in a conversation you are not watching is not
+   * known to this client at all. */
+  agents: [],
+
   /** The current conversation's branch-status frame, or null (panel hidden). */
   branch: null,
   /** Commits for the History view. */
