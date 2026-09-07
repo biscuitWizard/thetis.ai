@@ -432,20 +432,7 @@ async fn admin_branch_action(
                 );
             };
 
-            // The remote's `main` *is* the published version, so that is where
-            // the filtered history goes. It is not a fast-forward of anything
-            // local — the filtered chain is derived, and rewriting trunk's
-            // history rewrites it too — so publishing necessarily replaces
-            // what is there. The lease is what keeps that honest: it refuses
-            // if the remote has moved since we last saw it, so this can
-            // overwrite our own previous publish and never somebody else's.
-            root.run_hooked(&["fetch", "origin", crate::publish::REMOTE_BRANCH], &[])
-                .await
-                .ok();
-            let refspec = format!("public:{}", crate::publish::REMOTE_BRANCH);
-            let lease = format!("--force-with-lease={}", crate::publish::REMOTE_BRANCH);
-            root.run_hooked(&["push", &lease, "origin", &refspec], &[])
-                .await?;
+            crate::publish::push_public(root).await?;
             Ok(format!(
                 "exported {} commit(s) and published {} as '{}' on origin",
                 export.commits,
