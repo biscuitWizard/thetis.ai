@@ -370,6 +370,13 @@ pub const FIELDS: &[Field] = &[
     f("browser.idle_timeout_secs", Kind::Int, "browser", "An idle page is closed after this."),
     f("browser.snapshot_chars", Kind::Int, "browser", "Most characters of a page snapshot returned to the model."),
     f("browser.artifact_dir", Kind::Path, "browser", "Where screenshots and downloads land. Inside the workspace so guests can reach them."),
+    // --- rpg_kb -------------------------------------------------------------
+    fe("rpg_kb.enabled", Kind::Bool, "rpg_kb", "Run the campaign knowledge sidecar for the rpg-kb-search and rpg-kb-ask tools.", "THETIS_RPG_KB_ENABLED"),
+    fe("rpg_kb.port", Kind::Int, "rpg_kb", "Loopback port the sidecar listens on.", "THETIS_RPG_KB_PORT"),
+    f("rpg_kb.data_dir", Kind::Path, "rpg_kb", "Where the SQLite stores live. Gitignored: the verbatim rulebook population is kept here."),
+    fe("rpg_kb.python_bin", Kind::Path, "rpg_kb", "The python3 binary. Empty finds it on PATH.", "THETIS_RPG_KB_PYTHON"),
+    f("rpg_kb.embedding_model", Kind::Text, "rpg_kb", "Embedding model for documents and queries, through the default provider. Part of the vector cache key."),
+    f("rpg_kb.ask_model", Kind::Text, "rpg_kb", "The chat model that writes rpg-kb-ask answers, by provider id; the sidecar calls it directly."),
 ];
 
 pub fn field(key: &str) -> Option<&'static Field> {
@@ -741,6 +748,7 @@ pub const SECTIONS: &[(&str, &str, &str)] = &[
     ("sandbox", "Sandbox", "The command sandbox."),
     ("devkit", "Dev kit", "Self-modification."),
     ("browser", "Browser", "The headless browser sidecar."),
+    ("rpg_kb", "Campaign knowledge", "The retrieval sidecar behind the rpg-kb tools."),
     ("discord", "Discord", "The Discord connector."),
     ("build", "Build", "How guests are compiled."),
     ("watchdog", "Watchdog", "Failure detection and rollback."),

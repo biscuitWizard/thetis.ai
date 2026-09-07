@@ -890,6 +890,36 @@ pairing_code_ttl_secs = 900
 # even registered, so the picker never offers it.
 allow_fork = false
 
+# The campaign knowledge sidecar behind `rpg-kb-search` and `rpg-kb-ask`.
+#
+# Tool components are wasm and cannot open SQLite or spawn a process, so the
+# kernel runs one Python process (services/rpg-kb-sidecar/server.py) on loopback
+# holding the rulebook stores (`systems/<id>/rules`, `systems/<id>/setting`) and
+# each campaign's own store (`campaigns/<session>`), and the tools speak JSON to
+# it. It is supervised like the browser sidecar: a boot-time token is generated,
+# handed to the tools through their config block and to the campaign gateway
+# through `config-get("sidecar:rpg-kb")`, and never written where a browser
+# could read it.
+#
+# Off by default: with no system store built the tools could only ever answer
+# "nothing found". To turn it on, build the stores once —
+#   cd rpg/kb && python3 -m pipeline.build_store --sidecar http://127.0.0.1:39413 --token "$(cat data/rpg-kb-token)"
+# — then set `enabled = true` and restart. Needs python3 (3.11+); numpy is
+# optional and only speeds the dense pass up. The embedding and answer models
+# are called through the default provider with the kernel's key; without one
+# the sidecar still runs, lexically, with a hashed fallback for the dense half.
+[rpg_kb]
+enabled = false
+port = 39413
+# Gitignored. The verbatim rulebook population lives here and nowhere else.
+data_dir = "services/rpg-kb-sidecar/data"
+# Empty finds it on PATH.
+python_bin = "python3"
+# Part of the sidecar's vector cache key: changing it re-embeds on next index.
+embedding_model = "openai/text-embedding-3-small"
+# Writes the three-to-five sentence `rpg-kb-ask` answers.
+ask_model = "openai/gpt-4o-mini"
+
 [control]
 # Whether the agent may restart the orchestrator. A restart is how changes to
 # the native binary, or to settings only read at startup, take effect.
