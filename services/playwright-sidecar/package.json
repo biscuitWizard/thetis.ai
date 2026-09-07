@@ -1,0 +1,16 @@
+{
+  "name": "thetis-playwright-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless Playwright driver for the web-browser-* tool family. Thetis's wasm tool components cannot spawn processes, so the kernel runs this sidecar and the tools speak JSON over loopback HTTP to it.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "playwright": "1.61.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
