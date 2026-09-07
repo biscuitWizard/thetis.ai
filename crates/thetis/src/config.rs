@@ -1638,6 +1638,16 @@ impl Config {
             worktrees: resolve(&root, &file.paths.worktrees),
         };
 
+        // The WASI preopens, resolved once: they are needed twice over, because
+        // the shared workspace is both what guests get as `/workspace` and
+        // something the host-side file tools must be able to reach. A worker's
+        // gateway pins the real directory over the environment, so a branch
+        // cannot point its own workspace somewhere private.
+        let wasi_dirs: Vec<PathBuf> = match env.string("THETIS_WORKSPACE_DIR") {
+            Some(dir) => vec![PathBuf::from(dir)],
+            None => file.wasi.dirs.iter().map(|d| resolve(&root, d)).collect(),
+        };
+
         let bind_raw = env.string("THETIS_BIND").unwrap_or(file.server.bind);
         let bind_addr: SocketAddr = bind_raw
             .parse()
@@ -1834,10 +1844,7 @@ impl Config {
                 dns: env.parse("THETIS_WASI_DNS", file.wasi.dns),
                 env: env.parse("THETIS_WASI_ENV", file.wasi.env),
                 stdio: env.parse("THETIS_WASI_STDIO", file.wasi.stdio),
-                dirs: match env.string("THETIS_WORKSPACE_DIR") {
-                    Some(dir) => vec![PathBuf::from(dir)],
-                    None => file.wasi.dirs.iter().map(|d| resolve(&root, d)).collect(),
-                },
+                dirs: wasi_dirs.clone(),
             },
 
             watchdog: WatchdogSettings {
@@ -1856,14 +1863,33 @@ impl Config {
 
             filesystem: FilesystemSettings {
                 enabled: env.parse("THETIS_FILESYSTEM", file.filesystem.enabled),
-                roots: if file.filesystem.roots.is_empty() {
-                    vec![root.clone()]
-                } else {
-                    file.filesystem
-                        .roots
-                        .iter()
-                        .map(|r| resolve(&root, r))
-                        .collect()
+                roots: {
+                    let mut roots: Vec<PathBuf> = if file.filesystem.roots.is_empty() {
+                        vec![root.clone()]
+                    } else {
+                        file.filesystem
+                            .roots
+                            .iter()
+                            .map(|r| resolve(&root, r))
+                            .collect()
+                    };
+                    // The shared workspace is always reachable. It is the one
+                    // directory every guest already has as a WASI preopen and
+                    // every conversation and branch shares, so having the host
+                    // file tools refuse it was incoherent: an agent could write
+                    // there through a tool component but not read it back with
+                    // `read_path`, and in a mode where the terminal is withheld
+                    // it could not reach it at all. Granting it here takes away
+                    // no confinement that was doing work — the authority was
+                    // already handed out at the preopen — and it is appended
+                    // rather than prepended so relative paths still resolve
+                    // against the project root.
+                    for dir in &wasi_dirs {
+                        if !roots.iter().any(|r| r == dir) {
+                            roots.push(dir.clone());
+                        }
+                    }
+                    roots
                 },
                 max_read_bytes: file.filesystem.max_read_bytes,
                 protected: file.filesystem.protected,
@@ -2152,6 +2178,45 @@ mod tests {
         assert_eq!(cfg.modes.len(), 2);
         assert!(cfg.mode("plan").unwrap().read_only);
         assert!(!cfg.mode("agent").unwrap().read_only);
+    }
+
+    /// The shared workspace is every agent's common ground and is handed to
+    /// every guest as a preopen, so the host file tools must be able to reach
+    /// it whatever `filesystem.roots` says — including when a deployment sets
+    /// roots explicitly and forgets it.
+    #[test]
+    fn the_workspace_is_always_a_filesystem_root() {
+        let cfg = from_toml("").unwrap();
+        let ws = cfg.wasi.dirs[0].clone();
+        assert_eq!(ws, PathBuf::from("/proj/workspace"));
+        assert!(cfg.filesystem.roots.contains(&ws), "{:?}", cfg.filesystem.roots);
+
+        // Explicit roots that omit the workspace still get it.
+        let cfg = from_toml("[filesystem]\nroots = [\"/elsewhere\"]\n").unwrap();
+        assert_eq!(cfg.filesystem.roots[0], PathBuf::from("/elsewhere"));
+        assert!(
+            cfg.filesystem.roots.contains(&PathBuf::from("/proj/workspace")),
+            "{:?}",
+            cfg.filesystem.roots
+        );
+
+        // Relative paths still resolve against the project root, not the
+        // workspace: the workspace is appended, never prepended.
+        let cfg = from_toml("").unwrap();
+        assert_eq!(cfg.filesystem.roots[0], PathBuf::from("/proj"));
+
+        // And it is not duplicated when it is already named.
+        let cfg = from_toml("[filesystem]\nroots = [\"workspace\"]\n").unwrap();
+        assert_eq!(
+            cfg.filesystem
+                .roots
+                .iter()
+                .filter(|r| **r == PathBuf::from("/proj/workspace"))
+                .count(),
+            1,
+            "{:?}",
+            cfg.filesystem.roots
+        );
     }
 
     /// The agent's name defaults to the harness's, which is what made the two

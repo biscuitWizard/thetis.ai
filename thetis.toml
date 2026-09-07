@@ -269,6 +269,12 @@ env = false
 stdio = false
 # Directories guests get as preopens, readable and writable. Relative paths
 # resolve against the project root, and are created if missing.
+#
+# The first one is the shared workspace: every conversation and every branch
+# sees the same directory, a guest sees it under its last path segment
+# (`/workspace`), and the host file tools accept and return that same spelling.
+# It is also added to filesystem.roots automatically, so it is readable from
+# every mode including the read-only ones.
 dirs = ["workspace"]
 
 [watchdog]
@@ -307,6 +313,14 @@ enabled = false
 [filesystem]
 enabled = true
 # Empty means the project root. Add more to widen what the agent can reach.
+#
+# The shared workspace (wasi.dirs[0], below) is always a root whatever this
+# says, and cannot be removed by leaving it out here. It is the one directory
+# every guest already gets as a preopen and every conversation and branch
+# shares, so refusing it to the host file tools only made it unreadable to
+# agents that could already write to it — and unreachable entirely in a
+# read-only mode, where the terminal is withheld. Reaching it grants no
+# authority that the preopen had not already handed out.
 roots = []
 max_read_bytes = 1048576
 # Names that may not be written or deleted anywhere under a root. This keeps the

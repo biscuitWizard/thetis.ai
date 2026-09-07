@@ -84,6 +84,22 @@ first, then reload.
 
 ## Scratch space
 
-`workspace/` is shared by every conversation and is not in git — good for
-handing a file to the user, bad for anything you rely on. For scratch that is
-yours alone, use a path inside your own worktree.
+The shared workspace is `/workspace` — one directory on the host, shared by
+every conversation, every branch and every agent, and not in git. Good for
+handing a file to the user or to another agent, bad for anything you rely on.
+For scratch that is yours alone, use a path inside your own worktree.
+
+**`/workspace` is always reachable, from every mode.** It is a filesystem root
+unconditionally, appended to whatever `filesystem.roots` says, so `read_path`,
+`list_path`, `search_files` and `find_files` all work on it — including in Plan
+mode and any other read-only mode, where the terminal is withheld. Guests see
+it as `/workspace` because that is its WASI preopen name, and the host file
+tools accept and return that same spelling, so a path from a search result can
+be handed straight back to a read.
+
+Call it `/workspace/...` rather than `workspace/...`: a relative path resolves
+against the *first* root, which is your worktree, and your worktree has no
+`workspace` directory in it. This was once genuinely broken — the workspace was
+handed to every guest as a preopen while the file tools refused it, so an agent
+could write there through a tool component but not read it back, and in Plan
+mode could not reach it at all.
