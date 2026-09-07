@@ -1140,18 +1140,38 @@ async fn stream_reply(
     // Set once a question form has been posted, so the turn's ending does not
     // write a second message over the top of it.
     let mut asked = false;
+    /* The tool the turn is working in, shown as a trailing line while it runs.
+     *
+     * Held separately from `settled` and `buffer` because it is the one part of
+     * the message that is *retracted*: it is replaced by the next tool's note
+     * and disappears entirely when the turn produces text again or ends. Mixing
+     * it into either of the other two would make a transient progress note
+     * indistinguishable from something the model actually said. */
+    let mut activity: Option<String> = None;
+
+    /* Typing runs on its own clock, not on a `select!` arm.
+     *
+     * Discord clears the indicator after about ten seconds, so it has to be
+     * re-sent while a turn works. A `sleep` inside `select!` cannot do that: the
+     * future is rebuilt every iteration, so every event resets it, and during a
+     * turn events arrive far more often than every eight seconds. The timer
+     * therefore never elapsed once a turn was actually producing anything —
+     * exactly when the indicator is wanted — and only fired in the idle gaps.
+     *
+     * An interval owned outside the loop ticks on wall-clock time regardless of
+     * how busy the stream is. */
+    let mut typing_tick = tokio::time::interval(Duration::from_secs(8));
+    typing_tick.tick().await; // the first tick resolves immediately
 
     loop {
         let event = tokio::select! {
             received = events.recv() => received,
-            // Refresh the typing indicator, which Discord clears after about
-            // ten seconds, while a long turn is still working.
-            _ = tokio::time::sleep(Duration::from_secs(8)) => {
-                // Typing is shown while the turn is working and has nothing on
-                // screen yet. A settled step counts as on screen, so a turn
-                // that narrated and then went quiet into a tool keeps the
-                // indicator, which is the honest signal that more is coming.
-                if buffer.is_empty() {
+            _ = typing_tick.tick() => {
+                // Shown while the turn is working but has nothing on screen
+                // yet, and kept up once a step has settled and the model has
+                // gone quiet into a tool: that is the honest signal that more
+                // is still coming.
+                if visible(&settled, &buffer).trim().is_empty() {
                     let _ = rest.typing(&channel_id).await;
                 }
                 continue;
@@ -1173,6 +1193,9 @@ async fn stream_reply(
 
         match event.event {
             SessionEvent::StreamDelta(chunk) => {
+                // Text is arriving again, so the tool note has served its
+                // purpose and comes off.
+                activity = None;
                 buffer.push_str(&chunk);
                 let shown = visible(&settled, &buffer);
                 if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
@@ -1184,6 +1207,7 @@ async fn stream_reply(
             SessionEvent::AssistantMessage(m) => {
                 // The final text is authoritative: streamed deltas can be
                 // missing a tail, and a tool-only turn has no deltas at all.
+                activity = None;
                 if !m.content.trim().is_empty() {
                     buffer = m.content.clone();
                 }
@@ -1213,6 +1237,8 @@ async fn stream_reply(
                  * the agent's loop ends it as soon as this call succeeds — so
                  * anything said before the questions is flushed first, or it
                  * would be overwritten by the turn-finished text and lost. */
+                // The questions replace any progress note entirely.
+                activity = None;
                 let said = visible(&settled, &buffer);
                 if !said.trim().is_empty() {
                     flush(&rest, &channel_id, &mut message_id, &said).await;
@@ -1258,16 +1284,23 @@ async fn stream_reply(
                 }
             }
             SessionEvent::ToolInvocation(call) => {
-                // Only shown while nothing has been said yet, so a long
-                // research turn does not look stalled. Once there is text, that
-                // text stays: replacing it with a progress note would take back
-                // something already said.
-                if visible(&settled, &buffer).trim().is_empty() {
-                    let note = format!("_… {}_", call.name);
-                    if last_edit.elapsed() >= interval {
-                        flush(&rest, &channel_id, &mut message_id, &note).await;
-                        last_edit = std::time::Instant::now();
-                    }
+                /* The note is a *trailing line*, not a replacement.
+                 *
+                 * It used to be shown only while nothing had been said yet, on
+                 * the reasoning that overwriting text would take back something
+                 * already said. True, but the conclusion was too strong: it
+                 * meant that after the first sentence, every tool call was
+                 * invisible. A turn that says one line and then works for
+                 * eighteen minutes left that line frozen on screen with no sign
+                 * of life — which is what "streaming broke" actually looked
+                 * like. Keeping the note appended says what is happening
+                 * without retracting a word. */
+                activity = Some(call.name.clone());
+                let shown = compose(&settled, &buffer, activity.as_deref());
+                if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
+                    flush(&rest, &channel_id, &mut message_id, &shown).await;
+                    last_sent = shown;
+                    last_edit = std::time::Instant::now();
                 }
             }
             SessionEvent::Incident(detail) => {
@@ -1279,6 +1312,7 @@ async fn stream_reply(
                     visible(&settled, &buffer)
                 );
                 buffer.clear();
+                activity = None;
             }
             SessionEvent::TurnFinished(stats) => {
                 // A turn that ended by asking has already said its piece, in a
@@ -1316,6 +1350,20 @@ fn visible(settled: &str, buffer: &str) -> String {
         (true, _) => buffer.to_string(),
         (false, true) => settled.to_string(),
         (false, false) => format!("{settled}\n\n{buffer}"),
+    }
+}
+
+/// What the message should say right now: the text, plus the running tool.
+///
+/// The note goes last so the reading order is what was said, then what is
+/// happening. It is dropped once there is nothing running, which is what makes
+/// the finished message clean rather than ending on a stale "… web_search".
+fn compose(settled: &str, buffer: &str, activity: Option<&str>) -> String {
+    let text = visible(settled, buffer);
+    match activity {
+        Some(tool) if text.trim().is_empty() => format!("_… {tool}_"),
+        Some(tool) => format!("{text}\n\n_… {tool}_"),
+        None => text,
     }
 }
 
@@ -1374,8 +1422,60 @@ async fn typed_command(
 
 #[cfg(test)]
 mod tests {
-    use super::visible;
+    use super::{compose, visible};
     use crate::config::Config;
+
+    /* The regression these pin: a turn that says one sentence and then works in
+     * tools for eighteen minutes. The progress note used to be shown only while
+     * nothing had been said, so after the first sentence every tool call was
+     * invisible and the message sat frozen — no edits, no typing indicator, no
+     * error. Observed live: one Discord message, 146 characters, three
+     * sentences, a single edit across eighteen minutes. */
+
+    /// The note must appear *alongside* text, not instead of it. This is the
+    /// whole fix: activity is visible even once the model has spoken.
+    #[test]
+    fn a_running_tool_is_shown_without_retracting_what_was_said() {
+        let shown = compose("Let me verify a few things.", "", Some("web_search"));
+        assert!(
+            shown.starts_with("Let me verify a few things."),
+            "nothing already said may be taken back: {shown:?}"
+        );
+        assert!(
+            shown.ends_with("_… web_search_"),
+            "the running tool must be on screen: {shown:?}"
+        );
+    }
+
+    /// With nothing said yet the note stands alone, and must not be padded with
+    /// leading blank lines.
+    #[test]
+    fn the_note_stands_alone_before_anything_is_said() {
+        assert_eq!(compose("", "", Some("read_path")), "_… read_path_");
+    }
+
+    /// The note is the one retractable part of the message: when the turn ends
+    /// or speaks again it goes away, so a finished reply never ends on a stale
+    /// "… some_tool".
+    #[test]
+    fn the_note_disappears_when_nothing_is_running() {
+        assert_eq!(compose("All done.", "", None), "All done.");
+        // And a later tool replaces the earlier note rather than stacking.
+        let first = compose("Working.", "", Some("search_files"));
+        let second = compose("Working.", "", Some("read_path"));
+        assert!(!second.contains("search_files"), "stale note left behind: {second:?}");
+        assert_ne!(first, second);
+    }
+
+    /// The edit must be skipped when the composed text is unchanged, or a turn
+    /// calling the same tool repeatedly would burn Discord's edit rate limit on
+    /// identical requests.
+    #[test]
+    fn an_unchanged_message_is_not_re_sent() {
+        let a = compose("Thinking.", "", Some("read_path"));
+        let b = compose("Thinking.", "", Some("read_path"));
+        assert_eq!(a.trim(), b.trim(), "identical state must compare equal");
+    }
 
     /// The bug this pins: `StreamDelta` appends a fragment but
     /// `AssistantMessage` carries a step's whole final text. Held in one

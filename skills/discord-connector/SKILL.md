@@ -161,9 +161,35 @@ Two rules keep the message honest on a long turn:
   from the outside, and it needs no error to happen. The step's text is final, so
   there is nothing to wait for; the interval still bounds the streaming case, so
   it costs at most one extra edit per step.
-- **Text already said is never replaced by a progress note.** The plain
-  `ToolInvocation` arm checks `visible(...)`, not the delta buffer, or a tool
-  call after some narration would take back what was said.
+- **Text already said is never replaced by a progress note** — but it must still
+  be *joined* by one. The message has three parts, not two, and the third is the
+  only retractable one:
+
+  | Part | Meaning | Retracted? |
+  |---|---|---|
+  | `settled` | steps that have finished | never |
+  | `buffer` | the step in flight, appended by deltas | folded into `settled` |
+  | `activity` | the tool now running, as a trailing `_… name_` | yes, always |
+
+  `compose(settled, buffer, activity)` renders the three; `visible()` renders the
+  first two and is what `TurnFinished` and `Incident` use, which is how a
+  finished reply never ends on a stale `_… web_search_`.
+
+  Showing the note **only when nothing had been said yet** was a real bug, not a
+  safe conservatism. After the first sentence every tool call became invisible,
+  so a turn that spoke one line and then worked for eighteen minutes left that
+  line frozen with no edits, no typing indicator and no error. Measured live: one
+  message, 146 characters, three sentences, a single edit in eighteen minutes.
+  Clear `activity` on `StreamDelta`, `AssistantMessage`, `Incident` and the
+  `ask_user` arm — anywhere real text supersedes it.
+
+- **Typing must be driven by an interval owned outside the `select!`,** never a
+  `sleep` arm inside it. A future built in a `select!` arm is recreated on every
+  iteration, so each event resets it; during a busy turn events arrive every two
+  or three seconds and an 8s `sleep` therefore *never* elapses — the indicator
+  starves exactly when it is wanted and only appears when idle. A standalone
+  probe scores this 0 firings against 2 for `tokio::time::interval`. Call
+  `tick()` once before the loop, since the first tick resolves immediately.
 
 `Incident` appends to `settled` and clears `buffer` for the same reason: it
 belongs to no step, so the next `AssistantMessage` must not overwrite it.
@@ -199,6 +225,23 @@ the streaming path testable without a token — the edit cadence is not.
 - **Heartbeat shares the read task** via `select!`, because the socket is not
   `Sync` and a mutex between two tasks would be worse. A message is handled on
   its own spawned task, since a turn far outlasts the heartbeat interval.
+
+## Reading the channel is the fastest diagnosis
+
+A stalled reply is diagnosed in one call, not by reasoning about the code. Fetch
+the channel with the bot's own token (see `discord-connector/live-probing`) and
+look at `edited_timestamp` and `len` on the bot's message:
+
+- **Sent, one edit, hours old, short** → the loop is alive but suppressing
+  updates. A content bug, as above.
+- **Sent, never edited** → `flush` is failing; check for `could not edit a
+  Discord reply` warnings.
+- **Never sent** → the events are not reaching `stream_reply`; check the
+  `session_id` filter and the worker's `event` forwarding.
+
+The message body itself tells you which arm ran: three short sentences and no
+progress notes means `AssistantMessage` fired three times and every
+`ToolInvocation` was dropped.
 
 ## Testing without a token
 
