@@ -301,7 +301,24 @@ impl Store {
         Ok(out)
     }
 
-    pub fn unowned_sessions(&self) -> Result<Vec<String>> {
+    /// Conversations that still need an owner, and those whose owner is only a
+    /// placeholder.
+    ///
+    /// `stale` is the owner id to treat as not-really-owned — the `local` mode
+    /// sentinel. It matters because ownership is stamped on *every* boot: a
+    /// system that ran in local mode has already given all its conversations to
+    /// `local`, so by the time real users exist there is nothing left that is
+    /// unowned, `claim_unowned` claims nothing, and every conversation the user
+    /// had is answered with "conversation belongs to another user" — by an
+    /// owner that is not a user and can never log in. Pass `None` to ask only
+    /// for the genuinely unowned.
+    ///
+    /// An owner that is the empty string counts as absent: nobody's id is "",
+    /// and a session carrying one is as unreachable as an unowned one.
+    ///
+    /// Sub-agent sessions are excluded: a child belongs to its parent, and
+    /// `owner_of_root` resolves it there.
+    pub fn sessions_needing_an_owner(&self, stale: Option<&str>) -> Result<Vec<String>> {
         let tx = self.db.begin_read()?;
         let sessions = tx.open_table(SESSIONS)?;
         let children = tx.open_table(SUBAGENTS)?;
@@ -309,7 +326,20 @@ impl Store {
         let mut out = Vec::new();
         for row in sessions.iter()? {
             let (id, _) = row?;
-            if children.get(id.value())?.is_none() && owners.get(id.value())?.is_none() {
+            if children.get(id.value())?.is_some() {
+                continue;
+            }
+            let owned_by = owners.get(id.value())?;
+            let claimable = match owned_by.as_ref().map(|v| v.value()) {
+                // No row at all: written before ownership existed.
+                None => true,
+                // An empty owner is not a user either. It is what a session
+                // created without one carries, and it strands a conversation
+                // exactly as the sentinel does — nobody's id is "".
+                Some("") => true,
+                Some(current) => stale == Some(current),
+            };
+            if claimable {
                 out.push(id.value().to_owned());
             }
         }
@@ -1188,6 +1218,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         (store, dir)
+    }
+
+    // The trap this exists to close. Local mode stamps `local` on everything,
+    // so by the time real users are configured nothing is unowned — and a
+    // claim that only looks for unowned conversations moves none of them.
+    #[test]
+    fn switching_to_users_adopts_the_conversations_local_mode_claimed() {
+        let (store, _d) = temp_store();
+        let a = store.create_session(None, "agent", "").unwrap();
+        let b = store.create_session(None, "agent", "").unwrap();
+
+        // A local-mode boot: everything unowned becomes `local`.
+        let first = store.sessions_needing_an_owner(None).unwrap();
+        assert_eq!(first.len(), 2, "both start out unowned");
+        for id in &first {
+            store.set_owner(id, crate::auth::LOCAL_OWNER).unwrap();
+        }
+        // A second local-mode boot has nothing left to do.
+        assert!(store.sessions_needing_an_owner(None).unwrap().is_empty());
+
+        // Now users mode. Without treating the sentinel as unclaimed, this is
+        // empty and the user's whole history is stranded.
+        let next = store
+            .sessions_needing_an_owner(Some(crate::auth::LOCAL_OWNER))
+            .unwrap();
+        assert_eq!(next.len(), 2, "the placeholder must not look like an owner");
+        for id in &next {
+            store.set_owner(id, "alice").unwrap();
+        }
+
+        let hers = store.list_sessions_owned(Some("alice"), false).unwrap();
+        assert_eq!(hers.len(), 2, "she can see what she had");
+        assert_eq!(store.owner_of(&a.id).unwrap().as_deref(), Some("alice"));
+        assert_eq!(store.owner_of(&b.id).unwrap().as_deref(), Some("alice"));
+    }
+
+    // Claiming must never take a conversation off a real user, whatever the
+    // sentinel says.
+    #[test]
+    fn a_conversation_owned_by_a_real_user_is_never_reclaimed() {
+        let (store, _d) = temp_store();
+        store.create_session(None, "agent", "bob").unwrap();
+        store.create_session(None, "agent", "").unwrap();
+
+        let claimable = store
+            .sessions_needing_an_owner(Some(crate::auth::LOCAL_OWNER))
+            .unwrap();
+        assert_eq!(claimable.len(), 1, "only the unowned one: {claimable:?}");
+        let owners = store.owners_map().unwrap();
+        assert!(owners.values().any(|o| o == "bob"));
+    }
+
+    // A sub-agent is not a conversation; its owner is resolved through its
+    // parent, and stamping one directly would be a second source of truth.
+    #[test]
+    fn sub_agents_are_not_claimed_in_their_own_right() {
+        let (store, _d) = temp_store();
+        let parent = store.create_session(None, "agent", "").unwrap();
+        let child = store.create_session(None, "agent", "").unwrap();
+        let subs = crate::subagents::Subagents::new(&store);
+        subs.register(&parent.id, &child.id, "c", "t", "", "", "agent", 8)
+            .unwrap();
+
+        let claimable = store.sessions_needing_an_owner(None).unwrap();
+        assert_eq!(claimable, vec![parent.id.clone()], "{claimable:?}");
     }
 
     #[test]

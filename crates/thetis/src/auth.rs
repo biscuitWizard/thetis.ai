@@ -19,14 +19,24 @@ pub struct Principal {
     pub role: String,
     pub policy: Arc<EffectivePolicy>,
 }
+/// The owner every conversation gets in `auth.mode = "local"`.
+///
+/// A placeholder rather than an account: nobody can log in as it, and the
+/// startup claim in `roles::gateway` re-owns anything wearing it as soon as
+/// real users exist. Naming it matters because ownership rows written under it
+/// have to be recognised later, and a bare `"local"` spread across three files
+/// is not something you can recognise. (A configured user whose id happens to
+/// be `local` simply inherits its conversations, which is the right answer.)
+pub const LOCAL_OWNER: &str = "local";
+
 impl Principal {
     pub fn is_admin(&self) -> bool {
         self.policy.admin
     }
     pub fn local(c: &Config) -> Arc<Self> {
         Arc::new(Self {
-            user_id: "local".into(),
-            display_name: "local".into(),
+            user_id: LOCAL_OWNER.into(),
+            display_name: LOCAL_OWNER.into(),
             role: "admin".into(),
             policy: c.auth.local_policy.clone(),
         })

@@ -102,19 +102,33 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    // Ownership, backfilled every boot. In local mode everything belongs to the
+    // one implicit administrator; in users mode it belongs to whoever
+    // `auth.claim_unowned` names.
+    //
+    // The `stale` argument is what makes the second of those reachable. Local
+    // mode stamps `LOCAL_OWNER` on every conversation, so a system that has
+    // ever booted without users has nothing unowned left to claim — and
+    // turning users on would hand the new account an empty sidebar and
+    // "conversation belongs to another user" for every conversation it used to
+    // have, held by an owner that cannot log in. So in users mode the sentinel
+    // counts as unclaimed, and the history moves across with the switch.
     if let Some(store) = grip.local_store() {
-        let claim = if cfg.auth.users_mode {
-            cfg.auth.claim_unowned.as_str()
+        let (claim, stale) = if cfg.auth.users_mode {
+            (
+                cfg.auth.claim_unowned.as_str(),
+                Some(crate::auth::LOCAL_OWNER),
+            )
         } else {
-            "local"
+            (crate::auth::LOCAL_OWNER, None)
         };
-        let unowned = store.unowned_sessions()?;
-        for id in &unowned {
+        let claiming = store.sessions_needing_an_owner(stale)?;
+        for id in &claiming {
             store.set_owner(id, claim)?;
         }
-        if !unowned.is_empty() {
+        if !claiming.is_empty() {
             tracing::info!(
-                count = unowned.len(),
+                count = claiming.len(),
                 owner = claim,
                 "claimed legacy conversations"
             );
@@ -125,7 +139,7 @@ pub async fn run() -> Result<()> {
         let owner = if cfg.auth.users_mode {
             cfg.auth.claim_unowned.as_str()
         } else {
-            "local"
+            crate::auth::LOCAL_OWNER
         };
         let first = grip
             .persist
