@@ -40,6 +40,8 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
 
         SessionEvent::StreamDelta(chunk) => json!({ "kind": "delta", "text": chunk }),
 
+        SessionEvent::ReasoningDelta(chunk) => json!({ "kind": "reasoning", "text": chunk }),
+
         SessionEvent::ToolInvocation(call) => json!({
             "kind": "tool-call",
             "id": call.id,

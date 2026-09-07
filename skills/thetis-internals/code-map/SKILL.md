@@ -85,7 +85,7 @@ Grouped by concern.
 |---|---|
 | `store.rs` | Sessions, event logs, the KV store, spend accounting, the branch registry. |
 | `session.rs` | One tokio task for each active session. This makes concurrent input safe. |
-| `llm.rs` | The OpenRouter client. It reassembles partial tool-call deltas, so you only see complete calls. |
+| `llm.rs` | The chat-completions client, across every configured OpenAI-compatible provider. The request's `model` picks the endpoint via `Config::resolve_model`, and is rewritten to that provider's own name for it. Reassembles partial tool-call deltas, so you only see complete calls. |
 | `cache.rs` | Prompt cache breakpoints. Applied host-side, so you cannot break caching by rewriting your loop. |
 | `config.rs` | The three configuration layers and the `Secret` type. |
 | `settings.rs` | Runtime reads and writes of the config file, through `toml_edit`, with the comments kept. |

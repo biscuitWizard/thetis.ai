@@ -1,11 +1,11 @@
 ---
 name = "Configuration, restart and recovery"
-brief = "The three config layers, which settings need a restart, modes and models, prompt caching, and the safety nets that make a bad change recoverable."
-when_to_use = "Use when you must change a setting, add a mode or model, understand why a change did not take effect, restart this conversation's runtime, or recover from a bad change: the validation gate, the epoch watchdog, the circuit breaker, branch resets and /admin. Not for the step-by-step procedure of editing code, which is in careful-surgery."
+brief = "The three config layers, which settings need a restart, modes, models and providers, prompt caching, and the safety nets that make a bad change recoverable."
+when_to_use = "Use when you must change a setting, add a mode, model or LLM provider (including a local llama.cpp or vLLM endpoint beside OpenRouter), understand why a change did not take effect, restart this conversation's runtime, or recover from a bad change: the validation gate, the epoch watchdog, the circuit breaker, branch resets and /admin. Not for the step-by-step procedure of editing code, which is in careful-surgery."
 universal = false
-tags = ["config", "thetis.toml", "restart", "rollback", "branch", "watchdog", "recovery", "modes", "prompt cache", "admin", "tool-group:config", "tool-group:branch", "tool-group:selfmod"]
+tags = ["config", "thetis.toml", "restart", "rollback", "branch", "watchdog", "recovery", "modes", "models", "providers", "openrouter", "llama.cpp", "local model", "prompt cache", "admin", "tool-group:config", "tool-group:branch", "tool-group:selfmod"]
 related = ["careful-surgery"]
-version = 2
+version = 3
 ---
 
 # Configuration, restart and recovery
@@ -68,6 +68,66 @@ instead. That is what the `prompt` field is for.
 
 A **model** is a per-conversation override, chosen from `[[models]]` or
 `THETIS_MODELS`. Empty means the grip default.
+
+## Providers
+
+Thetis speaks to any number of OpenAI-compatible endpoints: OpenRouter, a local
+llama.cpp or vLLM server, a company gateway. `[llm]` is *always* registered as a
+provider under the id `openrouter`, so `[[providers]]` is purely additive and a
+config that lists none behaves as it always did. An entry whose id **is**
+`openrouter` replaces that synthesized one rather than sitting unreachable
+behind it.
+
+`Config::resolve_model` decides which endpoint serves a request, in this order:
+
+1. a matching `[[models]]` entry that names a `provider`;
+2. a provider-id prefix on the model id — `local/qwen3` reaches the provider
+   called `local` asking for `qwen3`, with no `[[models]]` entry needed;
+3. `llm.provider`, defaulting to `openrouter`.
+
+A prefix that is not a configured provider id is left alone, so an OpenRouter id
+like `anthropic/claude-opus-5` is never mistaken for routing. Do not give a
+provider the same id as an OpenRouter vendor.
+
+`wire_model` on a `[[models]]` entry separates the id Thetis uses everywhere —
+picker, session record, `THETIS_MODEL` — from the name the endpoint knows the
+model by. A local server usually wants a bare name where the picker wants
+something namespaced.
+
+### Scaling a provider
+
+A provider takes either `base_url` (one endpoint) or `base_urls` (several
+interchangeable ones, normalized to the same list internally — `base_url()`
+returns the first). Requests rotate over the list via a process-wide counter,
+and **each retry advances to the next endpoint**, so a dead or overloaded
+replica is stepped over rather than retried in place.
+
+The entries must serve the same model: this is replication, not model routing.
+Scaling this way leaves every model id unchanged, which is the point — capacity
+is not a picker concern. Note that one `llama-server --parallel N` already
+serves N concurrent slots on a single port, so `base_urls` is for separate
+processes or machines.
+
+Two behaviours worth knowing:
+
+- **No key means no header.** A provider with no `api_key` sends no
+  `Authorization` at all, because an empty bearer token is rejected outright by
+  some servers. Only an OpenRouter-hosted provider fails fast on a missing key.
+  `api_key = "env:NAME"` reads it from the environment, and an unset variable
+  leaves the provider unauthenticated rather than failing.
+- **Errors name the provider.** A provider error detail is prefixed `[<id>]`,
+  because "404 model not found" reads very differently against a local server
+  than against OpenRouter.
+
+Embeddings route the same way, either by the id in `skills.embedding_model` or
+by naming `skills.embedding_provider` outright.
+
+A model or `llm.provider` naming a provider that does not exist is rejected at
+startup — otherwise the mistake surfaces as a confusing 404 mid-conversation.
+
+**A local model must support tool calling.** Thetis is useless without it.
+llama.cpp's server needs `--jinja` or it does not apply the model's chat
+template and no tool call is ever produced.
 
 ## Prompt caching
 

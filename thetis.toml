@@ -44,6 +44,69 @@ max_retries = 3
 # thetis.local.toml, so point THETIS_CONFIG at one of those if this file is
 # ever going into version control.
 # api_key = "sk-or-..."
+#
+# Which provider serves a model that does not name one. Empty means the section
+# above, which is registered under the id `openrouter`. Set it to a
+# `[[providers]]` id below to run entirely against a local server.
+# THETIS_PROVIDER overrides it.
+# provider = "local"
+
+# Extra OpenAI-compatible endpoints, used beside the one above rather than
+# instead of it. llama.cpp's server, vLLM, Ollama, LM Studio, a company gateway
+# — anything that speaks `POST {base_url}/chat/completions` in the OpenAI shape.
+#
+# The [llm] section is always registered as a provider with the id
+# `openrouter`, so adding entries here changes nothing that already worked. An
+# entry whose id *is* `openrouter` replaces it, which is how you put a proxy in
+# front of everything.
+#
+# A model reaches a provider in one of two ways:
+#
+#   1. a [[models]] entry names it with `provider = "..."`;
+#   2. the model id is prefixed with the provider id — `local/qwen3-30b` goes
+#      to the provider called `local` asking for `qwen3-30b`. This needs no
+#      [[models]] entry at all, which is what you want when you have just
+#      loaded a different gguf and only mean to try it once.
+#
+# A prefix that is not a configured provider id is left alone, so an OpenRouter
+# id like `anthropic/claude-opus-5` is never mistaken for provider routing.
+# Avoid giving a provider the same id as an OpenRouter vendor for that reason.
+#
+# api_key is optional. Omitted or empty means *no* Authorization header is
+# sent, which is what an unauthenticated local server wants — an empty bearer
+# token is rejected outright by some servers. `env:NAME` reads the key from
+# that environment variable instead, so a real key need not sit on disk.
+
+# Scaling a provider: give it several endpoints with `base_urls` instead of
+# `base_url`, and requests rotate over them. They must serve the same model —
+# replicas, not different models. Each retry also steps to the next endpoint,
+# so one dead or overloaded server is walked past rather than hammered.
+#
+#   base_urls = [
+#     "http://127.0.0.1:8080/v1",
+#     "http://127.0.0.1:8081/v1",
+#   ]
+#
+# Adding capacity this way leaves every model id unchanged. Note that one
+# llama-server with `--parallel N` already serves N concurrent slots on a
+# single port; use `base_urls` for separate processes or separate machines.
+
+[[providers]]
+id = "local"
+label = "llama.cpp"
+# Whatever llama-server prints as its base; the OpenAI routes hang off it.
+# `--jinja` matters when you start the server: without it llama.cpp does not
+# apply the model's chat template, and tool calling — which Thetis depends on
+# entirely — will not work.
+base_url = "http://127.0.0.1:8080/v1"
+# api_key = "env:LLAMA_API_KEY"   # only if you started it with --api-key
+# headers = { "X-Org" = "acme" }  # sent on every request to this provider
+
+# [[providers]]
+# id = "vllm"
+# label = "vLLM (GPU box)"
+# base_url = "http://gpu.internal:8000/v1"
+# api_key = "env:VLLM_API_KEY"
 
 [agent]
 # Tool-call rounds allowed in a single turn.
@@ -89,6 +152,24 @@ default_mode = "agent"
 
 # Models offered in the chat surface's picker. Providers change their
 # catalogues often, so this is the first thing worth editing.
+#
+# `id` is how the model is named everywhere inside Thetis: in the picker, in a
+# session's saved choice, in THETIS_MODEL. Two optional keys route it:
+#
+#   provider    = which [[providers]] entry serves it; empty means the default.
+#   wire_model  = what to send as `model`, when that differs from `id`. A local
+#                 server usually knows a model by a bare name while the picker
+#                 wants something namespaced, so the two are allowed to differ.
+#
+# A local model listed here appears in the picker beside the hosted ones and is
+# chosen the same way:
+#
+# [[models]]
+# id = "local/qwen3-30b"
+# label = "Qwen3 30B (local)"
+# provider = "local"
+# wire_model = "qwen3-30b-a3b"
+
 [[models]]
 id = "anthropic/claude-opus-5"
 label = "Claude Opus 5"
@@ -104,6 +185,13 @@ label = "GPT-4o"
 [[models]]
 id = "google/gemini-2.5-pro"
 label = "Gemini 2.5 Pro"
+
+# The local llama.cpp server, offered in the picker beside the hosted models.
+[[models]]
+id = "local/deepseek-v4-flash"
+label = "DeepSeek V4 Flash (local)"
+provider = "local"
+wire_model = "deepseek-v4-flash"
 
 # Ways of working, offered per conversation. `read_only` is carried through to
 # the agent, which withholds every tool that changes something — so adding a
@@ -496,6 +584,12 @@ retrieve_limit = 4
 # either re-embeds the corpus rather than comparing incomparable vectors.
 embedding_model = "openai/text-embedding-3-small"
 embedding_dimensions = 1536
+# Which provider serves embeddings. Empty routes by the model id exactly as a
+# chat model does, so `local/nomic-embed-text` would reach the `local` provider
+# on its own. Name one here when the model id has no usable prefix — a
+# llama-server started with `--embeddings` serving a bare model name, say.
+# THETIS_EMBEDDING_PROVIDER overrides it.
+# embedding_provider = "local"
 # Opening messages longer than this are clipped before embedding.
 max_query_chars = 2000
 # Refuse to load more than this many universal skills, whatever the files say.

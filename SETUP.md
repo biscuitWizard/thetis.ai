@@ -60,7 +60,14 @@ rustup target list --installed
 You should see `wasm32-wasip2` listed. Thetis was developed against Rust 1.95.
 
 **An OpenRouter API key** from <https://openrouter.ai/keys>. Thetis talks to
-one OpenAI-compatible endpoint, so any OpenRouter-supported model works.
+OpenAI-compatible endpoints, so any OpenRouter-supported model works.
+
+You can also point Thetis at a local server — llama.cpp, vLLM, Ollama, LM
+Studio — either instead of OpenRouter or alongside it, so local and hosted
+models sit side by side in the model picker. Add a `[[providers]]` entry to
+`thetis.toml`; the section there documents it. Note that a local model must
+support tool calling, and llama.cpp's server needs `--jinja` for that to work
+at all.
 
 ---
 

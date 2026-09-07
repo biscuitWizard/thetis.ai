@@ -290,6 +290,21 @@ impl session::Host for HostState {
         Ok(())
     }
 
+    /// A reasoning fragment, transient like a token delta.
+    ///
+    /// Separate from `emit_output` because reasoning is not the answer: a
+    /// local DeepSeek-style model can spend forty chunks thinking before two
+    /// chunks of reply, and splicing that into the transcript would corrupt
+    /// the assistant message. The surface shows it as its own collapsible
+    /// element, and nothing persists it — only the answer is durable.
+    async fn emit_reasoning(&mut self, session_id: String, chunk: String) -> Result<()> {
+        self.budget.entered_host("emit_reasoning");
+        self.scope_ok(&session_id)?;
+        self.grip()
+            .publish_transient(&session_id, SessionEvent::ReasoningDelta(chunk));
+        Ok(())
+    }
+
     /// Compaction progress, transient like a token delta.
     ///
     /// Not persisted: the log already records the outcome as
