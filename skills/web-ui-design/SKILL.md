@@ -26,6 +26,11 @@ the surface got sloppy the last time.
 | Main | `--measure` 48rem, centred | The conversation: transcript, composer | Get replaced by another view |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
 
+Inside Main, `.stage` flanks the transcript with an avatar column on each side —
+the user's left, the agent's right — in the slack a wide window already has. The
+text column is untouched: the portraits appear only above a derived container
+width and retract when a rail panel docks. See `references/tokens.md`.
+
 **The one structural rule: an inspector is a rail tab, not a modal.** The rail
 docks — the chat reflows beside it and stays readable and typable with anything
 open. Before this, six features were full-viewport slide-overs with a scrim, one
@@ -82,9 +87,15 @@ These are not preferences. Breaking one has bitten this codebase.
 4. **Dependency-free, no build step.** Plain ES modules, hand-rolled SVG icons.
    A new file under `ui/` must be registered in `gateways/gateway-web/src/assets.rs`
    or it 404s at runtime with the module graph half-loaded.
-5. **Hide with the `hidden` attribute.** `app.css` forces
-   `[hidden] { display: none !important; }` precisely because component rules
-   that set their own `display` silently defeat the UA stylesheet.
+5. **Hide with the `hidden` attribute — via `setHidden`, not `.hidden =`.**
+   `app.css` forces `[hidden] { display: none !important; }` precisely because
+   component rules that set their own `display` silently defeat the UA
+   stylesheet. But `hidden` is an IDL attribute of `HTMLElement`, and
+   `SVGElement` does not inherit it: `svg.hidden = true` sets an ordinary JS
+   property and the element stays on screen, with no error. Every avatar in the
+   UI is an `<img>` paired with a fallback `<svg>` mark, so this showed up as
+   both being visible at once. `setHidden(node, bool)` in `lib/dom.js` goes
+   through the attribute and works on either.
 6. **Two steps for anything destructive, and name the object.** "Reset the
    branch to 7bf7a1a? — history is kept; this adds a new commit restoring that
    state" beats "Are you sure?". A destructive verb never sits on a bare 5px
@@ -224,6 +235,8 @@ about the diff:
 | A UI edit does nothing after restart | Guest built from committed trunk | Commit, then restart |
 | Module 404s, page half-dead | New `ui/` file not in `assets.rs` | Register it |
 | An element will not hide | A component rule sets `display` | Use the `hidden` attribute |
+| An `<svg>` will not hide, no error | `.hidden = true` on an SVGElement sets a dead JS property | `setHidden(node, true)` from `lib/dom.js` |
+| A flex row's children spill past their column | A flex item will not shrink below its content | `min-width: 0` on the one that should give way |
 | Colour looks off in one place only | Literal hex or a typo'd token | Token from `theme.css` |
 | A panel covers the chat | Built as a modal instead of a rail tab | `rail.open` |
 | Handler throws on the second call | Two paths both tearing down (Enter *and* blur) | Make teardown idempotent |

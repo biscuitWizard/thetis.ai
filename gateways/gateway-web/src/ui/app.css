@@ -425,6 +425,14 @@ body { display: flex; flex-direction: column; }
   display: flex;
   flex-direction: column;
   position: relative;
+  /* The portrait columns appear only when there is slack beside the
+     conversation, and how much slack there is depends on the sidebar and on
+     whether the rail's panel is docked — neither of which a viewport media
+     query can see. A container query on .main measures the space that is
+     actually there, so opening an inspector retracts the portraits instead of
+     squeezing the transcript. */
+  container-type: inline-size;
+  container-name: stage;
 }
 
 .chat-head {
@@ -479,10 +487,163 @@ body { display: flex; flex-direction: column; }
 /* Still climbing: the figure includes a turn that has not finished paying. */
 .chip-quiet.is-live { color: var(--warn); }
 
+/* --- the stage -------------------------------------------------------------
+   The conversation, flanked by whose conversation it is.
+
+   The rule that makes this safe: the transcript keeps its own --measure column
+   and stays centred, and the portraits are given only the slack a wide window
+   already had between the sidebars and the text. Both columns are laid out
+   whenever either is, so the centre column cannot drift off-axis when only one
+   side has a picture.
+
+   They are absent, not merely narrow, below the container width where that
+   slack runs out — see the container query at the foot of this block. A
+   container query rather than a media query because the space beside the
+   transcript depends on the docked rail panel too, which the viewport cannot
+   see: opening an inspector should retract the portraits, not crush the text. */
+
+.stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  gap: var(--gap-4);
+  /* No side padding: the transcript owns its own, so a portrait sits flush
+     against the zone edge the way the sidebar does. */
+}
+
+/* Off until there is room. Not `hidden`, because this is layout responding to
+   width rather than state — nothing has decided to hide them. */
+.stage-avatar { display: none; }
+
+/* The threshold is derived, not chosen: the transcript needs --measure plus its
+   own side padding (2 × --gap-5) to show text at full width, and each portrait
+   costs --portrait-w plus a --gap-4 to its neighbour. Below the sum, showing a
+   portrait would come out of the conversation, so there is none.
+   768 + 48 + 2 × (132 + 16) = 1112, rounded up for the sub-pixel margin.
+   Measured: at a 1440px viewport with the rail collapsed .main is 1124px, so
+   the small portraits appear there and retract the moment a panel docks. */
+@container stage (min-width: 1116px) {
+  .stage-avatar {
+    display: flex;
+    /* Both columns exist whenever either does, so the transcript stays on the
+       zone's centre line even with one picture set. */
+    flex: 0 1 var(--portrait-w);
+    min-width: 0;
+    /* Aligned to the foot: the live end of a conversation is at the bottom of
+       the transcript, and that is where the eye is. */
+    align-items: flex-end;
+    justify-content: center;
+    padding-bottom: var(--gap-6);
+    overflow: hidden;
+  }
+  .stage-avatar.is-user { justify-content: flex-start; padding-left: var(--gap-3); }
+  .stage-avatar.is-agent { justify-content: flex-end; padding-right: var(--gap-3); }
+}
+
+/* Same arithmetic with the larger portrait: 768 + 48 + 2 × (208 + 16) = 1264.
+   A very wide window gets a fuller portrait rather than more empty margin. */
+@container stage (min-width: 1268px) {
+  .stage-avatar { flex-basis: var(--portrait-w-lg); }
+}
+
+/* One portrait: the picture, with a name under it. A <button> on the user's
+   side and a <div> on the agent's, so the shared look lives here and only the
+   interactive one gets affordances. */
+.portrait {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--gap-2);
+  width: 100%;
+  max-width: var(--portrait-w-lg);
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--text-faint);
+  text-align: center;
+  min-width: 0;
+}
+
+.portrait-img,
+.portrait-mark {
+  width: 100%;
+  /* Portrait-shaped, like a character card. `cover` because a supplied image is
+     rarely this ratio, and cropping beats letterboxing for a face. */
+  aspect-ratio: 3 / 4;
+  max-height: 60vh;
+  object-fit: cover;
+  object-position: top center;
+  border-radius: var(--r-lg);
+  background: var(--surface-1);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+/* The drawn fallback is an icon, not an image: it keeps the frame but centres a
+   small glyph in it rather than scaling a two-path SVG to 300px. */
+.portrait-mark {
+  padding: 28% 34%;
+  color: var(--hairline-strong);
+}
+.portrait-name {
+  font-size: var(--text-xs);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Only the user's portrait is clickable, and it says so on hover — the agent's
+   is identity from config, and offering to change it here would be a lie. */
+button.portrait { cursor: pointer; }
+button.portrait:hover { color: var(--text-dim); }
+button.portrait:hover .portrait-img,
+button.portrait:hover .portrait-mark {
+  box-shadow: inset 0 0 0 1px var(--accent-edge);
+}
+button.portrait:focus-visible { outline: none; }
+button.portrait:focus-visible .portrait-img,
+button.portrait:focus-visible .portrait-mark {
+  box-shadow: inset 0 0 0 1px var(--accent-edge), 0 0 0 3px var(--accent-wash);
+}
+
+/* --- the sidebar's avatar button ------------------------------------------- */
+
+.user-avatar-btn {
+  flex: none;
+  width: 22px; height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: color var(--fast) var(--ease), box-shadow var(--fast) var(--ease);
+}
+.user-avatar-btn:hover { color: var(--text); }
+.user-avatar-btn:hover .user-avatar-img,
+.user-avatar-btn:hover .user-avatar-mark { box-shadow: inset 0 0 0 1px var(--accent-edge); }
+.user-avatar-img,
+.user-avatar-mark {
+  width: 22px; height: 22px;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.user-avatar-mark { padding: 2px; }
+
 /* --- transcript ----------------------------------------------------------- */
 
 .transcript {
   flex: 1 1 auto;
+  /* min-width because the transcript is now a row flex item inside .stage: a
+     flex item will not shrink below its content otherwise, so a wide code block
+     would push the portraits out rather than scrolling. */
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   padding: var(--gap-6) var(--gap-5) var(--gap-4);

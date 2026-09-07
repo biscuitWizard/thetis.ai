@@ -12,7 +12,7 @@
  * This file only wires pieces together. Behaviour lives in views/ and lib/.
  */
 
-import { $, clear, el } from "./lib/dom.js";
+import { $, clear, el, setHidden } from "./lib/dom.js";
 import { Connection } from "./lib/socket.js";
 import { store } from "./lib/store.js";
 import { toast, popover } from "./lib/toast.js";
@@ -25,6 +25,7 @@ import * as rail from "./views/rail.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
 import * as transcript from "./views/transcript.js";
+import * as avatars from "./views/avatars.js";
 import { mountTerminals } from "./views/terminal.js";
 
 // --- status -----------------------------------------------------------------
@@ -57,13 +58,20 @@ store.watch("pending", (pending) => {
 // at something that is not an image. The brand is the first thing on screen and
 // must not degrade to a broken-image glyph: fall back to the built-in mark,
 // which is always in the markup for exactly this reason.
+//
+// Two bugs were in here, both of the silent kind. The ids were "#"-prefixed
+// but `$` is getElementById, so the lookup found nothing and the function
+// returned before registering anything. And the mark is an <svg>, which does
+// not inherit the `hidden` IDL attribute — `mark.hidden = false` would have set
+// a dead JS property, leaving the mark hidden even once it was needed. Hence
+// setHidden, which goes through the attribute.
 function wireAvatar() {
-  const img = $("#brand-avatar");
-  const mark = $("#brand-mark");
+  const img = $("brand-avatar");
+  const mark = $("brand-mark");
   if (!img || !mark) return;
   img.addEventListener("error", () => {
-    img.hidden = true;
-    mark.hidden = false;
+    setHidden(img, true);
+    setHidden(mark, false);
   });
 }
 wireAvatar();
@@ -78,9 +86,20 @@ const connection = new Connection({
   },
 });
 
+// The portraits beside the conversation and the sidebar's avatar button. Mounted
+// before the frame handlers, which route `user-avatar` into it.
+// `id` is the open conversation on every frame on this socket, and the host
+// needs it to fan a change out to the other tabs watching this conversation —
+// so it is added here rather than made the view's business.
+avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame }));
+
 connection.onOpen(() => {
   connection.send({ type: "hello" });
   if (store.current) connection.send({ type: "open", id: store.current });
+  // `hello` already replies with the stored avatar, but it is asked for
+  // explicitly too: another tab can have changed it while this socket was down,
+  // and a broadcast sent then reached nobody here.
+  avatars.request();
 });
 
 // Mounted before the frame handlers below, which refer to it. The drawer asks
@@ -226,6 +245,9 @@ connection
 
   .on("system-status", statusbar.onFrame)
 
+  // The user's stored picture, on `hello` and after any tab changes it.
+  .on("user-avatar", avatars.onFrame)
+
   .on("skills", (frame) => {
     if (frame.session !== store.current) return;
     store.set({
@@ -338,7 +360,7 @@ connection
       statusbar.onUnsupported();
       return;
     }
-    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-)/.test(frame.message || "")) return;
+    if (/^unknown frame type: (branch-|debug-|turn-|unarchive|terminals?|terminal-|user-avatar)/.test(frame.message || "")) return;
     // An error naming the frame it answers is that frame's verdict. A `send`
     // that reached the host and then failed — a worker that will not start,
     // say — arrives exactly this way, and the composer is locked behind an

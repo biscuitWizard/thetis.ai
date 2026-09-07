@@ -61,6 +61,22 @@ export function clear(node) {
   return node;
 }
 
+/* Hides or shows any element, including an SVG.
+ *
+ * `hidden` is an IDL attribute of `HTMLElement`, and `SVGElement` does not
+ * inherit it — so `svg.hidden = true` quietly sets an ordinary JS property and
+ * the element stays on screen. That is exactly how an avatar's <img> and its
+ * fallback <svg> mark both ended up visible at once: the image was shown and
+ * the mark was "hidden" by an assignment that did nothing.
+ *
+ * Going through the attribute works on every element, and is what the house
+ * rule about hiding with `hidden` actually means. */
+export function setHidden(node, hide) {
+  if (!node) return;
+  if (hide) node.setAttribute("hidden", "");
+  else node.removeAttribute("hidden");
+}
+
 /** Closes a menu when the next click lands outside it. */
 export function onClickOutside(node, handler) {
   const listener = (event) => {
