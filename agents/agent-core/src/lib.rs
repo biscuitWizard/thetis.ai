@@ -639,6 +639,7 @@ impl Turn {
                 if !card.related.is_empty() {
                     prompt.push_str(&format!("\n  Related: {}", card.related.join(", ")));
                 }
+
             }
             prompt.push('\n');
         }

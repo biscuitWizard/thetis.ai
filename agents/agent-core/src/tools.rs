@@ -2679,12 +2679,21 @@ fn format_skill_cards(cards: &[skills::SkillCard]) -> String {
         if card.universal {
             out.push_str(" [universal]");
         }
+        if card.status == "retired" {
+            out.push_str(" [retired]");
+        }
         out.push_str(&format!("\n  {}", card.brief));
+        if card.status == "retired" && !card.superseded_by.is_empty() {
+            out.push_str(&format!("\n  Superseded by `{}`.", card.superseded_by));
+        }
         if !card.when_to_use.trim().is_empty() {
             out.push_str(&format!("\n  Use when: {}", card.when_to_use.trim()));
         }
         if !card.children.is_empty() {
             out.push_str(&format!("\n  Nested: {}", card.children.join(", ")));
+        }
+        if !card.related.is_empty() {
+            out.push_str(&format!("\n  Related: {}", card.related.join(", ")));
         }
         if !card.resources.is_empty() {
             out.push_str(&format!("\n  Files: {}", card.resources.join(", ")));
