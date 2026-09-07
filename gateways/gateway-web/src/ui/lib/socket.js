@@ -1,4 +1,4 @@
-/* The websocket, with reconnect.
+/* The websocket, with reconnect and login-expiry recovery. */
  *
  * Frames are handed to whoever registers for their `type`, so adding a message
  * kind means registering a handler rather than editing a switch.

@@ -7,7 +7,7 @@
 //! the database because it never opens it.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
@@ -58,12 +58,45 @@ impl Persist {
 
     // --- sessions -------------------------------------------------------------
 
-    pub async fn create_session(&self, title: Option<String>, mode: &str) -> Result<SessionMeta> {
+    pub async fn create_session(
+        &self,
+        title: Option<String>,
+        mode: &str,
+        owner: &str,
+    ) -> Result<SessionMeta> {
         delegate!(
             self,
             "store.create_session",
-            |s| s.create_session(title.clone(), mode),
-            json!({ "title": title, "mode": mode })
+            |s| s.create_session(title.clone(), mode, owner),
+            json!({ "title": title, "mode": mode, "owner": owner })
+        )
+    }
+
+    pub async fn list_sessions_owned(
+        &self,
+        owner: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<SessionMeta>> {
+        match self {
+            Persist::Local(store) => {
+                crate::offload::blocking(|| store.list_sessions_owned(owner, include_archived))
+            }
+            Persist::Remote(peer) => {
+                peer.call_as(
+                    "store.list_sessions",
+                    json!({"include_archived": include_archived}),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn owner_of_root(&self, id: &str) -> Result<Option<String>> {
+        delegate!(
+            self,
+            "store.owner_of_root",
+            |s| s.owner_of_root(id),
+            json!({"id":id})
         )
     }
 
@@ -291,12 +324,7 @@ impl Persist {
         delegate!(
             self,
             "store.settle_subagent",
-            |s| crate::subagents::Subagents::new(s).settle(
-                child_id,
-                result,
-                cost_usd,
-                stopped_by
-            ),
+            |s| crate::subagents::Subagents::new(s).settle(child_id, result, cost_usd, stopped_by),
             json!({
                 "child": child_id,
                 "result": result,
@@ -362,12 +390,8 @@ impl Persist {
         delegate!(
             self,
             "store.read_transcript",
-            |s| crate::transcripts::Transcripts::new(s).read(
-                session_id,
-                from_seq,
-                limit,
-                max_chars
-            ),
+            |s| crate::transcripts::Transcripts::new(s)
+                .read(session_id, from_seq, limit, max_chars),
             json!({
                 "id": session_id,
                 "from_seq": from_seq,
@@ -392,7 +416,8 @@ impl Persist {
         match self {
             Persist::Local(s) => Ok(s.skill_vector(key)),
             Persist::Remote(peer) => {
-                peer.call_as("store.skill_vector", json!({ "key": key })).await
+                peer.call_as("store.skill_vector", json!({ "key": key }))
+                    .await
             }
         }
     }
@@ -496,6 +521,13 @@ fn serve_store_call_inner(
         anyhow::bail!("a worker may only act on its own session or one of its sub-agents")
     }
 
+    let caller_owner = if caller_session.is_empty() {
+        None
+    } else {
+        store.owner_of_root(caller_session)?
+    };
+    let transcripts = || crate::transcripts::Transcripts::owned(store, caller_owner.as_deref());
+
     match method {
         "store.append_event" => {
             let session = own_session(store, &params, caller_session)?;
@@ -513,19 +545,43 @@ fn serve_store_call_inner(
                 .get("title")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            to_value(store.create_session(title, get_str(&params, "mode")?)?)
+            let requested = params
+                .get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or("local");
+            let owner = caller_owner.as_deref().unwrap_or(requested);
+            to_value(store.create_session(title, get_str(&params, "mode")?, owner)?)
         }
-        "store.get_session" => to_value(store.get_session(get_str(&params, "id")?)?),
+        "store.get_session" => {
+            let id = get_str(&params, "id")?;
+            if let Some(owner) = caller_owner.as_deref() {
+                anyhow::ensure!(
+                    store.owner_of_root(id)?.as_deref() == Some(owner),
+                    "conversation belongs to another user"
+                );
+            }
+            to_value(store.get_session(id)?)
+        }
+        "store.owner_of_root" => to_value(store.owner_of_root(get_str(&params, "id")?)?),
+        "store.list_sessions_owned" => {
+            let include = params
+                .get("include_archived")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            to_value(
+                store.list_sessions_owned(params.get("owner").and_then(Value::as_str), include)?,
+            )
+        }
         "store.list_sessions" => {
             let include = params
                 .get("include_archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            to_value(store.list_sessions(include)?)
+            to_value(store.list_sessions_owned(caller_owner.as_deref(), include)?)
         }
-        "store.rename_session" => to_value(
-            store.rename_session(get_str(&params, "id")?, get_str(&params, "title")?)?,
-        ),
+        "store.rename_session" => {
+            to_value(store.rename_session(get_str(&params, "id")?, get_str(&params, "title")?)?)
+        }
         "store.archive_session" => {
             let archived = params
                 .get("archived")
@@ -533,12 +589,12 @@ fn serve_store_call_inner(
                 .unwrap_or(true);
             to_value(store.archive_session(get_str(&params, "id")?, archived)?)
         }
-        "store.set_mode" => to_value(
-            store.set_mode(get_str(&params, "id")?, get_str(&params, "mode")?)?,
-        ),
-        "store.set_model" => to_value(
-            store.set_model(get_str(&params, "id")?, get_str(&params, "model")?)?,
-        ),
+        "store.set_mode" => {
+            to_value(store.set_mode(get_str(&params, "id")?, get_str(&params, "mode")?)?)
+        }
+        "store.set_model" => {
+            to_value(store.set_model(get_str(&params, "id")?, get_str(&params, "model")?)?)
+        }
         "store.clear_resume_attempts" => {
             to_value(store.clear_resume_attempts(own_session(store, &params, caller_session)?)?)
         }
@@ -552,9 +608,9 @@ fn serve_store_call_inner(
                 .unwrap_or(true);
             to_value(store.set_no_resume(own_session(store, &params, caller_session)?, flag)?)
         }
-        "store.kv_get" => to_value(
-            store.kv_get(get_str(&params, "scope")?, get_str(&params, "key")?)?,
-        ),
+        "store.kv_get" => {
+            to_value(store.kv_get(get_str(&params, "scope")?, get_str(&params, "key")?)?)
+        }
         "store.kv_put" => to_value(store.kv_put(
             get_str(&params, "scope")?,
             get_str(&params, "key")?,
@@ -566,7 +622,9 @@ fn serve_store_call_inner(
             get_str(&params, "expected")?,
             get_str(&params, "value")?,
         )?),
-        "store.get_spend" => to_value(store.get_spend(own_session(store, &params, caller_session)?)?),
+        "store.get_spend" => {
+            to_value(store.get_spend(own_session(store, &params, caller_session)?)?)
+        }
         // Scoped per id rather than in bulk: the batch exists to save round
         // trips, not to widen what a worker may look at.
         "store.session_progress" => {
@@ -594,32 +652,42 @@ fn serve_store_call_inner(
                 .get("max_children")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            to_value(crate::subagents::Subagents::new(store).register(
-                parent,
-                get_str(&params, "child")?,
-                params.get("label").and_then(Value::as_str).unwrap_or(""),
-                params.get("task").and_then(Value::as_str).unwrap_or(""),
-                params.get("agent").and_then(Value::as_str).unwrap_or(""),
-                params.get("model").and_then(Value::as_str).unwrap_or(""),
-                params.get("mode").and_then(Value::as_str).unwrap_or("agent"),
-                max,
-            )?)
+            to_value(
+                crate::subagents::Subagents::new(store).register(
+                    parent,
+                    get_str(&params, "child")?,
+                    params.get("label").and_then(Value::as_str).unwrap_or(""),
+                    params.get("task").and_then(Value::as_str).unwrap_or(""),
+                    params.get("agent").and_then(Value::as_str).unwrap_or(""),
+                    params.get("model").and_then(Value::as_str).unwrap_or(""),
+                    params
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent"),
+                    max,
+                )?,
+            )
         }
         "store.get_subagent" => to_value(store.get_subagent(get_str(&params, "child")?)?),
         "store.subagents_of" => {
             to_value(store.subagents_of(own_session(store, &params, caller_session)?)?)
         }
         "store.settle_subagent" => {
-            let cost = params.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
-            to_value(crate::subagents::Subagents::new(store).settle(
-                get_str(&params, "child")?,
-                params.get("result").and_then(Value::as_str).unwrap_or(""),
-                cost,
-                params
-                    .get("stopped_by")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stop"),
-            )?)
+            let cost = params
+                .get("cost_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            to_value(
+                crate::subagents::Subagents::new(store).settle(
+                    get_str(&params, "child")?,
+                    params.get("result").and_then(Value::as_str).unwrap_or(""),
+                    cost,
+                    params
+                        .get("stopped_by")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stop"),
+                )?,
+            )
         }
         "store.cancel_subagent" => to_value(
             crate::subagents::Subagents::new(store).mark_cancelled(get_str(&params, "child")?)?,
@@ -646,30 +714,21 @@ fn serve_store_call_inner(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
-            to_value(crate::transcripts::Transcripts::new(store).conversations(
-                include_archived,
-                include_subagents,
-                limit,
-            )?)
+            to_value(transcripts().conversations(include_archived, include_subagents, limit)?)
         }
-        "store.conversation_subagents" => to_value(
-            crate::transcripts::Transcripts::new(store).subagents(get_str(&params, "root")?)?,
-        ),
+        "store.conversation_subagents" => {
+            to_value(transcripts().subagents(get_str(&params, "root")?)?)
+        }
         "store.read_transcript" => {
             let from = params.get("from_seq").and_then(Value::as_u64).unwrap_or(0);
             let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
             let max_chars = params.get("max_chars").and_then(Value::as_u64).unwrap_or(0) as usize;
-            to_value(crate::transcripts::Transcripts::new(store).read(
-                get_str(&params, "id")?,
-                from,
-                limit,
-                max_chars,
-            )?)
+            to_value(transcripts().read(get_str(&params, "id")?, from, limit, max_chars)?)
         }
         "store.search_transcripts" => {
             let query: crate::transcripts::SearchQuery =
                 serde_json::from_value(params.get("query").cloned().unwrap_or(Value::Null))?;
-            to_value(crate::transcripts::Transcripts::new(store).search(&query)?)
+            to_value(transcripts().search(&query)?)
         }
         "store.skill_vector" => to_value(store.skill_vector(get_str(&params, "key")?)),
         "store.put_skill_vector" => {
@@ -745,16 +804,22 @@ mod tests {
         let remote = Persist::Remote(wk_peer);
 
         // Create through the remote arm, read back through both.
-        let meta = remote.create_session(Some("hi".into()), "build").await.unwrap();
-        assert_eq!(local.get_session(&meta.id).await.unwrap().unwrap().title, "hi");
-        assert_eq!(remote.get_session(&meta.id).await.unwrap().unwrap().mode, "build");
+        let meta = remote
+            .create_session(Some("hi".into()), &"build", "local")
+            .await
+            .unwrap();
+        assert_eq!(
+            local.get_session(&meta.id).await.unwrap().unwrap().title,
+            "hi"
+        );
+        assert_eq!(
+            remote.get_session(&meta.id).await.unwrap().unwrap().mode,
+            "build"
+        );
 
         // Events round-trip with their WIT payload intact.
         let seq = remote
-            .append_event(
-                &meta.id,
-                SessionEvent::Nudge("steer left".into()),
-            )
+            .append_event(&meta.id, SessionEvent::Nudge("steer left".into()))
             .await
             .unwrap()
             .seq;
@@ -800,10 +865,21 @@ mod tests {
         tokio::spawn(wk_done);
         let remote = Persist::Remote(wk_peer);
 
-        let parent = store.create_session(Some("the parent".into()), "agent").unwrap();
-        let child = store.create_session(None, "agent").unwrap();
+        let parent = store
+            .create_session(Some("the parent".into()), &"agent", "local")
+            .unwrap();
+        let child = store.create_session(None, &"agent", "local").unwrap();
         crate::subagents::Subagents::new(&store)
-            .register(&parent.id, &child.id, "scout", "go and look", "", "", "plan", 0)
+            .register(
+                &parent.id,
+                &child.id,
+                "scout",
+                "go and look",
+                "",
+                "",
+                "plan",
+                0,
+            )
             .unwrap();
         store
             .append_event(
@@ -844,12 +920,14 @@ mod tests {
 
         // A bad pattern is an error on the far side, not a panic or an empty
         // result that reads as "no matches".
-        assert!(remote
-            .search_transcripts(&crate::transcripts::SearchQuery {
-                pattern: "[unclosed".into(),
-                ..Default::default()
-            })
-            .await
-            .is_err());
+        assert!(
+            remote
+                .search_transcripts(&crate::transcripts::SearchQuery {
+                    pattern: "[unclosed".into(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
     }
 }

@@ -16,7 +16,7 @@
 //! be fetched from anywhere, or point back into the host filesystem, which is a
 //! different question from "may this tool use a crate".
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
@@ -168,7 +168,11 @@ fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > MAX_NAME {
         bail!("{name:?} is not a usable crate name");
     }
-    if !name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
         bail!("crate names start with a letter or digit: {name:?}");
     }
     if !name
@@ -321,18 +325,22 @@ opt-level = "s"
     fn removes_any_dependency_including_wit_bindgen() {
         let dir = scratch();
         remove(dir.path(), "serde_json").unwrap();
-        assert!(!list(dir.path())
-            .unwrap()
-            .iter()
-            .any(|d| d.name == "serde_json"));
+        assert!(
+            !list(dir.path())
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "serde_json")
+        );
 
         // The crate stops being a component without it. That shows up as a
         // failed build with the reason attached, not as a refusal here.
         remove(dir.path(), "wit-bindgen").unwrap();
-        assert!(!list(dir.path())
-            .unwrap()
-            .iter()
-            .any(|d| d.name == "wit-bindgen"));
+        assert!(
+            !list(dir.path())
+                .unwrap()
+                .iter()
+                .any(|d| d.name == "wit-bindgen")
+        );
     }
 
     #[test]
@@ -388,7 +396,15 @@ opt-level = "s"
 
     #[test]
     fn accepts_the_version_requirements_cargo_accepts() {
-        for good in ["1", "0.4.31", "^1.2", "~0.3", ">=1, <3", "1.0.0-alpha.1", "*"] {
+        for good in [
+            "1",
+            "0.4.31",
+            "^1.2",
+            "~0.3",
+            ">=1, <3",
+            "1.0.0-alpha.1",
+            "*",
+        ] {
             assert!(validate_version(good).is_ok(), "rejected {good}");
         }
     }

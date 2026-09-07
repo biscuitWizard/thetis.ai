@@ -163,12 +163,14 @@ pub async fn ensure_ready(cfg: &BrowserSettings) -> Result<()> {
     }
 
     // Node itself. Without it nothing else in here is worth trying.
-    let node = version_of(cfg.node_bin(), &["--version"]).await.with_context(|| {
-        format!(
-            "'{}' would not run. Node 18 or newer is what the browser tools need.",
-            cfg.node_bin()
-        )
-    })?;
+    let node = version_of(cfg.node_bin(), &["--version"])
+        .await
+        .with_context(|| {
+            format!(
+                "'{}' would not run. Node 18 or newer is what the browser tools need.",
+                cfg.node_bin()
+            )
+        })?;
     tracing::debug!(node = %node.trim(), "found node");
 
     ensure_playwright(cfg).await?;
@@ -268,7 +270,14 @@ async fn ensure_browser(cfg: &BrowserSettings) -> Result<()> {
     // `--with-deps` is deliberately not used: it needs root and would try to
     // install system packages under the orchestrator's privileges.
     let out = Command::new(cfg.npm_bin())
-        .args(["exec", "--", "playwright", "install", "chromium", "--only-shell"])
+        .args([
+            "exec",
+            "--",
+            "playwright",
+            "install",
+            "chromium",
+            "--only-shell",
+        ])
         .current_dir(&cfg.service_dir)
         .stdin(Stdio::null())
         .output();
@@ -326,16 +335,16 @@ async fn installed_version(dir: &Path) -> Option<String> {
         .current_dir(dir)
         .stdin(Stdio::null())
         .output();
-    let out = tokio::time::timeout(Duration::from_secs(20), out).await.ok()?.ok()?;
+    let out = tokio::time::timeout(Duration::from_secs(20), out)
+        .await
+        .ok()?
+        .ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!v.is_empty()).then_some(v)
 }
 
 async fn version_of(bin: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .output();
+    let out = Command::new(bin).args(args).stdin(Stdio::null()).output();
     let out = tokio::time::timeout(Duration::from_secs(20), out)
         .await
         .map_err(|_| anyhow::anyhow!("'{bin}' did not answer"))?
@@ -368,10 +377,7 @@ async fn supervise(cfg: Arc<Config>) {
             Ok(mut child) => {
                 backoff = Duration::from_secs(1);
                 let status = child.wait().await;
-                tracing::warn!(
-                    ?status,
-                    "the browser sidecar exited; restarting it shortly"
-                );
+                tracing::warn!(?status, "the browser sidecar exited; restarting it shortly");
             }
             Err(e) => {
                 tracing::warn!(
@@ -405,7 +411,10 @@ async fn start_once(cfg: &Config) -> Result<tokio::process::Child> {
         .env("THETIS_PW_PORT", b.port.to_string())
         .env(TOKEN_ENV, tok)
         .env("THETIS_PW_TIMEOUT_MS", b.default_timeout_ms.to_string())
-        .env("THETIS_PW_IDLE_MS", (b.idle_timeout_secs * 1000).to_string())
+        .env(
+            "THETIS_PW_IDLE_MS",
+            (b.idle_timeout_secs * 1000).to_string(),
+        )
         .env("THETIS_PW_SNAPSHOT_CHARS", b.snapshot_chars.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -427,10 +436,7 @@ async fn start_once(cfg: &Config) -> Result<tokio::process::Child> {
     let deadline = std::time::Instant::now() + b.startup_timeout;
     while std::time::Instant::now() < deadline {
         if healthy(b).await {
-            tracing::info!(
-                port = b.port,
-                "the headless browser sidecar is ready"
-            );
+            tracing::info!(port = b.port, "the headless browser sidecar is ready");
             return Ok(child);
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -520,7 +526,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(token_path(&dir)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(token_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "the token must not be world-readable");
         }
         let _ = std::fs::remove_dir_all(&dir);

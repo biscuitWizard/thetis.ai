@@ -9,7 +9,7 @@
 //! that marker appears. The marker is what turns an endless stream back into
 //! request and response.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -153,7 +153,6 @@ impl Session {
         signal_group(self.pgid, libc::SIGKILL);
         let _ = self.child.kill().await;
     }
-
 }
 
 /// Signals a whole process group, ignoring "nothing there" — the shell may
@@ -267,11 +266,7 @@ impl Terminals {
                 pid: s.pgid,
                 pty: s.pty,
                 user: s.user.clone(),
-                transcript: s
-                    .display
-                    .lock()
-                    .map(|d| d.clone())
-                    .unwrap_or_default(),
+                transcript: s.display.lock().map(|d| d.clone()).unwrap_or_default(),
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -305,7 +300,12 @@ impl Terminals {
 
         // A remote host is looked up before anything is spawned, so a typo in a
         // host name costs nothing.
-        let host = match spec.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+        let host = match spec
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
             Some(name) => {
                 if !cfg.terminal.ssh_enabled {
                     return Err(anyhow!(
@@ -548,7 +548,11 @@ impl Terminals {
                 // `try_wait` reports without blocking; `Some` means it exited.
                 alive: matches!(s.child.try_wait(), Ok(None)),
                 commands: s.commands,
-                busy: s.pending.as_ref().map(|p| p.command.clone()).unwrap_or_default(),
+                busy: s
+                    .pending
+                    .as_ref()
+                    .map(|p| p.command.clone())
+                    .unwrap_or_default(),
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -642,7 +646,7 @@ impl Terminals {
                 other => {
                     return Err(anyhow!(
                         "unknown signal {other:?}; use INT, TERM, TSTP, HUP, QUIT or KILL"
-                    ))
+                    ));
                 }
             };
             // Children only, never the shell. Signalling the group as a whole
@@ -659,7 +663,7 @@ impl Terminals {
                         "on the remote session {id} ({remote}) only INT, QUIT and TSTP can be \
                          delivered, as control characters — {other:?} would have to be sent by \
                          something running on that host. Close the session to end everything."
-                    ))
+                    ));
                 }
             };
             if !pty {
@@ -742,7 +746,7 @@ impl Terminals {
                 Err(_) => {
                     return Err(anyhow!(
                         "session {id} would not accept the input — it is not reading stdin"
-                    ))
+                    ));
                 }
             }
         }
@@ -804,11 +808,7 @@ impl Terminals {
             let session = sessions
                 .get(id)
                 .ok_or_else(|| anyhow!("no terminal session {id}"))?;
-            (
-                session.remote.clone(),
-                session.pty,
-                session.pending.clone(),
-            )
+            (session.remote.clone(), session.pty, session.pending.clone())
         };
 
         // A session with a backgrounded command still running is not free to
@@ -924,7 +924,7 @@ impl Terminals {
                         "terminal session {id} would not accept the command within {}s — \
                          it is wedged on a previous one. Close it and open a new session.",
                         timeout.as_secs()
-                    ))
+                    ));
                 }
             }
         }
@@ -1491,13 +1491,20 @@ mod tests {
         // indent of the output beneath them.
         let line = prompt_line("u", "", "/tmp", "for f in *; do\n  echo $f\ndone");
         let text = plain(&line);
-        assert_eq!(text.matches('\n').count(), 2, "only the wrapping newlines: {text:?}");
+        assert_eq!(
+            text.matches('\n').count(),
+            2,
+            "only the wrapping newlines: {text:?}"
+        );
         assert!(text.contains("for f in *; do ⏎ echo $f ⏎ done"), "{text:?}");
     }
 
     #[test]
     fn output_is_indented_under_its_prompt() {
-        assert_eq!(indent_output("Compiling thetis"), "\r  Compiling thetis\r\n");
+        assert_eq!(
+            indent_output("Compiling thetis"),
+            "\r  Compiling thetis\r\n"
+        );
         // A blank line stays blank rather than becoming two stray spaces.
         assert_eq!(indent_output(""), "\r\n");
     }
@@ -1575,7 +1582,10 @@ mod tests {
         // PowerShell leaves `$LASTEXITCODE` unset until a native command runs.
         let done = Completion::parse("\t\t/tmp");
         assert_eq!(done.exit_code, None);
-        assert_eq!(done.note("/elsewhere"), "\n\n[working directory is now /tmp]");
+        assert_eq!(
+            done.note("/elsewhere"),
+            "\n\n[working directory is now /tmp]"
+        );
     }
 
     #[test]
@@ -1617,15 +1627,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("leave your workspace"), "{err}");
-        assert!(err.contains("/usr/share"), "it must name where it would have gone: {err}");
+        assert!(
+            err.contains("/usr/share"),
+            "it must name where it would have gone: {err}"
+        );
 
         // The session survives the refusal and still works.
-        let ok = terminals.run(&cfg, &id, "echo still-usable", wait).await.unwrap();
+        let ok = terminals
+            .run(&cfg, &id, "echo still-usable", wait)
+            .await
+            .unwrap();
         assert_eq!(ok.output, "still-usable");
 
         // Moving around *inside* the workspace is untouched.
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
-        let moved = terminals.run(&cfg, &id, "cd sub && pwd", wait).await.unwrap();
+        let moved = terminals
+            .run(&cfg, &id, "cd sub && pwd", wait)
+            .await
+            .unwrap();
         assert!(moved.output.contains("sub"), "{moved:?}");
     }
 
@@ -1647,7 +1666,10 @@ mod tests {
             .unwrap();
         assert!(!binary.timed_out, "the binary write itself must complete");
 
-        let after = terminals.run(&cfg, &id, "echo still-here", wait).await.unwrap();
+        let after = terminals
+            .run(&cfg, &id, "echo still-here", wait)
+            .await
+            .unwrap();
         assert_eq!(
             after.output, "still-here",
             "the pump must survive invalid UTF-8: {after:?}"
@@ -2034,14 +2056,7 @@ mod tests {
         let id = terminals.open(&cfg, OpenSpec::local()).await.unwrap();
 
         terminals
-            .run_until(
-                &cfg,
-                &id,
-                "sleep 300",
-                Duration::from_secs(30),
-                true,
-                None,
-            )
+            .run_until(&cfg, &id, "sleep 300", Duration::from_secs(30), true, None)
             .await
             .unwrap();
 
@@ -2139,7 +2154,12 @@ mod tests {
             .unwrap();
 
         let out = terminals
-            .run(&cfg, &id, "echo \"$THETIS_TEST_VAR\"", Duration::from_secs(10))
+            .run(
+                &cfg,
+                &id,
+                "echo \"$THETIS_TEST_VAR\"",
+                Duration::from_secs(10),
+            )
             .await
             .unwrap();
         assert_eq!(out.output, "carried", "{out:?}");
@@ -2148,7 +2168,11 @@ mod tests {
         let info = listed.iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.name, "build box");
         assert!(info.remote.is_empty(), "a local session is not remote");
-        assert!(info.busy.is_empty(), "nothing is backgrounded: {:?}", info.busy);
+        assert!(
+            info.busy.is_empty(),
+            "nothing is backgrounded: {:?}",
+            info.busy
+        );
 
         terminals.close_all().await;
     }

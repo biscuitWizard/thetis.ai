@@ -22,7 +22,7 @@ pub mod commands;
 pub mod policy;
 pub mod split;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,9 +79,7 @@ pub fn spawn(grip: Arc<Grip>) -> Result<()> {
     }
 
     if cfg.allow_all_users {
-        tracing::warn!(
-            "DISCORD_ALLOW_ALL_USERS is on: anyone who can see the bot may talk to it"
-        );
+        tracing::warn!("DISCORD_ALLOW_ALL_USERS is on: anyone who can see the bot may talk to it");
     } else if cfg.allowed_users.is_empty() {
         tracing::warn!(
             "no Discord users are allowed yet; add ids to discord.allowed_users, \
@@ -297,8 +295,7 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
 /// list of ids, and a schema of its own would be more machinery than the data
 /// deserves.
 async fn paired_users(grip: &Grip) -> Vec<String> {
-    grip
-        .persist
+    grip.persist
         .kv_get(PAIR_SCOPE, PAIR_KEY)
         .await
         .ok()
@@ -318,8 +315,7 @@ async fn add_paired_user(grip: &Grip, user_id: &str) -> Result<()> {
     if !users.iter().any(|u| u == user_id) {
         users.push(user_id.to_string());
     }
-    grip
-        .persist
+    grip.persist
         .kv_put(PAIR_SCOPE, PAIR_KEY, &users.join(","))
         .await
         .map_err(Into::into)
@@ -399,12 +395,7 @@ async fn redeem_code(grip: &Grip, code: &str, user_id: &str) -> bool {
 
 // --- message handling ------------------------------------------------------
 
-async fn handle(
-    grip: Arc<Grip>,
-    rest: Rest,
-    bot_id: String,
-    msg: Incoming,
-) -> Result<()> {
+async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> Result<()> {
     let cfg = grip.cfg.discord.clone();
     let paired = paired_users(&grip).await;
 
@@ -479,11 +470,7 @@ async fn handle(
 /// Authorization is repeated here rather than borrowed from the message path:
 /// an interaction never passes through `decide`, so leaving it out would make
 /// every command reachable by anyone who can see the bot.
-async fn handle_command(
-    grip: Arc<Grip>,
-    rest: Rest,
-    interaction: Interaction,
-) -> Result<()> {
+async fn handle_command(grip: Arc<Grip>, rest: Rest, interaction: Interaction) -> Result<()> {
     let cfg = grip.cfg.discord.clone();
     let paired = paired_users(&grip).await;
 
@@ -524,7 +511,10 @@ async fn handle_command(
     )
     .await?
     .unwrap_or_else(|| {
-        format!("`/{}` is not a command I know. Try /help.", interaction.name)
+        format!(
+            "`/{}` is not a command I know. Try /help.",
+            interaction.name
+        )
     });
 
     // Discord shows "the application did not respond" after three seconds, and
@@ -639,11 +629,7 @@ async fn clear_form(grip: &Grip, state_id: &str) {
 /// Only for the window before the form is answerable: recording the message id
 /// on a form whose controls are already on screen would race with a click. It is
 /// safe there precisely because nobody can have loaded this state yet.
-async fn save_form_unconditionally(
-    grip: &Grip,
-    state_id: &str,
-    state: &ask::State,
-) -> Result<()> {
+async fn save_form_unconditionally(grip: &Grip, state_id: &str, state: &ask::State) -> Result<()> {
     let raw = serde_json::to_string(state)?;
     grip.persist
         .kv_put(ask::SCOPE, &ask::key(state_id), &raw)
@@ -687,7 +673,12 @@ async fn retire_live_form(grip: &Grip, rest: &Rest, session_id: &str) {
         ask::prompt_text(&form.state)
     );
     if let Err(e) = rest
-        .edit_with_components(&form.state.channel_id, message_id, &text, serde_json::json!([]))
+        .edit_with_components(
+            &form.state.channel_id,
+            message_id,
+            &text,
+            serde_json::json!([]),
+        )
         .await
     {
         tracing::warn!(error = %format!("{e:#}"),
@@ -1008,7 +999,8 @@ async fn handle_component(grip: Arc<Grip>, rest: Rest, component: Component) -> 
      * menu press updates in one request, which is both fewer round trips and
      * atomic: the control cannot be pressed twice while the edit is in flight. */
     if component.from_modal {
-        rest.ack_interaction(&component.id, &component.token).await?;
+        rest.ack_interaction(&component.id, &component.token)
+            .await?;
         if let Some(message_id) = component.message_id.as_deref() {
             if let Err(e) = rest
                 .edit_with_components(&component.channel_id, message_id, &text, components)
@@ -1110,9 +1102,11 @@ async fn session_for(grip: &Grip, key: &str) -> Result<String> {
     }
 
     let title = format!("Discord {key}");
+    let owner = format!("discord:{key}");
     let meta = grip
         .persist
-        .create_session(Some(title), &grip.cfg.discord.mode).await?;
+        .create_session(Some(title), &grip.cfg.discord.mode, &owner)
+        .await?;
     grip.persist.kv_put(PAIR_SCOPE, &kv_key, &meta.id).await?;
     tracing::info!(session = %meta.id, %key, mode = %grip.cfg.discord.mode,
         "created a Discord session");
@@ -1528,7 +1522,10 @@ mod tests {
         // And a later tool replaces the earlier note rather than stacking.
         let first = compose("Working.", "", Some("search_files"));
         let second = compose("Working.", "", Some("read_path"));
-        assert!(!second.contains("search_files"), "stale note left behind: {second:?}");
+        assert!(
+            !second.contains("search_files"),
+            "stale note left behind: {second:?}"
+        );
         assert_ne!(first, second);
     }
 
@@ -1557,7 +1554,10 @@ mod tests {
             shown.starts_with(settled),
             "the earlier step must still be on screen: {shown:?}"
         );
-        assert!(shown.ends_with(buffer), "the live step must be too: {shown:?}");
+        assert!(
+            shown.ends_with(buffer),
+            "the live step must be too: {shown:?}"
+        );
     }
 
     /// Either side can be empty — a tool-only turn never streams, and the

@@ -355,4 +355,18 @@ watcher's path-to-aspect mapping.
   implementation is a stub; with `THETIS_SANDBOX=false` the agent is simply not
   offered code-execution tools rather than being handed tools that fail.
 - **MCP.** The imports exist and return empty; no client is connected yet.
-- Additional gateways (REST, chat platforms) and authentication for the web UI.
+- Additional gateways (REST and other chat platforms).
+
+## Web accounts
+
+The default `[auth] mode = "local"` preserves the loopback-only, no-login setup.
+For multiple users, set `mode = "users"`, define `[[roles]]` and `[[users]]` in
+`thetis.local.toml`, and generate Argon2 hashes with
+`thetis hash-password --stdin`. Each conversation is owned by one account and
+is omitted from every other account's list and transcript recall.
+
+When binding off loopback, `server.public_origin` is required. Put Thetis behind
+a TLS reverse proxy that preserves `Host`; proxy headers are not trusted. Role
+capability denials are enforced in native host imports. Per-name denials of
+agent-internal built-ins are advisory; deny their capability family for a hard
+boundary. The shared workspace is not partitioned between users.

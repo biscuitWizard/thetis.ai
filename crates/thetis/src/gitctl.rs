@@ -8,11 +8,11 @@
 //! reimplementations diverge from the reference implementation. Output is
 //! parsed only from plumbing formats git documents as stable.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::process::Output;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Local git operations never legitimately take this long; a hung git would
@@ -430,7 +430,9 @@ impl GitCtl {
     /// name one.
     pub async fn rev_parse(&self, rev: &str) -> Result<Option<String>> {
         let spec = format!("{rev}^{{commit}}");
-        let out = self.run_ok(&["rev-parse", "--verify", "--quiet", &spec]).await?;
+        let out = self
+            .run_ok(&["rev-parse", "--verify", "--quiet", &spec])
+            .await?;
         if out.status.success() {
             Ok(Some(Self::stdout(&out)))
         } else {
@@ -442,7 +444,9 @@ impl GitCtl {
     /// the build cache uses. `None` when the path does not exist there.
     pub async fn tree_oid(&self, rev: &str, path: &str) -> Result<Option<String>> {
         let spec = format!("{rev}:{path}");
-        let out = self.run_ok(&["rev-parse", "--verify", "--quiet", &spec]).await?;
+        let out = self
+            .run_ok(&["rev-parse", "--verify", "--quiet", &spec])
+            .await?;
         if out.status.success() {
             Ok(Some(Self::stdout(&out)))
         } else {
@@ -494,7 +498,8 @@ impl GitCtl {
     /// A log over arbitrary rev-list arguments (exclusions included), with
     /// parent ids — what a commit graph draws from.
     pub async fn log_args(&self, revs: &[&str], limit: usize) -> Result<Vec<CommitInfo>> {
-        let format = format!("%H{FIELD_SEP}%P{FIELD_SEP}%s{FIELD_SEP}%an{FIELD_SEP}%at{RECORD_SEP}");
+        let format =
+            format!("%H{FIELD_SEP}%P{FIELD_SEP}%s{FIELD_SEP}%an{FIELD_SEP}%at{RECORD_SEP}");
         let max = format!("--max-count={limit}");
         let fmt = format!("--format={format}");
         let mut args = vec!["log", max.as_str(), fmt.as_str()];
@@ -635,7 +640,14 @@ impl GitCtl {
     /// older ones.
     pub async fn merge_tree(&self, ours: &str, theirs: &str) -> Result<MergeTree> {
         let out = self
-            .run_ok(&["merge-tree", "--write-tree", "-z", "--name-only", ours, theirs])
+            .run_ok(&[
+                "merge-tree",
+                "--write-tree",
+                "-z",
+                "--name-only",
+                ours,
+                theirs,
+            ])
             .await?;
         // `<tree>NUL` on success; on a conflict the tree is followed by one
         // NUL-terminated path per conflicted file, then an empty field, then
@@ -812,7 +824,8 @@ impl GitCtl {
         let path_str = path
             .to_str()
             .with_context(|| format!("non-utf8 worktree path {}", path.display()))?;
-        self.run(&["worktree", "remove", "--force", path_str]).await?;
+        self.run(&["worktree", "remove", "--force", path_str])
+            .await?;
         Ok(())
     }
 
@@ -944,14 +957,16 @@ mod tests {
 
         for n in 0..4 {
             fs::write(wt_path.join(format!("f{n}.txt")), format!("{n}\n")).unwrap();
-            wt.add_all_and_commit(&format!("checkpoint {n}")).await.unwrap().unwrap();
+            wt.add_all_and_commit(&format!("checkpoint {n}"))
+                .await
+                .unwrap()
+                .unwrap();
         }
         let old_tip = wt.head().await.unwrap();
-        let tree_before = String::from_utf8_lossy(
-            &wt.run(&["rev-parse", "HEAD^{tree}"]).await.unwrap().stdout,
-        )
-        .trim()
-        .to_string();
+        let tree_before =
+            String::from_utf8_lossy(&wt.run(&["rev-parse", "HEAD^{tree}"]).await.unwrap().stdout)
+                .trim()
+                .to_string();
         assert_eq!(git.ahead_behind("conv/sq", "main").await.unwrap(), (4, 0));
 
         let keep = "refs/thetis/presquash/test";
@@ -963,7 +978,10 @@ mod tests {
         // One commit ahead of trunk, same tree, worktree still clean.
         assert_eq!(git.ahead_behind("conv/sq", "main").await.unwrap(), (1, 0));
         let tree_after = String::from_utf8_lossy(
-            &git.run(&["rev-parse", "conv/sq^{tree}"]).await.unwrap().stdout,
+            &git.run(&["rev-parse", "conv/sq^{tree}"])
+                .await
+                .unwrap()
+                .stdout,
         )
         .trim()
         .to_string();
@@ -975,7 +993,10 @@ mod tests {
         }
 
         // The old history is rewritten out of the branch but still reachable.
-        assert_eq!(git.rev_parse(keep).await.unwrap().as_deref(), Some(old_tip.as_str()));
+        assert_eq!(
+            git.rev_parse(keep).await.unwrap().as_deref(),
+            Some(old_tip.as_str())
+        );
         assert!(!git.is_ancestor(&old_tip, "conv/sq").await.unwrap());
 
         // And trunk takes it as a fast-forward, one line long.
@@ -1011,11 +1032,18 @@ mod tests {
         let wt_path = tmp.path().join("worktrees").join("one");
         let wt = git.worktree_add(&wt_path, "conv/one").await.unwrap();
         fs::write(wt_path.join("only.txt"), "x\n").unwrap();
-        let tip = wt.add_all_and_commit("the only commit").await.unwrap().unwrap();
+        let tip = wt
+            .add_all_and_commit("the only commit")
+            .await
+            .unwrap()
+            .unwrap();
 
         // Still squashed to one commit — and the id is unchanged, so nothing
         // was rewritten for no gain.
-        let out = git.squash_onto("conv/one", "main", "rewrite", None).await.unwrap();
+        let out = git
+            .squash_onto("conv/one", "main", "rewrite", None)
+            .await
+            .unwrap();
         assert_ne!(out, tip, "one commit above trunk is still re-parented");
         assert_eq!(git.ahead_behind("conv/one", "main").await.unwrap(), (1, 0));
     }
@@ -1161,10 +1189,7 @@ mod tests {
         git.add_all_and_commit("broken").await.unwrap().unwrap();
 
         git.checkout_paths(&green, &["tools/demo"]).await.unwrap();
-        assert_eq!(
-            fs::read_to_string(tool.join("lib.rs")).unwrap(),
-            "good\n"
-        );
+        assert_eq!(fs::read_to_string(tool.join("lib.rs")).unwrap(), "good\n");
     }
 
     #[tokio::test]
@@ -1209,7 +1234,11 @@ mod tests {
     async fn hard_reset_clean_removes_untracked_but_keeps_ignored() {
         let (tmp, git) = repo().await;
         fs::write(tmp.path().join(".gitignore"), "kept-cache/\n").unwrap();
-        let base = git.add_all_and_commit("ignore file").await.unwrap().unwrap();
+        let base = git
+            .add_all_and_commit("ignore file")
+            .await
+            .unwrap()
+            .unwrap();
 
         fs::write(tmp.path().join("base.txt"), "changed\n").unwrap();
         fs::write(tmp.path().join("untracked.txt"), "new\n").unwrap();

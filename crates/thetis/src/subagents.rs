@@ -24,10 +24,10 @@
 //! cancellation semantics and the UI all comprehensible, and the parent stays
 //! identifiable as the thing responsible for the work.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{now_ms, Store};
+use crate::store::{Store, now_ms};
 
 /// Where a sub-agent is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,10 +189,7 @@ impl<'a> Subagents<'a> {
             );
         }
         let existing = self.store.subagents_of(parent_id)?;
-        let live = existing
-            .iter()
-            .filter(|r| !r.state.is_terminal())
-            .count();
+        let live = existing.iter().filter(|r| !r.state.is_terminal()).count();
         if max_children > 0 && live >= max_children {
             bail!(
                 "this session already has {live} sub-agents running, which is the \
@@ -351,11 +348,17 @@ mod tests {
             subs.register("p", &format!("c{i}"), "c", "t", "", "", "agent", 2)
                 .unwrap();
         }
-        assert!(subs.register("p", "c2", "c", "t", "", "", "agent", 2).is_err());
+        assert!(
+            subs.register("p", "c2", "c", "t", "", "", "agent", 2)
+                .is_err()
+        );
         // Settling one frees a slot: the cap is on concurrency, not on how many
         // a turn may delegate in total.
         subs.settle("c0", "an answer", 0.0, "stop").unwrap();
-        assert!(subs.register("p", "c2", "c", "t", "", "", "agent", 2).is_ok());
+        assert!(
+            subs.register("p", "c2", "c", "t", "", "", "agent", 2)
+                .is_ok()
+        );
     }
 
     // A child orphaned by a restart is not running and never will be again.
@@ -364,8 +367,10 @@ mod tests {
     fn a_startup_sweep_settles_children_nothing_is_running_any_more() {
         let store = store();
         let subs = Subagents::new(&store);
-        subs.register("p", "alive", "a", "t", "", "", "agent", 8).unwrap();
-        subs.register("p", "done", "d", "t", "", "", "agent", 8).unwrap();
+        subs.register("p", "alive", "a", "t", "", "", "agent", 8)
+            .unwrap();
+        subs.register("p", "done", "d", "t", "", "", "agent", 8)
+            .unwrap();
         subs.settle("done", "an answer", 0.5, "stop").unwrap();
 
         let swept = subs.fail_orphans("orphaned by a restart").unwrap();
@@ -386,18 +391,24 @@ mod tests {
     fn a_swept_orphan_keeps_the_money_its_turn_spent() {
         let store = store();
         let subs = Subagents::new(&store);
-        subs.register("p", "c", "c", "t", "", "", "agent", 8).unwrap();
+        subs.register("p", "c", "c", "t", "", "", "agent", 8)
+            .unwrap();
         store.add_spend("c", 4.25).unwrap();
 
         let swept = subs.fail_orphans("orphaned").unwrap();
-        assert!((swept[0].cost_usd - 4.25).abs() < f64::EPSILON, "{:?}", swept[0]);
+        assert!(
+            (swept[0].cost_usd - 4.25).abs() < f64::EPSILON,
+            "{:?}",
+            swept[0]
+        );
     }
 
     #[test]
     fn a_second_sweep_finds_nothing_left_to_do() {
         let store = store();
         let subs = Subagents::new(&store);
-        subs.register("p", "c", "c", "t", "", "", "agent", 8).unwrap();
+        subs.register("p", "c", "c", "t", "", "", "agent", 8)
+            .unwrap();
         assert_eq!(subs.fail_orphans("orphaned").unwrap().len(), 1);
         assert!(subs.fail_orphans("orphaned").unwrap().is_empty());
     }
@@ -406,10 +417,15 @@ mod tests {
     fn an_empty_result_is_a_failure_not_a_success() {
         let store = store();
         let subs = Subagents::new(&store);
-        subs.register("p", "c", "c", "t", "", "", "agent", 8).unwrap();
+        subs.register("p", "c", "c", "t", "", "", "agent", 8)
+            .unwrap();
         let row = subs.settle("c", "   ", 0.01, "stop").unwrap();
         assert_eq!(row.state, SubagentState::Failed);
-        assert!(row.detail.contains("without a final answer"), "{}", row.detail);
+        assert!(
+            row.detail.contains("without a final answer"),
+            "{}",
+            row.detail
+        );
     }
 
     #[test]
@@ -428,8 +444,12 @@ mod tests {
     fn children_are_hidden_from_the_session_list() {
         let store = store();
         let subs = Subagents::new(&store);
-        let parent = store.create_session(Some("parent".into()), "agent").unwrap();
-        let child = store.create_session(Some("child".into()), "agent").unwrap();
+        let parent = store
+            .create_session(Some("parent".into()), &"agent", "local")
+            .unwrap();
+        let child = store
+            .create_session(Some("child".into()), &"agent", "local")
+            .unwrap();
         subs.register(&parent.id, &child.id, "k", "t", "", "", "agent", 8)
             .unwrap();
         let listed = store.list_sessions(true).unwrap();

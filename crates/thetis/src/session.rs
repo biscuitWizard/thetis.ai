@@ -240,7 +240,11 @@ impl SessionActors {
 
     /// The stop signal for a session, for host imports that want to wait on it.
     pub fn cancel_flag(&self, session_id: &str) -> Option<Arc<CancelFlag>> {
-        self.handles.read().ok()?.get(session_id).map(|h| h.cancel.clone())
+        self.handles
+            .read()
+            .ok()?
+            .get(session_id)
+            .map(|h| h.cancel.clone())
     }
 
     /// Takes everything queued for the running turn. Called by the agent's
@@ -258,11 +262,7 @@ impl SessionActors {
         inbox.drain(..).collect()
     }
 
-    fn ensure(
-        &self,
-        grip: &Arc<Grip>,
-        session_id: &str,
-    ) -> mpsc::UnboundedSender<SessionMsg> {
+    fn ensure(&self, grip: &Arc<Grip>, session_id: &str) -> mpsc::UnboundedSender<SessionMsg> {
         if let Ok(handles) = self.handles.read() {
             if let Some(h) = handles.get(session_id) {
                 return h.tx.clone();
@@ -350,7 +350,10 @@ async fn actor(
         // moves the anchor past it.
         let since_seq = last_settled_seq(&grip, &session_id).await;
 
-        if let Err(e) = grip.append_event(&session_id, SessionEvent::TurnStarted).await {
+        if let Err(e) = grip
+            .append_event(&session_id, SessionEvent::TurnStarted)
+            .await
+        {
             tracing::error!(session = %session_id, error = %e, "failed to log turn start");
         }
 
@@ -423,12 +426,15 @@ async fn actor(
                 // covers all of it, so the log's totals win and the agent's
                 // richer detail — which tools it used — is kept.
                 let mut stats = stats;
-                let from_log = stats_from_log(&grip, &session_id, since_seq, &stats.stopped_by).await;
+                let from_log =
+                    stats_from_log(&grip, &session_id, since_seq, &stats.stopped_by).await;
                 stats.prompt_tokens = from_log.prompt_tokens;
                 stats.completion_tokens = from_log.completion_tokens;
                 stats.cost_usd = from_log.cost_usd;
                 stats.iterations = stats.iterations.max(from_log.iterations);
-                let _ = grip.append_event(&session_id, SessionEvent::TurnFinished(stats)).await;
+                let _ = grip
+                    .append_event(&session_id, SessionEvent::TurnFinished(stats))
+                    .await;
                 // The turn made it to the end, so a later interruption starts
                 // counting from zero again.
                 let _ = grip.persist.clear_resume_attempts(&session_id).await;
@@ -549,11 +555,7 @@ async fn actor(
         // Unless the user stopped it. A nudge and a stop can arrive together —
         // typing, then hitting stop — and starting a follow-up turn on the
         // nudge would restart the work that was just cancelled.
-        if !stopped
-            && leftovers
-                .iter()
-                .any(|i| matches!(i, InboxItem::Nudge(_)))
-        {
+        if !stopped && leftovers.iter().any(|i| matches!(i, InboxItem::Nudge(_))) {
             start_immediately = true;
         }
     }
@@ -640,7 +642,10 @@ mod tests {
         let whole = usage_since(&events, 0);
 
         assert_eq!(first.0, 300, "the steps before the first row settled");
-        assert_eq!(second.0, 1200, "the steps after it, including a resumed turn");
+        assert_eq!(
+            second.0, 1200,
+            "the steps after it, including a resumed turn"
+        );
         assert_eq!(
             first.0 + second.0,
             whole.0,

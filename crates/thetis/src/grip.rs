@@ -8,10 +8,11 @@
 //! an `Arc<Grip>`. It owns the database, the LLM client, the component
 //! registry, and the event fan-out to connected browsers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+use crate::aspect::Aspect;
 use crate::bindings::types::{Attachment, OutboundEvent, SessionEvent, ToolManifest, TurnStats};
 use crate::builder::Builder;
 use crate::config::Config;
@@ -21,7 +22,6 @@ use crate::persist::Persist;
 use crate::revisions::Revisions;
 use crate::runtime::{Budget, Caps, Runtime};
 use crate::session::SessionActors;
-use crate::aspect::Aspect;
 use crate::store::Store;
 use crate::watchdog::Breakers;
 
@@ -343,9 +343,7 @@ impl Grip {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
         self.report_turns(running);
-        TurnGuard {
-            grip: self.clone(),
-        }
+        TurnGuard { grip: self.clone() }
     }
 
     /// Tells the gateway how many turns this worker is running.
@@ -373,8 +371,11 @@ impl Grip {
             + 1;
         let peer = peer.clone();
         handle.spawn(async move {
-            peer.notify("turns", serde_json::json!({ "running": running, "seq": seq }))
-                .await;
+            peer.notify(
+                "turns",
+                serde_json::json!({ "running": running, "seq": seq }),
+            )
+            .await;
         });
     }
 
@@ -409,10 +410,7 @@ impl Grip {
         if self.turns_running.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             return true;
         }
-        self.building
-            .lock()
-            .map(|b| !b.is_empty())
-            .unwrap_or(false)
+        self.building.lock().map(|b| !b.is_empty()).unwrap_or(false)
     }
 
     /// Claims the right to build an aspect, or `None` if one is already running.
@@ -491,6 +489,36 @@ impl Grip {
         });
     }
 
+    // --- policy-scoped stores ----------------------------------------------
+    pub fn gateway_store(
+        self: &Arc<Self>,
+        budget: Budget,
+        principal: Arc<crate::auth::Principal>,
+    ) -> wasmtime::Store<crate::runtime::HostState> {
+        let mut s = self
+            .runtime
+            .new_store(self.clone(), Caps::Gateway, budget, None);
+        s.data_mut().policy = principal.policy.clone();
+        s.data_mut().principal = Some(principal);
+        s
+    }
+    pub async fn session_store(
+        self: &Arc<Self>,
+        caps: Caps,
+        budget: Budget,
+        id: &str,
+    ) -> wasmtime::Store<crate::runtime::HostState> {
+        let policy = match self.persist.owner_of_root(id).await {
+            Ok(Some(o)) => self.cfg.auth.policy_for(&o),
+            _ => self.cfg.auth.local_policy.clone(),
+        };
+        let mut s = self
+            .runtime
+            .new_store(self.clone(), caps, budget, Some(id.into()));
+        s.data_mut().policy = policy;
+        s
+    }
+
     // --- turns -------------------------------------------------------------
 
     /// Runs one agentic turn to completion inside a fresh store.
@@ -498,20 +526,16 @@ impl Grip {
     /// A trap (guest panic, memory limit, blown budget) surfaces here as an
     /// `Err`, never as a process failure.
     pub async fn run_turn(self: &Arc<Self>, session_id: &str) -> Result<TurnStats, TurnError> {
-        let loaded = self.loader.get(&Aspect::Agent).ok_or_else(|| {
-            TurnError::Reported("no agent component is loaded".to_string())
-        })?;
+        let loaded = self
+            .loader
+            .get(&Aspect::Agent)
+            .ok_or_else(|| TurnError::Reported("no agent component is loaded".to_string()))?;
 
         // The turn's stop signal is carried by the session's `CancelFlag`,
         // which host imports await directly; the budget only enforces the
         // grace window once one has been raised.
         let budget = Budget::new(format!("agent turn ({session_id})"), self.cfg.wasm_slice);
-        let mut store = self.runtime.new_store(
-            self.clone(),
-            Caps::Agent,
-            budget,
-            Some(session_id.to_string()),
-        );
+        let mut store = self.session_store(Caps::Agent, budget, session_id).await;
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -574,9 +598,12 @@ impl Grip {
         };
 
         let budget = Budget::probe("agent list-tools", self.cfg.probe_budget);
-        let mut store = self
-            .runtime
-            .new_store(self.clone(), Caps::Agent, budget, Some(session_id.to_string()));
+        let mut store = self.runtime.new_store(
+            self.clone(),
+            Caps::Agent,
+            budget,
+            Some(session_id.to_string()),
+        );
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -667,7 +694,10 @@ impl Grip {
                 )
                 .await
                 {
-                    Ok(v) => v.get("stopped").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                    Ok(v) => v
+                        .get("stopped")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
                     Err(e) => {
                         tracing::warn!(session = %session_id, error = %e, "cancel did not reach the worker");
                         false
@@ -740,7 +770,10 @@ impl Grip {
     /// invisible to the model, which is indistinguishable from it not being
     /// installed at all. Routing every install through here is what makes that
     /// impossible to forget.
-    pub async fn install_component(self: &Arc<Self>, component: Arc<crate::loader::LoadedComponent>) {
+    pub async fn install_component(
+        self: &Arc<Self>,
+        component: Arc<crate::loader::LoadedComponent>,
+    ) {
         let aspect = component.aspect.clone();
         self.loader.install(component);
 

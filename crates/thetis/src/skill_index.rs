@@ -282,7 +282,10 @@ fn absorb_into_parents(tree: &SkillTree, scored: Vec<(String, f64)>) -> Vec<(Str
         }
     }
 
-    let mut out: Vec<(String, f64)> = order.into_iter().map(|id| (id.clone(), lifted[&id])).collect();
+    let mut out: Vec<(String, f64)> = order
+        .into_iter()
+        .map(|id| (id.clone(), lifted[&id]))
+        .collect();
     sort_by_score(&mut out);
     out
 }
@@ -322,7 +325,7 @@ fn promote_parents(tree: &SkillTree, out: &mut Vec<Ranked>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::{discover, SkillTree};
+    use crate::skills::{SkillTree, discover};
 
     fn tree_from(files: &[(&str, &str)]) -> (tempfile::TempDir, SkillTree) {
         let dir = tempfile::tempdir().unwrap();
@@ -376,11 +379,20 @@ mod tests {
         .iter()
         .map(|(n, b)| (format!("{n}.md"), skill_file(n, b)))
         .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
-        let out = rank(&tree, &corpus, "how do I restore an earlier revision", None, 3);
+        let out = rank(
+            &tree,
+            &corpus,
+            "how do I restore an earlier revision",
+            None,
+            3,
+        );
 
         assert_eq!(out[0].id, "rollback");
         assert_eq!(out[0].how, How::Lexical);
@@ -391,7 +403,10 @@ mod tests {
         let files: Vec<(String, String)> = (0..6)
             .map(|i| (format!("s{i}.md"), skill_file(&format!("S{i}"), "A skill.")))
             .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let all = tree.all();
@@ -425,7 +440,10 @@ mod tests {
         let files: Vec<(String, String)> = (0..6)
             .map(|i| (format!("s{i}.md"), skill_file(&format!("S{i}"), "A skill.")))
             .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let all = tree.all();
@@ -461,7 +479,10 @@ mod tests {
         .iter()
         .map(|(n, b)| (format!("{n}.md"), skill_file(n, b)))
         .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
@@ -500,7 +521,10 @@ mod tests {
                 skill_file(&format!("F{i}"), "Unrelated filler."),
             ));
         }
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
@@ -529,7 +553,10 @@ mod tests {
                 skill_file(&format!("F{i}"), "Unrelated filler."),
             ));
         }
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
@@ -556,7 +583,10 @@ mod tests {
                 skill_file(&format!("F{i}"), "Widget grinding also."),
             ));
         }
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
@@ -574,7 +604,10 @@ mod tests {
                 )
             })
             .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);
@@ -593,7 +626,10 @@ mod tests {
                 )
             })
             .collect();
-        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let (_d, tree) = tree_from(&refs);
 
         let corpus = lexical_corpus(&tree);

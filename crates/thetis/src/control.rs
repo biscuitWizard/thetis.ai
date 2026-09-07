@@ -4,7 +4,7 @@
 //! only at startup — takes effect. Guest code cannot be trusted to do this
 //! sensibly on its own, so it is rate limited by uptime and can be turned off.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,8 +79,7 @@ fn pin(cfg: &crate::config::Config) -> Result<PathBuf> {
 }
 
 fn pin_into(exe: &Path, dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let pinned = dir.join("thetis");
     let staging = dir.join(format!("thetis.incoming.{}", std::process::id()));
     let _ = std::fs::remove_file(&staging);
@@ -152,11 +151,7 @@ pub fn kernel_binary(root: &Path) -> PathBuf {
 ///
 /// Errors read as "no": a missing tree is not evidence of a change, and
 /// rebuilding the kernel on a bad answer is far more disruptive than skipping.
-pub async fn kernel_source_moved(
-    git: &crate::gitctl::GitCtl,
-    before: &str,
-    after: &str,
-) -> bool {
+pub async fn kernel_source_moved(git: &crate::gitctl::GitCtl, before: &str, after: &str) -> bool {
     for path in KERNEL_PATHS {
         let was = git.tree_oid(before, path).await.ok().flatten();
         let now = git.tree_oid(after, path).await.ok().flatten();
@@ -429,11 +424,7 @@ async fn install_kernel_from_cache(cached: &Path, destination: &Path) -> Result<
     Ok(())
 }
 
-fn store_kernel(
-    cache: &crate::buildcache::BuildCache,
-    key: &str,
-    binary: &Path,
-) -> Result<()> {
+fn store_kernel(cache: &crate::buildcache::BuildCache, key: &str, binary: &Path) -> Result<()> {
     let meta = crate::buildcache::BuildMeta {
         aspect: KERNEL_CACHE_ASPECT.to_string(),
         key: key.to_string(),
@@ -577,7 +568,9 @@ fn kernel_is_stale(cfg: &crate::config::Config) -> bool {
         }
     }
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -655,7 +648,10 @@ fn build_then_restart(
             let session = session_id.clone();
             async move {
                 let _ = grip
-                    .append_event(&session, crate::bindings::types::SessionEvent::Incident(text))
+                    .append_event(
+                        &session,
+                        crate::bindings::types::SessionEvent::Incident(text),
+                    )
                     .await;
             }
         };
@@ -1009,13 +1005,19 @@ mod kernel_cache_tests {
             .await
             .expect("installing");
 
-        assert!(destination.is_file(), "the kernel lands at the restart path");
+        assert!(
+            destination.is_file(),
+            "the kernel lands at the restart path"
+        );
         assert_eq!(
             std::fs::read(&built).unwrap(),
             std::fs::read(&destination).unwrap(),
             "the installed kernel is byte-identical to the one built"
         );
-        let mode = std::fs::metadata(&destination).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode();
         assert!(mode & 0o111 != 0, "the installed kernel must be executable");
 
         // Installing again over the file that is already there must work:
@@ -1052,7 +1054,10 @@ mod kernel_cache_tests {
         let strays: Vec<_> = std::fs::read_dir(tmp.path().join("target/release"))
             .map(|d| d.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
-        assert!(strays.is_empty(), "staging files must be cleaned up: {strays:?}");
+        assert!(
+            strays.is_empty(),
+            "staging files must be cleaned up: {strays:?}"
+        );
     }
 }
 
@@ -1124,7 +1129,10 @@ mod tests {
         // A file genuinely named "... (deleted)" is left alone: it exists, so
         // there is nothing to see through.
         let only_marked = |p: &Path| p == marked;
-        assert_eq!(resolve_exe(marked.clone(), only_marked), Some(marked.clone()));
+        assert_eq!(
+            resolve_exe(marked.clone(), only_marked),
+            Some(marked.clone())
+        );
 
         // Nothing on disk under either name is an honest "we cannot say".
         assert_eq!(resolve_exe(marked, |_: &Path| false), None);
@@ -1232,7 +1240,11 @@ mod tests {
 
         // Native code: the kernel must be rebuilt.
         write("crates/thetis/src/lib.rs", "// v2\n");
-        let native = git.add_all_and_commit("kernel edit").await.unwrap().unwrap();
+        let native = git
+            .add_all_and_commit("kernel edit")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(kernel_source_moved(&git, &guest_only, &native).await);
 
         // The contract counts too — it is compiled into the kernel.

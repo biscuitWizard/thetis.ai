@@ -51,6 +51,10 @@ dirs = "6"
 toml = "1.1.4"
 toml_edit = "0.25.13"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+# authentication: password hashing (users mode) and cookie/token encoding
+argon2 = "0.5"
+base64 = "0.22"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"

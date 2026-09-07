@@ -10,15 +10,15 @@
 //! files that decide what code runs at *build* time — `Cargo.toml`, `build.rs`,
 //! `.cargo/` — are off limits, because a host-side build executes them.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::aspect::{Aspect, validate_component_name};
 use crate::bindings::types::{CompileReport, ModTarget};
 use crate::grip::Grip;
 use crate::pipeline;
 use crate::revisions::Origin;
-use crate::aspect::{validate_component_name, Aspect};
 
 /// Why a path is off limits, or `None` when it is not.
 ///
@@ -110,7 +110,10 @@ pub fn resolve_path(grip: &Arc<Grip>, aspect: &Aspect, relative: &str) -> Result
     if let (Ok(root_real), Ok(parent_real)) = (
         dunce_canonicalize(&root),
         full.parent().map(dunce_canonicalize).unwrap_or_else(|| {
-            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no parent",
+            ))
         }),
     ) {
         if !parent_real.starts_with(&root_real) {
@@ -159,11 +162,7 @@ fn report_from(outcome: pipeline::Outcome) -> CompileReport {
 // --- operations -------------------------------------------------------------
 
 /// Scaffolds a new tool crate from the template, builds it, and loads it.
-pub async fn new_tool(
-    grip: &Arc<Grip>,
-    name: &str,
-    description: &str,
-) -> CompileReport {
+pub async fn new_tool(grip: &Arc<Grip>, name: &str, description: &str) -> CompileReport {
     let aspect_label = format!("tool/{name}");
 
     if let Err(e) = validate_component_name(name) {
@@ -260,7 +259,9 @@ pub async fn patch_file(
     if occurrences > 1 {
         return report_error(
             &aspect.key(),
-            format!("the text to replace appears {occurrences} times in {path}; include more surrounding context to make it unique"),
+            format!(
+                "the text to replace appears {occurrences} times in {path}; include more surrounding context to make it unique"
+            ),
         );
     }
 
@@ -308,11 +309,7 @@ pub async fn add_dependency(
 }
 
 /// Removes a dependency and rebuilds.
-pub async fn remove_dependency(
-    grip: &Arc<Grip>,
-    target: &ModTarget,
-    name: &str,
-) -> CompileReport {
+pub async fn remove_dependency(grip: &Arc<Grip>, target: &ModTarget, name: &str) -> CompileReport {
     let aspect = match aspect_with_source(grip, target) {
         Ok(aspect) => aspect,
         Err(report) => return report,
@@ -364,7 +361,12 @@ fn aspect_with_source(
         Ok(s) => s,
         Err(e) => return Err(report_error("unknown", format!("{e:#}"))),
     };
-    if !grip.cfg.aspect_source_dir(&aspect).join("Cargo.toml").is_file() {
+    if !grip
+        .cfg
+        .aspect_source_dir(&aspect)
+        .join("Cargo.toml")
+        .is_file()
+    {
         return Err(report_error(
             &aspect.key(),
             format!("{aspect} has no crate on disk"),
@@ -439,12 +441,7 @@ fn locate(
     }
 }
 
-async fn build(
-    grip: &Arc<Grip>,
-    aspect: &Aspect,
-    origin: Origin,
-    note: &str,
-) -> CompileReport {
+async fn build(grip: &Arc<Grip>, aspect: &Aspect, origin: Origin, note: &str) -> CompileReport {
     // The watcher would otherwise queue a second, redundant build for the same
     // edit a moment later.
     grip.suppress_watch(aspect, grip.cfg.watchdog.watch_suppression);

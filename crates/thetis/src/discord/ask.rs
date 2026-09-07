@@ -27,7 +27,7 @@
 //! Discord gives back.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// KV scope for form state. Global because a form belongs to a channel, and
 /// channels are not sessions.
@@ -684,7 +684,13 @@ mod tests {
 
     #[test]
     fn an_open_question_still_gets_both_controls() {
-        let state = State::new("s", "c", "u", ask_of(r#"{"questions":[{"question":"q"}]}"#), 0);
+        let state = State::new(
+            "s",
+            "c",
+            "u",
+            ask_of(r#"{"questions":[{"question":"q"}]}"#),
+            0,
+        );
         let text = components(&state, "abc").to_string();
         assert!(text.contains("Answer"));
         assert!(text.contains("Skip"));
@@ -692,7 +698,13 @@ mod tests {
 
     #[test]
     fn the_controls_retire_when_the_form_is_finished() {
-        let mut state = State::new("s", "c", "u", ask_of(r#"{"questions":[{"question":"q"}]}"#), 0);
+        let mut state = State::new(
+            "s",
+            "c",
+            "u",
+            ask_of(r#"{"questions":[{"question":"q"}]}"#),
+            0,
+        );
         state.record(Answer {
             skipped: false,
             text: "yes".into(),
@@ -745,7 +757,10 @@ mod tests {
             0,
         );
         state.record(Answer::default());
-        assert_ne!(index, state.index, "an old row must not match the new index");
+        assert_ne!(
+            index, state.index,
+            "an old row must not match the new index"
+        );
     }
 
     #[test]
@@ -825,7 +840,13 @@ mod tests {
 
     #[test]
     fn a_form_expires_so_an_old_message_cannot_answer_a_finished_turn() {
-        let state = State::new("s", "c", "u", ask_of(r#"{"questions":[{"question":"q"}]}"#), 0);
+        let state = State::new(
+            "s",
+            "c",
+            "u",
+            ask_of(r#"{"questions":[{"question":"q"}]}"#),
+            0,
+        );
         assert!(!state.expired(TTL_MS));
         assert!(state.expired(TTL_MS + 1));
     }

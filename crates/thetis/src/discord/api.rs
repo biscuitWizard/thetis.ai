@@ -4,14 +4,14 @@
 //! wire protocol and hands plain events upward, which keeps the routing and
 //! authorization policy in `mod.rs` testable without a socket.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
 };
 
 pub const API_BASE: &str = "https://discord.com/api/v10";
@@ -167,9 +167,11 @@ pub fn is_fatal_close(code: u16) -> bool {
 pub fn fatal_advice(code: u16) -> &'static str {
     match code {
         4004 => "the bot token was rejected; check discord.bot_token or DISCORD_BOT_TOKEN",
-        4013 | 4014 => "the gateway refused the intents; enable Message Content Intent \
+        4013 | 4014 => {
+            "the gateway refused the intents; enable Message Content Intent \
                         and Server Members Intent under Privileged Gateway Intents in the \
-                        Discord Developer Portal",
+                        Discord Developer Portal"
+        }
         4010 | 4011 => "the shard configuration is wrong for this bot",
         4012 => "the gateway API version is no longer supported by this build",
         _ => "the gateway closed the connection permanently",
@@ -204,16 +206,10 @@ fn parse_message(d: &Value) -> Option<Incoming> {
     Some(Incoming {
         message_id: d.get("id")?.as_str()?.to_string(),
         channel_id: d.get("channel_id")?.as_str()?.to_string(),
-        guild_id: d
-            .get("guild_id")
-            .and_then(Value::as_str)
-            .map(String::from),
+        guild_id: d.get("guild_id").and_then(Value::as_str).map(String::from),
         author_id,
         author_name,
-        author_is_bot: author
-            .get("bot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        author_is_bot: author.get("bot").and_then(Value::as_bool).unwrap_or(false),
         content: d
             .get("content")
             .and_then(Value::as_str)
@@ -419,9 +415,10 @@ impl Shard {
         };
 
         // HELLO always arrives first and carries the heartbeat interval.
-        let hello = shard.read_payload().await?.ok_or_else(|| {
-            anyhow!("the gateway closed before sending HELLO")
-        })?;
+        let hello = shard
+            .read_payload()
+            .await?
+            .ok_or_else(|| anyhow!("the gateway closed before sending HELLO"))?;
         if hello.get("op").and_then(Value::as_u64) != Some(OP_HELLO) {
             return Err(anyhow!("expected HELLO, got op {:?}", hello.get("op")));
         }
@@ -492,7 +489,7 @@ impl Shard {
         while let Some(frame) = self.socket.next().await {
             match frame.context("reading the gateway socket")? {
                 Message::Text(text) => {
-                    return Ok(Some(serde_json::from_str(&text).context("gateway JSON")?))
+                    return Ok(Some(serde_json::from_str(&text).context("gateway JSON")?));
                 }
                 Message::Close(frame) => {
                     // Keep the code separate from the prose: the caller has to
@@ -555,7 +552,9 @@ impl Shard {
                     self.send(json!({ "op": OP_HEARTBEAT, "d": seq })).await?;
                 }
                 Some(OP_RECONNECT) => {
-                    return Ok(Event::Disconnected("the gateway asked us to reconnect".into()))
+                    return Ok(Event::Disconnected(
+                        "the gateway asked us to reconnect".into(),
+                    ));
                 }
                 Some(OP_INVALID_SESSION) => {
                     // `d: false` means the session cannot be resumed, so drop
@@ -565,7 +564,9 @@ impl Shard {
                         self.session_id = None;
                         self.last_seq = None;
                     }
-                    return Ok(Event::Disconnected("the gateway invalidated the session".into()));
+                    return Ok(Event::Disconnected(
+                        "the gateway invalidated the session".into(),
+                    ));
                 }
                 Some(OP_DISPATCH) => {
                     let name = payload.get("t").and_then(Value::as_str).unwrap_or("");
@@ -754,13 +755,12 @@ impl Rest {
     /// and it survived because the only evidence was a cheerful log line. The
     /// count returned now excludes anything Discord stored in that state, so a
     /// silent failure shows up as a warning and a short count.
-    pub async fn register_commands(
-        &self,
-        application_id: &str,
-        commands: Value,
-    ) -> Result<usize> {
+    pub async fn register_commands(&self, application_id: &str, commands: Value) -> Result<usize> {
         let registered = self
-            .put(&format!("/applications/{application_id}/commands"), commands)
+            .put(
+                &format!("/applications/{application_id}/commands"),
+                commands,
+            )
             .await?;
         let stored = registered.as_array().map(Vec::as_slice).unwrap_or(&[]);
         let limbo = commands_without_contexts(stored);
@@ -844,12 +844,7 @@ impl Rest {
     /// A modal response cannot be sent to a modal submission — Discord rejects
     /// a modal from a modal — so this is only ever the answer to a command or a
     /// component.
-    pub async fn open_modal(
-        &self,
-        interaction_id: &str,
-        token: &str,
-        modal: Value,
-    ) -> Result<()> {
+    pub async fn open_modal(&self, interaction_id: &str, token: &str, modal: Value) -> Result<()> {
         const MODAL: u64 = 9;
         self.interaction_callback(
             interaction_id,
@@ -897,7 +892,9 @@ impl Rest {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Discord rejected an interaction reply: {status} {text}"));
+            return Err(anyhow!(
+                "Discord rejected an interaction reply: {status} {text}"
+            ));
         }
         Ok(())
     }
@@ -1218,11 +1215,13 @@ mod tests {
         // Type 1 is Discord's PING and 3 is a message component. Treating
         // either as a command would invent a name out of nothing.
         for kind in [1, 3, 5] {
-            assert!(parse_interaction(&json!({
-                "id": "i", "token": "t", "type": kind, "channel_id": "c",
-                "user": { "id": "u", "username": "sam" },
-            }))
-            .is_none());
+            assert!(
+                parse_interaction(&json!({
+                    "id": "i", "token": "t", "type": kind, "channel_id": "c",
+                    "user": { "id": "u", "username": "sam" },
+                }))
+                .is_none()
+            );
         }
     }
 

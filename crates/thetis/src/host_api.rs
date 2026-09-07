@@ -25,10 +25,9 @@ fn err(msg: impl Into<String>) -> wasmtime::Error {
 
 use crate::bindings::types::{
     Attachment, CompactionProgress, CompileReport, ConfigEntry, Dependency, EventRecord,
-    ExecResult, FsEntry, InboxItem,
-    LlmError, LogLevel, ModeInfo, ModTarget, ModelInfo, SessionEvent,
-    SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen, TerminalOutput,
-    ToolManifest,
+    ExecResult, FsEntry, InboxItem, LlmError, LogLevel, ModTarget, ModeInfo, ModelInfo,
+    SessionEvent, SessionMeta, SshHostInfo, StreamChunk, TerminalInfo, TerminalOpen,
+    TerminalOutput, ToolManifest,
 };
 use crate::bindings::{
     branch, configuration, control, delegation, devkit, hostfs, llm, sandbox, session, sys,
@@ -58,6 +57,25 @@ impl HostState {
                 "session {session_id} is out of scope for this call (scoped to {mine})"
             ))),
             _ => Ok(()),
+        }
+    }
+
+    fn may_access(&self, session_id: &str) -> Result<()> {
+        if self.session_id.is_some() {
+            return self.scope_ok(session_id);
+        }
+        match &self.principal {
+            Some(p) => {
+                crate::auth::may_access(self.grip(), p, session_id).map_err(|e| err(e.to_string()))
+            }
+            None => self.scope_ok(session_id),
+        }
+    }
+    fn require(&self, cap: crate::policy::Cap) -> Result<()> {
+        if self.policy.denies(cap) {
+            Err(err(format!("{cap:?} is withheld for this user by policy")))
+        } else {
+            Ok(())
         }
     }
 
@@ -163,21 +181,73 @@ impl sys::Host for HostState {
 
     async fn kv_get(&mut self, scope: String, key: String) -> Result<Option<String>> {
         self.budget.entered_host("kv_get");
-        if scope != "global" {
-            self.scope_ok(&scope)?;
+        let scope = if scope == "user" {
+            if let Some(p) = &self.principal {
+                format!("user:{}", p.user_id)
+            } else if let Some(id) = &self.session_id {
+                format!(
+                    "user:{}",
+                    self.grip()
+                        .persist
+                        .owner_of_root(id)
+                        .await
+                        .wt()?
+                        .unwrap_or_else(|| "local".into())
+                )
+            } else {
+                return Err(err("no user for this call"));
+            }
+        } else if scope.starts_with("user:") {
+            return Err(err("user scopes are addressed as `user`"));
+        } else {
+            scope
+        };
+        if scope != "global" && !scope.starts_with("user:") {
+            self.may_access(&scope)?;
         }
         self.grip().persist.kv_get(&scope, &key).await.wt()
     }
 
     async fn kv_put(&mut self, scope: String, key: String, value: String) -> Result<()> {
         self.budget.entered_host("kv_put");
-        if scope != "global" {
-            self.scope_ok(&scope)?;
+        let scope = if scope == "user" {
+            if let Some(p) = &self.principal {
+                format!("user:{}", p.user_id)
+            } else if let Some(id) = &self.session_id {
+                format!(
+                    "user:{}",
+                    self.grip()
+                        .persist
+                        .owner_of_root(id)
+                        .await
+                        .wt()?
+                        .unwrap_or_else(|| "local".into())
+                )
+            } else {
+                return Err(err("no user for this call"));
+            }
+        } else if scope.starts_with("user:") {
+            return Err(err("user scopes are addressed as `user`"));
+        } else {
+            scope
+        };
+        if scope != "global" && !scope.starts_with("user:") {
+            self.may_access(&scope)?;
+        }
+        if scope == "global"
+            && self.session_id.is_none()
+            && self.principal.as_ref().is_some_and(|p| !p.is_admin())
+        {
+            return Err(err("only an administrator may write global settings"));
         }
         if value.len() > 1 << 20 {
             return Err(err("kv value exceeds 1 MiB"));
         }
-        self.grip().persist.kv_put(&scope, &key, &value).await.wt()?;
+        self.grip()
+            .persist
+            .kv_put(&scope, &key, &value)
+            .await
+            .wt()?;
         Ok(())
     }
 
@@ -187,7 +257,11 @@ impl sys::Host for HostState {
         self.budget.entered_host("config_get");
         let cfg = &self.grip().cfg;
         Ok(match key.as_str() {
-            "model" => Some(cfg.model.clone()),
+            "model" => Some(self.policy.default_model.clone()),
+            "policy_read_only" => Some(self.policy.read_only.to_string()),
+            "policy_deny_tools" => Some(self.policy.deny_tools.join(",")),
+            "policy_deny_groups" => Some(self.policy.deny_groups.join(",")),
+            "policy_models_restricted" => Some(self.policy.models_restricted.to_string()),
             // What the agent calls itself. The harness is always Thetis; this
             // is the name the agent answers to in a prompt or on screen.
             "agent_name" => Some(cfg.agent_name.clone()),
@@ -204,11 +278,7 @@ impl sys::Host for HostState {
             // useful in a terminal command — the filesystem tools are rooted at
             // the conversation's own checkout, which the workspace sits outside
             // of. Not a secret: it is printed in the UI's workspace explorer.
-            "workspace_dir" => cfg
-                .wasi
-                .dirs
-                .first()
-                .map(|d| d.display().to_string()),
+            "workspace_dir" => cfg.wasi.dirs.first().map(|d| d.display().to_string()),
             // The dev kit is wired up; the agent uses this to decide whether to
             // offer itself the self-modification tools.
             "devkit_available" => Some(cfg.devkit.enabled.to_string()),
@@ -242,6 +312,7 @@ impl sys::Host for HostState {
             .cfg
             .models
             .iter()
+            .filter(|m| self.policy.allows_model(&m.id))
             .map(|m| ModelInfo {
                 id: m.id.clone(),
                 label: m.label.clone(),
@@ -256,11 +327,12 @@ impl sys::Host for HostState {
             .cfg
             .modes
             .iter()
+            .filter(|m| self.policy.allows_mode(&m.id))
             .map(|m| ModeInfo {
                 id: m.id.clone(),
                 label: m.label.clone(),
                 description: m.description.clone(),
-                read_only: m.read_only,
+                read_only: self.policy.read_only || m.read_only,
                 prompt: m.prompt.clone(),
             })
             .collect())
@@ -353,11 +425,25 @@ impl session::Host for HostState {
         // what the picker offers, not the set of ids the provider accepts, so
         // silently swapping an unlisted one for the default made a deliberate
         // choice look like it had been ignored.
-        self.grip().persist.list_sessions(include_archived).await.wt()
+        let owned = if self.policy.see_all_sessions {
+            None
+        } else if let Some(p) = &self.principal {
+            Some(p.user_id.clone())
+        } else if let Some(id) = &self.session_id {
+            self.grip().persist.owner_of_root(id).await.wt()?
+        } else {
+            None
+        };
+        self.grip()
+            .persist
+            .list_sessions_owned(owned.as_deref(), include_archived)
+            .await
+            .wt()
     }
 
     async fn get_session(&mut self, session_id: String) -> Result<Option<SessionMeta>> {
         self.budget.entered_host("get_session");
+        self.may_access(&session_id)?;
         self.grip().persist.get_session(&session_id).await.wt()
     }
 
@@ -377,10 +463,15 @@ impl session::Host for HostState {
                 "an agent cannot create conversations; use spawn_agent to delegate",
             ));
         }
-        let mode = self.grip().cfg.default_mode.clone();
+        let mode = self.policy.default_mode.clone();
+        let owner = self
+            .principal
+            .as_ref()
+            .map(|p| p.user_id.as_str())
+            .unwrap_or("local");
         self.grip()
             .persist
-            .create_session(title, &mode)
+            .create_session(title, &mode, owner)
             .await
             .map(|s| s.id)
             .wt()
@@ -389,14 +480,22 @@ impl session::Host for HostState {
     async fn rename_session(&mut self, session_id: String, title: String) -> Result<()> {
         self.budget.entered_host("rename_session");
         self.scope_ok(&session_id)?;
-        self.grip().persist.rename_session(&session_id, &title).await.wt()?;
+        self.grip()
+            .persist
+            .rename_session(&session_id, &title)
+            .await
+            .wt()?;
         Ok(())
     }
 
     async fn archive_session(&mut self, session_id: String, archived: bool) -> Result<()> {
         self.budget.entered_host("archive_session");
         self.scope_ok(&session_id)?;
-        self.grip().persist.archive_session(&session_id, archived).await.wt()?;
+        self.grip()
+            .persist
+            .archive_session(&session_id, archived)
+            .await
+            .wt()?;
         // An archived conversation's worker has nothing left to do, and its
         // checkout is disposable — the branch and every commit stay. All
         // gateway-side: the registry and the fleet live there.
@@ -410,9 +509,10 @@ impl session::Host for HostState {
                         let _ = peer.call("shutdown", serde_json::Value::Null).await;
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
-                    let Some(store) = grip.local_store() else { return };
-                    let branches =
-                        crate::branches::Branches::new(grip.cfg.clone(), store.clone());
+                    let Some(store) = grip.local_store() else {
+                        return;
+                    };
+                    let branches = crate::branches::Branches::new(grip.cfg.clone(), store.clone());
                     if let Ok(Some(mut row)) = branches.get(&session_id) {
                         row.state = crate::branches::BranchState::Archived;
                         let _ = branches.update(&row);
@@ -451,14 +551,21 @@ impl session::Host for HostState {
 
     async fn set_session_mode(&mut self, session_id: String, mode: String) -> Result<()> {
         self.budget.entered_host("set_session_mode");
-        self.scope_ok(&session_id)?;
+        self.may_access(&session_id)?;
+        if !self.policy.allows_mode(&mode) {
+            return Err(err(format!("mode `{mode}` is not available to this user")));
+        };
         // Only offered modes are accepted, so a guest cannot invent one the
         // agent has no handling for.
         let known = self.grip().cfg.mode(&mode).is_some();
         if !known {
             return Err(err(format!("unknown mode: {mode}")));
         }
-        self.grip().persist.set_mode(&session_id, &mode).await.wt()?;
+        self.grip()
+            .persist
+            .set_mode(&session_id, &mode)
+            .await
+            .wt()?;
         Ok(())
     }
 
@@ -472,14 +579,23 @@ impl session::Host for HostState {
 
     async fn set_session_model(&mut self, session_id: String, model: String) -> Result<()> {
         self.budget.entered_host("set_session_model");
-        self.scope_ok(&session_id)?;
-        // Any model id is accepted. The configured list is what the picker
+        self.may_access(&session_id)?;
+        if !model.is_empty() && !self.policy.allows_model(&model) {
+            return Err(err(format!(
+                "model `{model}` is not available to this user"
+            )));
+        };
+        // The configured list is what the picker
         // offers, not what the provider supports, so checking against it meant a
         // model had to be added to the config - and the process restarted -
         // before it could ever be tried. A wrong id comes back from the provider
         // as a clear error on the next turn, which is a better place to find out
         // than a rejected click.
-        self.grip().persist.set_model(&session_id, &model).await.wt()?;
+        self.grip()
+            .persist
+            .set_model(&session_id, &model)
+            .await
+            .wt()?;
         Ok(())
     }
 }
@@ -540,7 +656,10 @@ impl HostState {
         // A context this large cannot survive compaction, so it means something
         // is wrong upstream; storing it would be the second problem.
         if text.len() > MAX_CAPTURED_REQUEST {
-            tracing::warn!(bytes = text.len(), "request too large to capture for the inspector");
+            tracing::warn!(
+                bytes = text.len(),
+                "request too large to capture for the inspector"
+            );
             return;
         }
         let persist = self.grip.persist.clone();
@@ -571,7 +690,10 @@ impl HostState {
 }
 
 impl llm::Host for HostState {
-    async fn chat(&mut self, request_json: String) -> Result<std::result::Result<String, LlmError>> {
+    async fn chat(
+        &mut self,
+        request_json: String,
+    ) -> Result<std::result::Result<String, LlmError>> {
         self.budget.entered_host("chat");
         let (persist, sid, limit) = self.budget_inputs();
         if let Err(e) = Self::check_budget(persist, sid, limit).await {
@@ -586,7 +708,10 @@ impl llm::Host for HostState {
         // and everything else driven by the turn were dead.
         let session = self.session_id.clone();
         let result = self
-            .interruptible("the completion", llm.chat_for(&request_json, session.as_deref()))
+            .interruptible(
+                "the completion",
+                llm.chat_for(&request_json, session.as_deref()),
+            )
             .await;
         self.yielded();
         Ok(match result {
@@ -751,7 +876,11 @@ impl tooling::Host for HostState {
         args_json: String,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("invoke");
-        self.scope_ok(&session_id)?;
+        self.require(crate::policy::Cap::ComponentTools)?;
+        self.may_access(&session_id)?;
+        if self.policy.denies_tool(&name) {
+            return Ok(Err(format!("'{name}' is withheld for this user by policy")));
+        }
         let grip = self.grip.clone();
         // A tool can spend a long time on the network. Stopping the turn should
         // not mean waiting for it, and certainly should not mean the remaining
@@ -790,6 +919,7 @@ impl tooling::Host for HostState {
 impl devkit::Host for HostState {
     async fn new_tool(&mut self, name: String, description: String) -> Result<CompileReport> {
         self.budget.entered_host("new_tool");
+        self.require(crate::policy::Cap::Devkit)?;
         let grip = self.grip.clone();
         let report = crate::devkit::new_tool(&grip, &name, &description).await;
         // Compiling is slow by nature; do not charge it to the guest's budget.
@@ -804,6 +934,7 @@ impl devkit::Host for HostState {
         contents: String,
     ) -> Result<CompileReport> {
         self.budget.entered_host("write_file");
+        self.require(crate::policy::Cap::Devkit)?;
         let grip = self.grip.clone();
         let report = crate::devkit::write_file(&grip, &target, &path, &contents).await;
         self.yielded();
@@ -819,9 +950,9 @@ impl devkit::Host for HostState {
         new_text: String,
     ) -> Result<CompileReport> {
         self.budget.entered_host("patch_file");
+        self.require(crate::policy::Cap::Devkit)?;
         let grip = self.grip.clone();
-        let report =
-            crate::devkit::patch_file(&grip, &target, &path, &old_text, &new_text).await;
+        let report = crate::devkit::patch_file(&grip, &target, &path, &old_text, &new_text).await;
         self.yielded();
         self.note_pending_swap(&target);
         Ok(report)
@@ -833,6 +964,7 @@ impl devkit::Host for HostState {
         dep: Dependency,
     ) -> Result<CompileReport> {
         self.budget.entered_host("add_dependency");
+        self.require(crate::policy::Cap::Devkit)?;
         let grip = self.grip.clone();
         let dep = crate::manifest::Dependency {
             name: dep.name,
@@ -852,6 +984,7 @@ impl devkit::Host for HostState {
         name: String,
     ) -> Result<CompileReport> {
         self.budget.entered_host("remove_dependency");
+        self.require(crate::policy::Cap::Devkit)?;
         let grip = self.grip.clone();
         let report = crate::devkit::remove_dependency(&grip, &target, &name).await;
         self.yielded();
@@ -897,7 +1030,6 @@ impl devkit::Host for HostState {
         let grip = self.grip.clone();
         Ok(crate::devkit::list_files(&grip, &target))
     }
-
 }
 
 // --- branch ------------------------------------------------------------------
@@ -913,9 +1045,7 @@ impl HostState {
 }
 
 impl branch::Host for HostState {
-    async fn status(
-        &mut self,
-    ) -> Result<std::result::Result<branch::BranchState, String>> {
+    async fn status(&mut self) -> Result<std::result::Result<branch::BranchState, String>> {
         self.budget.entered_host("status");
         let grip = self.grip.clone();
         let out = crate::branchops::status(&grip)
@@ -939,6 +1069,7 @@ impl branch::Host for HostState {
         &mut self,
     ) -> Result<std::result::Result<branch::BranchState, String>> {
         self.budget.entered_host("update_from_trunk");
+        self.require(crate::policy::Cap::BranchWrite)?;
         let session = self.branch_session()?;
         let grip = self.grip.clone();
         let out = crate::branchops::update_from_trunk(&grip, &session)
@@ -953,6 +1084,7 @@ impl branch::Host for HostState {
         rev: String,
     ) -> Result<std::result::Result<branch::BranchState, String>> {
         self.budget.entered_host("reset_to");
+        self.require(crate::policy::Cap::BranchWrite)?;
         let session = self.branch_session()?;
         let grip = self.grip.clone();
         let out = crate::branchops::reset_to(&grip, &session, &rev)
@@ -967,6 +1099,7 @@ impl branch::Host for HostState {
         message: Option<String>,
     ) -> Result<std::result::Result<branch::BranchState, String>> {
         self.budget.entered_host("complete_merge");
+        self.require(crate::policy::Cap::BranchWrite)?;
         let session = self.branch_session()?;
         let grip = self.grip.clone();
         let out = crate::branchops::complete_merge(&grip, &session, message)
@@ -976,10 +1109,9 @@ impl branch::Host for HostState {
         Ok(out)
     }
 
-    async fn abort_merge(
-        &mut self,
-    ) -> Result<std::result::Result<branch::BranchState, String>> {
+    async fn abort_merge(&mut self) -> Result<std::result::Result<branch::BranchState, String>> {
         self.budget.entered_host("abort_merge");
+        self.require(crate::policy::Cap::BranchWrite)?;
         let session = self.branch_session()?;
         let grip = self.grip.clone();
         let out = crate::branchops::abort_merge(&grip, &session)
@@ -1014,7 +1146,7 @@ impl delegation::Host for HostState {
     async fn available(&mut self) -> Result<bool> {
         self.budget.entered_host("available");
         let cfg = &self.grip().cfg;
-        if !cfg.subagents.enabled {
+        if !cfg.subagents.enabled || self.policy.denies(crate::policy::Cap::Delegation) {
             return Ok(false);
         }
         // A sub-agent is told delegation is unavailable, not merely refused it
@@ -1063,7 +1195,7 @@ impl delegation::Host for HostState {
         self.budget.entered_host("limits");
         let cfg = &self.grip().cfg;
         Ok(delegation::DelegationLimits {
-            max_children: cfg.subagents.max_children as u32,
+            max_children: cfg.subagents.max_children.min(self.policy.max_children) as u32,
             max_wait_secs: cfg.subagents.max_wait_secs,
             max_result_bytes: cfg.subagents.max_result_bytes as u32,
         })
@@ -1074,6 +1206,7 @@ impl delegation::Host for HostState {
         req: delegation::SpawnRequest,
     ) -> Result<std::result::Result<delegation::SubagentInfo, String>> {
         self.budget.entered_host("spawn");
+        self.require(crate::policy::Cap::Delegation)?;
         let parent = self.delegating_session()?;
         let grip = self.grip.clone();
         let out = crate::delegation::spawn(
@@ -1188,7 +1321,9 @@ impl delegation::Host for HostState {
                 .events(&child_id, from_seq)
                 .await
                 .map_err(|e| format!("{e:#}")),
-            _ => Err(format!("`{child_id}` is not one of this session's sub-agents")),
+            _ => Err(format!(
+                "`{child_id}` is not one of this session's sub-agents"
+            )),
         };
         self.yielded();
         Ok(out)
@@ -1295,6 +1430,7 @@ impl transcripts::Host for HostState {
         limit: u64,
     ) -> Result<std::result::Result<Vec<transcripts::ConversationSummary>, String>> {
         self.budget.entered_host("conversations");
+        self.require(crate::policy::Cap::Transcripts)?;
         let grip = self.grip.clone();
         let out = grip
             .persist
@@ -1311,6 +1447,7 @@ impl transcripts::Host for HostState {
         session_id: String,
     ) -> Result<std::result::Result<transcripts::ConversationSummary, String>> {
         self.budget.entered_host("conversation");
+        self.require(crate::policy::Cap::Transcripts)?;
         let grip = self.grip.clone();
         // Served through the catalogue rather than a dedicated call: one
         // conversation is the same query with a filter, and adding an IPC arm
@@ -1335,6 +1472,7 @@ impl transcripts::Host for HostState {
         root_id: String,
     ) -> Result<std::result::Result<Vec<transcripts::ConversationSummary>, String>> {
         self.budget.entered_host("subagents");
+        self.require(crate::policy::Cap::Transcripts)?;
         let grip = self.grip.clone();
         let out = grip
             .persist
@@ -1354,6 +1492,7 @@ impl transcripts::Host for HostState {
         max_chars: u64,
     ) -> Result<std::result::Result<Vec<transcripts::TranscriptEntry>, String>> {
         self.budget.entered_host("read");
+        self.require(crate::policy::Cap::Transcripts)?;
         let grip = self.grip.clone();
         let out = grip
             .persist
@@ -1380,6 +1519,7 @@ impl transcripts::Host for HostState {
         query: transcripts::SearchQuery,
     ) -> Result<std::result::Result<transcripts::SearchReport, String>> {
         self.budget.entered_host("search");
+        self.require(crate::policy::Cap::Transcripts)?;
         let grip = self.grip.clone();
         let out = grip
             .persist
@@ -1420,9 +1560,7 @@ impl transcripts::Host for HostState {
     }
 }
 
-fn summary_to_wit(
-    c: &crate::transcripts::ConversationSummary,
-) -> transcripts::ConversationSummary {
+fn summary_to_wit(c: &crate::transcripts::ConversationSummary) -> transcripts::ConversationSummary {
     transcripts::ConversationSummary {
         id: c.id.clone(),
         title: c.title.clone(),
@@ -1451,11 +1589,13 @@ fn summary_to_wit(
 impl hostfs::Host for HostState {
     async fn available(&mut self) -> Result<bool> {
         self.budget.entered_host("available");
-        Ok(self.grip().cfg.filesystem.enabled)
+        Ok(self.grip().cfg.filesystem.enabled
+            && !self.policy.denies(crate::policy::Cap::FilesystemRead))
     }
 
     async fn read_file(&mut self, path: String) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("read_file");
+        self.require(crate::policy::Cap::FilesystemRead)?;
         let grip = self.grip.clone();
         Ok(
             crate::offload::blocking(|| crate::hostfs::read_file(&grip.cfg, &path))
@@ -1470,17 +1610,20 @@ impl hostfs::Host for HostState {
         contents: String,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("write_file");
+        self.require(crate::policy::Cap::FilesystemWrite)?;
         let grip = self.grip.clone();
         Ok(
-            crate::offload::blocking(|| {
-                crate::hostfs::write_file(&grip.cfg, &path, &contents)
-            })
-            .map_err(|e| format!("{e:#}")),
+            crate::offload::blocking(|| crate::hostfs::write_file(&grip.cfg, &path, &contents))
+                .map_err(|e| format!("{e:#}")),
         )
     }
 
-    async fn list_dir(&mut self, path: String) -> Result<std::result::Result<Vec<FsEntry>, String>> {
+    async fn list_dir(
+        &mut self,
+        path: String,
+    ) -> Result<std::result::Result<Vec<FsEntry>, String>> {
         self.budget.entered_host("list_dir");
+        self.require(crate::policy::Cap::FilesystemRead)?;
         let grip = self.grip.clone();
         Ok(
             crate::offload::blocking(|| crate::hostfs::list_dir(&grip.cfg, &path))
@@ -1494,6 +1637,7 @@ impl hostfs::Host for HostState {
         recursive: bool,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("delete_path");
+        self.require(crate::policy::Cap::FilesystemDelete)?;
         let grip = self.grip.clone();
         let result =
             crate::offload::blocking(|| crate::hostfs::delete_path(&grip.cfg, &path, recursive));
@@ -1511,14 +1655,13 @@ impl hostfs::Host for HostState {
         limit: u32,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("read_file_range");
+        self.require(crate::policy::Cap::FilesystemRead)?;
         let grip = self.grip.clone();
-        Ok(
-            crate::offload::blocking(|| {
-                crate::hostfs::read_file_range(&grip.cfg, &path, offset, limit)
-            })
-            .map(|text| grip.truncate(text))
-            .map_err(|e| format!("{e:#}")),
-        )
+        Ok(crate::offload::blocking(|| {
+            crate::hostfs::read_file_range(&grip.cfg, &path, offset, limit)
+        })
+        .map(|text| grip.truncate(text))
+        .map_err(|e| format!("{e:#}")))
     }
 
     async fn edit_file(
@@ -1529,6 +1672,7 @@ impl hostfs::Host for HostState {
         replace_all: bool,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("edit_file");
+        self.require(crate::policy::Cap::FilesystemWrite)?;
         let grip = self.grip.clone();
         Ok(crate::offload::blocking(|| {
             crate::hostfs::edit_file(&grip.cfg, &path, &old_text, &new_text, replace_all)
@@ -1545,6 +1689,7 @@ impl hostfs::Host for HostState {
         max_results: u32,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("search_files");
+        self.require(crate::policy::Cap::FilesystemRead)?;
         let grip = self.grip.clone();
         // Searching a large tree blocks on the filesystem for long enough to
         // starve the runtime's other tasks, so it runs on the blocking pool.
@@ -1577,6 +1722,7 @@ impl hostfs::Host for HostState {
         max_results: u32,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("find_files");
+        self.require(crate::policy::Cap::FilesystemRead)?;
         let grip = self.grip.clone();
         let cfg = grip.cfg.clone();
         let joined = tokio::task::spawn_blocking(move || {
@@ -1597,11 +1743,15 @@ impl hostfs::Host for HostState {
 impl terminal::Host for HostState {
     async fn available(&mut self) -> Result<bool> {
         self.budget.entered_host("available");
-        Ok(self.grip().cfg.terminal.enabled)
+        Ok(self.grip().cfg.terminal.enabled && !self.policy.denies(crate::policy::Cap::Terminal))
     }
 
     async fn open(&mut self, spec: TerminalOpen) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("open");
+        self.require(crate::policy::Cap::Terminal)?;
+        if spec.host.is_some() {
+            self.require(crate::policy::Cap::Ssh)?;
+        }
         let grip = self.grip.clone();
         let result = grip
             .terminals
@@ -1626,6 +1776,7 @@ impl terminal::Host for HostState {
         signal: String,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("signal");
+        self.require(crate::policy::Cap::Terminal)?;
         let grip = self.grip.clone();
         tracing::info!(terminal = %id, %signal, "signalling a session");
         let result = grip
@@ -1645,6 +1796,7 @@ impl terminal::Host for HostState {
         submit: bool,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("send");
+        self.require(crate::policy::Cap::Terminal)?;
         let grip = self.grip.clone();
         let result = grip
             .terminals
@@ -1664,6 +1816,7 @@ impl terminal::Host for HostState {
         background: bool,
     ) -> Result<std::result::Result<TerminalOutput, String>> {
         self.budget.entered_host("run");
+        self.require(crate::policy::Cap::Terminal)?;
         let grip = self.grip.clone();
         let timeout = if timeout_ms == 0 {
             grip.cfg.terminal.default_timeout
@@ -1680,14 +1833,8 @@ impl terminal::Host for HostState {
         let result = self
             .interruptible(
                 "the command",
-                grip.terminals.run_until(
-                    &grip.cfg,
-                    &id,
-                    &command,
-                    timeout,
-                    background,
-                    cancel,
-                ),
+                grip.terminals
+                    .run_until(&grip.cfg, &id, &command, timeout, background, cancel),
             )
             .await;
         // A command can legitimately take a long time; that is not the guest
@@ -1701,6 +1848,7 @@ impl terminal::Host for HostState {
 
     async fn read(&mut self, id: String) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("read");
+        self.require(crate::policy::Cap::Terminal)?;
         let grip = self.grip.clone();
         Ok(grip
             .terminals
@@ -1712,14 +1860,20 @@ impl terminal::Host for HostState {
 
     async fn close(&mut self, id: String) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("close");
+        self.require(crate::policy::Cap::Terminal)?;
         let grip = self.grip.clone();
-        let result = grip.terminals.close(&id).await.map_err(|e| format!("{e:#}"));
+        let result = grip
+            .terminals
+            .close(&id)
+            .await
+            .map_err(|e| format!("{e:#}"));
         self.yielded();
         Ok(result)
     }
 
     async fn sessions(&mut self) -> Result<Vec<TerminalInfo>> {
         self.budget.entered_host("sessions");
+        self.require(crate::policy::Cap::Terminal)?;
         let grip = self.grip.clone();
         let list = grip.terminals.list().await;
         self.yielded();
@@ -1731,11 +1885,14 @@ impl terminal::Host for HostState {
     async fn ssh_available(&mut self) -> Result<bool> {
         self.budget.entered_host("ssh-available");
         let cfg = &self.grip().cfg;
-        Ok(cfg.terminal.enabled && cfg.terminal.ssh_enabled)
+        Ok(cfg.terminal.enabled
+            && cfg.terminal.ssh_enabled
+            && !self.policy.denies(crate::policy::Cap::Ssh))
     }
 
     async fn ssh_hosts(&mut self) -> Result<std::result::Result<Vec<SshHostInfo>, String>> {
         self.budget.entered_host("ssh-hosts");
+        self.require(crate::policy::Cap::Ssh)?;
         let grip = self.grip.clone();
         Ok(crate::sshhosts::list(&grip.cfg)
             .map(|hosts| hosts.iter().map(host_info).collect())
@@ -1748,6 +1905,7 @@ impl terminal::Host for HostState {
         merge: bool,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("ssh-host-set");
+        self.require(crate::policy::Cap::Ssh)?;
         let grip = self.grip.clone();
         let result = crate::sshhosts::set(&grip.cfg, from_host_info(host), merge)
             .map_err(|e| format!("{e:#}"));
@@ -1760,6 +1918,7 @@ impl terminal::Host for HostState {
         name: String,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("ssh-host-remove");
+        self.require(crate::policy::Cap::Ssh)?;
         let grip = self.grip.clone();
         let result = crate::sshhosts::remove(&grip.cfg, &name).map_err(|e| format!("{e:#}"));
         self.yielded();
@@ -1772,6 +1931,7 @@ impl terminal::Host for HostState {
         to: String,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("ssh-host-rename");
+        self.require(crate::policy::Cap::Ssh)?;
         let grip = self.grip.clone();
         let result = crate::sshhosts::rename(&grip.cfg, &from, &to).map_err(|e| format!("{e:#}"));
         self.yielded();
@@ -1812,7 +1972,8 @@ fn from_host_info(info: SshHostInfo) -> crate::sshhosts::SshHost {
 impl control::Host for HostState {
     async fn available(&mut self) -> Result<bool> {
         self.budget.entered_host("available");
-        Ok(self.grip().cfg.control.allow_restart)
+        Ok(self.grip().cfg.control.allow_restart
+            && !self.policy.denies(crate::policy::Cap::Control))
     }
 
     async fn restart(
@@ -1821,6 +1982,7 @@ impl control::Host for HostState {
         resume: bool,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("restart");
+        self.require(crate::policy::Cap::Control)?;
         let grip = self.grip.clone();
         let session = self.session_id.clone();
         Ok(
@@ -1862,8 +2024,13 @@ impl configuration::Host for HostState {
             .map(entry))
     }
 
-    async fn set(&mut self, key: String, value: String) -> Result<std::result::Result<String, String>> {
+    async fn set(
+        &mut self,
+        key: String,
+        value: String,
+    ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("set");
+        self.require(crate::policy::Cap::ConfigWrite)?;
         let grip = self.grip.clone();
         let result = crate::settings::set(&grip.cfg, &key, &value);
         self.yielded();
@@ -2040,6 +2207,7 @@ impl skills::Host for HostState {
         contents: String,
     ) -> Result<std::result::Result<SkillWrite, String>> {
         self.budget.entered_host("upsert");
+        self.require(crate::policy::Cap::SkillsWrite)?;
         let mgr = self.grip().skills.clone();
         let out = mgr
             .upsert(&id, &file, &contents)
@@ -2063,6 +2231,7 @@ impl skills::Host for HostState {
         recursive: bool,
     ) -> Result<std::result::Result<String, String>> {
         self.budget.entered_host("remove");
+        self.require(crate::policy::Cap::SkillsWrite)?;
         let mgr = self.grip().skills.clone();
         let out = mgr.remove(&id, recursive).map_err(|e| e.to_string());
         if out.is_ok() {
@@ -2192,7 +2361,8 @@ mod tests {
             // Up to the next method, so a later `scope_ok` cannot satisfy this.
             let body = body.split("    async fn ").next().unwrap_or(body);
             assert!(
-                body.contains("self.scope_ok(&session_id)?"),
+                body.contains("self.scope_ok(&session_id)?")
+                    || body.contains("self.may_access(&session_id)?"),
                 "`{method}` does not call scope_ok, so an agent turn can use it \
                  on another conversation's session. Add \
                  `self.scope_ok(&session_id)?;` after the budget line, or — if \
