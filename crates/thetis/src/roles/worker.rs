@@ -68,8 +68,8 @@ impl Handler for WorkerHandler {
                     Ok(Value::Null)
                 }
                 "cancel" => {
-                    grip.cancel(&session()?).await;
-                    Ok(Value::Null)
+                    let stopped = grip.cancel(&session()?).await;
+                    Ok(serde_json::json!({ "stopped": stopped }))
                 }
                 "resume" => {
                     grip.resume(&session()?).await;
