@@ -17,7 +17,8 @@ would actually offer.
 `groups.rs` is a wasm guest: it imports `sys::log` and `sys::kv-get` from the
 host, so `cargo test` against it needs the whole component harness. `extract.py`
 copies the pure items — the table, `component_group`, `score`, `coverage_gaps`,
-`in_table_order` — into a plain binary and stubs `sys::log` as a `println!`.
+`in_table_order`, `repair_pin` — into a plain binary and stubs `sys::log` as a
+`println!`.
 
 It copies rather than restates. A test that retyped the group table would only
 prove the copy self-consistent, which is the one thing that does not matter.
@@ -37,6 +38,17 @@ Routing: each scenario asserts groups that must be admitted and groups that must
 not. The must-not half is the valuable half — it is what caught `selfmod` being
 tagged `tool`/`tools`, which admitted the entire dev kit for any conversation
 that so much as mentioned tooling.
+
+The pin as untrusted input: the web gateway writes `__tool_groups` directly to
+override the routing, so `repair_pin` is the only thing standing between a bad
+writer and a conversation that cannot recover its tools. The checks assert that
+always-on groups are forced back in (so `tool_search` is never losable), that
+unknown ids are dropped, that order is normalised to the table's — a reordering
+alone would miss the provider's prompt cache — and, most importantly, that an
+empty or wholly unrecognisable pin reads as *unrouted* rather than as "route to
+nothing". Getting that last one backwards is how a corrupt value turns into a
+model with no tools at all; the same inversion in the gateway made the panel
+report 0 of 75 tools attached when the truth was 75 of 75.
 
 ## Tag discipline
 

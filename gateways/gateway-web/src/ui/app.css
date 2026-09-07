@@ -288,6 +288,9 @@ body { display: flex; flex-direction: column; }
 .ghost-btn.is-primary:hover { background: var(--accent-wash); color: var(--accent-hot); }
 .ghost-btn.is-danger:hover { background: var(--err-wash); color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
 .ghost-btn.is-wide { width: 100%; justify-content: center; border-style: dashed; }
+/* Sized to sit on a row it does not own — a group heading, a card's action
+   column — where the full-size button would set the row's height. */
+.ghost-btn.sm { padding: 2px 8px; font-size: var(--text-xs); }
 
 /* --- session list --------------------------------------------------------- */
 
@@ -1175,6 +1178,14 @@ body { display: flex; flex-direction: column; }
 
 .panel-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: var(--gap-3) var(--gap-4) var(--gap-5); }
 .panel-note { color: var(--text-faint); font-size: var(--text-sm); padding: var(--gap-5) 0; text-align: center; }
+/* A note that is one item in a list rather than the whole panel's empty state:
+   left-aligned, and without the vertical space that centres a lone message. */
+.panel-note.is-inline {
+  text-align: left;
+  padding: 0 0 var(--gap-2);
+  font-size: var(--text-xs);
+  line-height: 1.55;
+}
 .panel-list { display: flex; flex-direction: column; gap: var(--gap-2); }
 
 .card {
@@ -1298,6 +1309,19 @@ body { display: flex; flex-direction: column; }
   font-size: var(--text-xs);
   color: var(--text-faint);
   line-height: 1.5;
+}
+/* A group id is a literal the config file and the logs also use, so it is set
+   in the mono face and left in its own case rather than being title-cased into
+   something that cannot be grepped for. */
+.panel-section-title.is-literal { text-transform: none; letter-spacing: 0; }
+/* State and controls for the section itself, pushed to the trailing edge so the
+   heading, its count and its switch read as one row. */
+.panel-section-aside {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
+  flex: 0 0 auto;
 }
 
 /* A section that folds. Same heading as `.panel-section`, but the rows live
@@ -1433,6 +1457,14 @@ body { display: flex; flex-direction: column; }
 }
 .badge.is-mutating { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
 .badge.is-component { color: var(--accent); border-color: var(--accent-edge); }
+/* A tool that exists and is permitted here, but whose group is not attached, so
+   its definition is not in the prompt. Marked on the badge and dimmed on the
+   card — not hidden: naming a withheld tool attaches its group, so it remains a
+   true answer to what the conversation can do. */
+.badge.is-detached { border-style: dashed; }
+
+.card.is-detached { opacity: .55; }
+.card.is-detached:hover { opacity: 1; }
 
 /* --- toasts -------------------------------------------------------------------
    Outcomes land here: protocol errors, refusals, undoable archives. Turn-level

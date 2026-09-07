@@ -224,6 +224,60 @@ fn main() {
     let b = in_table_order(&["shell".into(), "web".into(), "core".into()]);
     check("in_table_order is order-independent", a == b, format!("{a:?}"));
 
+    // --- the pin is untrusted input ----------------------------------------
+    //
+    // The web gateway writes the pin directly to override the routing, so
+    // `repair_pin` is what stands between a bad writer and a conversation that
+    // cannot get its tools back. These are the cases that matter.
+
+    let always: Vec<&str> = all().iter().filter(|g| g.always_on).map(|g| g.id).collect();
+
+    // A pin naming one scopable group must still come back with the floor.
+    let repaired = repair_pin("web").unwrap_or_default();
+    check(
+        "a pin missing the always-on groups is repaired",
+        always.iter().all(|a| repaired.iter().any(|r| r == a)),
+        format!("{repaired:?}"),
+    );
+
+    // The specific thing that must never be losable.
+    let hatch = all()
+        .iter()
+        .find(|g| g.members.contains(&"tool_search"))
+        .map(|g| g.id)
+        .unwrap_or("");
+    check(
+        "tool_search's group survives a pin that omits it",
+        repaired.iter().any(|r| r == hatch),
+        format!("{hatch} in {repaired:?}"),
+    );
+
+    // Empty and unrecognisable pins mean "never routed", so the caller falls
+    // open to everything. Reading them as "route to nothing" would leave the
+    // model with no tools at all.
+    check("an empty pin reads as unrouted", repair_pin("").is_none(), String::new());
+    check(
+        "a pin of only unknown ids reads as unrouted",
+        repair_pin("nonsense\nalso-nonsense").is_none(),
+        String::new(),
+    );
+
+    // Unknown ids alongside real ones are dropped, not passed through.
+    let mixed = repair_pin("web\nnonsense\nshell").unwrap_or_default();
+    check(
+        "unknown ids are dropped from a mixed pin",
+        !mixed.iter().any(|m| m == "nonsense") && mixed.iter().any(|m| m == "web"),
+        format!("{mixed:?}"),
+    );
+
+    // Order must not depend on how the writer happened to sort it, or the
+    // serialised tool block changes and the prompt cache misses.
+    check(
+        "a pin is normalised to table order",
+        repair_pin("web\nshell\ncore") == repair_pin("core\nshell\nweb"),
+        format!("{:?}", repair_pin("web\nshell\ncore").unwrap_or_default()),
+    );
+
     // --- how much is actually withheld -------------------------------------
 
     println!("\n-- surface size by scenario (built-ins only) --");

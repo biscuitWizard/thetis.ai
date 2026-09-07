@@ -69,7 +69,52 @@ use crate::thetis::grip::types::LogLevel;
 use crate::thetis::grip::{skills, sys, tooling};
 
 /// Session KV key holding the pinned active group ids, newline separated.
-const PIN_KEY: &str = "__tool_groups";
+///
+/// Mirrored as a string literal in the web gateway, which reads this to show
+/// what is attached and writes it to override the routing. The two cannot share
+/// a constant — they are separate guest components — so a rename here means a
+/// grep for the literal there. `publish_table` exists so that the *table* at
+/// least is never duplicated that way.
+pub const PIN_KEY: &str = "__tool_groups";
+
+/// Global KV key holding the group table as JSON.
+///
+/// Published by the agent, read by the chat surface. Global rather than
+/// per-session because the table is a property of the build, not of one
+/// conversation, and static enough that republishing it is idempotent.
+///
+/// This exists so the panel does not need a live worker. `available-tools` asks
+/// the agent directly and so cannot drift, but it routes through
+/// `workers::call_session`, and a worker is the shortest-lived thing in the
+/// system — reaped when idle, restarted onto kernels it built. A panel that
+/// spawned one as a side effect of being opened would also be empty for exactly
+/// the conversations someone is most likely to be inspecting: stopped and
+/// archived ones. So the durable store is the contract instead.
+pub const TABLE_KEY: &str = "__tool_group_table";
+
+/// Session KV key holding `id=reason` lines: why each active group is active.
+///
+/// Kept beside the pin rather than inside it because the pin is on the hot path
+/// — read once per turn to build the tool block — and provenance is only ever
+/// read by the panel. Reasons are advisory: a missing or stale line costs an
+/// explanation in the UI, never a capability.
+pub const WHY_KEY: &str = "__tool_groups_why";
+
+/// Why a group is in the active set. The panel shows this so an attached group
+/// is never unexplained, and so a user overriding the routing can see what they
+/// are overriding.
+///
+/// A shared vocabulary rather than an enum, because the writers live in two
+/// components: the reasons below are written here during routing, while
+/// `manual` is written by the web gateway when a user overrides. Nothing
+/// validates them — an unrecognised reason renders as itself.
+#[allow(dead_code)] // written by the web gateway, read here and by the panel.
+pub const REASON_MANUAL: &str = "manual";
+pub const REASON_ALWAYS_ON: &str = "always-on";
+pub const REASON_CONFIGURED: &str = "configured";
+pub const REASON_SKILL: &str = "skill";
+pub const REASON_TAG: &str = "tag";
+pub const REASON_SEARCH: &str = "search";
 
 /// The tag prefix a skill uses to point at a tool group.
 const SKILL_TAG_PREFIX: &str = "tool-group:";
@@ -510,16 +555,24 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
         return pinned;
     }
 
+    // Every admission records why, so the panel can explain an attached group
+    // rather than presenting it as a bare fact.
+    let mut why: Vec<(String, &str)> = Vec::new();
+
     let mut active: Vec<String> = all()
         .iter()
         .filter(|g| g.always_on)
         .map(|g| g.id.to_string())
         .collect();
+    for id in &active {
+        why.push((id.clone(), REASON_ALWAYS_ON));
+    }
 
     // Configured always-on, for a deployment that wants a group unconditionally
     // without editing this table.
     for id in configured_always_on() {
         if find(&id).is_some() && !active.contains(&id) {
+            why.push((id.clone(), REASON_CONFIGURED));
             active.push(id);
         }
     }
@@ -529,6 +582,7 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
     let from_skills = groups_from_skills(&skills::pinned(session_id));
     for id in &from_skills {
         if !active.contains(id) {
+            why.push((id.clone(), REASON_SKILL));
             active.push(id.clone());
         }
     }
@@ -544,12 +598,14 @@ pub fn route_once(session_id: &str, query: &str) -> Vec<String> {
         let s = score(group, &query_tokens);
         if s >= threshold {
             active.push(group.id.to_string());
+            why.push((group.id.to_string(), REASON_TAG));
             from_tags.push(format!("{} {:.2}", group.id, s));
         }
     }
 
     let ordered = in_table_order(&active);
     write_pin(session_id, &ordered);
+    note_reasons(session_id, &why);
 
     sys::log(
         LogLevel::Debug,
@@ -584,6 +640,9 @@ pub fn admit(session_id: &str, ids: &[String]) -> Vec<String> {
     }
     if !added.is_empty() {
         write_pin(session_id, &in_table_order(&active));
+        let pairs: Vec<(String, &str)> =
+            added.iter().map(|id| (id.clone(), REASON_SEARCH)).collect();
+        note_reasons(session_id, &pairs);
     }
     added
 }
@@ -602,23 +661,142 @@ fn in_table_order(ids: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Reads the pinned set, and repairs it.
+///
+/// The pin is a shared contract, not private state: the chat surface writes it
+/// directly to override the routing, because the gateway is a separate
+/// component and cannot call into here. So it is treated as untrusted input on
+/// every read — unknown ids dropped, always-on groups forced back in, order
+/// normalised.
+///
+/// Forcing always-on back in is the safety property that makes a manual
+/// override safe to offer at all. `core` holds `tool_search`, the route by
+/// which every withheld group is recovered; a UI bug, a hand-edited store or a
+/// future writer that dropped it would leave a conversation unable to get any
+/// tool back. Repairing on read means the invariant holds no matter who wrote.
 fn read_pin(session_id: &str) -> Option<Vec<String>> {
-    let raw = sys::kv_get(session_id, PIN_KEY)?;
-    let ids: Vec<String> = raw
+    repair_pin(&sys::kv_get(session_id, PIN_KEY)?)
+}
+
+/// The repair itself, split from the host call so it can be tested.
+///
+/// See `read_pin` for why this exists. Returning `None` for an empty or
+/// unrecognisable pin is the important half: it means "never routed", so the
+/// caller falls open to every group. Treating it as "route to nothing" would
+/// turn a corrupt value into a conversation with no tools at all.
+fn repair_pin(raw: &str) -> Option<Vec<String>> {
+    let mut ids: Vec<String> = raw
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .filter(|l| find(l).is_some())
         .map(str::to_string)
         .collect();
     if ids.is_empty() {
-        None
-    } else {
-        Some(ids)
+        return None;
     }
+    for group in all().iter().filter(|g| g.always_on) {
+        if !ids.iter().any(|i| i == group.id) {
+            ids.push(group.id.to_string());
+        }
+    }
+    Some(in_table_order(&ids))
 }
 
 fn write_pin(session_id: &str, ids: &[String]) {
     sys::kv_put(session_id, PIN_KEY, &ids.join("\n"));
+}
+
+/// Records why each active group is active, for the panel.
+///
+/// Merges rather than replaces: `admit` adds one group at a time and must not
+/// erase the reasons already established by routing.
+fn note_reasons(session_id: &str, pairs: &[(String, &str)]) {
+    let mut existing = read_reasons(session_id);
+    for (id, reason) in pairs {
+        if let Some(slot) = existing.iter_mut().find(|(e, _)| e == id) {
+            slot.1 = reason.to_string();
+        } else {
+            existing.push((id.clone(), reason.to_string()));
+        }
+    }
+    let body = existing
+        .iter()
+        .map(|(id, reason)| format!("{id}={reason}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    sys::kv_put(session_id, WHY_KEY, &body);
+}
+
+fn read_reasons(session_id: &str) -> Vec<(String, String)> {
+    sys::kv_get(session_id, WHY_KEY)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (id, reason) = line.split_once('=')?;
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            Some((id.to_string(), reason.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Publishes the group table so the chat surface can render it without a live
+/// worker. Cheap, idempotent, and called once per turn whether or not grouping
+/// is enabled — the panel has to be able to say "scoping is off" too.
+pub fn publish_table() {
+    let groups: Vec<String> = all()
+        .iter()
+        .map(|g| {
+            format!(
+                r#"{{"id":{},"brief":{},"tags":{},"always_on":{},"members":{}}}"#,
+                json_str(g.id),
+                json_str(g.brief),
+                json_array(g.tags),
+                g.always_on,
+                json_array(g.members),
+            )
+        })
+        .collect();
+    let payload = format!(
+        r#"{{"enabled":{},"threshold":{},"ungrouped":{},"groups":[{}]}}"#,
+        grouping_enabled(),
+        route_threshold(),
+        json_str(UNGROUPED),
+        groups.join(","),
+    );
+    sys::kv_put("global", TABLE_KEY, &payload);
+}
+
+/// Minimal JSON string escaping. The agent has no serialiser linked, and the
+/// only values passing through are compile-time table entries, but a stray
+/// quote would corrupt the whole payload silently — so it is escaped properly
+/// rather than trusted.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_array(items: &[&str]) -> String {
+    format!(
+        "[{}]",
+        items.iter().map(|i| json_str(i)).collect::<Vec<_>>().join(",")
+    )
 }
 
 // --- configuration ----------------------------------------------------------
