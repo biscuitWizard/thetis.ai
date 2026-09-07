@@ -23,7 +23,7 @@ the surface got sloppy the last time.
 | Zone | Width | Job | Never |
 |---|---|---|---|
 | Sidebar | `--sidebar-w` 272px | Navigate conversations: search, recency groups, archived | Hold a feature. The workspace explorer lived here once and was unfindable |
-| Main | `--measure` 48rem, centred | The conversation: transcript, composer | Get replaced by another view |
+| Main | Tab strip + stage; the chat pane keeps `--measure` 48rem, centred | The stage: the conversation, plus a tab per sub-agent and per open file | Let another tab displace the conversation's own — it is tab 0 and never closes |
 | Rail | 44px strip + docked panel | Every inspector, as a tab | Cover the conversation |
 
 Inside Main, each turn carries an avatar in a gutter outside the text column —
@@ -41,18 +41,60 @@ The tabs are Branch, Files, Context, Skills, Tools, Models. Branch is the
 resting tab and opens itself once a conversation has a commit graph, so version
 state is ever-present rather than behind a click.
 
-### Two directions that were tried and rejected
+### The centre stage is tabbed — reversed by operator decision
 
-Do not "improve" the surface back into either of these.
+This skill used to forbid tabs over the centre stage, on the grounds that making
+the editor a peer of the conversation turns the product into an IDE. **The
+operator overruled that, and the tabs are built.** What actually made the
+original objection wrong was scale: a turn now spawns half a dozen sub-agents,
+and rendering every child inline in one scroll made the conversation unreadable
+long before the editor was the problem. Do not revert this; the reasoning below
+is what keeps it from becoming an IDE.
 
-1. **Tabs over the centre stage** (chat and files as peers, the editor filling
-   the main zone). This makes the editor a peer of the conversation, and one
-   keystroke turns the product into an IDE. The editor matters, but it is
-   something you glance at while conversing. Files widens the *rail* instead.
-2. **A command palette instead of the rail.** A palette is an accelerator for
-   people who already know the surface; it is not information architecture. It
-   would leave every panel still hidden. Worth adding *on top of* the rail one
-   day, never in place of it.
+The stage lives in `views/stage.js` and owns the strip and the panes.
+
+- **Tab 0 is the conversation, is not closable, and carries the title.**
+  Clicking it while it is already active is the rename affordance the old
+  `.chat-head` carried. The conversation is the product; a tab is a place to
+  glance from it.
+- **The composer belongs to the chat pane, not the stage.** A sub-agent tab has
+  no composer — you do not talk to a child. A file tab shows Save/Revert in that
+  slot. This is what stops the editor reading as the main event.
+- **Every pane stays in the DOM; exactly one is visible, via the `hidden`
+  attribute** (rule 5). Two children streaming at once must both keep
+  accumulating while you watch one, and a half-typed file draft must survive a
+  tab switch — that draft is the one thing on the surface the host cannot give
+  back.
+- **A sub-agent renders in two homes at once**: its inline `details.agent` block
+  in the transcript *and* its own pane. `inAgent()` in `transcript.js` runs each
+  renderer once per home with per-home cursors (`live`, `thinking`, `open`,
+  `compactNode`, `openAsks`). One shared cursor across two homes puts a
+  streaming delta in whichever home drew last.
+- **Sub-agent tabs are per-conversation; file tabs are global.** The workspace is
+  shared by every conversation, so its tabs follow you across a switch. Children
+  do not, and are closed by `store.agents` going empty on transcript reset.
+- **A tab outlives what it shows.** A finished child keeps its tab, with a state
+  dot and its cost; that is the point of it.
+- **Give tabs a width floor, not `min-width: 0`.** With no floor, twelve tabs
+  shrink until every label is *nought pixels* wide and the strip is a row of
+  identical close buttons — measured in a real browser, not imagined. A floor
+  makes them overflow, which the strip's `overflow-x: auto` turns into a scroll.
+  Scroll the active tab into view on every redraw (`block: "nearest"`), or
+  activating a tab past the right-hand edge looks like a no-op.
+
+The rail is unaffected and still owns every inspector. Two tab systems coexist
+deliberately: the **stage** holds things you *work in* (a conversation, a child's
+stream, a file), the **rail** holds things you *consult about* the conversation.
+A new surface that answers "what is the state of this?" is a rail tab.
+
+### One direction that was tried and rejected
+
+Do not "improve" the surface into this.
+
+- **A command palette instead of the rail.** A palette is an accelerator for
+  people who already know the surface; it is not information architecture. It
+  would leave every panel still hidden. Worth adding *on top of* the rail one
+  day, never in place of it.
 
 ### Ask which box, before building
 
@@ -184,6 +226,24 @@ Reach for an existing class before inventing one. Full markup in
 | Outcome message | `toast(message, {tone, action})` |
 | Confirm / rename in place | `popover(anchor, {...})` |
 
+## Adding a stage tab kind
+
+Only for a *third* kind of thing to work in — not for an inspector, which is a
+rail tab. In `views/stage.js`:
+
+1. Give the kind an id prefix (`chat`, `agent:<id>`, `file:<path>`) and a
+   `kind` string; the strip styles itself off `.stage-tab.is-<kind>`.
+2. Build the pane once and keep it: furniture (head, body, foot) built in a
+   `build*` function, contents refreshed separately. Rebuilding a pane on every
+   update destroys a `<textarea>`'s caret, selection and scroll — the file
+   editor's node identity is asserted across a save for exactly this reason.
+3. Decide the lifetime and say so in a comment: does the tab survive a
+   conversation switch (file: yes) or belong to one (agent: no)?
+4. Anything the host must fetch needs a filter on the reply. `workspace-file`
+   carries no requester identity, so the rail and the stage each keep a set of
+   paths they asked for and ignore the rest. A failed read replies only with
+   `workspace-result` — handle that, or the pane says "reading…" for ever.
+
 ## Adding a rail tab
 
 1. Write the view in `ui/views/<name>.js`. Export a draw function that calls
@@ -266,3 +326,8 @@ about the diff:
 | A panel sits stale while the agent works | Nothing invalidates it | Add the tab to `INVALIDATED_BY` |
 | Totals read zero during a long turn | Accounting hangs off `turn-finished` | Accumulate each `assistant` frame's usage |
 | A sidebar row keeps an old title | The tab was not subscribed to that session | Re-ask for the list on open |
+| Every tab label is 0px wide, strip is a row of close buttons | `.stage-tab { min-width: 0 }` lets a dozen tabs shrink to nothing | A width floor (`min-width: 7.5rem`), so they overflow and the strip scrolls |
+| Activating a tab appears to do nothing | The tab is scrolled off the strip's right edge | `scrollIntoView({block:"nearest"})` on every `drawStrip` |
+| A streaming delta lands in the wrong copy of a sub-agent | Two homes sharing one `live`/`open` cursor | Per-home cursors in `inAgent()` |
+| An editor loses its caret on save | The pane was rebuilt instead of refreshed | Build furniture once; assert node identity across a save |
+| A file pane says "reading…" for ever | A failed read replies only with `workspace-result` | Handle `op === "read"` failure and clear the wanted set |

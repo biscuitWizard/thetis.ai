@@ -42,6 +42,10 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/views/branch.js", mime: JS, body: include_str!("ui/views/branch.js") },
     Asset { path: "/views/workspace.js", mime: JS, body: include_str!("ui/views/workspace.js") },
     Asset { path: "/views/rail.js", mime: JS, body: include_str!("ui/views/rail.js") },
+    // The centre stage's tab strip: the conversation first and always, then a
+    // tab per sub-agent and per open file. Owns which pane is showing, the
+    // conversation's title and rename, and the file editors.
+    Asset { path: "/views/stage.js", mime: JS, body: include_str!("ui/views/stage.js") },
     Asset { path: "/views/context.js", mime: JS, body: include_str!("ui/views/context.js") },
     // The portraits either side of the transcript, and the sidebar's avatar
     // button. Not a rail tab: an avatar is not something you inspect, it is

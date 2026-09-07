@@ -500,40 +500,216 @@ body { display: flex; flex-direction: column; }
   position: relative;
 }
 
-.chat-head {
+/* --- the centre stage ------------------------------------------------------
+ *
+ * A tab strip where the chat header used to be. The conversation is the first
+ * tab and carries the title; sub-agents and open files add their own after it.
+ * The strip scrolls sideways rather than wrapping: it must stay one row tall,
+ * because the stage below it is the tallest thing on screen and a second row
+ * would shorten every pane by as much again.
+ */
+
+.stage-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: var(--gap-2) var(--gap-3) 0;
+  border-bottom: 1px solid var(--hairline);
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* The strip's own scrollbar would sit between the tabs and their panes and
+     read as a second hairline. Kept thin and only drawn when hovered. */
+  scrollbar-width: none;
+}
+.stage-tabs::-webkit-scrollbar { height: 0; }
+
+.stage-tab {
+  /* The floor matters more than it looks. With `min-width: 0` a dozen tabs
+     shrink until every label is nought pixels wide and the strip is a row of
+     identical close buttons — measured, not imagined. A floor makes the tabs
+     overflow instead, which `overflow-x: auto` above turns into a scroll. */
+  flex: 0 1 auto;
+  min-width: 7.5rem;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--gap-3);
-  padding: var(--gap-3) var(--gap-5);
-  border-bottom: 1px solid var(--hairline);
+  gap: var(--gap-2);
+  max-width: 15rem;
+  padding: 7px var(--gap-3);
+  font-size: var(--text-sm);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--r-md) var(--r-md) 0 0;
+  cursor: pointer;
+  /* The active tab's border overlaps the strip's own hairline, so the pane
+     below reads as continuous with it rather than as a box under a box. */
+  margin-bottom: -1px;
+  transition: color var(--fast) var(--ease), background-color var(--fast) var(--ease);
 }
-.chat-title-wrap { min-width: 0; display: flex; align-items: center; gap: var(--gap-3); overflow: hidden; }
-.chat-title {
-  margin: 0;
-  font-size: var(--text-lg);
-  font-weight: 600;
-  letter-spacing: -.01em;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  min-width: 4rem;
-  cursor: text;
+.stage-tab:hover { color: var(--text); background: var(--surface-1); }
+/* The accent wash marks the active tab — one of exactly two things it fills. */
+.stage-tab.is-active {
+  color: var(--text);
+  background: var(--accent-wash);
+  border-color: var(--hairline);
+  border-bottom: 1px solid var(--bg);
+}
+.stage-tab.is-chat.is-active { font-weight: 600; }
+.stage-tab.is-chat.is-active:hover .stage-tab-label { color: var(--accent-hot); }
+
+.stage-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stage-tab.is-file .stage-tab-label { font-family: var(--mono); font-size: var(--text-xs); }
+.stage-tab.is-agent .stage-tab-label { font-family: var(--mono); font-size: var(--text-xs); color: var(--accent); }
+.stage-tab-icon { flex: none; display: flex; color: var(--text-faint); }
+.stage-tab-note { flex: none; font-family: var(--mono); font-size: var(--text-xs); color: var(--text-faint); }
+
+/* An unsaved draft is the one thing about a tab worth shouting slightly: a dot
+   before the name, in the warn hue, and nothing else changes. */
+.stage-tab.is-dirty .stage-tab-label::before {
+  content: "\2022 ";
+  color: var(--warn);
+}
+
+.stage-tab-close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 1px;
   border-radius: var(--r-sm);
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity var(--fast) var(--ease), color var(--fast) var(--ease);
 }
-.chat-title:hover { color: var(--accent-hot); }
-.chat-title-input {
+.stage-tab:hover .stage-tab-close,
+.stage-tab.is-active .stage-tab-close { opacity: 1; }
+.stage-tab-close:hover { color: var(--err); background: var(--err-wash); }
+
+/* The dot on a sub-agent's tab, mirroring the block's: pulsing while it works,
+   flat when done, red if it ended badly. */
+.stage-dot {
+  width: 6px; height: 6px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--text-faint);
+}
+.stage-dot.is-running { background: var(--accent); animation: agent-pulse 1.6s var(--ease) infinite; }
+.stage-dot.is-done { background: var(--ok); }
+.stage-dot.is-bad { background: var(--err); }
+@media (prefers-reduced-motion: reduce) {
+  .stage-dot.is-running { animation: none; }
+}
+
+.stage-title-input {
   font: inherit;
-  font-size: var(--text-lg);
   font-weight: 600;
-  min-width: 16rem;
-  padding: 1px 8px;
+  min-width: 12rem;
+  padding: 0 6px;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--accent-edge);
   border-radius: var(--r-sm);
   outline: none;
 }
+
+/* The panes. Exactly one is not `hidden`; each fills the stage and manages its
+   own scrolling, so switching tabs never moves the strip or the drawer. */
+.stage { flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; }
+.stage-pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The bar at the head of a pane: what this tab is about, and the actions that
+   belong to it. Same height and hairline as the chat pane's own bar, so the
+   panes do not jump as tabs are switched. */
+.stage-bar,
+.chat-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-5);
+  border-bottom: 1px solid var(--hairline);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  overflow: hidden;
+}
+.stage-bar-gap, .chat-bar-gap { flex: 1 1 auto; }
+.stage-bar-name {
+  font-family: var(--mono);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.stage-bar-state { flex: none; white-space: nowrap; }
+
+.stage-body { flex: 1 1 auto; min-height: 0; display: flex; overflow: auto; }
+.stage-body.is-preview {
+  align-items: flex-start;
+  justify-content: center;
+  padding: var(--gap-5);
+}
+.file-preview { max-width: 100%; max-height: 100%; border-radius: var(--r-md); }
+.file-audio { width: min(100%, 30rem); align-self: center; }
+
+/* A file editor fills its pane. Monospace, no border of its own — the pane's
+   hairlines already bound it, and a box inside a box wastes the width that
+   opening a file in the stage was for. */
+.file-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  padding: var(--gap-4) var(--gap-5);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg);
+  border: none;
+  outline: none;
+  resize: none;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+
+/* Where the composer sits on the chat tab, a file tab puts its own actions. */
+.file-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: var(--gap-2) var(--gap-5);
+  border-top: 1px solid var(--hairline);
+}
+.file-status { font-size: var(--text-xs); color: var(--text-faint); }
+.file-status.is-error { color: var(--err); }
+
+/* A sub-agent's tab is its stream at full width, so the block's own framing —
+   the border, the fold, the accent stripe — is dropped and only the rules that
+   make a child's rows read as a child's remain. */
+.agent-stage { flex: 1 1 auto; min-height: 0; overflow-y: auto; scroll-behavior: smooth; }
+.agent-body.is-stage {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: var(--gap-5) var(--gap-4);
+  border-top: none;
+  font-size: var(--text-md);
+}
+
 .chat-sub { font-size: var(--text-xs); color: var(--text-faint); white-space: nowrap; }
-.chat-actions { display: flex; align-items: center; gap: var(--gap-2); flex: 0 0 auto; }
 
 /* Header chips: quiet, factual, clickable — each opens the tab that owns it. */
 .chat-chip { flex: 0 0 auto; }
@@ -1997,7 +2173,7 @@ body { display: flex; flex-direction: column; }
 .popover-actions { display: flex; gap: var(--gap-2); justify-content: flex-end; margin-top: 2px; }
 
 @media (max-width: 860px) {
-  .chat-actions .ghost-btn { padding: 5px 7px; }
+  .chat-bar .ghost-btn { padding: 5px 7px; }
 }
 
 /* --- drop veil ------------------------------------------------------------ */
@@ -2329,7 +2505,12 @@ body { display: flex; flex-direction: column; }
   .composer-wrap {
     padding: 0 calc(var(--gap-3) + var(--avatar-gutter)) var(--gap-2);
   }
-  .chat-head { padding: var(--gap-3); }
+  .stage-tabs { padding: var(--gap-2) var(--gap-2) 0; }
+  /* Narrow: the tab is a name, not a name plus its accounting. */
+  .stage-tab { max-width: 10rem; }
+  .stage-tab-note { display: none; }
+  .chat-bar, .stage-bar, .file-foot { padding: var(--gap-2) var(--gap-3); }
+  .file-editor { padding: var(--gap-3); }
   .composer-hint { display: none; }
   .branch-actions .ghost-btn { padding: 3px 6px; }
 }

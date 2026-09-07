@@ -4,10 +4,11 @@
  * user does is submitted to the host and comes back as an event, so several
  * tabs on one conversation stay in step with no client-side reconciliation.
  *
- * The shell is three zones. The sidebar is navigation only; the middle is the
- * conversation; every inspector — Branch, Files, Context, Skills, Tools,
- * Models — is a tab in the persistent rail on the right, which docks beside
- * the chat instead of covering it.
+ * The shell is three zones. The sidebar is navigation only; the middle is a
+ * tabbed stage whose first tab is always the conversation, with a tab per
+ * sub-agent and per open file after it; every inspector — Branch, Files,
+ * Context, Skills, Tools, Models — is a tab in the persistent rail on the
+ * right, which docks beside the stage instead of covering it.
  *
  * This file only wires pieces together. Behaviour lives in views/ and lib/.
  */
@@ -22,6 +23,7 @@ import { mountSessions } from "./views/sessions.js";
 import * as workspace from "./views/workspace.js";
 import * as panel from "./views/panel.js";
 import * as rail from "./views/rail.js";
+import * as stage from "./views/stage.js";
 import * as context from "./views/context.js";
 import * as statusbar from "./views/statusbar.js";
 import * as transcript from "./views/transcript.js";
@@ -112,6 +114,18 @@ const terminals = mountTerminals({
   // its own field rather than overloading it.
   onKill: (terminal) =>
     connection.send({ type: "terminal-close", id: store.current, terminal }),
+});
+
+/* The centre stage's tab strip. Mounted before the transcript, which opens a
+ * pane for every sub-agent on its first frame, and before the frame handlers,
+ * which route `workspace-file` into the editor tabs. */
+const centre = stage.mountStage({
+  sendFrame: (frame) => connection.send(frame),
+  onRename: (title) => {
+    connection.send({ type: "rename", id: store.current, title });
+    store.set({ title });
+    setHeader();
+  },
 });
 
 // A reconnect replays `open` for the same conversation, which `setSession`
@@ -309,9 +323,16 @@ connection
   // Fuzzy path search for the composer's `@` menu. Answered host-side from a
   // cached walk: the shared workspace is far too large to index in a browser.
   .on("workspace-find", (frame) => composer.mentions.onFind(frame))
-  .on("workspace-file", workspace.onFile)
+  // Read replies feed the rail's preview and any editor tab on the stage. The
+  // stage ignores a path it did not ask for, so a single click in Files cannot
+  // stamp over an open editor's draft.
+  .on("workspace-file", (frame) => {
+    workspace.onFile(frame);
+    stage.onFile(frame);
+  })
   .on("workspace-result", (frame) => {
     workspace.onResult(frame);
+    stage.onResult(frame);
     composer.mentions.onResult(frame);
   })
 
@@ -1157,8 +1178,10 @@ function refreshOpenTab() {
 
 // --- header -----------------------------------------------------------------
 
+/* The conversation's title lives on its tab now, and the chips it used to sit
+ * beside live in the chat pane's own bar. */
 function setHeader() {
-  $("chat-title").textContent = store.title || "—";
+  centre.setChatTitle(store.title);
   $("chat-sub").textContent = store.mode && store.mode !== "agent" ? store.modeLabel() : "";
 
   const model = $("chip-model");
@@ -1210,38 +1233,9 @@ $("chip-model").addEventListener("click", openModels);
 $("chip-branch").addEventListener("click", showBranchTab);
 $("chip-spend").addEventListener("click", () => context.openTab("usage"));
 
-// The title renames in place: click it, type, Enter. Blur cancels — commits
-// belong to an explicit keypress, not to focus wandering off.
-$("chat-title").addEventListener("click", () => {
-  if (!store.current) return;
-  const title = $("chat-title");
-  const input = el("input", { class: "chat-title-input", type: "text", value: store.title });
-  title.replaceWith(input);
-  input.focus();
-  input.select();
-
-  // Enter restores explicitly and the input's blur fires right after — the
-  // second call must be a no-op, not a DOM exception.
-  let restored = false;
-  const restore = () => {
-    if (restored) return;
-    restored = true;
-    input.replaceWith(title);
-  };
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      const next = input.value.trim();
-      if (next && next !== store.title) {
-        connection.send({ type: "rename", id: store.current, title: next });
-        store.set({ title: next });
-        title.textContent = next;
-      }
-      restore();
-    }
-    if (event.key === "Escape") restore();
-  });
-  input.addEventListener("blur", restore);
-});
+// Renaming moved onto the conversation's own tab: click the active chat tab a
+// second time and the label becomes an input. views/stage.js owns that, and
+// calls back through `onRename` above.
 
 $("archive-chat").addEventListener("click", (event) => {
   if (!store.current) return;
@@ -1293,15 +1287,17 @@ mountSessions({
     connection.send({ type: "unarchive", id });
     toast("Conversation restored.");
   },
-  /* Scrolls a sub-agent's block into view and opens it.
+  /* Brings a sub-agent's own tab forward.
    *
-   * No navigation and no host round trip: the child's output is already in this
-   * transcript, inside its own block, so the sidebar row is a jump link. It is
-   * opened on the way because a finished child folds itself away, and clicking
-   * a row that then showed nothing would read as broken. */
+   * No host round trip: the child's stream is already rendered into its tab, so
+   * the sidebar row is a jump link. Falls back to the inline block in the
+   * conversation if the tab has gone — which happens only for a child whose
+   * conversation is no longer open. */
   onRevealAgent: (id) => {
+    if (centre.focusAgent(id)) return;
     const block = document.querySelector(`details.agent[data-agent="${id}"]`);
     if (!block) return toast("That sub-agent's output is no longer on screen.", { tone: "error" });
+    centre.show("chat");
     block.open = true;
     block.scrollIntoView({ behavior: "smooth", block: "center" });
     block.classList.add("is-flashed");
