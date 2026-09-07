@@ -377,6 +377,12 @@ pub const FIELDS: &[Field] = &[
     fe("rpg_kb.python_bin", Kind::Path, "rpg_kb", "The python3 binary. Empty finds it on PATH.", "THETIS_RPG_KB_PYTHON"),
     f("rpg_kb.embedding_model", Kind::Text, "rpg_kb", "Embedding model for documents and queries, through the default provider. Part of the vector cache key."),
     f("rpg_kb.ask_model", Kind::Text, "rpg_kb", "The chat model that writes rpg-kb-ask answers, by provider id; the sidecar calls it directly."),
+
+    // --- rpg_images ---------------------------------------------------------
+    fe("rpg_images.enabled", Kind::Bool, "rpg_images", "Draw campaign portraits and scene backdrops. Off by default: unlike every other campaign feature, each image spends real money at an API. Needs the knowledge sidecar, which renders them.", "THETIS_RPG_IMAGES_ENABLED"),
+    f("rpg_images.model", Kind::Text, "rpg_images", "Image model id, through the same provider the sidecar embeds and asks with."),
+    f("rpg_images.size", Kind::Text, "rpg_images", "Pixel size requested from the image model, such as 1024x1024."),
+    f("rpg_images.per_campaign_limit", Kind::Int, "rpg_images", "How many images one campaign may spend, portraits and backdrops together."),
 ];
 
 pub fn field(key: &str) -> Option<&'static Field> {
@@ -749,6 +755,7 @@ pub const SECTIONS: &[(&str, &str, &str)] = &[
     ("devkit", "Dev kit", "Self-modification."),
     ("browser", "Browser", "The headless browser sidecar."),
     ("rpg_kb", "Campaign knowledge", "The retrieval sidecar behind the rpg-kb tools."),
+    ("rpg_images", "Campaign images", "Portraits and scene backdrops, rendered by the knowledge sidecar."),
     ("discord", "Discord", "The Discord connector."),
     ("build", "Build", "How guests are compiled."),
     ("watchdog", "Watchdog", "Failure detection and rollback."),
