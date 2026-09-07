@@ -189,28 +189,65 @@ pub struct Update {
     pub changed: usize,
 }
 
+/// Which item an update means.
+///
+/// Split out from [`update`] so it can be tested at all: `update` reaches the
+/// host to load and store the list, and the host imports do not exist on the
+/// test target.
+///
+/// The rules are deliberately forgiving, because the strict version was
+/// unusable. It required *exactly* one of `id` and `index` and counted a
+/// present-but-blank `id` as one of them, so a model that filled in every
+/// field of the shape it had been shown was refused with a message that did
+/// not say which field to drop. One run spent six consecutive calls on that
+/// and abandoned the tool, ending its turn with every todo still open. So:
+/// blank is absent, and naming the same item twice is not an error.
+fn resolve_target(change: &Value, items: &[Todo]) -> Result<usize, String> {
+    let by_id = change
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let by_index = change.get("index").and_then(Value::as_u64);
+
+    // The id is the name that survives the list being reordered, so when both
+    // are given it wins and the index is ignored.
+    if let Some(id) = by_id {
+        return items
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or_else(|| {
+                format!(
+                    "no todo '{id}'; live ids: {}",
+                    items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            });
+    }
+    if let Some(index) = by_index {
+        let index = index as usize;
+        if index == 0 || index > items.len() {
+            return Err(format!("todo index {index} is out of range 1..={}", items.len()));
+        }
+        return Ok(index - 1);
+    }
+    Err(format!(
+        "each update must name the todo to change, with either id or index: {}",
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| format!("{} = {}", i + 1, item.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 pub fn update(session_id: &str, updates: &[Value]) -> Result<Update, String> {
     if updates.is_empty() { return Err("give at least one todo update".to_string()); }
     let mut list = load(session_id);
     if list.items.is_empty() { return Err("there is no todo list yet — write one with todo_write".to_string()); }
     let now = sys::now_ms();
     for change in updates {
-        let by_id = change.get("id").and_then(Value::as_str);
-        let by_index = change.get("index").and_then(Value::as_u64);
-        if by_id.is_some() == by_index.is_some() {
-            return Err("each update must name exactly one of id or index".to_string());
-        }
-        let position = if let Some(id) = by_id {
-            list.items.iter().position(|item| item.id == id).ok_or_else(|| {
-                format!("no todo '{id}'; live ids: {}", list.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(", "))
-            })?
-        } else {
-            let index = by_index.unwrap() as usize;
-            if index == 0 || index > list.items.len() {
-                return Err(format!("todo index {index} is out of range 1..={}", list.items.len()));
-            }
-            index - 1
-        };
+        let position = resolve_target(change, &list.items)?;
         let item = &mut list.items[position];
         if let Some(status) = change.get("status").and_then(Value::as_str) { item.status = Status::parse(status)?; }
         if let Some(content) = change.get("content").and_then(Value::as_str) {
@@ -291,6 +328,54 @@ mod tests {
         assert_eq!(Status::parse("in-progress").unwrap(), Status::InProgress);
         assert_eq!(Status::parse("done").unwrap(), Status::Completed);
         assert!(Status::parse("later").is_err());
+    }
+
+    // The failure this replaced: `{"id": "t1", "index": 1}` was refused as
+    // naming two things, six times in a row, until the model stopped using the
+    // tool. Both names for one item is not an ambiguity worth failing on.
+    #[test]
+    fn naming_a_todo_by_id_and_index_together_is_accepted() {
+        let items = vec![item("t1", "a", Status::Pending), item("t2", "b", Status::Pending)];
+        assert_eq!(
+            resolve_target(&json!({"id": "t1", "index": 1}), &items),
+            Ok(0)
+        );
+        // Even when they disagree: the id is the name that means the item.
+        assert_eq!(
+            resolve_target(&json!({"id": "t1", "index": 2}), &items),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn a_blank_id_means_absent_rather_than_present_and_wrong() {
+        let items = vec![item("t1", "a", Status::Pending), item("t2", "b", Status::Pending)];
+        assert_eq!(resolve_target(&json!({"id": "", "index": 2}), &items), Ok(1));
+        assert_eq!(resolve_target(&json!({"id": "  ", "index": 1}), &items), Ok(0));
+    }
+
+    // Naming nothing is still an error — but the message has to say what the
+    // caller could have written instead.
+    #[test]
+    fn naming_no_todo_at_all_lists_the_ones_it_could_have_named() {
+        let items = vec![item("t1", "a", Status::Pending), item("t2", "b", Status::Pending)];
+        let err = resolve_target(&json!({"status": "completed"}), &items).unwrap_err();
+        assert!(err.contains("1 = t1") && err.contains("2 = t2"), "{err}");
+    }
+
+    #[test]
+    fn an_index_is_one_based_and_bounded() {
+        let items = vec![item("t1", "a", Status::Pending)];
+        assert_eq!(resolve_target(&json!({"index": 1}), &items), Ok(0));
+        assert!(resolve_target(&json!({"index": 0}), &items).is_err());
+        assert!(resolve_target(&json!({"index": 2}), &items).is_err());
+    }
+
+    #[test]
+    fn an_unknown_id_names_the_ids_that_do_exist() {
+        let items = vec![item("t1", "a", Status::Pending)];
+        let err = resolve_target(&json!({"id": "t9"}), &items).unwrap_err();
+        assert!(err.contains("t1"), "{err}");
     }
 
     #[test]

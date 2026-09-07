@@ -298,6 +298,8 @@ fn subagent_tools() -> Vec<ToolDef> {
             name: "agent_status",
             description:
                 "List your sub-agents with their state, answer so far, cost and elapsed time. \
+                 A running child also reports how much log it has written and when it last \
+                 wrote any, which is how you tell one that is working from one that is stuck. \
                  Free of side effects, but prefer `wait` when what you actually want is for one \
                  of them to be finished.",
             mutating: false,
@@ -984,8 +986,8 @@ fn todo_tools() -> Vec<ToolDef> {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": string_prop("Stable todo id, e.g. t3. Give this or index, not both."),
-                            "index": { "type": "integer", "description": "One-based item position. Give this or id, not both." },
+                            "id": string_prop("Stable todo id, e.g. t3. Preferred: it survives the list being reordered."),
+                            "index": { "type": "integer", "description": "One-based item position, for when you do not have the id. Sending both is fine — the id wins." },
                             "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
                             "content": string_prop("Replacement description."),
                             "active_form": string_prop("Replacement present-continuous label."),
@@ -1913,10 +1915,10 @@ pub fn invoke(
             }
             match name {
                 "spawn_agent" => spawn_agent(&args),
-                "agent_status" => Ok(format_children(&delegation::children())),
+                "agent_status" => Ok(format_children(&delegation::children(), now_ms())),
                 "agent_transcript" => agent_transcript(&args),
                 "cancel_agent" => delegation::cancel_child(&req_str(&args, "child_id")?)
-                    .map(|row| format!("cancelled\n\n{}", format_child(&row))),
+                    .map(|row| format!("cancelled\n\n{}", format_child(&row, now_ms()))),
                 _ => Ok(format_profiles(
                     &delegation::profiles(),
                     &delegation::limits(),
@@ -2776,7 +2778,15 @@ fn wait_for(args: &Value) -> Result<String, String> {
     let out = delegation::wait(&until, &children, timeout)?;
 
     let mut text = if out.timed_out {
-        format!("waited {timeout}s and timed out — {}", out.reason)
+        // A timeout is the deadline expiring, not a verdict on the children.
+        // Said plainly here because the alternative reading — "they are stuck"
+        // — is the one that gets a working fan-out cancelled wholesale.
+        format!(
+            "waited {timeout}s and timed out — {}\n\nThis says the deadline passed, not that \
+             anything is wrong. Check the per-child progress below before deciding: a child \
+             whose log and cost are still moving is working, however long it has been.",
+            out.reason
+        )
     } else {
         format!("wait ended: {}", out.reason)
     };
@@ -2784,7 +2794,7 @@ fn wait_for(args: &Value) -> Result<String, String> {
         text.push_str("\n\nNo sub-agents.");
     } else {
         text.push_str("\n\n");
-        text.push_str(&format_children(&out.children));
+        text.push_str(&format_children(&out.children, now_ms()));
     }
     Ok(text)
 }
@@ -3115,7 +3125,7 @@ fn format_search_report(report: &transcripts::SearchReport) -> String {
 /// The answer is included in full whenever there is one: the point of
 /// delegation is that the answer arrives without the work behind it, so making
 /// the parent take a second call to read it would defeat the mechanism.
-fn format_child(row: &delegation::SubagentInfo) -> String {
+fn format_child(row: &delegation::SubagentInfo, now: u64) -> String {
     let mut out = format!("### {} — {}\n`{}`\n", row.label, row.state, row.id);
 
     let mut facts: Vec<String> = Vec::new();
@@ -3128,11 +3138,11 @@ fn format_child(row: &delegation::SubagentInfo) -> String {
     if !row.mode.is_empty() && row.mode != DEFAULT_MODE {
         facts.push(format!("{} mode", row.mode));
     }
-    if row.finished_ms > row.created_ms {
-        facts.push(format!(
-            "{}s",
-            (row.finished_ms - row.created_ms).div_ceil(1000)
-        ));
+    // Elapsed for a finished child, and — the point of the live fields — for
+    // one still going. Without it a running child carried no clock at all, so
+    // thirty seconds and thirty minutes read the same.
+    if let Some(elapsed) = elapsed_secs(row, now) {
+        facts.push(format!("{elapsed}s"));
     }
     if row.cost_usd > 0.0 {
         facts.push(format!("${:.4}", row.cost_usd));
@@ -3148,12 +3158,64 @@ fn format_child(row: &delegation::SubagentInfo) -> String {
     if !row.answer.is_empty() {
         out.push_str(&format!("\n{}\n", row.answer));
     } else if row.state == "running" {
-        out.push_str("\nStill working.\n");
+        out.push_str(&format!("\n{}\n", running_progress(row, now)));
     }
     out
 }
 
-fn format_children(rows: &[delegation::SubagentInfo]) -> String {
+/// How long a child has been going, finished or not.
+///
+/// `None` only when the row carries no usable clock at all, which is what a
+/// freshly spawned child looks like for its first instant.
+fn elapsed_secs(row: &delegation::SubagentInfo, now: u64) -> Option<u64> {
+    let end = if row.finished_ms > row.created_ms {
+        row.finished_ms
+    } else if now > row.created_ms {
+        now
+    } else {
+        return None;
+    };
+    Some((end - row.created_ms).div_ceil(1000))
+}
+
+/// What a running child is doing, in the terms that separate busy from stuck.
+///
+/// "Still working" was all this used to say, which is true of a child mid-tool
+/// and equally true of one whose worker died half an hour ago. A parent that
+/// cannot tell those apart has one move available to it — cancel — and will
+/// eventually use it on work that was going fine. So: how much log the child
+/// has written, and how long since it last wrote any.
+fn running_progress(row: &delegation::SubagentInfo, now: u64) -> String {
+    if row.events == 0 && row.activity_ms == 0 {
+        // No live read got through. Say so rather than implying silence.
+        return "Still working (no progress reading available).".to_string();
+    }
+    let last = ago(row.activity_ms, now);
+    let stalled = row.activity_ms > 0
+        && now > row.activity_ms
+        && (now - row.activity_ms) >= STALE_CHILD_MS;
+    let mut line = format!(
+        "Still working — {} log entries, last activity {last}.",
+        row.events
+    );
+    if stalled {
+        line.push_str(
+            " Nothing for a while: check `agent_transcript` before assuming it is wedged, \
+             because a single long tool call looks exactly like this.",
+        );
+    }
+    line
+}
+
+/// How quiet a running child has to go before its listing says so.
+///
+/// Generously long on purpose. One build, one large search or one slow
+/// completion can hold a child silent for minutes without anything being
+/// wrong, and a warning that fires on healthy work teaches a parent to ignore
+/// it — which is the same failure as not having one.
+const STALE_CHILD_MS: u64 = 10 * 60 * 1000;
+
+fn format_children(rows: &[delegation::SubagentInfo], now: u64) -> String {
     if rows.is_empty() {
         return "You have not spawned any sub-agents.".to_string();
     }
@@ -3175,7 +3237,7 @@ fn format_children(rows: &[delegation::SubagentInfo]) -> String {
         head.push_str(&format!(", ${total:.4} so far"));
     }
 
-    let body: Vec<String> = rows.iter().map(format_child).collect();
+    let body: Vec<String> = rows.iter().map(|r| format_child(r, now)).collect();
     format!("{head}\n\n{}", body.join("\n"))
 }
 
@@ -3814,7 +3876,10 @@ mod recall_tests {
 /// plan, and the formatters a parent reads its children through.
 #[cfg(test)]
 mod delegation_tests {
-    use super::{check_brief, format_child, format_children, format_profiles, wait_plan, MIN_BRIEF};
+    use super::{
+        check_brief, format_child, format_children, format_profiles, wait_plan, MIN_BRIEF,
+        STALE_CHILD_MS,
+    };
     use crate::thetis::grip::delegation;
     use serde_json::json;
 
@@ -3833,8 +3898,14 @@ mod delegation_tests {
             cost_usd: 0.0,
             created_ms: 1_000,
             finished_ms: 0,
+            events: 0,
+            activity_ms: 0,
         }
     }
+
+    /// The clock every formatting test reads against. Far enough past
+    /// `created_ms` that elapsed time is a real number.
+    const NOW: u64 = 1_000 + 60_000;
 
     // --- the brief ---------------------------------------------------------
 
@@ -3934,21 +4005,70 @@ mod delegation_tests {
     // pay a round trip for every child.
     #[test]
     fn a_finished_child_shows_its_answer_inline() {
-        let out = format_child(&child("c1", "done", "the answer is 12"));
+        let out = format_child(&child("c1", "done", "the answer is 12"), NOW);
         assert!(out.contains("the answer is 12"), "{out}");
     }
 
     #[test]
     fn a_running_child_says_so_instead_of_showing_nothing() {
-        let out = format_child(&child("c1", "running", ""));
+        let out = format_child(&child("c1", "running", ""), NOW);
         assert!(out.contains("Still working"), "{out}");
+    }
+
+    // The failure this exists to prevent: seven children working hard rendered
+    // as seven identical lines with no clock and no cost, so the parent read
+    // them as hung and cancelled every one.
+    #[test]
+    fn a_running_child_shows_progress_not_just_that_it_is_running() {
+        let mut row = child("c1", "running", "");
+        row.events = 143;
+        row.activity_ms = NOW - 5_000;
+        row.cost_usd = 4.25;
+        let out = format_child(&row, NOW);
+        assert!(out.contains("143"), "the log has to be countable: {out}");
+        assert!(out.contains("just now"), "last activity has to show: {out}");
+        assert!(out.contains("$4.25"), "live spend has to show: {out}");
+        assert!(out.contains("60s"), "a running child needs a clock: {out}");
+    }
+
+    #[test]
+    fn a_child_that_has_gone_quiet_is_called_out() {
+        let now = 1_000 + STALE_CHILD_MS * 2;
+        let mut row = child("c1", "running", "");
+        row.events = 12;
+        row.activity_ms = 1_000;
+        let out = format_child(&row, now);
+        assert!(
+            out.contains("Nothing for a while"),
+            "a long silence is the one thing worth flagging: {out}"
+        );
+    }
+
+    // A silence that is merely long is not evidence of death, and saying so
+    // keeps the warning from being the reason a parent cancels healthy work.
+    #[test]
+    fn going_quiet_suggests_looking_rather_than_cancelling() {
+        let now = 1_000 + STALE_CHILD_MS * 2;
+        let mut row = child("c1", "running", "");
+        row.events = 12;
+        row.activity_ms = 1_000;
+        let out = format_child(&row, now);
+        assert!(out.contains("agent_transcript"), "{out}");
+    }
+
+    // A failed progress read is not the same fact as a child that has done
+    // nothing, and conflating them would recreate the original bug.
+    #[test]
+    fn an_unavailable_progress_reading_says_so() {
+        let out = format_child(&child("c1", "running", ""), NOW);
+        assert!(out.contains("no progress reading available"), "{out}");
     }
 
     #[test]
     fn a_failure_reason_is_not_swallowed() {
         let mut row = child("c1", "failed", "");
         row.detail = "ran out of iterations".to_string();
-        let out = format_child(&row);
+        let out = format_child(&row, NOW);
         assert!(out.contains("ran out of iterations"), "{out}");
         assert!(out.contains("failed"), "the state must be visible too: {out}");
     }
@@ -3964,7 +4084,11 @@ mod delegation_tests {
             child("c", "failed", ""),
             child("d", "cancelled", ""),
         ];
-        let head = format_children(&rows).lines().next().unwrap().to_string();
+        let head = format_children(&rows, NOW)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
         assert!(head.contains("4 sub-agent"), "{head}");
         assert!(head.contains("1 running"), "{head}");
         assert!(
@@ -3975,13 +4099,13 @@ mod delegation_tests {
 
     #[test]
     fn no_children_reads_as_a_sentence_not_an_empty_string() {
-        assert!(format_children(&[]).contains("not spawned"));
+        assert!(format_children(&[], NOW).contains("not spawned"));
     }
 
     #[test]
     fn every_child_appears_in_the_listing() {
         let rows = vec![child("a", "done", "A answer"), child("b", "done", "B answer")];
-        let out = format_children(&rows);
+        let out = format_children(&rows, NOW);
         assert!(out.contains("A answer") && out.contains("B answer"), "{out}");
     }
 

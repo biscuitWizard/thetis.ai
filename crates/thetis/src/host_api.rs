@@ -1100,8 +1100,9 @@ impl delegation::Host for HostState {
         let grip = self.grip.clone();
         let rows = grip.persist.subagents_of(&parent).await.unwrap_or_default();
         let cap = grip.cfg.subagents.max_result_bytes;
+        let infos = infos_from_rows(&grip, &rows, cap).await;
         self.yielded();
-        Ok(rows.iter().map(|r| info_from_row(r, cap)).collect())
+        Ok(infos)
     }
 
     /// Blocks the parent's turn until a predicate holds or the deadline passes.
@@ -1134,14 +1135,17 @@ impl delegation::Host for HostState {
         // agent store's budget here as well: the wait result may be rendered as a
         // tool error, but the stopped turn must not resume Wasm and issue another
         // tool call if its inbox checkpoint is buggy or delayed.
-        let out = crate::delegation::wait(&grip, &parent, &predicate, timeout)
-            .await
-            .map(|o| delegation::WaitResult {
-                reason: o.reason,
-                timed_out: o.timed_out,
-                children: o.children.iter().map(|r| info_from_row(r, cap)).collect(),
-            })
-            .map_err(|e| format!("{e:#}"));
+        let out = match crate::delegation::wait(&grip, &parent, &predicate, timeout).await {
+            Ok(o) => {
+                let children = infos_from_rows(&grip, &o.children, cap).await;
+                Ok(delegation::WaitResult {
+                    reason: o.reason,
+                    timed_out: o.timed_out,
+                    children,
+                })
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
         if self.cancelled() {
             self.budget.cancel();
         }
@@ -1191,6 +1195,53 @@ impl delegation::Host for HostState {
     }
 }
 
+/// A child list for the parent to read, with live numbers on anything still
+/// running.
+///
+/// The registry row is authoritative once a child has settled, and silent
+/// before then: `cost_usd` stays 0.0 and there is nothing at all to say how
+/// far the child has got. That silence is what made seven working sub-agents
+/// look identical to seven hung ones, so a running row is topped up here from
+/// the ledger and the child's own session metadata — one batched call for the
+/// whole list, whatever its length.
+async fn infos_from_rows(
+    grip: &Arc<Grip>,
+    rows: &[crate::subagents::SubagentRow],
+    max_result_bytes: usize,
+) -> Vec<delegation::SubagentInfo> {
+    let mut infos: Vec<delegation::SubagentInfo> = rows
+        .iter()
+        .map(|r| info_from_row(r, max_result_bytes))
+        .collect();
+
+    let live: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.state.is_terminal())
+        .map(|r| r.child_id.clone())
+        .collect();
+    if live.is_empty() {
+        return infos;
+    }
+    // Best effort on purpose: a status render that fails because the progress
+    // read failed would be worse than one without the extra numbers.
+    let progress = match grip.persist.session_progress(&live).await {
+        Ok(p) if p.len() == live.len() => p,
+        Ok(_) => return infos,
+        Err(e) => {
+            tracing::debug!(error = %e, "sub-agent progress was not read");
+            return infos;
+        }
+    };
+    for (id, p) in live.iter().zip(progress) {
+        if let Some(info) = infos.iter_mut().find(|i| &i.id == id) {
+            info.cost_usd = p.cost_usd;
+            info.events = p.events;
+            info.activity_ms = p.activity_ms;
+        }
+    }
+    infos
+}
+
 /// Wire form of a registry row, with the answer clamped to what the parent's
 /// context should carry.
 fn info_from_row(
@@ -1210,6 +1261,10 @@ fn info_from_row(
         cost_usd: row.cost_usd,
         created_ms: row.created_ms,
         finished_ms: row.finished_ms,
+        // Filled in by `infos_from_rows` for a child that is still running;
+        // a settled child's log is history, and its cost is on the row.
+        events: 0,
+        activity_ms: 0,
     }
 }
 

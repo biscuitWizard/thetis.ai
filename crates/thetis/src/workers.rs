@@ -67,6 +67,18 @@ struct WorkerEntry {
     /// inside MIN_UPTIME counted as two fast deaths and threw away a perfectly
     /// good branch kernel with "it kept crashing at startup".
     stopping: std::sync::atomic::AtomicBool,
+    /// Turns this worker says it is running, and when it last said so.
+    ///
+    /// Reported by the worker rather than inferred here: the gateway's own
+    /// turn counter is necessarily zero, because turns run over there. Without
+    /// this `/admin/waits` answered "nothing is running" for a conversation
+    /// that was twelve minutes into a stalled turn — the one question that
+    /// page exists to answer.
+    turns: std::sync::atomic::AtomicUsize,
+    turns_since: std::sync::Mutex<Instant>,
+    /// Highest report stamp seen, so a note that overtook a newer one on its
+    /// way here is dropped rather than applied. See `Grip::turn_report_seq`.
+    turns_seq: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -117,6 +129,7 @@ impl WorkerRouter {
                 .into_iter()
                 .map(|(id, method, age)| json!({ "id": id, "method": method, "age_s": age }))
                 .collect();
+            let turns = entry.turns.load(std::sync::atomic::Ordering::SeqCst);
             rows.push(json!({
                 "session": session,
                 "ready": *entry.ready.borrow(),
@@ -127,6 +140,19 @@ impl WorkerRouter {
                     .lock()
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or_default(),
+                "turns_running": turns,
+                // How long the count has stood. A turn that has been running
+                // for one figure while the socket has been idle for the same
+                // one is the shape of a stall, and neither number says it
+                // alone.
+                "turn_age_s": match turns {
+                    0 => None,
+                    _ => entry
+                        .turns_since
+                        .lock()
+                        .map(|t| t.elapsed().as_secs())
+                        .ok(),
+                },
                 "pending": pending,
             }));
         }
@@ -358,6 +384,9 @@ async fn materialize(
         ready: ready_rx,
         last_activity: std::sync::Mutex::new(Instant::now()),
         stopping: std::sync::atomic::AtomicBool::new(false),
+        turns: std::sync::atomic::AtomicUsize::new(0),
+        turns_since: std::sync::Mutex::new(Instant::now()),
+        turns_seq: std::sync::atomic::AtomicU64::new(0),
     });
     router
         .workers
@@ -659,6 +688,42 @@ impl ipc::Handler for GatewayHandler {
         }
 
         match name.as_str() {
+            // How many turns the worker has in flight. See `WorkerEntry::turns`.
+            "turns" => {
+                let running = params
+                    .get("running")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as usize;
+                let seq = params.get("seq").and_then(Value::as_u64).unwrap_or_default();
+                if let Role::Gateway(router) = &grip.role {
+                    let router = router.clone();
+                    let session = self.session_id.clone();
+                    tokio::spawn(async move {
+                        let Some(entry) = router.entry(&session).await else {
+                            return;
+                        };
+                        // Stale report: a newer one is already applied.
+                        if entry
+                            .turns_seq
+                            .fetch_max(seq, std::sync::atomic::Ordering::SeqCst)
+                            >= seq
+                        {
+                            return;
+                        }
+                        let was = entry
+                            .turns
+                            .swap(running, std::sync::atomic::Ordering::SeqCst);
+                        // Only restart the clock when the count actually
+                        // changes, so `turn_age_s` measures the turn rather
+                        // than the last report about it.
+                        if was != running {
+                            if let Ok(mut since) = entry.turns_since.lock() {
+                                *since = Instant::now();
+                            }
+                        }
+                    });
+                }
+            }
             // A frame the worker rendered for one of its session's events.
             "frame" => {
                 let session = params

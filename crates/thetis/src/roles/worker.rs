@@ -302,6 +302,10 @@ pub async fn run(
         }
     }
 
+    // A stalled provider is otherwise completely silent. See
+    // `spawn_retry_notices`.
+    spawn_retry_notices(grip.clone());
+
     // This worker renders its own sessions' events and ships the frames up.
     spawn_render_loop(grip.clone(), peer.clone());
     // Shell activity goes up the same socket, so the browser can draw a live
@@ -342,6 +346,47 @@ pub async fn run(
     let _ = connection.await;
     tracing::info!("gateway hung up; worker exiting");
     Ok(())
+}
+
+/// Writes the LLM client's retry notices into the conversation they belong to.
+///
+/// Without this a provider that accepts a request and never answers is
+/// invisible: the read timeout is a silence, the retry is a silence, and the
+/// default four attempts at 180s each is twelve minutes in which a turn is
+/// indistinguishable from a hung one. The only thing that ever reached the
+/// person watching was the transport error at the very end.
+///
+/// An incident rather than a system note, because that is what the browser
+/// already renders as something gone wrong, and because it leaves the retries
+/// in the log afterwards — "this turn spent eleven of its twelve minutes
+/// waiting on a provider" is not reconstructible from anything else.
+fn spawn_retry_notices(grip: Arc<Grip>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    grip.llm.on_retry(tx);
+    tokio::spawn(async move {
+        while let Some(notice) = rx.recv().await {
+            if notice.session.is_empty() {
+                continue;
+            }
+            let text = format!(
+                "Attempt {} of {} got no answer from the model provider after {}s ({}). Retrying.",
+                notice.attempt,
+                notice.attempts,
+                notice.elapsed.as_secs(),
+                notice.error,
+            );
+            if let Err(e) = grip
+                .persist
+                .append_event(
+                    &notice.session,
+                    crate::bindings::types::SessionEvent::Incident(text),
+                )
+                .await
+            {
+                tracing::debug!(error = %e, "a retry notice was not recorded");
+            }
+        }
+    });
 }
 
 /// Exits if the gateway goes away.

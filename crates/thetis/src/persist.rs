@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::bindings::types::{EventRecord, SessionEvent, SessionMeta};
 use crate::ipc::Peer;
-use crate::store::Store;
+use crate::store::{SessionProgress, Store};
 use crate::subagents::SubagentRow;
 use crate::transcripts::{ConversationSummary, SearchQuery, SearchReport, TranscriptEntry};
 
@@ -202,6 +202,25 @@ impl Persist {
             "store.add_spend",
             |s| s.add_spend(session_id, usd),
             json!({ "session": session_id, "usd": usd })
+        )
+    }
+
+    /// Live progress for several sessions at once.
+    ///
+    /// Batched because the caller is always rendering a child list, and one
+    /// round trip per child turned a status render into twenty.
+    pub async fn session_progress(&self, session_ids: &[String]) -> Result<Vec<SessionProgress>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        delegate!(
+            self,
+            "store.session_progress",
+            |s| session_ids
+                .iter()
+                .map(|id| s.session_progress(id))
+                .collect::<Result<Vec<_>>>(),
+            json!({ "sessions": session_ids })
         )
     }
 
@@ -548,6 +567,19 @@ fn serve_store_call_inner(
             get_str(&params, "value")?,
         )?),
         "store.get_spend" => to_value(store.get_spend(own_session(store, &params, caller_session)?)?),
+        // Scoped per id rather than in bulk: the batch exists to save round
+        // trips, not to widen what a worker may look at.
+        "store.session_progress" => {
+            let ids: Vec<String> =
+                serde_json::from_value(params.get("sessions").cloned().unwrap_or(Value::Null))?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let scoped = json!({ "session": id });
+                let checked = own_session(store, &scoped, caller_session)?.to_string();
+                out.push(store.session_progress(&checked)?);
+            }
+            to_value(out)
+        }
         "store.add_spend" => {
             let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
             to_value(store.add_spend(own_session(store, &params, caller_session)?, usd)?)

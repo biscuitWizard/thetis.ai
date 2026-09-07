@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::bindings::types::{FinishInfo, LlmError, StreamChunk, TokenUsage, ToolCall};
@@ -36,6 +36,34 @@ pub struct LlmClient {
     /// makes, so successive calls land on different endpoints instead of each
     /// starting at the first one.
     next_replica: std::sync::atomic::AtomicUsize,
+    /// Where retry notices go, once someone is listening.
+    ///
+    /// The client cannot reach the store — the grip owns both, and the
+    /// dependency runs that way round — so it announces instead of writing.
+    /// Set once at startup by whoever wants the notices; unset in tests and in
+    /// the gateway, where nothing would read them.
+    retries: std::sync::OnceLock<mpsc::UnboundedSender<RetryNotice>>,
+}
+
+/// One failed attempt at a completion, announced as it is retried.
+///
+/// Exists because a stalled provider is invisible: the read timeout is a
+/// silence, the retry is a silence, and four of them in a row is twelve
+/// minutes in which a turn looks identical to a hung one. Whoever holds a
+/// session log turns these into something the person watching can read.
+#[derive(Debug, Clone)]
+pub struct RetryNotice {
+    /// The conversation the request belonged to, empty when untagged.
+    pub session: String,
+    /// Which attempt just failed, counted from 1. The log counts from 0; a
+    /// person reading a conversation does not.
+    pub attempt: u32,
+    /// How many attempts there will be in total, retries included.
+    pub attempts: u32,
+    /// How long the attempt ran before it gave up.
+    pub elapsed: Duration,
+    /// Why it failed, as the transport described it.
+    pub error: String,
 }
 
 /// A prepared request, as sent, with when it was sent.
@@ -83,6 +111,23 @@ impl StreamHandle {
     }
 }
 
+/// What a failed attempt should be called, in a few words.
+///
+/// A read timeout is the case worth naming outright: it is what a provider
+/// that accepted the request and then went quiet looks like from here, and it
+/// is indistinguishable from every other transport failure unless something
+/// says so.
+fn describe_attempt(result: &Result<reqwest::Response, reqwest::Error>) -> String {
+    match result {
+        Ok(resp) => format!("http {}", resp.status().as_u16()),
+        Err(e) if e.is_timeout() => {
+            format!("no response within the read timeout ({e})")
+        }
+        Err(e) if e.is_connect() => format!("could not connect ({e})"),
+        Err(e) => e.to_string(),
+    }
+}
+
 impl LlmClient {
     pub fn new(cfg: Arc<Config>) -> Result<Self> {
         // `read_timeout`, not `timeout`. reqwest's `timeout` is a *total*
@@ -106,7 +151,14 @@ impl LlmClient {
             cfg,
             last_request: std::sync::Mutex::new(None),
             next_replica: std::sync::atomic::AtomicUsize::new(0),
+            retries: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Starts announcing retries to `tx`. The first caller wins; later ones are
+    /// ignored, so a second subscriber cannot silently displace the first.
+    pub fn on_retry(&self, tx: mpsc::UnboundedSender<RetryNotice>) {
+        let _ = self.retries.set(tx);
     }
 
     /// The most recent streaming request body, for the caller to persist.
@@ -298,7 +350,9 @@ impl LlmClient {
                 req = req.header(name.as_str(), value.as_str());
             }
 
+            let started = Instant::now();
             let result = req.json(body).send().await;
+            let elapsed = started.elapsed();
 
             let retryable = match &result {
                 Ok(resp) => {
@@ -311,14 +365,32 @@ impl LlmClient {
             if retryable && attempt < self.cfg.max_retries {
                 // Exponential backoff with a little jitter from the attempt index.
                 let delay = Duration::from_millis(400 * (1 << attempt) + (attempt as u64 * 37));
+                // What actually went wrong, which this line used to omit
+                // entirely: four identical warnings could be a dead socket, a
+                // 503 or a provider that accepted the request and never
+                // answered, and the log could not tell you which.
+                let why = describe_attempt(&result);
                 tracing::warn!(
                     attempt,
                     ?delay,
+                    elapsed_s = elapsed.as_secs(),
                     provider = %provider.id,
                     %url,
                     replicas = provider.replicas(),
+                    error = %why,
                     "llm request failed, retrying"
                 );
+                if let Some(tx) = self.retries.get() {
+                    let _ = tx.send(RetryNotice {
+                        session: session.unwrap_or_default().to_string(),
+                        // The log counts attempts from zero; a person reading a
+                        // conversation counts from one.
+                        attempt: attempt + 1,
+                        attempts: self.cfg.max_retries + 1,
+                        elapsed,
+                        error: why,
+                    });
+                }
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 continue;
@@ -1104,6 +1176,90 @@ mod tests {
                 "https://openrouter.ai/api/v1/chat/completions"
             );
         }
+    }
+
+    /// A server that accepts the request, reads it, and then says nothing at
+    /// all — the failure that started this: OpenRouter took a 320KB prompt,
+    /// acked every byte, and returned zero.
+    async fn silent_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                // Held, not dropped: closing would be a connection error, and
+                // the case under test is a socket that stays open and quiet.
+                held.push(socket);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    // Twelve minutes of silence, in miniature. Four attempts against a
+    // provider that never answers used to produce four log lines that did not
+    // say why and nothing at all in the conversation, so the only evidence a
+    // person ever saw was the transport error at the end.
+    #[tokio::test]
+    async fn a_provider_that_never_answers_is_retried_and_announced() {
+        let (base, _server) = silent_server().await;
+
+        let mut cfg = Config::load().expect("the shipped config loads");
+        cfg.max_retries = 2;
+        cfg.request_timeout = Duration::from_millis(300);
+        cfg.providers = vec![crate::config::ProviderSpec {
+            id: "local".into(),
+            label: "quiet".into(),
+            base_urls: vec![base],
+            api_key: None,
+            headers: Vec::new(),
+        }];
+        cfg.default_provider = "local".into();
+        cfg.models = Vec::new();
+        let client = LlmClient::new(Arc::new(cfg)).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        client.on_retry(tx);
+
+        let outcome = client
+            .open_stream_for(
+                r#"{"model":"local/x","messages":[{"role":"user","content":"hi"}]}"#,
+                Some("conv-1"),
+            )
+            .await;
+        match outcome {
+            Ok(_) => panic!("a provider that never answers cannot produce a stream"),
+            Err(e) => assert!(
+                matches!(e, LlmError::Transport(_)),
+                "a silent provider is a transport failure: {e:?}"
+            ),
+        }
+
+        // One notice per retry — the attempts before the last, which has no
+        // retry to announce.
+        let mut notices = Vec::new();
+        while let Ok(notice) = rx.try_recv() {
+            notices.push(notice);
+        }
+        assert_eq!(notices.len(), 2, "two retries, two notices: {notices:?}");
+        assert_eq!(notices[0].attempt, 1);
+        assert_eq!(notices[1].attempt, 2);
+        assert!(
+            notices.iter().all(|n| n.attempts == 3),
+            "the total has to include the first attempt: {notices:?}"
+        );
+        assert!(
+            notices.iter().all(|n| n.session == "conv-1"),
+            "a notice nobody can file against a conversation is not worth sending"
+        );
+        // The distinction the log used to lose entirely.
+        assert!(
+            notices[0].error.contains("read timeout"),
+            "a silent provider must not read as a connection failure: {}",
+            notices[0].error
+        );
     }
 
     #[tokio::test]

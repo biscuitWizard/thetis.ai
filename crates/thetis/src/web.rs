@@ -738,19 +738,42 @@ async fn admin_waits(State(grip): State<Arc<Grip>>) -> Response {
     };
 
     // The build lock file carries its holder's pid (written when taken), so a
-    // build that is queueing the fleet can be identified from here.
+    // build that is queueing the fleet can be identified from here. The pid
+    // alone is not evidence that anyone holds it: the file keeps the name of
+    // whoever wrote it last, and a holder that was killed leaves it behind. Ask
+    // the kernel whether the lock is actually taken, and only name a pid when
+    // it is — reporting a stale one as live sent more than one investigation
+    // after a process that had exited hours before.
     let lock = grip.cfg.build_lock_path();
+    let build_lock_held = crate::builder::lock_is_held(&lock);
     let build_lock = std::fs::read_to_string(&lock)
         .ok()
         .map(|pid| pid.trim().to_string())
-        .filter(|pid| !pid.is_empty());
+        .filter(|pid| !pid.is_empty() && build_lock_held);
+
+    // Turns run in workers, so this process's own counter is zero on the
+    // gateway and the fleet's total is what the question means. Both are
+    // reported: `turns_running` is the honest answer to "is anything running",
+    // and `turns_running_here` keeps the old, narrower number available.
+    let turns_here = grip.turns_in_flight();
+    let turns_in_workers: u64 = workers
+        .get("workers")
+        .and_then(|w| w.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("turns_running").and_then(|t| t.as_u64()))
+                .sum()
+        })
+        .unwrap_or(0);
 
     let body = serde_json::json!({
         "uptime_s": crate::control::uptime().as_secs(),
         "workers": workers,
+        "build_lock_held": build_lock_held,
         "build_lock_holder_pid": build_lock,
         "building": grip.building_aspects(),
-        "turns_running": grip.turns_in_flight(),
+        "turns_running": turns_here as u64 + turns_in_workers,
+        "turns_running_here": turns_here,
     });
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],

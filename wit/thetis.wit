@@ -665,6 +665,15 @@ interface delegation {
     created-ms: u64,
     // 0 while still running.
     finished-ms: u64,
+    // Live progress, filled in only while the child is running: how many
+    // events its log holds, and when it last appended one. Both are 0 once it
+    // has settled, and 0 is also what a caller sees if the read failed.
+    //
+    // They exist because the registry says nothing at all about a child until
+    // it finishes, so "working hard" and "wedged" rendered identically — and a
+    // parent with no way to tell them apart eventually cancels both.
+    events: u64,
+    activity-ms: u64,
   }
 
   record wait-result {
