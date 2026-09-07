@@ -30,6 +30,10 @@ const RESUME_ATTEMPTS_KEY: &str = "__resume_attempts";
 /// reconciliation sees it. An interruption the orchestrator caused on purpose
 /// is not evidence that the turn is unhealthy.
 const EXPECTED_RESTART_KEY: &str = "__expected_restart";
+/// The event the log had reached when this turn was last interrupted, so the
+/// next interruption can tell "it died again having got nowhere" from "it has
+/// been working since and was interrupted again".
+const RESUME_MARK_KEY: &str = "__resume_mark";
 const MAX_RESUME_ATTEMPTS: u32 = 2;
 
 /// session id -> SessionMeta (json)
@@ -439,6 +443,37 @@ impl Store {
             if expected {
                 self.kv_put(&meta.id, EXPECTED_RESTART_KEY, "")?;
             }
+
+            // Has the turn got anywhere since it was last interrupted?
+            //
+            // The budget exists to stop a turn that cannot survive being
+            // resumed — one that dies immediately, every time, making no
+            // progress. It was being spent by turns that were working
+            // perfectly well and merely got interrupted repeatedly, which is a
+            // problem with whatever is interrupting them, not with the turn.
+            // Counting only fruitless attempts keeps the crash-loop guard
+            // while letting a healthy turn be picked up as often as it needs.
+            let mark = self
+                .kv_get(&meta.id, RESUME_MARK_KEY)?
+                .and_then(|v| v.parse::<u64>().ok());
+            let progressed = match mark {
+                None => false,
+                Some(mark) => events.iter().any(|r| {
+                    r.seq > mark
+                        && matches!(
+                            r.event,
+                            SessionEvent::AssistantMessage(_)
+                                | SessionEvent::ToolInvocation(_)
+                                | SessionEvent::ToolResult(_)
+                        )
+                }),
+            };
+            let attempts = if progressed { 0 } else { attempts };
+            if progressed {
+                self.clear_resume_attempts(&meta.id)?;
+            }
+            let latest = events.last().map(|r| r.seq).unwrap_or(0);
+            self.kv_put(&meta.id, RESUME_MARK_KEY, &latest.to_string())?;
 
             // A turn that keeps dying takes its worker with it each time.
             // Stop after a couple of tries rather than looping forever.
@@ -1106,6 +1141,44 @@ use crate::bindings::types::{AssistantMsg, Attachment, ToolCall, ToolOutcome};
             .unwrap()
             .iter()
             .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))));
+    }
+
+    #[test]
+    fn a_turn_that_keeps_working_is_picked_up_as_often_as_it_needs() {
+        let (store, _d) = temp_store();
+        let id = mid_turn(&store, "productive but interrupted", None);
+
+        // What was actually happening in production: the turn was fine, the
+        // worker under it kept dying, and after two deaths a working turn was
+        // abandoned. Progress between interruptions means the turn survives
+        // resuming, which is the only thing the budget is meant to test.
+        for round in 0..8 {
+            let found = store
+                .reconcile_interrupted_turns("restarted", &[], None)
+                .unwrap();
+            assert!(found[0].resume, "round {round} must still resume");
+            // It gets somewhere before the next interruption.
+            store
+                .append_event(
+                    &id,
+                    SessionEvent::AssistantMessage(AssistantMsg {
+                        content: "got somewhere".into(),
+                        tool_calls: Vec::new(),
+                        model: "m".into(),
+                        usage: None,
+                    }),
+                )
+                .unwrap();
+            store.append_event(&id, SessionEvent::TurnStarted).unwrap();
+        }
+        assert!(
+            !store
+                .events(&id, 0)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))),
+            "a turn making progress must never be abandoned"
+        );
     }
 
     #[test]
