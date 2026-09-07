@@ -20,6 +20,7 @@ pub mod api;
 pub mod ask;
 pub mod commands;
 pub mod policy;
+pub mod split;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -1134,7 +1135,8 @@ async fn stream_reply(
      * first narration silently vanishes from the channel. */
     let mut settled = String::new();
     let mut buffer = String::new();
-    let mut message_id: Option<String> = None;
+    // A reply may span several messages: see `Reply` and `split`.
+    let mut reply = Reply::default();
     let mut last_edit = std::time::Instant::now();
     let mut last_sent = String::new();
     // Set once a question form has been posted, so the turn's ending does not
@@ -1171,7 +1173,10 @@ async fn stream_reply(
                 // yet, and kept up once a step has settled and the model has
                 // gone quiet into a tool: that is the honest signal that more
                 // is still coming.
-                if visible(&settled, &buffer).trim().is_empty() {
+                if compose(&settled, &buffer, activity.as_deref())
+                    .trim()
+                    .is_empty()
+                {
                     let _ = rest.typing(&channel_id).await;
                 }
                 continue;
@@ -1197,9 +1202,9 @@ async fn stream_reply(
                 // purpose and comes off.
                 activity = None;
                 buffer.push_str(&chunk);
-                let shown = visible(&settled, &buffer);
+                let shown = compose(&settled, &buffer, activity.as_deref());
                 if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut message_id, &shown).await;
+                    flush(&rest, &channel_id, &mut reply, &shown).await;
                     last_sent = shown;
                     last_edit = std::time::Instant::now();
                 }
@@ -1225,9 +1230,10 @@ async fn stream_reply(
                  * The text is final here, so there is nothing to wait for; the
                  * interval still bounds the streaming case, so this costs at
                  * most one extra edit per assistant step. */
-                if settled.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut message_id, &settled).await;
-                    last_sent = settled.clone();
+                let shown = compose(&settled, &buffer, activity.as_deref());
+                if shown.trim() != last_sent.trim() {
+                    flush(&rest, &channel_id, &mut reply, &shown).await;
+                    last_sent = shown;
                     last_edit = std::time::Instant::now();
                 }
             }
@@ -1239,9 +1245,9 @@ async fn stream_reply(
                  * would be overwritten by the turn-finished text and lost. */
                 // The questions replace any progress note entirely.
                 activity = None;
-                let said = visible(&settled, &buffer);
+                let said = compose(&settled, &buffer, activity.as_deref());
                 if !said.trim().is_empty() {
-                    flush(&rest, &channel_id, &mut message_id, &said).await;
+                    flush(&rest, &channel_id, &mut reply, &said).await;
                     last_sent = said.clone();
                 }
                 // The call id is what makes posting idempotent. A provider that
@@ -1277,7 +1283,7 @@ async fn stream_reply(
                             // Nothing askable and nothing said: fall back to the
                             // note, so a malformed call is not silence.
                             let note = format!("_… {}_", call.name);
-                            flush(&rest, &channel_id, &mut message_id, &note).await;
+                            flush(&rest, &channel_id, &mut reply, &note).await;
                             last_edit = std::time::Instant::now();
                         }
                     }
@@ -1298,7 +1304,7 @@ async fn stream_reply(
                 activity = Some(call.name.clone());
                 let shown = compose(&settled, &buffer, activity.as_deref());
                 if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut message_id, &shown).await;
+                    flush(&rest, &channel_id, &mut reply, &shown).await;
                     last_sent = shown;
                     last_edit = std::time::Instant::now();
                 }
@@ -1313,6 +1319,10 @@ async fn stream_reply(
                 );
                 buffer.clear();
                 activity = None;
+                let shown = compose(&settled, &buffer, activity.as_deref());
+                flush(&rest, &channel_id, &mut reply, &shown).await;
+                last_sent = shown;
+                last_edit = std::time::Instant::now();
             }
             SessionEvent::TurnFinished(stats) => {
                 // A turn that ended by asking has already said its piece, in a
@@ -1321,14 +1331,17 @@ async fn stream_reply(
                 if asked {
                     break;
                 }
-                let mut final_text = visible(&settled, &buffer);
+                // The tool note is retracted here whatever was running: the turn
+                // is over, so nothing is.
+                activity = None;
+                let mut final_text = compose(&settled, &buffer, activity.as_deref());
                 if final_text.trim().is_empty() {
                     final_text = format!(
                         "I finished without saying anything (stopped by {}).",
                         stats.stopped_by
                     );
                 }
-                flush(&rest, &channel_id, &mut message_id, &final_text).await;
+                flush(&rest, &channel_id, &mut reply, &final_text).await;
                 break;
             }
             _ => {}
@@ -1367,28 +1380,70 @@ fn compose(settled: &str, buffer: &str, activity: Option<&str>) -> String {
     }
 }
 
-/// Sends the reply, or edits it if one is already posted.
-async fn flush(
-    rest: &Rest,
-    channel_id: &str,
-    message_id: &mut Option<String>,
-    content: &str,
-) {
-    if content.trim().is_empty() {
+/// The messages a reply currently occupies in the channel.
+///
+/// A reply is not one message. Discord caps a body at 2000 characters, and the
+/// connector used to meet that by keeping the tail and stamping
+/// `… (truncated)` on the front — so the opening of every long answer was
+/// thrown away, which is where the reasoning is. A long reply is now laid out
+/// across as many messages as it needs.
+///
+/// The ids are held in order, so page N is always `ids[N]`, and pagination is
+/// prefix-stable, so a page that has not changed is never re-sent.
+#[derive(Default)]
+struct Reply {
+    ids: Vec<String>,
+    /// The body each message currently holds, so an unchanged page can be
+    /// recognised without asking Discord what it says.
+    bodies: Vec<String>,
+}
+
+/// Brings the channel in line with `content`, sending, editing and deleting
+/// messages as the layout requires.
+async fn flush(rest: &Rest, channel_id: &str, reply: &mut Reply, content: &str) {
+    let want = split::paginate(content, split::LIMIT);
+    if want.is_empty() {
         return;
     }
-    match message_id {
-        Some(id) => {
-            if let Err(e) = rest.edit_message(channel_id, id, content).await {
-                tracing::warn!(error = %format!("{e:#}"), "could not edit a Discord reply");
+    for op in split::plan(&reply.bodies, &want) {
+        match op {
+            split::Op::Edit { page } => {
+                let id = reply.ids[page].clone();
+                match rest.edit_message(channel_id, &id, &want[page]).await {
+                    Ok(()) => reply.bodies[page] = want[page].clone(),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "could not edit a Discord reply")
+                    }
+                }
+            }
+            split::Op::Send { page } => {
+                match rest.send_message(channel_id, &want[page]).await {
+                    Ok(id) => {
+                        reply.ids.push(id);
+                        reply.bodies.push(want[page].clone());
+                    }
+                    Err(e) => {
+                        // Stop rather than carrying on: posting page N+1 after
+                        // page N failed would show the answer out of order,
+                        // with a hole in it and no sign that anything is
+                        // missing. A later flush retries from here.
+                        tracing::warn!(error = %format!("{e:#}"), "could not send a Discord reply");
+                        return;
+                    }
+                }
+            }
+            split::Op::Delete { page } => {
+                let id = reply.ids[page].clone();
+                if let Err(e) = rest.delete_message(channel_id, &id).await {
+                    // Leave the record alone on failure: the message is still
+                    // there, so forgetting it would orphan it on screen.
+                    tracing::warn!(error = %format!("{e:#}"), "could not delete a Discord page");
+                    continue;
+                }
+                reply.ids.remove(page);
+                reply.bodies.remove(page);
             }
         }
-        None => match rest.send_message(channel_id, content).await {
-            Ok(id) => *message_id = Some(id),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "could not send a Discord reply")
-            }
-        },
     }
 }
 

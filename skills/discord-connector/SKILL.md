@@ -226,6 +226,35 @@ the streaming path testable without a token — the edit cadence is not.
   `Sync` and a mutex between two tasks would be worse. A message is handled on
   its own spawned task, since a turn far outlasts the heartbeat interval.
 
+## A reply is several messages, and the split is stateful
+
+Discord rejects a body over 2000 characters. Meeting that by truncating throws
+away the **start** of every long answer, which is where the reasoning is — the
+symptom is a reply beginning `… (truncated)`. `split::paginate` lays a long reply
+out across as many messages as it needs; `api::truncate` survives only as a
+backstop for callers that do not paginate, such as ephemeral command replies.
+
+Three properties make it work, and each is load-bearing:
+
+- **Markup state crosses the break.** A page that ends inside a fenced block
+  must close the fence and the next must reopen it *with the same info string*,
+  or Discord renders the continuation as prose — and an unclosed fence swallows
+  the rest of its own message. Same for an odd inline backtick. `Pager` carries
+  `open: Option<String>` and `inline: bool` for exactly this.
+- **Pagination is prefix-stable.** Pages are packed greedily from the start, so
+  appending text can only change the *last* page. This is what lets a streaming
+  reply repaginate on every tick without rewriting messages the reader has
+  already scrolled past. Break it and every tick edits every message.
+- **`split::plan` diffs pages against what was sent** and emits only
+  `Edit`/`Send`/`Delete` for what actually differs, deletes descending so
+  earlier indices stay valid. A `Send` failure must stop the loop — posting page
+  N+1 after N failed shows the answer out of order with an invisible hole.
+
+Do **not** "repair" unbalanced markup in a reply that fits in one message. Mid-
+stream text is legitimately unbalanced and resolves itself as more arrives;
+normalising it makes fences flicker on every tick. Balance is a property of pages
+*this splitter created*, not of the model's text.
+
 ## Reading the channel is the fastest diagnosis
 
 A stalled reply is diagnosed in one call, not by reasoning about the code. Fetch
@@ -242,6 +271,14 @@ look at `edited_timestamp` and `len` on the bot's message:
 The message body itself tells you which arm ran: three short sentences and no
 progress notes means `AssistantMessage` fired three times and every
 `ToolInvocation` was dropped.
+
+Verify the pagination against the real API, not just as strings — a 2000-char
+body is refused with a 400 and the reply disappears with only a log line. The
+`#[ignore]`d `dump_pages_for_a_live_probe` in `split.rs` writes the real
+paginator's output to `/tmp/pages.json`, and `/workspace/zero-discord-probe`
+posts it, edits the tail as a delta would, reads it back and deletes it. Six
+pages of 1951–1991 chars: every `POST 200`, the tail `PATCH 200`, every page read
+back balanced. That is the evidence to cite, not the unit tests alone.
 
 ## Testing without a token
 
