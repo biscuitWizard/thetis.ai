@@ -1,0 +1,112 @@
+//! Inspection and turn-control frames the browser speaks.
+//!
+//! Handled host-side like `branch-*` and `workspace-*`, because both need
+//! things the gateway guest cannot reach: the store, and the worker fleet.
+//!
+//! `debug-request` reads the conversation's last captured request out of the
+//! store, where the worker put it (`host_api::capture_request`). Reading the
+//! durable copy rather than asking the worker is what makes the inspector
+//! answer at all after a restart — and it answers for stopped and archived
+//! conversations too. `turn-cancel` does need the live worker, and settles for
+//! saying "nothing running" when there is none: neither frame may spawn a
+//! worker as a side effect of someone opening a panel.
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+use crate::grip::{Grip, Role};
+
+/// Frames answered on the socket without a reply-broadcast are kept under
+/// this ceiling so a huge context cannot blow the WS message cap.
+const MAX_REPLY_BYTES: usize = 12 * 1024 * 1024;
+
+/// True when this frame type belongs here.
+pub fn handles(frame_type: &str) -> bool {
+    frame_type == "debug-request" || frame_type == "turn-cancel"
+}
+
+/// Handles one frame, returning the reply frames to send on this socket.
+pub async fn handle(grip: &Arc<Grip>, frame: &Value) -> Vec<String> {
+    let frame_type = frame
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let session = frame
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    match dispatch(grip, &frame_type, &session).await {
+        Ok(reply) => vec![reply],
+        Err(e) => vec![json!({
+            "type": frame_type,
+            "session": session,
+            "ok": false,
+            "message": format!("{e:#}"),
+        })
+        .to_string()],
+    }
+}
+
+async fn dispatch(grip: &Arc<Grip>, frame_type: &str, session: &str) -> Result<String> {
+    let Role::Gateway(router) = &grip.role else {
+        anyhow::bail!("debug frames are a gateway concern");
+    };
+    anyhow::ensure!(!session.is_empty(), "missing 'id'");
+
+    match frame_type {
+        // The exact request body this conversation last sent to the provider.
+        "debug-request" => {
+            let stored = grip
+                .persist
+                .kv_get(session, crate::host_api::LAST_REQUEST_KEY)
+                .await?;
+            let Some(text) = stored.filter(|t| !t.is_empty()) else {
+                return Ok(json!({
+                    "type": "debug-request",
+                    "session": session,
+                    "ok": false,
+                    "message": "no request captured for this conversation yet — \
+                                send a message, then look again",
+                })
+                .to_string());
+            };
+            let captured: Value = serde_json::from_str(&text)
+                .context("the stored request is not readable")?;
+            let reply = json!({
+                "type": "debug-request",
+                "session": session,
+                "ok": true,
+                "ts_ms": captured.get("ts_ms"),
+                "body": captured.get("body"),
+            })
+            .to_string();
+            anyhow::ensure!(
+                reply.len() <= MAX_REPLY_BYTES,
+                "the captured request is too large to ship over the socket ({} bytes)",
+                reply.len()
+            );
+            Ok(reply)
+        }
+
+        // Stop the running turn. Politely a no-op when nothing is running.
+        "turn-cancel" => {
+            let Some(peer) = router.live_peer(session).await else {
+                return Ok(json!({
+                    "type": "turn-cancel",
+                    "session": session,
+                    "ok": true,
+                    "message": "nothing running",
+                })
+                .to_string());
+            };
+            peer.call("cancel", json!({ "session": session })).await?;
+            Ok(json!({ "type": "turn-cancel", "session": session, "ok": true }).to_string())
+        }
+
+        other => anyhow::bail!("unknown frame type: {other}"),
+    }
+}

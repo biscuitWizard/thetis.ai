@@ -1,0 +1,34 @@
+# Build output
+/target
+/target-wasm
+# Native builds of guest crates, for running their unit tests off-target.
+/target-native
+# Guest crates build into the shared target dir, but keep any stray local ones out.
+**/target/
+
+# Runtime state
+/data
+/artifacts
+
+# Local configuration, which is where a real API key belongs.
+thetis.local.toml
+*.local.toml
+
+# Scratch: one-off migration scripts, benchmarks and staged copies. Useful
+# while a change is in flight, redundant once it is committed.
+/workspace
+
+# Per-conversation sandbox worktrees. Branch state lives in .git; the
+# checkouts themselves are disposable.
+/worktrees
+
+# Credentials. The GitHub App's private key may sit in either place: `secrets/`
+# is the convention the setup docs give, and `github-app.pem` at the top level
+# is where it currently lives beside thetis.local.toml. Both sides of this
+# merge added one of the two; neither is redundant.
+/secrets/
+github-app.pem
+
+# Notes for a different project that happen to live in this skills tree.
+# Kept on disk, deliberately not checked in.
+/skills/nova-island/

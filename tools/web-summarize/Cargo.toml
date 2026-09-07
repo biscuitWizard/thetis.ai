@@ -1,0 +1,22 @@
+[package]
+name = "web-summarize"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone: built for wasm32-wasip2 by the orchestrator, not by the host
+# workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTP over wasi:http. The host terminates TLS, because no TLS crate builds for
+# wasm32-wasip2 - ring and openssl both want a C toolchain targeting wasm.
+waki = "0.5"
+
+[profile.release]
+opt-level = "s"

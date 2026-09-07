@@ -1,0 +1,10 @@
+# Keep line endings stable regardless of platform.
+#
+# Without this, editing a file on Windows can rewrite every line, which buries
+# a one-line change in a whole-file diff and makes history hard to read.
+* text=auto eol=lf
+
+# Binary, never touched.
+*.wasm binary
+*.png binary
+*.jpg binary

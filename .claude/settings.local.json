@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(rustup target *)",
+      "Bash(cargo component *)",
+      "Bash(docker --version)",
+      "PowerShell($d = \\(Get-Command docker -ErrorAction SilentlyContinue\\); if \\($d\\) { \"docker: $\\($d.Source\\)\"; docker --version } else { \"docker: NOT FOUND\" })",
+      "Bash(cargo search *)",
+      "Bash(cargo build *)",
+      "Bash(cargo run *)",
+      "Bash(cd \"C:/Users/bitMuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasmtime-wasi-47.0.3/src\" && echo \"=== lib.rs pub use ===\" && grep -n \"^pub use\\\\|^pub mod\" lib.rs | head -40 && echo \"=== view.rs ===\" && grep -n \"pub trait\\\\|pub struct\\\\|pub fn\" view.rs 2>/dev/null | head -20 && echo \"=== p2/mod.rs pub ===\" && grep -n \"^pub use\\\\|^pub mod\" p2/mod.rs | head -30)",
+      "Bash(cd \"C:/Users/bitMuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f\" && echo \"=== WasiView trait ===\" && sed -n '30,60p' wasmtime-wasi-47.0.3/src/view.rs && echo \"=== p2 add_to_linker fns ===\" && grep -rn \"pub fn add_to_linker\" wasmtime-wasi-47.0.3/src/p2/mod.rs)",
+      "Bash(cd \"C:/Users/bitMuse/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f\" && echo \"=== bindgen imports/exports opts ===\" && grep -rn \"imports\\\\|exports\" wasmtime-47.0.3/src/component/mod.rs 2>/dev/null | grep -i \"async\\\\|default\" | head -20; echo \"=== macro docs ===\"; find wasmtime-47.0.3 -name \"*.rs\" -path \"*component*\" | head; grep -rn \"default: async\\\\|/// \\\\s*imports:\" wasmtime-47.0.3/src/component/mod.rs | head -30)",
+      "Bash(sed -i 's|members = \\\\[\"crates/orchestrator\", \"crates/novibot-types\"\\\\]|members = [\"crates/orchestrator\"]|' Cargo.toml)",
+      "Bash(mkdir -p crates/orchestrator/src)",
+      "Bash(cargo fetch *)",
+      "Bash(sed -i 's/additional_derives: \\\\[serde::Serialize, serde::Deserialize, Clone, Debug\\\\],/additional_derives: [serde::Serialize, serde::Deserialize],/' crates/orchestrator/src/bindings.rs)",
+      "Bash(sed -i 's/^pub use agent::novibot::grip::types;/#[allow\\(unused_imports\\)]\\\\npub use agent::novibot::grip::types;/' crates/orchestrator/src/bindings.rs)",
+      "Bash(sed -i 's/^pub use agent::novibot::grip::{devkit, llm, sandbox, session, sys, tooling};/#[allow\\(unused_imports\\)]\\\\npub use agent::novibot::grip::{devkit, llm, sandbox, session, sys, tooling};/' crates/orchestrator/src/bindings.rs)",
+      "Bash(cargo add *)",
+      "Bash(sed -i 's/^mod bindings;/mod bindings;\\\\nmod store;/' crates/orchestrator/src/main.rs)",
+      "Bash(cargo test *)",
+      "Bash(CARGO_TARGET_DIR=\"C:/Dev/novibot/target-wasm\" cargo build --release --target wasm32-wasip2)",
+      "Bash(env)",
+      "PowerShell(Get-Process orchestrator,mock-llm -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force)",
+      "PowerShell(Get-Process orchestrator -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Process mock-llm -ErrorAction SilentlyContinue)"
+    ]
+  }
+}

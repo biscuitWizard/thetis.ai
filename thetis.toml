@@ -1,0 +1,427 @@
+# Thetis configuration.
+#
+# Every setting below is optional — delete this file entirely and Thetis still
+# runs on its built-in defaults. Environment variables override anything here,
+# which is what makes per-run tweaks and secrets easy.
+#
+# A mistyped key is a startup error rather than a setting that quietly does
+# nothing, so if Thetis refuses to boot, read the message: it names the key.
+
+[server]
+bind = "127.0.0.1:7777"
+# Which gateway component serves the browser UI. The crate is expected at
+# <paths.gateways>/<paths.gateway_prefix><name>.
+primary_gateway = "web"
+# The host-rendered recovery console. Keep it on: it is the control surface
+# that still works when every WebAssembly guest is broken.
+admin_enabled = true
+
+[paths]
+# All relative paths are resolved against the project root (the directory
+# holding this file). Absolute paths are used as given.
+data = "data"
+artifacts = "artifacts"
+skills = "skills"
+templates = "templates"
+wit = "wit"
+agent = "agents/agent-core"
+gateways = "gateways"
+gateway_prefix = "gateway-"
+tools = "tools"
+tool_prefix = ""
+# An aspect's directory name is also its cargo package name, which is how the
+# built component's filename is derived. Keep the two in step.
+
+[llm]
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-opus-5"
+request_timeout_secs = 180
+max_retries = 3
+# Your OpenRouter key. OPENROUTER_API_KEY overrides this when set, so you can
+# keep a key here for convenience and still override it per run.
+#
+# A real key in this file is a real key on disk: .gitignore already excludes
+# thetis.local.toml, so point THETIS_CONFIG at one of those if this file is
+# ever going into version control.
+# api_key = "sk-or-..."
+
+[agent]
+# Tool-call rounds allowed in a single turn.
+max_iterations = 32
+default_mode = "agent"
+# The system prompt. Use `system_prompt_file` to keep it in its own file
+# (recommended once it grows), or `system_prompt` for a short inline one.
+# Leaving both empty uses the built-in prompt.
+# system_prompt_file = "prompts/system.md"
+
+# Models offered in the chat surface's picker. Providers change their
+# catalogues often, so this is the first thing worth editing.
+[[models]]
+id = "anthropic/claude-opus-5"
+label = "Claude Opus 5"
+
+[[models]]
+id = "anthropic/claude-sonnet-5"
+label = "Claude Sonnet 5"
+
+[[models]]
+id = "openai/gpt-4o"
+label = "GPT-4o"
+
+[[models]]
+id = "google/gemini-2.5-pro"
+label = "Gemini 2.5 Pro"
+
+# Ways of working, offered per conversation. `read_only` is carried through to
+# the agent, which withholds every tool that changes something — so adding a
+# mode here needs no agent code.
+[[modes]]
+id = "agent"
+label = "Agent"
+description = "Full access. Runs tools and can modify the running system."
+read_only = false
+
+[[modes]]
+id = "plan"
+label = "Plan"
+description = "Reads and reasons, but makes no changes. Tools that would modify anything are withheld."
+read_only = true
+# Appended to the system prompt while this mode is active. read_only decides
+# which tools are offered; this decides what the model does with them. Without
+# it the model just finds the tools missing and works around the gap.
+prompt = """
+You are in Plan mode. Every tool that would change something is withheld, so \
+you cannot edit code, run commands, or modify the running system. Read and \
+reason only.
+
+Produce a plan, not an implementation:
+- Investigate first with the read-only tools you do have. A plan written \
+without looking at the code is a guess.
+- Say what you would change, file by file, and why each change is needed.
+- Name the decisions that are the user's to make, and the risks worth checking \
+before starting.
+- Sketch the shape of code rather than writing it out in full. You cannot \
+compile it here, and untested code reads as more certain than it is.
+
+If you find yourself wanting a tool that is not offered, say what you would \
+have done with it instead of quietly working around it. When the plan is ready, \
+say so plainly and stop; the user will switch to Agent mode to carry it out.
+"""
+
+[[modes]]
+id = "chat"
+label = "Chat"
+description = "For messaging surfaces such as Discord. Answers and researches, but changes nothing."
+read_only = true
+# This is the mode the Discord connector stamps on every session it creates.
+# read_only is what actually withholds the mutating tools -- the agent enforces
+# it both when it lists tools and again at dispatch -- so this prompt only has
+# to explain the situation to the model, not police it.
+prompt = """
+You are talking to people over a chat service such as Discord, not in the \
+Thetis web UI. Every tool that would change something is withheld: you cannot \
+edit code, write files, run commands, or modify the running system. Reading and \
+research still work, including web search.
+
+Write for the medium. Messages are short and shown in a chat window, so prefer \
+a few sentences to a document, and keep code to the smallest excerpt that makes \
+the point.
+
+A channel may hold more than one person, and the person writing now may not be \
+the person who wrote before. Do not assume one continuous speaker.
+
+If you are asked to do something that needs a withheld tool, say plainly that \
+this surface is read-only and what you would have needed, rather than working \
+around it or pretending it is done.
+"""
+
+# Summarizing a long conversation down, so it can keep going past the window.
+#
+# The trigger is the provider's own usage.prompt_tokens from the last turn - the
+# entire input it saw, system prompt and tool schemas included - so it measures
+# what actually costs money rather than estimating one part of it.
+[context]
+enabled = true
+# Assumed usable window. Deliberately under any real one: compaction should
+# happen well before the provider starts refusing, not at the cliff edge.
+window_tokens = 200000
+# Compact when the context passes this fraction of the window...
+compact_threshold = 0.6
+# ...and shed until it is back under this one. Summarizing stops at the first
+# round boundary that gets under the target, so a long conversation sheds what
+# it must and keeps the rest.
+compact_target = 0.25
+# A cheaper model for the summaries themselves. Empty uses the session's model.
+# summary_model = "anthropic/claude-haiku-4.5"
+summary_model = ""
+# Never summarized: the opening messages, which everything after them refers
+# back to, and the most recent ones, which are the agent's working memory. User
+# messages are never summarized either, wherever they sit.
+keep_head = 4
+keep_tail = 30
+
+[budgets]
+# Longest a guest may run without returning to a blocking host call. This is
+# what catches an infinite loop; it does not punish slow model calls, because
+# time parked in a host import does not count against it.
+#
+# There is deliberately no ceiling on how long a whole turn may take. A turn
+# that streams a long answer, runs a dozen tools and compiles something is doing
+# its job, and a fixed number of seconds cannot tell that apart from a hang.
+wasm_slice_secs = 10
+tool_secs = 30
+probe_secs = 5
+
+[limits]
+agent_memory_mb = 512
+tool_memory_mb = 128
+gateway_memory_mb = 128
+# Per-conversation spend ceiling in USD. 0 disables the check.
+session_spend_limit_usd = 0.0
+# Tool and exec output is truncated to this before it reaches the model.
+max_tool_output_bytes = 32768
+max_attachment_bytes = 8388608
+max_attachments = 8
+
+# Prompt caching. Providers differ in kind, not just in syntax: Anthropic
+# caches nothing unless the request marks where, while OpenAI and Google cache
+# long prefixes on their own. Marking a moving prefix on a provider that already
+# caches would bill writes for nothing, so only the vendors listed here get
+# explicit breakpoints.
+[cache]
+enabled = true
+# "5m" or "1h". The longer one costs twice as much to write, and is worth it
+# only if gaps between turns regularly exceed five minutes.
+ttl = "5m"
+# Spacing of the stable anchor breakpoints in the message list. A cache read
+# looks back at most twenty blocks, so a turn that runs many tools can overshoot
+# the previous mark; the anchors hold still and stay within reach. Smaller means
+# more resilience and more writes.
+anchor_stride = 8
+explicit_vendors = ["anthropic"]
+
+[build]
+command = "cargo"
+target = "wasm32-wasip2"
+profile = "release"
+# Shared cargo target directory, so guests compile their dependencies once.
+target_dir = "target-wasm"
+# Pass --locked when a lockfile exists, keeping dependency resolution
+# reproducible for builds the agent triggers.
+locked = true
+extra_args = []
+# Ceiling on a single cargo invocation. Builds are serialized, so one that hangs
+# would block every later build; this kills it and reports a failed compile
+# instead. Raise it if a genuinely large dependency tree is being fetched.
+timeout_secs = 900
+# Crates guests are allowed to depend on. Empty means anything on crates.io.
+# Populate it to restrict what the agent can pull in, e.g.
+#   allowed_crates = ["regex", "serde", "chrono"]
+allowed_crates = []
+
+[wasi]
+# Guests run on WASI preview 2, which grants nothing until it is told to. These
+# are the grants. They apply to every guest; the component boundary and the
+# memory ceiling are what actually contain a tool.
+#
+# Outbound sockets and wasi:http. A tool that talks to a web API needs both of
+# these; TLS is terminated host-side, because no TLS crate builds for
+# wasm32-wasip2 (ring and openssl both need a C toolchain targeting wasm).
+network = true
+dns = true
+# The host's environment variables. Left off on purpose: OPENROUTER_API_KEY
+# lives there, and a tool has no business reading it. Tool secrets belong in a
+# [tools.<name>] block instead.
+env = false
+stdio = false
+# Directories guests get as preopens, readable and writable. Relative paths
+# resolve against the project root, and are created if missing.
+dirs = ["workspace"]
+
+[watchdog]
+# Failures inside this window count toward the same circuit breaker.
+failure_window_secs = 120
+# Failures before an aspect is rolled back to its last known-good revision.
+failure_threshold = 3
+probe_interval_secs = 30
+# How long the file watcher ignores an aspect the orchestrator just wrote to, so a
+# rollback is not immediately rebuilt over.
+watch_suppression_secs = 5
+# Editors save in bursts; wait for the dust to settle before spending a compile.
+debounce_ms = 500
+
+[devkit]
+# Whether the agent is offered the tools that modify the running system.
+enabled = true
+# Paths a component may not edit in its own source tree. Empty means it may edit
+# anything, including its own Cargo.toml and build.rs — which is what adding a
+# dependency or generating code requires.
+#
+# These were previously a hardcoded list that these keys did not actually
+# control; they are honoured now. Fill them in only to hold a component still.
+#   protected_files = ["Cargo.toml", "build.rs"]
+protected_files = []
+protected_dirs = []
+
+[sandbox]
+# The Docker exec sandbox. While off, the agent is simply not offered
+# code-execution tools rather than being handed tools that always fail.
+enabled = false
+
+# Reading and writing files on this machine. Unlike [sandbox], these touch the
+# host directly, so the roots below are the real boundary: every path the agent
+# gives is resolved — symlinks included — and must land inside one of them.
+[filesystem]
+enabled = true
+# Empty means the project root. Add more to widen what the agent can reach.
+roots = []
+max_read_bytes = 1048576
+# Names that may not be written or deleted anywhere under a root. This keeps the
+# system from destroying its own state by accident; it is not a security
+# control, since a terminal session can reach these paths regardless.
+protected = ["data", "artifacts", ".git"]
+allow_delete = true
+
+# Shell sessions on this machine. A session keeps its working directory and
+# shell state between commands.
+[terminal]
+enabled = true
+# Empty picks PowerShell on Windows and sh elsewhere.
+shell = ""
+shell_args = []
+max_sessions = 4
+default_timeout_ms = 30000
+max_output_bytes = 65536
+# Sessions idle longer than this are closed. 0 disables reaping.
+idle_timeout_secs = 1800
+
+# Per-tool settings. Each tool component is handed its own block as JSON when it
+# is invoked, and never sees another's or anything else here. The shape is
+# whatever that tool expects — put its API keys, endpoints and defaults here
+# rather than hardcoding them in its source.
+[tools.config-probe]
+greeting = "hello from configuration"
+retries = 3
+
+# The Notion tool group. Every `notion-*` tool inherits this block, so the
+# credential is named once rather than eleven times: `tool_config_json` merges
+# `[tools.notion]` under `[tools.notion-<x>]`, with the specific block winning.
+#
+# `token` is a real credential, so put it in thetis.local.toml, which is
+# gitignored, and leave this file for the settings that are safe to commit.
+# Create one at https://www.notion.so/my-integrations — a personal access token
+# starts with `ntn_`.
+#
+# Notion shares nothing with a connection by default. After setting the token,
+# open each page or database it should reach in Notion and add the connection
+# through the ••• menu -> Connections; children inherit that access. A token
+# that authenticates fine still returns 404 for everything unshared, which is
+# the single most common surprise here.
+[tools.notion]
+# token = "ntn_..."
+# The API version, sent as the Notion-Version header on every request. Pinned
+# deliberately: Notion changes property shapes between versions, and a floating
+# version would move the ground under the tools.
+version = "2026-03-11"
+timeout_secs = 30
+
+# The GitHub tool group. Every `github-*` tool inherits this block, so the
+# credential is named once rather than once per tool.
+#
+# The identity is a **GitHub App**, not a bot user with a personal access token.
+# An App is its own principal: it authors commits under a stable `<slug>[bot]`
+# name, it is installed on an org or a chosen set of repositories by someone with
+# admin rights and removed the same way, its permissions are fine-grained and
+# auditable, and its credentials are short-lived. A PAT on a human-shaped
+# account inherits that account's whole blast radius and needs a paid seat.
+#
+# Authentication is two steps, both handled in `github.rs`: sign a JWT with the
+# App's RSA key (authenticates as the App, reaches only `/app/*`), then exchange
+# it for an installation access token (reaches repositories, lasts an hour, and
+# is cached in the KV store so a chain of calls mints it once).
+#
+# `app_id` is safe to commit. The private key is not: keep the .pem outside this
+# file and point at it with `private_key_path`. A tool has no filesystem import,
+# so the orchestrator reads that file and inlines it — see `inline_file_secrets`
+# in crates/thetis/src/config.rs. The path must resolve inside the project root.
+#
+# Run `github-whoami` after setting this up: it exercises the whole chain and
+# names the step that failed rather than returning a bare 401.
+[tools.github]
+# app_id = "123456"
+# private_key_path = "secrets/github-app.pem"
+# Only needed when the App is installed on more than one account, where guessing
+# would risk writing to the wrong org.
+# installation_id = 12345678
+timeout_secs = 30
+
+# The Discord bot. Off until a token is set.
+#
+# The safety property here is `mode`: every session the bot creates is stamped
+# with it, and the agent withholds every mutating tool for a mode marked
+# read_only. The connector refuses to start if this mode is missing or is not
+# read-only, because the agent treats an unknown mode as full access -- so a
+# typo would otherwise expose the dev kit over chat. There is deliberately no
+# command to change the mode from Discord.
+[discord]
+enabled = true
+# DISCORD_BOT_TOKEN overrides this, which is the better place for it: a token
+# here is a token on disk. Leave it empty to keep the bot off.
+bot_token = ""
+mode = "chat"
+# Discord user ids allowed to talk to the bot. Right-click a user with Developer
+# Mode on to copy an id. Empty means nobody, until someone is paired.
+allowed_users = []
+# Who may issue /pair. Empty means everyone in allowed_users may; a user who was
+# themselves paired never can, so pairing cannot spread on its own.
+admin_users = []
+# Let anyone who can see the bot talk to it. Read the mode note above before
+# turning this on for a public server.
+allow_all_users = false
+# Require an @mention in guild channels. DMs never require one.
+require_mention = true
+# Channels where a mention is not needed.
+free_response_channels = []
+# Stay quiet when a message mentions other people but not the bot, so it does
+# not interrupt conversations aimed at someone else.
+ignore_no_mention = true
+# Give each person their own conversation inside a shared channel. With this
+# off, everyone in the room shares one transcript and one context budget.
+group_sessions_per_user = true
+# Gap between edits to a streaming reply. Discord rate-limits edits, so this is
+# well above per-token; the floor is 250ms.
+stream_edit_interval_ms = 1200
+# How long a pairing code stays valid.
+pairing_code_ttl_secs = 900
+
+[control]
+# Whether the agent may restart the orchestrator. A restart is how changes to
+# the native binary, or to settings only read at startup, take effect.
+allow_restart = true
+# Restarts are refused before this much uptime, so a restart that fails to fix
+# anything cannot become a loop.
+min_uptime_secs = 20
+# Delay before the process replaces itself, so the turn finishes and the user
+# reads why first.
+restart_delay_ms = 1500
+
+# Skill retrieval. Skills live under `paths.skills`, one directory each with a
+# SKILL.md carrying TOML frontmatter. Those marked `universal` are named in
+# every system prompt by their brief; the rest are retrieved per conversation.
+[skills]
+# Whether to retrieve skills for the opening message at all. With this off only
+# the universal briefs appear, and skills are reachable solely via skill_fetch.
+retrieval_enabled = true
+# How many skills to put in the L1 block. The ranker is skipped entirely when
+# the corpus is this size or smaller, since there is nothing to choose between.
+# Held below the corpus size on purpose for now, so the ranking path runs in
+# real turns while the corpus is still small. Raise to 10 once it grows.
+retrieve_limit = 4
+# Embedding model and width. Both are part of the vector cache key, so changing
+# either re-embeds the corpus rather than comparing incomparable vectors.
+embedding_model = "openai/text-embedding-3-small"
+embedding_dimensions = 1536
+# Opening messages longer than this are clipped before embedding.
+max_query_chars = 2000
+# Refuse to load more than this many universal skills, whatever the files say.
+max_universal = 20
