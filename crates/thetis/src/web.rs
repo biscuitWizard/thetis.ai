@@ -274,6 +274,9 @@ async fn workspace_upload(
     }
     match tokio::fs::write(&resolved, &body).await {
         Ok(()) => {
+            // A new file must show up in the composer's `@` menu without
+            // waiting out the index's TTL.
+            crate::workspace_api::invalidate_index();
             tracing::info!(path = %path, bytes = body.len(), "workspace upload");
             (
                 StatusCode::OK,

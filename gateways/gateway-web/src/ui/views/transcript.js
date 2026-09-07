@@ -134,14 +134,22 @@ export function clearPending() {
 /** Local attachments carry raw base64, not the data URL the wire form has. */
 function pendingThumbs(attachments) {
   if (!attachments?.length) return null;
+  const images = attachments.filter((a) => a.mime?.startsWith("image/"));
+  const files = attachments.filter((a) => !a.mime?.startsWith("image/"));
   return el(
     "div",
     { class: "thumbs" },
-    attachments.map((a) =>
-      a.mime?.startsWith("image/")
-        ? el("img", { class: "thumb", src: `data:${a.mime};base64,${a.data}`, alt: a.name, title: a.name })
-        : el("div", { class: "thumb-file" }, a.name)
-    )
+    images.map((a) =>
+      el("img", { class: "thumb", src: `data:${a.mime};base64,${a.data}`, alt: a.name, title: a.name })
+    ),
+    files.length
+      ? el(
+          "div",
+          { class: "attached-files" },
+          el("span", { class: "attached-label" }, `files attached (${files.length}):`),
+          files.map((a) => el("span", { class: "thumb-file mono", title: a.name }, workspaceRel(a.name)))
+        )
+      : null
   );
 }
 
@@ -297,15 +305,60 @@ function completeToolRow(ev) {
 
 function thumbs(attachments) {
   if (!attachments?.length) return null;
+  const images = attachments.filter((a) => a.data);
+  const files = attachments.filter((a) => !a.data);
+
   return el(
     "div",
     { class: "thumbs" },
-    attachments.map((a) =>
-      a.data
-        ? el("img", { class: "thumb", src: a.data, alt: a.name, title: a.name })
-        : el("div", { class: "thumb-file" }, a.name)
-    )
+    images.map((a) => el("img", { class: "thumb", src: a.data, alt: a.name, title: a.name })),
+    // Named rather than merely listed: a file attachment is invisible in the
+    // message text unless it was mentioned, and even then the reader should be
+    // able to see at a glance that its *contents* went along.
+    files.length
+      ? el(
+          "div",
+          { class: "attached-files" },
+          el("span", { class: "attached-label" }, `files attached (${files.length}):`),
+          files.map((a) => el("span", { class: "thumb-file mono", title: a.name }, workspaceRel(a.name)))
+        )
+      : null
   );
+}
+
+/** Attachment names carry the `workspace/` prefix so the agent's file tools can
+ *  use them verbatim. The reader does not need it repeated on every chip.
+ *  (Verified after the trunk merge that restyled the transcript.) */
+function workspaceRel(name) {
+  return String(name ?? "").replace(/^workspace\//, "");
+}
+
+/* The user's own text with its @-mentions marked, so a sent message reads the
+ * same way it did while being typed.
+ *
+ * Only tokens that match something actually attached are highlighted. A token
+ * that never resolved is left plain, which is the honest rendering: it was
+ * ordinary text as far as the message was concerned. */
+function userText(text, attachments) {
+  const attached = new Set((attachments || []).map((a) => workspaceRel(a.name).replace(/\/ \(listing\)$/, "/")));
+  if (!attached.size) return el("div", { class: "bubble-text" }, text);
+
+  const nodes = [];
+  const token = /(^|[\s(\[])@([^\s@]+)/g;
+  let at = 0;
+  let match;
+  while ((match = token.exec(text))) {
+    const raw = match[2].replace(/[.,;:!?)\]}'"]+$/, "");
+    if (!attached.has(raw) && !attached.has(`${raw}/`)) continue;
+    const start = match.index + match[1].length;
+    const end = start + 1 + raw.length;
+    if (start > at) nodes.push(text.slice(at, start));
+    nodes.push(el("span", { class: "mention-ref mono", title: `workspace/${raw}` }, text.slice(start, end)));
+    at = end;
+  }
+  if (!nodes.length) return el("div", { class: "bubble-text" }, text);
+  nodes.push(text.slice(at));
+  return el("div", { class: "bubble-text" }, ...nodes);
 }
 
 function fmtK(n) {
@@ -357,7 +410,7 @@ const RENDERERS = {
     // Whatever was asked has now been replied to, one way or another.
     lockAsks();
     row("user", "you",
-      ev.text ? el("div", { class: "bubble-text" }, ev.text) : null,
+      ev.text ? userText(ev.text, ev.attachments) : null,
       thumbs(ev.attachments));
   },
 

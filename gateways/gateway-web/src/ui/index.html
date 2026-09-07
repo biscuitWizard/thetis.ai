@@ -138,11 +138,20 @@
       <form id="composer" class="composer" autocomplete="off">
         <div id="attachments" class="attachments" hidden></div>
 
-        <!-- Substituted at serve time so the first paint already carries the
-             agent's name; drawLock in composer.js keeps it in step after that. -->
-        <textarea id="input" class="composer-input" rows="1"
-                  placeholder="Message {agent_name}…"
-                  aria-label="Message"></textarea>
+        <!-- The input and its highlight mirror, stacked. The mirror sits behind
+             the textarea with identical font, padding and width so it wraps the
+             same way; its own glyphs are transparent and only the @-mention
+             rectangles show through, which leaves the caret, selection and
+             spellcheck native to the textarea. views/mentions.js paints it, and
+             also appends its suggestion menu to this wrapper. -->
+        <div id="input-wrap" class="composer-field">
+          <div id="input-mirror" class="composer-mirror" aria-hidden="true"></div>
+          <!-- Substituted at serve time so the first paint already carries the
+               agent's name; drawLock in composer.js keeps it in step after that. -->
+          <textarea id="input" class="composer-input" rows="1"
+                    placeholder="Message {agent_name}…"
+                    aria-label="Message"></textarea>
+        </div>
 
         <div class="composer-bar">
           <div class="composer-tools">
@@ -175,7 +184,7 @@
           </div>
         </div>
       </form>
-      <p class="composer-hint">Enter to send · Shift+Enter for a newline · sending mid-turn nudges the running turn</p>
+      <p class="composer-hint">Enter to send · Shift+Enter for a newline · @ to attach a workspace file · sending mid-turn nudges the running turn</p>
     </div>
 
     <!-- The terminal drawer: the shells this conversation's agent has open,

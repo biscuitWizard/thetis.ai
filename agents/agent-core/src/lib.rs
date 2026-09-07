@@ -1017,10 +1017,25 @@ struct Reply {
     usage: Option<TokenUsage>,
 }
 
+/// Largest single text attachment inlined into a user message, in characters.
+/// Past this the head is sent with a line saying what was cut, and the path is
+/// there to read the rest with.
+const MAX_INLINE_FILE_CHARS: usize = 96_000;
+/// Ceiling across every text attachment on one message, so a dozen files
+/// cannot quietly spend the whole context.
+const MAX_INLINE_TOTAL_CHARS: usize = 240_000;
+
 /// Builds the `content` field for a user message.
 ///
 /// Plain text stays a bare string, which every provider accepts; attachments
-/// promote it to the multi-part form with inline data URLs.
+/// promote it to the multi-part form.
+///
+/// Images go inline as data URLs. A **text** attachment is inlined as its
+/// actual contents, fenced and labelled with its path — the same thing an
+/// editor's `@file` mention does, and the reason it works: a path alone tells
+/// the model a file exists but leaves it to guess or to spend a tool call, and
+/// the point of attaching was that the sender already knew it was relevant.
+/// The path is still given, so a truncated or edited file can be read properly.
 fn user_content(msg: &UserMsg) -> Value {
     if msg.attachments.is_empty() {
         return json!(msg.text);
@@ -1030,6 +1045,7 @@ fn user_content(msg: &UserMsg) -> Value {
     if !msg.text.trim().is_empty() {
         parts.push(json!({ "type": "text", "text": msg.text }));
     }
+    let mut budget = MAX_INLINE_TOTAL_CHARS;
     for attachment in &msg.attachments {
         if attachment.mime.starts_with("image/") {
             parts.push(json!({
@@ -1038,16 +1054,93 @@ fn user_content(msg: &UserMsg) -> Value {
                     "url": format!("data:{};base64,{}", attachment.mime, attachment.data_base64)
                 }
             }));
-        } else {
-            // Nothing sensible to send inline, but the model should still know
-            // the file was there.
-            parts.push(json!({
+            continue;
+        }
+        match inline_text(attachment, &mut budget) {
+            Some(text) => parts.push(json!({ "type": "text", "text": text })),
+            // Binary, undecodable, or past the budget: the model should still
+            // know the file was there and how to reach it.
+            None => parts.push(json!({
                 "type": "text",
-                "text": format!("[attached file: {} ({})]", attachment.name, attachment.mime)
-            }));
+                "text": format!(
+                    "[attached file: {} ({}) — contents not inlined; read it with read_path if needed]",
+                    attachment.name, attachment.mime
+                )
+            })),
         }
     }
     json!(parts)
+}
+
+/// One text attachment as a labelled block, or `None` when it is not text.
+///
+/// `budget` is decremented by what this one spends, so the cap is across the
+/// whole message rather than per file.
+fn inline_text(
+    attachment: &crate::thetis::grip::types::Attachment,
+    budget: &mut usize,
+) -> Option<String> {
+    if *budget == 0 {
+        return None;
+    }
+    let bytes = base64_decode(&attachment.data_base64)?;
+    let body = String::from_utf8(bytes).ok()?;
+
+    let allowed = MAX_INLINE_FILE_CHARS.min(*budget);
+    let mut note = String::new();
+    let shown = if body.chars().count() > allowed {
+        let head: String = body.chars().take(allowed).collect();
+        note = format!(
+            "\n… truncated at {allowed} characters; read the rest with read_path {}\n",
+            attachment.name
+        );
+        head
+    } else {
+        body
+    };
+    *budget = budget.saturating_sub(shown.chars().count());
+
+    Some(format!(
+        "<attached-file path=\"{}\">\n{}{}\n</attached-file>",
+        attachment.name, shown, note
+    ))
+}
+
+/// Standard base64 with padding, which is what the wire carries. Hand-rolled
+/// rather than pulling a crate in for forty lines of table lookup.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u32> {
+        Some(match byte {
+            b'A'..=b'Z' => (byte - b'A') as u32,
+            b'a'..=b'z' => (byte - b'a') as u32 + 26,
+            b'0'..=b'9' => (byte - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        // Whitespace is ignored; '=' ends the data. Anything else is a
+        // malformed payload, and guessing at it would produce silent garbage.
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if byte == b'=' {
+            break;
+        }
+        acc = (acc << 6) | value(byte)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 fn assistant_message(reply: &Reply) -> Value {
@@ -1138,6 +1231,151 @@ mod interrupt_tests {
             seen, Interrupt::Cancelled,
             "a stop seen mid-sequence must stick to the end"
         );
+    }
+}
+
+/// Tests for the attachment inlining, which is what makes an `@`-mentioned
+/// file actually reach the model. Pure functions over a value type, so they
+/// need no host.
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    fn attach(name: &str, mime: &str, body: &str) -> crate::thetis::grip::types::Attachment {
+        crate::thetis::grip::types::Attachment {
+            name: name.to_string(),
+            mime: mime.to_string(),
+            data_base64: encode(body.as_bytes()),
+        }
+    }
+
+    /// Test-side encoder, so a round trip proves the decoder against something
+    /// other than itself.
+    fn encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    #[test]
+    fn base64_round_trips_including_every_padding_case() {
+        for body in ["", "a", "ab", "abc", "abcd", "hello, world", "λ — ünïcode"] {
+            assert_eq!(
+                base64_decode(&encode(body.as_bytes())).unwrap(),
+                body.as_bytes(),
+                "round trip failed for {body:?}"
+            );
+        }
+        // Whitespace in the payload is ignored, as a wrapped payload carries.
+        assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello");
+        // Anything else is malformed, and guessing would inline silent garbage.
+        assert!(base64_decode("not*base64").is_none());
+    }
+
+    #[test]
+    fn a_text_attachment_is_inlined_with_its_path() {
+        let msg = UserMsg {
+            text: "what does this do? @workspace/moor/README.md".into(),
+            attachments: vec![attach("workspace/moor/README.md", "text/markdown", "# moor\nhi")],
+        };
+        let content = user_content(&msg);
+        let parts = content.as_array().expect("attachments promote to multi-part");
+        assert_eq!(parts.len(), 2, "the text, then the file");
+        assert_eq!(parts[0]["text"], json!(msg.text));
+
+        let inlined = parts[1]["text"].as_str().unwrap();
+        // The path is what makes a later read_path possible; the body is the
+        // whole point, and is what a path-only mention failed to give.
+        assert!(inlined.contains("path=\"workspace/moor/README.md\""), "{inlined}");
+        assert!(inlined.contains("# moor\nhi"), "{inlined}");
+    }
+
+    #[test]
+    fn an_image_still_goes_as_an_image() {
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![attach("shot.png", "image/png", "\u{89}PNG-ish")],
+        };
+        let parts = user_content(&msg);
+        assert_eq!(parts[0]["type"], json!("image_url"));
+        assert!(parts[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn binary_is_named_rather_than_inlined_as_mojibake() {
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![crate::thetis::grip::types::Attachment {
+                name: "workspace/data.bin".into(),
+                mime: "application/octet-stream".into(),
+                data_base64: encode(&[0u8, 159, 146, 150]),
+            }],
+        };
+        let parts = user_content(&msg);
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("workspace/data.bin"), "{text}");
+        assert!(text.contains("not inlined"), "{text}");
+        assert!(text.contains("read_path"), "the model needs a way to look");
+    }
+
+    #[test]
+    fn a_huge_file_is_truncated_and_says_so() {
+        let body = "x".repeat(MAX_INLINE_FILE_CHARS + 500);
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: vec![attach("workspace/big.log", "text/plain", &body)],
+        };
+        let parts = user_content(&msg);
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("truncated at"), "{}", &text[text.len() - 200..]);
+        assert!(text.contains("read_path workspace/big.log"));
+        assert!(text.chars().count() < body.chars().count());
+    }
+
+    #[test]
+    fn the_budget_is_shared_across_attachments() {
+        // Three files that each fit on their own but not together: the last
+        // must be named rather than inlined, so a dozen mentions cannot quietly
+        // spend the whole context.
+        let chunk = "y".repeat(MAX_INLINE_FILE_CHARS);
+        let msg = UserMsg {
+            text: String::new(),
+            attachments: (0..4)
+                .map(|i| attach(&format!("workspace/f{i}.txt"), "text/plain", &chunk))
+                .collect(),
+        };
+        let parts = user_content(&msg);
+        let total: usize = parts
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["text"].as_str().unwrap_or("").chars().count())
+            .sum();
+        assert!(
+            total < MAX_INLINE_TOTAL_CHARS + 4 * 200,
+            "inlined {total} characters, over the shared budget"
+        );
+        let last = parts[3]["text"].as_str().unwrap();
+        assert!(last.contains("not inlined"), "the last file must be named only: {last}");
+    }
+
+    #[test]
+    fn plain_text_stays_a_bare_string() {
+        // Every provider accepts a string; promoting to multi-part when there is
+        // nothing to promote would break the ones that do not.
+        let msg = UserMsg { text: "hello".into(), attachments: vec![] };
+        assert_eq!(user_content(&msg), json!("hello"));
     }
 }
 
