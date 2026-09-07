@@ -32,3 +32,10 @@ github-app.pem
 # Notes for a different project that happen to live in this skills tree.
 # Kept on disk, deliberately not checked in.
 /skills/nova-island/
+
+# Backups of local config. `*.local.toml` does not cover them: the glob needs
+# the name to end in `.local.toml`, and a backup appends its own suffix. These
+# hold the same secrets as the file they copy, so the miss is worth a rule of
+# its own — an untracked one also makes trunk read dirty, which turns off the
+# kernel and UI build caches.
+*.local.toml.*
