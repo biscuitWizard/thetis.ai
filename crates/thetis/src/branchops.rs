@@ -318,7 +318,13 @@ async fn refresh_branch_kernel(
     let cause = cause.to_string();
     tokio::spawn(async move {
         match crate::control::build_kernel(&grip.cfg).await {
-            Ok(_) => {
+            // A build already running is the build this wanted. It will
+            // restart on its own when it lands, so saying anything here would
+            // only contradict it.
+            Ok(crate::control::KernelBuild::Busy(why)) => {
+                tracing::info!(%why, "a kernel build was already running; leaving it to finish");
+            }
+            Ok(crate::control::KernelBuild::Built(_)) => {
                 if let Err(e) = crate::control::request_restart(
                     &grip,
                     &format!(

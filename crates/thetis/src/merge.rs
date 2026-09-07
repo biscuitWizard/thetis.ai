@@ -452,7 +452,14 @@ async fn refresh_trunk_kernel(grip: &Arc<Grip>, before: &str, session_id: &str) 
             .await;
 
         let built = match crate::control::build_kernel(&grip.cfg).await {
-            Ok(path) => path,
+            Ok(crate::control::KernelBuild::Built(path)) => path,
+            // Contention, not failure. The build already going covers this
+            // merge too, so the announcement above stays true and this adds
+            // nothing.
+            Ok(crate::control::KernelBuild::Busy(why)) => {
+                tracing::info!(%why, "a kernel build was already running; leaving it to finish");
+                return;
+            }
             Err(e) => {
                 incident(
                     grip.clone(),

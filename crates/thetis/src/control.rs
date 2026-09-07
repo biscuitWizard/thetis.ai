@@ -178,6 +178,26 @@ pub async fn kernel_source_moved(
 /// a file lock, which is what actually serializes the fleet.
 static KERNEL_BUILD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// How a kernel build ended.
+///
+/// [`KernelBuild::Busy`] is the case this type exists for. Declining because
+/// someone else is already building is not a build failure, and reporting it as
+/// one is actively misleading: a second `restart_orchestrator` in one process
+/// used to be answered with "the orchestrator did not build, so nothing was
+/// restarted ... fix this and ask again", moments before the *first* build
+/// finished and restarted the process. The agent was told to fix a healthy
+/// system and to repeat the request that had collided. Contention and failure
+/// are different answers and now have different shapes.
+#[derive(Debug)]
+pub enum KernelBuild {
+    /// Compiled, or served from the build cache. The binary a restart uses.
+    Built(PathBuf),
+    /// A build is already running — in this process, or elsewhere in the
+    /// fleet. Nothing was compiled, nothing is wrong, and the right response
+    /// is to wait for the one already going rather than to ask again.
+    Busy(String),
+}
+
 /// Runs a child to completion, killing it if it outstays `limit`.
 ///
 /// `Ok(None)` means it was killed. Every child this process spawns goes
@@ -258,9 +278,11 @@ async fn toolchain_id(cfg: &crate::config::Config) -> String {
 /// costing several minutes of every core: the ~390 dependency units behind the
 /// orchestrator (cranelift and wasmtime dominate) are identical for every
 /// branch that has not touched `crates/` or `wit/`.
-pub async fn build_kernel(cfg: &crate::config::Config) -> Result<PathBuf> {
+pub async fn build_kernel(cfg: &crate::config::Config) -> Result<KernelBuild> {
     let Ok(_one_at_a_time) = KERNEL_BUILD.try_lock() else {
-        bail!("a kernel build is already running in this process");
+        return Ok(KernelBuild::Busy(
+            "a kernel build is already running in this conversation".to_string(),
+        ));
     };
 
     // And once across the fleet. A kernel build is the most expensive thing
@@ -273,12 +295,10 @@ pub async fn build_kernel(cfg: &crate::config::Config) -> Result<PathBuf> {
     let lock_path = cfg.kernel_build_lock_path();
     let Some(_fleet) = crate::builder::FileLock::acquire(&lock_path, KERNEL_BUILD_WAIT).await?
     else {
-        bail!(
-            "another conversation has been building the orchestrator for over {}s. Nothing was \
-             built or restarted, and you are still on the kernel you started with — try again \
-             once it finishes.",
+        return Ok(KernelBuild::Busy(format!(
+            "another conversation has been building the orchestrator for over {}s",
             KERNEL_BUILD_WAIT.as_secs()
-        );
+        )));
     };
 
     let destination = kernel_binary(&cfg.root);
@@ -306,7 +326,7 @@ pub async fn build_kernel(cfg: &crate::config::Config) -> Result<PathBuf> {
                             key = %key,
                             "kernel served from the build cache; no compile needed"
                         );
-                        return Ok(destination);
+                        return Ok(KernelBuild::Built(destination));
                     }
                     // Not fatal: fall through and build properly.
                     Err(e) => tracing::warn!(
@@ -360,7 +380,7 @@ pub async fn build_kernel(cfg: &crate::config::Config) -> Result<PathBuf> {
         }
     }
 
-    Ok(destination)
+    Ok(KernelBuild::Built(destination))
 }
 
 /// Where source-keyed kernel builds are filed, and under what name.
@@ -573,14 +593,63 @@ fn kernel_is_stale(cfg: &crate::config::Config) -> bool {
     newest > built_at
 }
 
+/// Set while a build-then-restart is in flight in this process.
+///
+/// One restart request is one restart. Without this, a second
+/// `restart_orchestrator` while the first was still compiling spawned a second
+/// build that could only collide with it — and the collision was reported as a
+/// build failure telling the agent to fix something and ask again, seconds
+/// before the first build succeeded and restarted the process. Two
+/// contradictory verdicts for one request, the wrong one first.
+static RESTART_BUILDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Clears the flag it claimed however the build ends, panic included. A flag
+/// left set would make the process unrestartable, which is a worse failure
+/// than the double-request it exists to prevent.
+struct RestartBuildGuard(&'static std::sync::atomic::AtomicBool);
+
+impl Drop for RestartBuildGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Claims the right to build-and-restart, or `None` if one is already going.
+fn claim_restart_build() -> Option<RestartBuildGuard> {
+    claim_flag(&RESTART_BUILDING)
+}
+
+/// The claim itself, over whichever flag. Parameterised so a test can use its
+/// own rather than the process-wide one, which two tests sharing would race.
+fn claim_flag(flag: &'static std::sync::atomic::AtomicBool) -> Option<RestartBuildGuard> {
+    flag.compare_exchange(
+        false,
+        true,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    )
+    .ok()
+    .map(|_| RestartBuildGuard(flag))
+}
+
 /// Builds this checkout's kernel, then restarts onto it.
 ///
 /// Spawned, because a release build takes minutes while the call that asked
 /// for it must return in seconds — so the verdict arrives in the session log
 /// instead of as a return value. A build that fails does *not* restart: the
 /// conversation keeps the process it has and reads the compiler error.
-fn build_then_restart(grip: Arc<Grip>, reason: String, session_id: String) {
+///
+/// The guard is held for the whole spawned task, so a restart request that
+/// arrives while this one is compiling is answered rather than raced.
+fn build_then_restart(
+    grip: Arc<Grip>,
+    reason: String,
+    session_id: String,
+    guard: RestartBuildGuard,
+) {
     tokio::spawn(async move {
+        let _building = guard;
         let note = |text: String| {
             let grip = grip.clone();
             let session = session_id.clone();
@@ -598,7 +667,7 @@ fn build_then_restart(grip: Arc<Grip>, reason: String, session_id: String) {
 
         tracing::info!(session = %session_id, "building this branch's kernel before restarting");
         match build_kernel(&grip.cfg).await {
-            Ok(path) => {
+            Ok(KernelBuild::Built(path)) => {
                 if let Err(e) = probe_kernel(&path).await {
                     note(format!(
                         "The orchestrator built, but the new binary would not start, so nothing \
@@ -614,6 +683,18 @@ fn build_then_restart(grip: Arc<Grip>, reason: String, session_id: String) {
                 )
                 .await;
                 finish_restart(&grip, reason).await;
+            }
+            // Not a failure, and emphatically not something to ask again
+            // about: the build that is already running is the one that was
+            // asked for, and it will announce its own verdict here.
+            Ok(KernelBuild::Busy(why)) => {
+                note(format!(
+                    "A rebuild of the orchestrator is already under way ({why}), so this request \
+                     did not start a second one. Wait for it: its result arrives in this \
+                     conversation, and if it succeeds the restart happens on its own. There is \
+                     nothing to fix and nothing to ask again."
+                ))
+                .await;
             }
             Err(e) => {
                 note(format!(
@@ -694,7 +775,21 @@ pub async fn request_restart(
     // this is where it belongs.
     if let (Some(session), true) = (session_id, kernel_is_stale(cfg)) {
         if matches!(grip.role, crate::grip::Role::Worker(_)) {
-            build_then_restart(grip.clone(), reason.clone(), session.to_string());
+            // Asking twice is not asking for two of them. A second request
+            // while the first is still compiling is answered here, with the
+            // truth, rather than becoming a second build that can only lose a
+            // race with the first and be reported as its failure.
+            let Some(guard) = claim_restart_build() else {
+                return Ok(
+                    "a rebuild of the orchestrator is already running for this conversation, so \
+                     this request did not start another. It is the same build you asked for: its \
+                     verdict arrives here, and a successful one restarts on its own. Carry on \
+                     with something else, and do not ask again — repeating the request cannot \
+                     make it finish sooner."
+                        .to_string(),
+                );
+            };
+            build_then_restart(grip.clone(), reason.clone(), session.to_string(), guard);
             return Ok(format!(
                 "you have changed the orchestrator's own source, so it is being rebuilt before \
                  anything restarts: {reason}. This takes a few minutes and does not block you — \
@@ -964,6 +1059,52 @@ mod kernel_cache_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One restart request is one restart. The second used to spawn a build
+    // that could only collide with the first, and the collision was reported
+    // as "the orchestrator did not build ... fix this and ask again" moments
+    // before the first build finished and restarted the process.
+    #[test]
+    fn only_one_restart_build_is_claimed_at_a_time() {
+        static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let first = claim_flag(&FLAG).expect("nothing is building yet");
+        assert!(
+            claim_flag(&FLAG).is_none(),
+            "a second request must be answered, not raced"
+        );
+        drop(first);
+        assert!(
+            claim_flag(&FLAG).is_some(),
+            "the claim has to be released when the build ends, or restarts stop working"
+        );
+    }
+
+    // Whatever happens to the build — success, failure, panic — the next
+    // request must be able to claim. A stuck flag would make the system
+    // unrestartable, which is worse than the bug it fixes.
+    #[test]
+    fn a_panicking_build_still_releases_its_claim() {
+        static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = claim_flag(&FLAG).expect("free");
+            panic!("the build blew up");
+        });
+        assert!(claim_flag(&FLAG).is_some());
+    }
+
+    // Contention is not failure. `build_kernel` returning `Err` here is what
+    // made a healthy, already-running build read as a broken one.
+    #[tokio::test]
+    async fn a_build_that_collides_reports_busy_rather_than_an_error() {
+        let cfg = crate::config::Config::load().expect("the shipped config loads");
+        let _held = KERNEL_BUILD.lock().await;
+        match build_kernel(&cfg).await {
+            Ok(KernelBuild::Busy(why)) => {
+                assert!(why.contains("already running"), "{why}");
+            }
+            other => panic!("a collision must not read as a build failure: {other:?}"),
+        }
+    }
 
     /// The "(deleted)" suffix Linux appends to `/proc/self/exe` after a
     /// rebuild. Read literally it names nothing, which is how a self-deploy
