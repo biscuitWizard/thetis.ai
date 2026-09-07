@@ -184,6 +184,11 @@ pub fn all() -> &'static [ToolGroup] {
                 "todo_add",
                 "todo_update",
                 "todo_read",
+                "model_info",
+                // Read-only and asked out of the blue ("what model are you?"),
+                // usually with no group loaded and often in plan mode. A
+                // scopable home would mean the honest answer is unavailable
+                // exactly when someone thinks to ask for it.
             ],
         },
         ToolGroup {

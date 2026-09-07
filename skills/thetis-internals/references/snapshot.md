@@ -53,7 +53,7 @@ Values at the time of the snapshot, grouped. All are marked `[needs restart]`.
 | `limits.session_spend_limit_usd` | 0, so no limit |
 | `llm.base_url` | `https://openrouter.ai/api/v1` |
 | `llm.max_retries` | 3 |
-| `llm.model` | `anthropic/claude-opus-5` |
+| `llm.model` | `openai/gpt-5.6-sol` (ask `model_info` for what is actually serving) |
 | `llm.provider` | empty, so the `[llm]` section itself, registered as `openrouter` |
 | `llm.request_timeout_secs` | 180 |
 | `providers` | none, so OpenRouter alone |
