@@ -68,6 +68,23 @@ pub async fn run() -> Result<()> {
     }
     crate::offload::spawn_stall_detector();
     workers::spawn_reaper(router.clone());
+    {
+        let grip = grip.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let now = crate::store::now_ms();
+                if let Some(store) = grip.local_store() {
+                    match store.prune_expired_logins(now) {
+                        Ok(n) if n > 0 => tracing::debug!(count = n, "pruned expired logins"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "could not prune expired logins"),
+                    }
+                }
+            }
+        });
+    }
 
     // The headless browser behind the `web-browser-*` tools. Set up and
     // supervised here because the gateway outlives every worker, so one browser

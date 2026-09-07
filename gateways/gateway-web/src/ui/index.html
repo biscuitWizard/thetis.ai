@@ -64,7 +64,11 @@
 
     <footer class="sidebar-foot">
       <span id="status" class="status is-offline">connecting</span>
-      <a href="/admin" target="_blank" rel="noopener" class="quiet-link">admin</a>
+      <span id="user-name" class="quiet"></span>
+      <a id="admin-link" href="/admin" target="_blank" rel="noopener" class="quiet-link">admin</a>
+      <form id="logout" method="post" action="/logout" hidden>
+        <button type="submit" class="quiet-link">log out</button>
+      </form>
       <!-- Your own face, and the way to change it. Sits beside `admin` because
            this is the footer's "who and what am I" corner, and because an
            avatar is settings rather than navigation — it must not be a row in

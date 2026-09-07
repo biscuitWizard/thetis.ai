@@ -157,17 +157,27 @@ connection.onOpen(() => {
 });
 
 connection
+  .on("user", (frame) => {
+    store.set({ user: frame });
+    const name = $("user-name");
+    if (name) name.textContent = frame.name || frame.id || "";
+    setHidden($("admin-link"), !frame.admin);
+    setHidden($("logout"), frame.id === "local");
+  })
+
   .on("catalog", (frame) => {
     store.set({
       models: frame.models || [],
       modelsHidden: frame.models_hidden || [],
       modes: frame.modes || [],
+      modelsRestricted: Boolean(frame.restricted),
     });
     // The catalogue is the panel's whole content, so a change made in any tab
     // redraws it here. The picker follows through its own `models` watcher.
     if (rail.isOpen("models")) drawModels();
     setHeader();
   })
+
 
   .on("sessions", (frame) => {
     store.set({ sessions: frame.sessions || [] });
@@ -863,13 +873,23 @@ function drawTools() {
     );
   }
 
+  const policyNote = store.user?.read_only
+    ? el(
+        "p",
+        { class: "panel-note is-inline" },
+        "Some tools are withheld by your role."
+      )
+    : null;
+
   rail.open({
     id: "tools",
     title: "Tools",
     subtitle: tools.length ? parts.join(" · ") : undefined,
     head,
     items: tools,
-    blocks: tools.length ? [toolScopeNote(grouping, routed), ...blocks] : undefined,
+    blocks: tools.length
+      ? [toolScopeNote(grouping, routed), policyNote, ...blocks].filter(Boolean)
+      : undefined,
     empty: "No tools are available in this mode.",
     renderItem: panel.toolItem,
   });
@@ -912,6 +932,7 @@ function drawModels() {
   const models = store.models || [];
   const hidden = store.modelsHidden || [];
 
+  const restricted = Boolean(store.modelsRestricted);
   const handlers = {
     // Only offered when a conversation is open: the catalogue is global, but
     // choosing a model is a per-conversation setting.
@@ -921,16 +942,22 @@ function drawModels() {
           store.set({ model: model.id });
         }
       : null,
-    onEdit: (model) => {
-      editing = model.id;
-      drawModels();
-    },
-    onRemove: (model) => {
-      connection.send({ type: "model-remove", id: store.current, slug: model.id });
-    },
-    onRestore: (model) => {
-      connection.send({ type: "model-restore", id: store.current, slug: model.id });
-    },
+    onEdit: restricted
+      ? null
+      : (model) => {
+          editing = model.id;
+          drawModels();
+        },
+    onRemove: restricted
+      ? null
+      : (model) => {
+          connection.send({ type: "model-remove", id: store.current, slug: model.id });
+        },
+    onRestore: restricted
+      ? null
+      : (model) => {
+          connection.send({ type: "model-restore", id: store.current, slug: model.id });
+        },
   };
 
   const save = ({ slug, label, previous }) => {
@@ -954,6 +981,16 @@ function drawModels() {
 
   const blocks = [];
 
+  if (restricted) {
+    blocks.push(
+      el(
+        "p",
+        { class: "panel-section-note" },
+        "Your role fixes the model catalogue. You may select an offered model, but cannot add or edit entries."
+      )
+    );
+  }
+
   blocks.push(
     panel.section({
       title: "In the picker",
@@ -963,7 +1000,9 @@ function drawModels() {
   );
   blocks.push(...models.map(row));
 
-  if (editing === "") {
+  if (restricted) {
+    editing = null;
+  } else if (editing === "") {
     blocks.push(
       panel.modelForm({
         onSave: save,

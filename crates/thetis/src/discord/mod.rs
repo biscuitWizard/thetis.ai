@@ -453,7 +453,7 @@ async fn handle(grip: Arc<Grip>, rest: Rest, bot_id: String, msg: Incoming) -> R
         return Ok(());
     }
 
-    let session_id = session_for(&grip, &key).await?;
+    let session_id = session_for(&grip, &key, &msg.author_id).await?;
     let attributed = policy::attribute(&msg, &text, cfg.group_sessions_per_user);
 
     // Subscribe before submitting, or a fast first token could be missed.
@@ -1083,7 +1083,7 @@ async fn retire(rest: &Rest, component: &Component, message: &str) -> Result<()>
 /// meant to be at rest. Discord gets a fresh conversation instead, exactly as
 /// if the channel had never spoken. Archiving is therefore equivalent to `/new`
 /// for every surface at once, and the archived transcript stays readable.
-async fn session_for(grip: &Grip, key: &str) -> Result<String> {
+async fn session_for(grip: &Grip, key: &str, discord_user_id: &str) -> Result<String> {
     let kv_key = format!("discord.session.{key}");
     if let Some(existing) = grip.persist.kv_get(PAIR_SCOPE, &kv_key).await? {
         // `get_session` returns archived sessions too — archiving only sets a
@@ -1102,7 +1102,11 @@ async fn session_for(grip: &Grip, key: &str) -> Result<String> {
     }
 
     let title = format!("Discord {key}");
-    let owner = format!("discord:{key}");
+    let synthetic_owner = format!("discord:{key}");
+    let owner = grip
+        .cfg
+        .auth
+        .owner_for_discord(discord_user_id, &synthetic_owner);
     let meta = grip
         .persist
         .create_session(Some(title), &grip.cfg.discord.mode, &owner)

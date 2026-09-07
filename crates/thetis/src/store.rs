@@ -455,10 +455,12 @@ impl Store {
         Ok(t.get(user)?.map(|v| v.value()).unwrap_or(0.0))
     }
     pub fn add_user_spend(&self, user: &str, usd: f64) -> Result<f64> {
-        let total = self.get_user_spend(user)? + usd;
         let tx = self.db.begin_write()?;
+        let total;
         {
-            tx.open_table(USER_SPEND)?.insert(user, total)?;
+            let mut table = tx.open_table(USER_SPEND)?;
+            total = table.get(user)?.map(|v| v.value()).unwrap_or(0.0) + usd;
+            table.insert(user, total)?;
         }
         tx.commit()?;
         Ok(total)
@@ -1283,6 +1285,47 @@ mod tests {
 
         let claimable = store.sessions_needing_an_owner(None).unwrap();
         assert_eq!(claimable, vec![parent.id.clone()], "{claimable:?}");
+    }
+
+    #[test]
+    fn ownership_logins_and_user_spend_round_trip() {
+        let (store, _d) = temp_store();
+        let alice = store
+            .create_session(Some("Alice".into()), "agent", "alice")
+            .unwrap();
+        let bob = store
+            .create_session(Some("Bob".into()), "agent", "bob")
+            .unwrap();
+        assert_eq!(store.owner_of(&alice.id).unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            store
+                .list_sessions_owned(Some("alice"), false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_sessions_owned(Some("bob"), false).unwrap()[0].id,
+            bob.id
+        );
+
+        let row = LoginRow {
+            user_id: "alice".into(),
+            created_ms: 10,
+            last_seen_ms: 10,
+            expires_ms: 20,
+            user_agent: "test".into(),
+        };
+        store.put_login("token", &row).unwrap();
+        assert_eq!(store.get_login("token").unwrap(), Some(row.clone()));
+        store.touch_login("token", 15, 30).unwrap();
+        assert_eq!(store.get_login("token").unwrap().unwrap().expires_ms, 30);
+        assert_eq!(store.prune_expired_logins(31).unwrap(), 1);
+        assert!(store.get_login("token").unwrap().is_none());
+
+        assert_eq!(store.add_user_spend("alice", 1.25).unwrap(), 1.25);
+        assert_eq!(store.add_user_spend("alice", 0.75).unwrap(), 2.0);
+        assert_eq!(store.get_user_spend("alice").unwrap(), 2.0);
     }
 
     #[test]

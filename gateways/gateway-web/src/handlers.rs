@@ -149,8 +149,7 @@ pub fn dispatch(frame: &Value) -> Vec<GatewayAction> {
 
 // --- the model catalogue ----------------------------------------------------
 
-/// Where the overlay is kept. Global scope: the catalogue is a property of the
-/// installation, not of one conversation.
+/// Where this user's model-catalogue overlay is kept.
 const MODEL_KEY: &str = "gateway.web.models";
 /// Ceiling on stored entries, so a runaway client cannot grow the record without
 /// bound. Well past any plausible hand-curated list.
@@ -538,6 +537,8 @@ pub fn catalog() -> GatewayAction {
 
     reply(json!({
         "type": "catalog",
+        "restricted": sys::config_get("policy_models_restricted")
+            .as_deref() == Some("true"),
         "models": merged.iter().filter(|m| !m.hidden).map(entry).collect::<Vec<_>>(),
         "models_hidden": merged.iter().filter(|m| m.hidden).map(entry).collect::<Vec<_>>(),
         "modes": sys::list_modes().iter().map(|m| json!({

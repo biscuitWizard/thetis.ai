@@ -5,6 +5,8 @@
 //! the orchestrator gains capabilities (the sandbox, the dev kit), the flags
 //! flip and the tools appear without the agent needing to change.
 
+use crate::groups;
+use crate::plan;
 use crate::thetis::grip::types::{
     CompileReport, ConfigEntry, Dependency, EnvVar, EventRecord, ExecResult, FsEntry, LogLevel,
     ModTarget, SessionEvent, SshHostInfo, TerminalOpen, TerminalOutput, ToolManifest,
@@ -13,10 +15,8 @@ use crate::thetis::grip::{
     branch, configuration, control, delegation, devkit, hostfs, sandbox, skills, sys, terminal,
     tooling, transcripts,
 };
-use crate::groups;
-use crate::plan;
 use crate::todos;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The mode assumed when a session has not chosen one.
 pub const DEFAULT_MODE: &str = "agent";
@@ -264,7 +264,10 @@ fn sandbox_tools() -> Vec<ToolDef> {
             name: "read_file",
             description: "Read a file from the session's container workspace.",
             mutating: false,
-            parameters: obj(json!({ "path": string_prop("Path inside the workspace.") }), &["path"]),
+            parameters: obj(
+                json!({ "path": string_prop("Path inside the workspace.") }),
+                &["path"],
+            ),
         },
     ]
 }
@@ -282,8 +285,7 @@ fn subagent_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "spawn_agent",
-            description:
-                "Delegate a self-contained piece of work to a sub-agent: a fresh conversation \
+            description: "Delegate a self-contained piece of work to a sub-agent: a fresh conversation \
                  with its own context window, working in this same checkout, whose final answer \
                  comes back to you. Returns as soon as the child has started, so call it \
                  several times to fan out and then `wait`.\n\n\
@@ -328,8 +330,7 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "agent_status",
-            description:
-                "List your sub-agents with their state, answer so far, cost and elapsed time. \
+            description: "List your sub-agents with their state, answer so far, cost and elapsed time. \
                  A running child also reports how much log it has written and when it last \
                  wrote any, which is how you tell one that is working from one that is stuck. \
                  Free of side effects, but prefer `wait` when what you actually want is for one \
@@ -339,8 +340,7 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "agent_transcript",
-            description:
-                "Read a sub-agent's own event log — what it did, not just what it concluded. \
+            description: "Read a sub-agent's own event log — what it did, not just what it concluded. \
                  For diagnosing a child that failed or answered oddly; the answer in \
                  agent_status is the normal way to collect work.",
             mutating: false,
@@ -357,8 +357,7 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "cancel_agent",
-            description:
-                "Stop a sub-agent that is no longer worth finishing — going the wrong way, or \
+            description: "Stop a sub-agent that is no longer worth finishing — going the wrong way, or \
                  made redundant by another child's answer. Whatever it had produced is kept.",
             mutating: true,
             parameters: obj(
@@ -368,8 +367,7 @@ fn subagent_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "agent_profiles",
-            description:
-                "List the configured sub-agent profiles — each a model, a mode and a standing \
+            description: "List the configured sub-agent profiles — each a model, a mode and a standing \
                  brief — and the delegation limits: how many children may run at once, the \
                  longest a wait may block, and how much of an answer reaches you.",
             mutating: false,
@@ -394,8 +392,7 @@ fn transcript_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "conversation_list",
-            description:
-                "List conversations in this Thetis instance, most recently active first: id, \
+            description: "List conversations in this Thetis instance, most recently active first: id, \
                  title, mode, when it was last active, and a preview. Use it to find the \
                  conversation you want before reading or grepping it — and prefer \
                  `conversation_grep` when you know what you are looking for but not where.\n\n\
@@ -423,8 +420,7 @@ fn transcript_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "conversation_read",
-            description:
-                "Read a conversation's transcript by id — messages, tool calls, tool failures, \
+            description: "Read a conversation's transcript by id — messages, tool calls, tool failures, \
                  notes and incidents, oldest first. Works on any conversation and on any \
                  sub-agent session, since a sub-agent is just a session: pass the child id from \
                  `subagent_list` or from a grep hit.\n\n\
@@ -459,8 +455,7 @@ fn transcript_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "conversation_grep",
-            description:
-                "Search transcripts for a regular expression and get back the matching lines \
+            description: "Search transcripts for a regular expression and get back the matching lines \
                  with the conversation and sequence number each came from. This is the tool for \
                  recall: whether you have hit a problem before, what was decided about something \
                  and where, which conversation a piece of work happened in.\n\n\
@@ -512,8 +507,7 @@ fn transcript_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "subagent_list",
-            description:
-                "List the sub-agents spawned under a conversation — label, brief, state, when it \
+            description: "List the sub-agents spawned under a conversation — label, brief, state, when it \
                  last ran, and the child's session id, which `conversation_read` will open. Works for any \
                  conversation and reports the whole tree.\n\n\
                  For the children *you* started in this turn, `agent_status` is the better tool: \
@@ -540,8 +534,7 @@ fn configuration_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_config",
-            description:
-                "List Thetis's settings as dotted paths with their current values. Pass a \
+            description: "List Thetis's settings as dotted paths with their current values. Pass a \
                  prefix such as 'llm' or 'terminal' to narrow it.",
             mutating: false,
             parameters: obj(
@@ -560,8 +553,7 @@ fn configuration_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "set_config",
-            description:
-                "Change one setting and write it back to the config file. The change is \
+            description: "Change one setting and write it back to the config file. The change is \
                  refused if the result would not load. Settings are read at startup, so call \
                  restart_orchestrator afterwards for it to take effect.",
             mutating: true,
@@ -581,8 +573,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "remember",
-            description:
-                "Save a durable note for this conversation. Survives restarts and self-modification.",
+            description: "Save a durable note for this conversation. Survives restarts and self-modification.",
             mutating: false,
             parameters: obj(
                 json!({
@@ -594,8 +585,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "recall",
-            description:
-                "Read back a saved note. Omit the key to list everything remembered here.",
+            description: "Read back a saved note. Omit the key to list everything remembered here.",
             mutating: false,
             parameters: obj(
                 json!({ "key": string_prop("The note to read; omit to list all keys.") }),
@@ -613,8 +603,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // any other. The mode filter still applies to whatever it admits.
         ToolDef {
             name: TOOL_SEARCH,
-            description:
-                "Find and load a group of tools that is not currently in your tool list. Your \
+            description: "Find and load a group of tools that is not currently in your tool list. Your \
                  tool surface is scoped to what this conversation looks like it needs, so \
                  capabilities you have — BigQuery, Notion, the web, GitHub, ssh hosts, the dev \
                  kit — may not be visible right now. Call this with a description of what you \
@@ -645,8 +634,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // besides read. That is also what lets Discord use it.
         ToolDef {
             name: ASK_USER,
-            description:
-                "Ask the user one or more questions and have them answered in the interface \
+            description: "Ask the user one or more questions and have them answered in the interface \
                  rather than in prose. Each question is either multiple choice or open ended; \
                  every choice question also offers a free-text answer of the user's own, and \
                  every question can be skipped. Use this whenever you need input to go on — a \
@@ -717,8 +705,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // and it is the one every session can reach.
         ToolDef {
             name: "wait",
-            description:
-                "Block until something you are waiting on has happened, instead of polling in a \
+            description: "Block until something you are waiting on has happened, instead of polling in a \
                  loop — each round of polling costs an iteration and a slice of context.\n\n\
                  Predicates: 'time' — sleep for the timeout, for something outside this system, \
                  like a long build or a deploy settling; 'all' — every sub-agent named (or every \
@@ -764,8 +751,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         // to be pushy: a skill that is never fetched may as well not exist.
         ToolDef {
             name: "skill_fetch",
-            description:
-                "Read a skill's full instructions before doing the thing it covers. The system \
+            description: "Read a skill's full instructions before doing the thing it covers. The system \
                  prompt lists only one-line briefs, so fetch the skill whenever its brief looks \
                  relevant — the brief is a pointer, not the content. Also fetches a bundled \
                  reference, script or asset by relative path.",
@@ -785,8 +771,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_search",
-            description:
-                "Search the skill corpus by meaning and get back matching briefs, ranked. Use \
+            description: "Search the skill corpus by meaning and get back matching briefs, ranked. Use \
                  this when a task looks like something there might be a skill for but nothing \
                  in the prompt names it — the prompt only carries universal skills plus what \
                  was retrieved for the opening message, so most of the corpus is not listed.",
@@ -801,8 +786,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_write",
-            description:
-                "Create or replace a skill, or one of its bundled files. Replaces the whole \
+            description: "Create or replace a skill, or one of its bundled files. Replaces the whole \
                  file, as with code edits. Lint diagnostics come back in the same call. Use \
                  this to record a procedure worth keeping rather than repeating it from memory \
                  next time.",
@@ -826,8 +810,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_delete",
-            description:
-                "Delete a skill. Refuses a skill with nested children unless recursive is set, \
+            description: "Delete a skill. Refuses a skill with nested children unless recursive is set, \
                  so a subtree cannot be orphaned by accident.",
             mutating: true,
             parameters: obj(
@@ -840,8 +823,7 @@ pub fn available(mode: &str) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "skill_lint",
-            description:
-                "Check skills for problems: missing or overlong briefs, broken parent links, \
+            description: "Check skills for problems: missing or overlong briefs, broken parent links, \
                  nesting deeper than the limit. Omit the id to lint the whole corpus.",
             mutating: false,
             parameters: obj(
@@ -920,8 +902,7 @@ fn plan_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "plan_write",
-            description:
-                "Create or replace this conversation's plan document. The plan opens in its own \
+            description: "Create or replace this conversation's plan document. The plan opens in its own \
                  tab, where the user can read it and press Execute to hand it to an agent — so \
                  write it for that reader: numbered steps, the files each one touches, and the \
                  decisions that are theirs to make. Prefer `plan_edit` for a revision; a whole \
@@ -941,8 +922,7 @@ fn plan_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plan_edit",
-            description:
-                "Revise part of the plan by replacing an exact snippet — the same contract as \
+            description: "Revise part of the plan by replacing an exact snippet — the same contract as \
                  `edit_path`. Read the plan first: `old_text` must match byte for byte, \
                  whitespace included, and an edit matching nothing or matching twice is refused \
                  rather than guessed. This is the tool for reworking a step after the user \
@@ -964,8 +944,7 @@ fn plan_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plan_append",
-            description:
-                "Add a section to the end of the plan, without restating the rest of it. Use \
+            description: "Add a section to the end of the plan, without restating the rest of it. Use \
                  this while investigating, as each part of the shape becomes clear.",
             mutating: false,
             parameters: obj(
@@ -975,8 +954,7 @@ fn plan_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plan_read",
-            description:
-                "Read this conversation's plan back, with its revision number. Do this before \
+            description: "Read this conversation's plan back, with its revision number. Do this before \
                  editing: another turn may have revised it, and `plan_edit` matches exact text.",
             mutating: false,
             parameters: obj(json!({}), &[]),
@@ -1004,34 +982,43 @@ fn todo_tools() -> Vec<ToolDef> {
             name: "todo_write",
             description: "Write this conversation's todo list, replacing whatever is there. Use it once when work has three or more distinct steps or the user gives you a list. Prefer todo_update afterwards: restating the whole list to change one status is how a row quietly disappears.",
             mutating: false,
-            parameters: obj(json!({ "todos": { "type": "array", "items": item.clone(), "description": "The complete replacement list." } }), &["todos"]),
+            parameters: obj(
+                json!({ "todos": { "type": "array", "items": item.clone(), "description": "The complete replacement list." } }),
+                &["todos"],
+            ),
         },
         ToolDef {
             name: "todo_add",
             description: "Add items without restating the list. Use this when work turns out to be larger than expected or a blocker becomes concrete.",
             mutating: false,
-            parameters: obj(json!({ "todos": { "type": "array", "items": item, "description": "Items to append." } }), &["todos"]),
+            parameters: obj(
+                json!({ "todos": { "type": "array", "items": item, "description": "Items to append." } }),
+                &["todos"],
+            ),
         },
         ToolDef {
             name: "todo_update",
             description: "Change items in place. Mark exactly one item in_progress before starting it and completed when it is actually done. Use cancelled for work deliberately abandoned and say why in your reply.",
             mutating: false,
-            parameters: obj(json!({
-                "updates": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": string_prop("Stable todo id, e.g. t3. Preferred: it survives the list being reordered."),
-                            "index": { "type": "integer", "description": "One-based item position, for when you do not have the id. Sending both is fine — the id wins." },
-                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
-                            "content": string_prop("Replacement description."),
-                            "active_form": string_prop("Replacement present-continuous label."),
+            parameters: obj(
+                json!({
+                    "updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": string_prop("Stable todo id, e.g. t3. Preferred: it survives the list being reordered."),
+                                "index": { "type": "integer", "description": "One-based item position, for when you do not have the id. Sending both is fine — the id wins." },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
+                                "content": string_prop("Replacement description."),
+                                "active_form": string_prop("Replacement present-continuous label."),
+                            },
+                            "additionalProperties": false,
                         },
-                        "additionalProperties": false,
-                    },
-                }
-            }), &["updates"]),
+                    }
+                }),
+                &["updates"],
+            ),
         },
         ToolDef {
             name: "todo_read",
@@ -1048,8 +1035,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "read_path",
-            description:
-                "Read a file from the host filesystem, with every line numbered. Reads the \
+            description: "Read a file from the host filesystem, with every line numbered. Reads the \
                  whole file by default; for a large one pass `offset` and `limit` to take a \
                  window, and the reply says how to read on. Prefer this over `cat`, `head`, \
                  `sed -n` or `less` in a terminal: it costs fewer tokens and the line numbers \
@@ -1072,8 +1058,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "edit_path",
-            description:
-                "Change part of a file on the host filesystem by replacing an exact snippet. \
+            description: "Change part of a file on the host filesystem by replacing an exact snippet. \
                  This is the tool for an ordinary edit — reach for `write_path` only to create \
                  a file or genuinely rewrite all of it. Read the file first: `old_text` must \
                  match byte for byte, indentation included. If it appears more than once the \
@@ -1097,8 +1082,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "search_files",
-            description:
-                "Search file contents across the tree for a regular expression, and get back \
+            description: "Search file contents across the tree for a regular expression, and get back \
                  `path:line: text` for each hit. This is how to find where something lives: \
                  a symbol's definition, every caller of a function, a string from a log. \
                  Narrow with `glob` ('*.rs') or `path` (a subdirectory) rather than widening \
@@ -1130,8 +1114,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "find_files",
-            description:
-                "List files whose path matches a glob, most recently changed first. Use it to \
+            description: "List files whose path matches a glob, most recently changed first. Use it to \
                  find a file you know the shape of the name of, or to see what a directory \
                  holds without listing it level by level. A pattern with no '/' matches the \
                  file name anywhere in the tree, so '*.wit' finds every one. Prefer this over \
@@ -1154,8 +1137,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "write_path",
-            description:
-                "Create a file on the host filesystem, or replace one outright, creating parent \
+            description: "Create a file on the host filesystem, or replace one outright, creating parent \
                  directories as needed. This writes the whole file, so use `edit_path` for a \
                  change to a file that already exists — a whole-file write costs the file's \
                  length in tokens and loses anything you did not think to repeat.",
@@ -1170,8 +1152,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_path",
-            description:
-                "List one directory on the host filesystem. To look across a whole tree use \
+            description: "List one directory on the host filesystem. To look across a whole tree use \
                  `find_files` instead of walking level by level.",
             mutating: false,
             parameters: obj(
@@ -1181,8 +1162,7 @@ fn filesystem_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "delete_path",
-            description:
-                "Delete a file or directory on the host filesystem. This cannot be undone, so \
+            description: "Delete a file or directory on the host filesystem. This cannot be undone, so \
                  check the path first.",
             mutating: true,
             parameters: obj(
@@ -1206,8 +1186,7 @@ fn terminal_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "terminal_open",
-            description:
-                "Open a shell session and return its id. Reuse the id for related commands so \
+            description: "Open a shell session and return its id. Reuse the id for related commands so \
                  the working directory and environment carry over. Pass `host` to open the \
                  session on a remote machine over ssh, naming a host you registered with \
                  `ssh_host_set`.\n\nThe terminal is for running programs — builds, tests, git, \
@@ -1243,8 +1222,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_run",
-            description:
-                "Run a command in an open shell session and wait for it to finish. Returns \
+            description: "Run a command in an open shell session and wait for it to finish. Returns \
                  whatever it printed, with the exit status. A command that outlives the timeout \
                  keeps running; read the session again later for the rest.\n\nThis waits for the \
                  command to complete, so it cannot drive anything interactive: a program sitting \
@@ -1274,8 +1252,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_read",
-            description:
-                "Read anything a session has printed since the last read, without running \
+            description: "Read anything a session has printed since the last read, without running \
                  anything. Use it to collect output from a command that timed out or was \
                  backgrounded — it says whether that command has since finished.",
             mutating: false,
@@ -1283,8 +1260,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_send",
-            description:
-                "Write raw input to a session and return immediately, without waiting for a \
+            description: "Write raw input to a session and return immediately, without waiting for a \
                  command to complete. This is how to answer a prompt — a confirmation, a \
                  passphrase, a `y` — or to drive a REPL, none of which `terminal_run` can do, \
                  because it waits for the command to end and an interactive program never \
@@ -1310,8 +1286,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_signal",
-            description:
-                "Interrupt what a session is running, leaving the session itself alive — the \
+            description: "Interrupt what a session is running, leaving the session itself alive — the \
                  deliberate Ctrl-C. Use it to stop a `tail -f`, end a test run whose first \
                  failure already told you what you needed, or unstick a command waiting on \
                  input you cannot give.\n\nA remote session needs a pty on its host for this to \
@@ -1337,8 +1312,7 @@ fn terminal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "terminal_list",
-            description:
-                "List the open shell sessions, with where each one runs, where it is, and \
+            description: "List the open shell sessions, with where each one runs, where it is, and \
                  whether it is busy with a background command.",
             mutating: false,
             parameters: obj(json!({}), &[]),
@@ -1366,8 +1340,7 @@ const CLONE_ROOT: &str = "workspace";
 fn git_tools() -> Vec<ToolDef> {
     vec![ToolDef {
         name: "git_clone",
-        description:
-            "Clone a GitHub repository into a real working tree, authenticated as the app's \
+        description: "Clone a GitHub repository into a real working tree, authenticated as the app's \
              GitHub App identity. Use this when you need actual files and a .git — a rebase, a \
              bisect, running a test suite, or a commit series with exact parentage; the git-* \
              tools read and write through the API without cloning, which is cheaper and is \
@@ -1413,16 +1386,14 @@ fn ssh_host_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "ssh_host_list",
-            description:
-                "List the named ssh hosts `terminal_open` can open a session on, with each \
+            description: "List the named ssh hosts `terminal_open` can open a session on, with each \
                  one's connection details. Start here when you need a host name.",
             mutating: false,
             parameters: obj(json!({}), &[]),
         },
         ToolDef {
             name: "ssh_host_get",
-            description:
-                "Show one registered ssh host's connection details. Use `ssh_host_list` when \
+            description: "Show one registered ssh host's connection details. Use `ssh_host_list` when \
                  you do not know the name.",
             mutating: false,
             parameters: obj(
@@ -1432,8 +1403,7 @@ fn ssh_host_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "ssh_host_set",
-            description:
-                "Register a new ssh host for `terminal_open`, or edit one that exists. Fields \
+            description: "Register a new ssh host for `terminal_open`, or edit one that exists. Fields \
                  you leave out keep their current value, so this is how to change just the port \
                  or just the pty setting.\n\nA name here is all `terminal_open` needs, so \
                  connection details are stated once. Hosts live in a gitignored file the config \
@@ -1482,8 +1452,7 @@ fn ssh_host_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "ssh_host_remove",
-            description:
-                "Delete a registered ssh host. Sessions already open on it keep running; \
+            description: "Delete a registered ssh host. Sessions already open on it keep running; \
                  nothing new can be opened by that name afterwards.",
             mutating: true,
             parameters: obj(
@@ -1493,8 +1462,7 @@ fn ssh_host_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "ssh_host_rename",
-            description:
-                "Rename a registered ssh host, keeping its connection details. The old name \
+            description: "Rename a registered ssh host, keeping its connection details. The old name \
                  stops working, so update anything that refers to it.",
             mutating: true,
             parameters: obj(
@@ -1524,8 +1492,7 @@ fn devkit_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "new_tool",
-            description:
-                "Scaffold a new tool component: creates the crate, builds it, and loads it. \
+            description: "Scaffold a new tool component: creates the crate, builds it, and loads it. \
                  Returns the compile result.",
             mutating: true,
             parameters: obj(
@@ -1538,8 +1505,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "write_code",
-            description:
-                "Replace a whole file in a component, then rebuild and hot-swap it. The compile \
+            description: "Replace a whole file in a component, then rebuild and hot-swap it. The compile \
                  result comes back immediately, so fix errors and call again until it builds.",
             mutating: true,
             parameters: obj(
@@ -1553,8 +1519,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "patch_code",
-            description:
-                "Replace an exact snippet in a component file, then rebuild and hot-swap it. \
+            description: "Replace an exact snippet in a component file, then rebuild and hot-swap it. \
                  Returns the compile result.",
             mutating: true,
             parameters: obj(
@@ -1569,8 +1534,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "add_dependency",
-            description:
-                "Add a crate from crates.io to a component's dependencies, then rebuild it. Any \
+            description: "Add a crate from crates.io to a component's dependencies, then rebuild it. Any \
                  published crate that supports wasm32-wasip2 will work; pure-computation crates \
                  almost always do. This fetches over the network, so it is slower than an \
                  ordinary edit. If the build fails the manifest is put back as it was.",
@@ -1628,16 +1592,14 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "branch_status",
-            description:
-                "Where this conversation's sandbox branch stands: what changed here, whether \
+            description: "Where this conversation's sandbox branch stands: what changed here, whether \
                  trunk has moved on, and any unresolved merge conflicts.",
             mutating: false,
             parameters: obj(json!({}), &[]),
         },
         ToolDef {
             name: "branch_log",
-            description:
-                "The commit history of this conversation's branch — every green build, skill \
+            description: "The commit history of this conversation's branch — every green build, skill \
                  edit, and checkpoint, newest first.",
             mutating: false,
             parameters: obj(
@@ -1649,8 +1611,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "update_from_trunk",
-            description:
-                "Bring the latest trunk into this conversation's branch. Fast-forwards when \
+            description: "Bring the latest trunk into this conversation's branch. Fast-forwards when \
                  possible; a conflicted merge comes back with the conflicted files listed and \
                  standard git conflict markers left in them — resolve with the normal editing \
                  tools, then call complete_merge.",
@@ -1659,8 +1620,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "reset_branch",
-            description:
-                "Restore this conversation's code to how it was at an earlier commit (see \
+            description: "Restore this conversation's code to how it was at an earlier commit (see \
                  branch_log). Use when a change made things worse. Moves forward: history is \
                  kept, nothing is rewritten.",
             mutating: true,
@@ -1673,8 +1633,7 @@ fn devkit_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "complete_merge",
-            description:
-                "Finish a conflicted trunk update after resolving every conflict marker in the \
+            description: "Finish a conflicted trunk update after resolving every conflict marker in the \
                  working tree. Refuses while markers remain.",
             mutating: true,
             parameters: obj(
@@ -1730,9 +1689,8 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
     out
 }
 
-/// Tool definitions in the format the chat completions API expects, including
-/// any hot-loaded tool components the orchestrator has registered, restricted
-/// to an active set of tool groups.
+/// Tool definitions in chat-completions format, including hot-loaded
+/// components, restricted by account policy and the active tool groups.
 ///
 /// `None` means every group, which is the behaviour before grouping existed and
 /// what runs whenever `tool_groups.grouping_enabled` is off. A group filter is
@@ -1742,9 +1700,12 @@ pub fn manifests(mode: &str) -> Vec<ToolManifest> {
 pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
     let mut defs: Vec<Value> = available(mode)
         .iter()
-        .filter(|t| match active {
-            Some(active) => groups::builtin_active(t.name, active),
-            None => true,
+        .filter(|t| {
+            !groups::policy_denies_group(&groups::group_of(t.name))
+                && match active {
+                    Some(active) => groups::builtin_active(t.name, active),
+                    None => true,
+                }
         })
         .map(|t| {
             json!({
@@ -1770,10 +1731,13 @@ pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
         if policy_denies(&manifest.name) {
             continue;
         }
+        let group = groups::component_group(&manifest.name, &manifest.capabilities);
+        if groups::policy_denies_group(&group) {
+            continue;
+        }
         // The manifest is already in hand, so its group is read from it rather
         // than looked up again through the registry it came from.
         if let Some(active) = active {
-            let group = groups::component_group(&manifest.name, &manifest.capabilities);
             if !active.iter().any(|a| *a == group) {
                 continue;
             }
@@ -1795,20 +1759,12 @@ pub fn definitions_for(mode: &str, active: Option<&[String]>) -> Vec<Value> {
 
 /// Every built-in name the agent could offer, for the group-coverage check.
 pub fn builtin_names() -> Vec<String> {
-    all_builtins()
-        .iter()
-        .map(|t| t.name.to_string())
-        .collect()
+    all_builtins().iter().map(|t| t.name.to_string()).collect()
 }
 
 // --- dispatch ---------------------------------------------------------------
 
-pub fn invoke(
-    session_id: &str,
-    mode: &str,
-    name: &str,
-    args_json: &str,
-) -> Result<String, String> {
+pub fn invoke(session_id: &str, mode: &str, name: &str, args_json: &str) -> Result<String, String> {
     // Withholding a tool from the definitions is not enough on its own: a model
     // can still name one it saw earlier in the conversation. The mode is
     // enforced here, where the call would actually happen.
@@ -1821,10 +1777,8 @@ pub fn invoke(
     // Soft, per-account denial, checked at the same place the mode is: a model
     // that already knows the tool's name must still be refused here, not only
     // withheld from the definitions it is offered.
-    if policy_denies(name) {
-        return Err(format!(
-            "'{name}' is not available to this account."
-        ));
+    if policy_denies(name) || groups::policy_denies_group(&groups::group_of(name)) {
+        return Err(format!("'{name}' is not available to this account."));
     }
 
     // A tool called from outside the active groups is honoured, and its group is
@@ -1891,7 +1845,9 @@ pub fn invoke(
 
         "plan_write" => plan::write(
             session_id,
-            args.get("title").and_then(Value::as_str).map(str::to_string),
+            args.get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             &req_str(&args, "body")?,
         )
         .map(|p| {
@@ -1906,7 +1862,9 @@ pub fn invoke(
             session_id,
             &req_str(&args, "old_text")?,
             &req_str(&args, "new_text")?,
-            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+            args.get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         )
         .map(|e| {
             format!(
@@ -1916,8 +1874,13 @@ pub fn invoke(
                 plan::describe(&e.plan)
             )
         }),
-        "plan_append" => plan::append(session_id, &req_str(&args, "text")?)
-            .map(|p| format!("appended, now revision {}.\n\n{}", p.revision, plan::describe(&p))),
+        "plan_append" => plan::append(session_id, &req_str(&args, "text")?).map(|p| {
+            format!(
+                "appended, now revision {}.\n\n{}",
+                p.revision,
+                plan::describe(&p)
+            )
+        }),
         "plan_read" => {
             let p = plan::load(session_id);
             if p.body.trim().is_empty() {
@@ -1928,21 +1891,39 @@ pub fn invoke(
         }
 
         "todo_write" => {
-            let values = args.get("todos").and_then(Value::as_array).ok_or_else(|| "todos must be an array".to_string())?;
+            let values = args
+                .get("todos")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "todos must be an array".to_string())?;
             todos::write(session_id, values).map(|list| todos::render(&list))
         }
         "todo_add" => {
-            let values = args.get("todos").and_then(Value::as_array).ok_or_else(|| "todos must be an array".to_string())?;
+            let values = args
+                .get("todos")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "todos must be an array".to_string())?;
             todos::add(session_id, values).map(|list| todos::render(&list))
         }
         "todo_update" => {
-            let values = args.get("updates").and_then(Value::as_array).ok_or_else(|| "updates must be an array".to_string())?;
-            todos::update(session_id, values).map(|update| format!("updated {} item(s).\n{}", update.changed, todos::render(&update.list)))
+            let values = args
+                .get("updates")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "updates must be an array".to_string())?;
+            todos::update(session_id, values).map(|update| {
+                format!(
+                    "updated {} item(s).\n{}",
+                    update.changed,
+                    todos::render(&update.list)
+                )
+            })
         }
         "todo_read" => {
             let list = todos::load(session_id);
-            if list.items.is_empty() { Ok("no todo list yet. Write one with todo_write.".to_string()) }
-            else { Ok(todos::render(&list)) }
+            if list.items.is_empty() {
+                Ok("no todo list yet. Write one with todo_write.".to_string())
+            } else {
+                Ok(todos::render(&list))
+            }
         }
 
         // `wait` is not in this arm: it is a core tool, reachable by a
@@ -1950,8 +1931,7 @@ pub fn invoke(
         // delegate. See the note beside its definition.
         "wait" => wait_for(&args),
 
-        "spawn_agent" | "agent_status" | "agent_transcript" | "cancel_agent"
-        | "agent_profiles" => {
+        "spawn_agent" | "agent_status" | "agent_transcript" | "cancel_agent" | "agent_profiles" => {
             // The one-level rule, enforced a second time at the call. The
             // withheld tool definition is the cheap enforcement; this is the
             // one that holds when the model names a tool it saw earlier in the
@@ -2035,7 +2015,9 @@ pub fn invoke(
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(30_000) as u32;
-            Ok(format_exec(sandbox::exec(session_id, &command, None, timeout)))
+            Ok(format_exec(sandbox::exec(
+                session_id, &command, None, timeout,
+            )))
         }
         "write_file" => sandbox::write_file(
             session_id,
@@ -2128,10 +2110,8 @@ pub fn invoke(
         }
         "update_from_trunk" => branch::update_from_trunk().map(format_branch_state),
         "reset_branch" => branch::reset_to(&req_str(&args, "rev")?).map(format_branch_state),
-        "complete_merge" => branch::complete_merge(
-            args.get("message").and_then(Value::as_str),
-        )
-        .map(format_branch_state),
+        "complete_merge" => branch::complete_merge(args.get("message").and_then(Value::as_str))
+            .map(format_branch_state),
         "abort_merge" => branch::abort_merge().map(format_branch_state),
 
         "read_path" => hostfs::read_file_range(
@@ -2143,7 +2123,9 @@ pub fn invoke(
             &req_str(&args, "path")?,
             &req_str(&args, "old_text")?,
             &req_str(&args, "new_text")?,
-            args.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+            args.get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ),
         "search_files" => hostfs::search_files(
             &req_str(&args, "pattern")?,
@@ -2157,14 +2139,13 @@ pub fn invoke(
             opt_arg(&args, "path").as_deref(),
             args.get("max_results").and_then(Value::as_u64).unwrap_or(0) as u32,
         ),
-        "write_path" => hostfs::write_file(
-            &req_str(&args, "path")?,
-            &req_str(&args, "contents")?,
-        ),
+        "write_path" => hostfs::write_file(&req_str(&args, "path")?, &req_str(&args, "contents")?),
         "list_path" => hostfs::list_dir(&req_str(&args, "path")?).map(format_listing),
         "delete_path" => hostfs::delete_path(
             &req_str(&args, "path")?,
-            args.get("recursive").and_then(Value::as_bool).unwrap_or(false),
+            args.get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ),
 
         "git_clone" => git_clone(&args),
@@ -2198,7 +2179,9 @@ pub fn invoke(
             &req_str(&args, "id")?,
             &req_str(&args, "command")?,
             args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(0) as u32,
-            args.get("background").and_then(Value::as_bool).unwrap_or(false),
+            args.get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         )
         .map(format_terminal),
         "terminal_read" => terminal::read(&req_str(&args, "id")?).map(|text| {
@@ -2215,9 +2198,7 @@ pub fn invoke(
             args.get("text").and_then(Value::as_str).unwrap_or(""),
             args.get("submit").and_then(Value::as_bool).unwrap_or(true),
         ),
-        "terminal_signal" => {
-            terminal::signal(&req_str(&args, "id")?, &req_str(&args, "signal")?)
-        }
+        "terminal_signal" => terminal::signal(&req_str(&args, "id")?, &req_str(&args, "signal")?),
         "terminal_close" => terminal::close(&req_str(&args, "id")?),
         "terminal_list" => {
             let sessions = terminal::sessions();
@@ -2256,9 +2237,11 @@ pub fn invoke(
         "ssh_host_list" => {
             let hosts = terminal::ssh_hosts()?;
             if hosts.is_empty() {
-                return Ok("no ssh hosts defined. Add one with ssh_host_set, giving at least \
+                return Ok(
+                    "no ssh hosts defined. Add one with ssh_host_set, giving at least \
                            name and host."
-                    .to_string());
+                        .to_string(),
+                );
             }
             Ok(hosts
                 .iter()
@@ -2332,9 +2315,7 @@ pub fn invoke(
                 .map(|e| format_setting(&e))
                 .ok_or_else(|| format!("no setting named '{key}'"))
         }
-        "set_config" => {
-            configuration::set(&req_str(&args, "key")?, &req_str(&args, "value")?)
-        }
+        "set_config" => configuration::set(&req_str(&args, "key")?, &req_str(&args, "value")?),
 
         "restart_orchestrator" => control::restart(
             &req_str(&args, "reason")?,
@@ -2512,7 +2493,7 @@ fn ask_user(args: &Value) -> Result<String, String> {
             Some(other) => {
                 return Err(format!(
                     "question {position} has type '{other}'; use 'choice' or 'open'"
-                ))
+                ));
             }
             None if options.is_empty() => "open",
             None => "choice",
@@ -2720,8 +2701,9 @@ fn remember(session_id: &str, args: &Value) -> Result<String, String> {
 
 fn recall(session_id: &str, args: &Value) -> Result<String, String> {
     match args.get("key").and_then(Value::as_str) {
-        Some(key) => sys::kv_get(session_id, key)
-            .ok_or_else(|| format!("nothing remembered under '{key}'")),
+        Some(key) => {
+            sys::kv_get(session_id, key).ok_or_else(|| format!("nothing remembered under '{key}'"))
+        }
         None => {
             let keys = memory_keys(session_id);
             if keys.is_empty() {
@@ -2868,7 +2850,9 @@ fn wait_plan(args: &Value, watching: bool, max_wait_secs: u64) -> Result<(String
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if asked == 0 && until == "time" {
-        return Err("a 'time' wait needs timeout_secs — it has nothing else to end it.".to_string());
+        return Err(
+            "a 'time' wait needs timeout_secs — it has nothing else to end it.".to_string(),
+        );
     }
 
     // A wait with no deadline is indistinguishable from a hung turn, so one is
@@ -3242,9 +3226,8 @@ fn running_progress(row: &delegation::SubagentInfo, now: u64) -> String {
         return "Still working (no progress reading available).".to_string();
     }
     let last = ago(row.activity_ms, now);
-    let stalled = row.activity_ms > 0
-        && now > row.activity_ms
-        && (now - row.activity_ms) >= STALE_CHILD_MS;
+    let stalled =
+        row.activity_ms > 0 && now > row.activity_ms && (now - row.activity_ms) >= STALE_CHILD_MS;
     let mut line = format!(
         "Still working — {} log entries, last activity {last}.",
         row.events
@@ -3817,7 +3800,10 @@ mod recall_tests {
         ];
         let out = format_transcript_entries("### head", &entries);
         assert!(out.contains("[4]") && out.contains("[7]"), "{out}");
-        assert!(out.contains("FAILED"), "a failure must look like one: {out}");
+        assert!(
+            out.contains("FAILED"),
+            "a failure must look like one: {out}"
+        );
         // Paging is only possible if the reply says where it stopped.
         assert!(out.contains("from_seq=7"), "{out}");
     }
@@ -3877,7 +3863,10 @@ mod recall_tests {
         // of the output and repeating it per line is most of the tokens.
         assert_eq!(out.matches("session-aaa").count(), 1, "{out}");
         assert_eq!(out.matches("session-bbb").count(), 1, "{out}");
-        assert!(out.contains("conversation_read"), "say how to open one: {out}");
+        assert!(
+            out.contains("conversation_read"),
+            "say how to open one: {out}"
+        );
     }
 
     #[test]
@@ -3928,8 +3917,8 @@ mod recall_tests {
 #[cfg(test)]
 mod delegation_tests {
     use super::{
-        check_brief, format_child, format_children, format_profiles, wait_plan, MIN_BRIEF,
-        STALE_CHILD_MS,
+        MIN_BRIEF, STALE_CHILD_MS, check_brief, format_child, format_children, format_profiles,
+        wait_plan,
     };
     use crate::thetis::grip::delegation;
     use serde_json::json;
@@ -3980,11 +3969,13 @@ mod delegation_tests {
 
     #[test]
     fn a_real_brief_is_accepted() {
-        assert!(check_brief(
-            "Find every call site of `commit_worktree` under crates/ and report each as \
+        assert!(
+            check_brief(
+                "Find every call site of `commit_worktree` under crates/ and report each as \
              path:line with one line of why it is there. Do not change any file."
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     // A short brief in a multi-byte script must be measured the same way as an
@@ -4121,7 +4112,10 @@ mod delegation_tests {
         row.detail = "ran out of iterations".to_string();
         let out = format_child(&row, NOW);
         assert!(out.contains("ran out of iterations"), "{out}");
-        assert!(out.contains("failed"), "the state must be visible too: {out}");
+        assert!(
+            out.contains("failed"),
+            "the state must be visible too: {out}"
+        );
     }
 
     // The header is what the model reads first and often all it reads, so the
@@ -4155,9 +4149,15 @@ mod delegation_tests {
 
     #[test]
     fn every_child_appears_in_the_listing() {
-        let rows = vec![child("a", "done", "A answer"), child("b", "done", "B answer")];
+        let rows = vec![
+            child("a", "done", "A answer"),
+            child("b", "done", "B answer"),
+        ];
         let out = format_children(&rows, NOW);
-        assert!(out.contains("A answer") && out.contains("B answer"), "{out}");
+        assert!(
+            out.contains("A answer") && out.contains("B answer"),
+            "{out}"
+        );
     }
 
     // A deployment with no profiles still delegates, so the empty case must
@@ -4351,7 +4351,7 @@ mod coverage_tests {
 /// never shown would hang the conversation waiting for an answer.
 #[cfg(test)]
 mod ask_user_tests {
-    use super::{ask_user, ASK_USER, MAX_OPTIONS, MAX_QUESTIONS};
+    use super::{ASK_USER, MAX_OPTIONS, MAX_QUESTIONS, ask_user};
     use serde_json::json;
 
     // `available()` is deliberately not called here: building the tool list
@@ -4377,10 +4377,12 @@ mod ask_user_tests {
 
     #[test]
     fn an_open_question_needs_no_options() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "What broke?", "type": "open" }]
-        }))
-        .is_ok());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "What broke?", "type": "open" }]
+            }))
+            .is_ok()
+        );
     }
 
     // Each of these must be an `Err`. The loop only pauses on success, so a
@@ -4388,10 +4390,12 @@ mod ask_user_tests {
     // conversation on a form the user never saw.
     #[test]
     fn a_choice_question_with_no_options_is_rejected() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Pick one", "type": "choice" }]
-        }))
-        .is_err());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "Pick one", "type": "choice" }]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4416,17 +4420,21 @@ mod ask_user_tests {
     #[test]
     fn too_many_options_is_rejected() {
         let options: Vec<_> = (0..MAX_OPTIONS + 1).map(|i| format!("o{i}")).collect();
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Pick", "options": options }]
-        }))
-        .is_err());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "Pick", "options": options }]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn an_unknown_type_is_rejected_rather_than_guessed() {
-        assert!(ask_user(&json!({
-            "questions": [{ "question": "Eh?", "type": "dropdown" }]
-        }))
-        .is_err());
+        assert!(
+            ask_user(&json!({
+                "questions": [{ "question": "Eh?", "type": "dropdown" }]
+            }))
+            .is_err()
+        );
     }
 }

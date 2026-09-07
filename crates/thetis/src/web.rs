@@ -36,6 +36,7 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         .route("/preview/{session}/", get(preview_root))
         .route("/preview/{session}/{*path}", get(preview_asset))
         .route("/admin/branch", post(admin_branch))
+        .route("/admin/user/logout", post(admin_user_logout))
         .route("/admin/rollback", post(admin_rollback_legacy))
         // Raw workspace bytes. Separate from the frame protocol because these
         // are payloads, not messages: an image wants to be an <img> src, a
@@ -49,12 +50,9 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         )
         .route("/", get(root_asset))
         .route("/{*path}", get(path_asset))
-        // The whole trust boundary in one layer: Thetis binds to loopback and
-        // has no auth, so "a process on this machine" is the boundary. Two
-        // browser-borne ways around it are closed here — a hostile page opening
-        // the WebSocket (the same-origin policy does not cover WS), and a domain
-        // that rebinds to 127.0.0.1 to reach the /admin forms or the upload
-        // route. See `guard_local`.
+        // Identity and authorization live in this native router. The outer
+        // origin guard preserves same-origin/Host protection; authentication
+        // then attaches a principal before any user-facing handler runs.
         .layer(middleware::from_fn_with_state(grip.clone(), authenticate))
         .layer(middleware::from_fn_with_state(grip.clone(), guard_origin))
         .with_state(grip.clone());
@@ -88,6 +86,7 @@ fn is_loopback_authority(authority: &str) -> bool {
 
 /// True when an `Origin` (`scheme://authority`) is loopback. A syntactically
 /// broken or opaque Origin (e.g. `null`) is not trusted.
+#[cfg(test)]
 fn is_loopback_origin(origin: &str) -> bool {
     match origin.split_once("://") {
         Some((_, authority)) => is_loopback_authority(authority),
@@ -103,6 +102,7 @@ fn is_loopback_origin(origin: &str) -> bool {
 /// DNS-rebinding, where the attacker's domain resolves to `127.0.0.1` — its
 /// name still shows up here. A missing header is allowed: a non-browser client
 /// on this machine (curl, the test grip) is already inside the boundary.
+#[cfg(test)]
 async fn guard_local(req: Request, next: Next) -> Response {
     let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
@@ -147,8 +147,12 @@ async fn authenticate(State(grip): State<Arc<Grip>>, mut req: Request, next: Nex
     let public = matches!(req.uri().path(), "/login" | "/logout");
     match crate::auth::resolve(&grip, req.headers()).await {
         Some(p) => {
-            if req.uri().path().starts_with("/admin") && !p.is_admin() {
-                return (StatusCode::FORBIDDEN, "admin only").into_response();
+            if req.uri().path() == "/login" && grip.cfg.auth.users_mode {
+                return Redirect::to("/").into_response();
+            }
+            if req.uri().path().starts_with("/admin") && (!grip.cfg.admin_enabled || !p.is_admin())
+            {
+                return (StatusCode::FORBIDDEN, "admin console unavailable").into_response();
             }
             req.extensions_mut().insert(p);
             next.run(req).await
@@ -162,13 +166,31 @@ async fn authenticate(State(grip): State<Arc<Grip>>, mut req: Request, next: Nex
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.contains("text/html"))
             {
-                Redirect::to("/login").into_response()
+                let next = req
+                    .uri()
+                    .path_and_query()
+                    .map(|v| v.as_str())
+                    .unwrap_or("/");
+                Redirect::to(&format!("/login?next={}", percent_encode(next))).into_response()
             } else {
                 (StatusCode::UNAUTHORIZED, "sign in first").into_response()
             }
         }
     }
 }
+fn percent_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
 #[derive(serde::Deserialize, Default)]
 struct LoginQuery {
     #[serde(default)]
@@ -187,7 +209,11 @@ async fn login_page(State(g): State<Arc<Grip>>, Query(q): Query<LoginQuery>) -> 
     }
     crate::auth::page(&g.cfg, None, &q.next).into_response()
 }
-async fn login_submit(State(g): State<Arc<Grip>>, Form(f): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(g): State<Arc<Grip>>,
+    headers: HeaderMap,
+    Form(f): Form<LoginForm>,
+) -> Response {
     let Some(u) = g.cfg.auth.user(&f.user) else {
         crate::auth::login_failed(&f.user, &g.cfg);
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -210,7 +236,13 @@ async fn login_submit(State(g): State<Arc<Grip>>, Form(f): Form<LoginForm>) -> R
         created_ms: now,
         last_seen_ms: now,
         expires_ms: now + g.cfg.auth.session_ttl.as_millis() as u64,
-        user_agent: String::new(),
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect(),
     };
     if let Some(s) = g.local_store() {
         let _ = s.put_login(&crate::auth::token_hash(&t), &row);
@@ -643,6 +675,25 @@ async fn admin_page(State(grip): State<Arc<Grip>>) -> Html<String> {
     Html(render_admin(&grip, "").await)
 }
 
+#[derive(serde::Deserialize)]
+struct AdminUserLogout {
+    user: String,
+}
+
+async fn admin_user_logout(
+    State(grip): State<Arc<Grip>>,
+    Form(form): Form<AdminUserLogout>,
+) -> Response {
+    if grip.cfg.auth.user(&form.user).is_none() {
+        return (StatusCode::BAD_REQUEST, "unknown user").into_response();
+    }
+    let removed = grip
+        .local_store()
+        .and_then(|store| store.remove_logins_for(&form.user).ok())
+        .unwrap_or(0);
+    Redirect::to(&format!("/admin?signed_out={removed}")).into_response()
+}
+
 async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
     let root = crate::gitctl::GitCtl::new(grip.cfg.root.clone());
     let trunk_name = root
@@ -755,6 +806,26 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
         .await
         .map(|s| s.len())
         .unwrap_or(0);
+    let user_rows = grip
+        .cfg
+        .auth
+        .users
+        .iter()
+        .map(|user| {
+            let spend = grip
+                .local_store()
+                .and_then(|store| store.get_user_spend(&user.id).ok())
+                .unwrap_or(0.0);
+            format!(
+                r#"<tr><td>{}</td><td>{}</td><td>{:.4}</td><td><form method=post action="/admin/user/logout"><input type=hidden name=user value="{}"><button>sign out everywhere</button></form></td></tr>"#,
+                html_escape(&user.id),
+                html_escape(&user.role),
+                spend,
+                html_escape(&user.id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let private = crate::publish::private_dirs(&root, "HEAD")
         .await
@@ -804,6 +875,9 @@ the break-glass path and stops every worker first.</p>
 Stopping a worker loses nothing — branch state is on disk and in the log.</p>
 <table><tr><th>conversation</th><th>branch</th><th>worker</th><th>&uarr;/&darr;</th><th>state</th><th>kernel</th><th></th></tr>
 {branch_rows}</table>
+<h2>Users</h2>
+<table><tr><th>user</th><th>role</th><th>spend (USD)</th><th></th></tr>
+{user_rows}</table>
 <h2>Publishing</h2>
 <p class=note>Directories holding a <code>.thetis-private</code> marker never leave this
 machine: a filtered <code>public</code> branch mirrors trunk without them, and a pre-push
@@ -841,6 +915,11 @@ for replacing their work. Only paths that leave this machine are touched.</p>
             branch_rows
         },
         sessions = sessions,
+        user_rows = if user_rows.is_empty() {
+            "<tr><td colspan=4><em>local mode — no configured users</em></td></tr>".to_string()
+        } else {
+            user_rows
+        },
     )
 }
 
@@ -1108,6 +1187,83 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
             .unwrap_or_default()
             .to_string();
 
+        // Host-side protocols do not pass through the gateway guest, so they
+        // enforce ownership and capability policy here before dispatch.
+        if let Some(frame) = &frame {
+            let named_session = frame
+                .get("id")
+                .or_else(|| frame.get("session"))
+                .and_then(serde_json::Value::as_str);
+            if (crate::debug_api::handles(&frame_type) || crate::branch_api::handles(&frame_type))
+                && named_session
+                    .is_some_and(|id| crate::auth::may_access(&grip, &principal, id).is_err())
+            {
+                let _ = out_tx
+                    .send(error_frame(
+                        "that conversation is not yours",
+                        Some(frame_type.clone()),
+                    ))
+                    .await;
+                continue;
+            }
+            if crate::debug_api::handles(&frame_type)
+                && matches!(frame_type.as_str(), "terminals" | "terminal-close")
+                && principal.policy.denies(crate::policy::Cap::Terminal)
+            {
+                let _ = out_tx
+                    .send(error_frame(
+                        "terminal access is withheld by policy",
+                        Some(frame_type.clone()),
+                    ))
+                    .await;
+                continue;
+            }
+            if crate::branch_api::handles(&frame_type)
+                && matches!(
+                    frame_type.as_str(),
+                    "branch-update"
+                        | "branch-reset"
+                        | "branch-resolve"
+                        | "branch-abort"
+                        | "branch-base"
+                        | "branch-merge"
+                )
+                && principal.policy.denies(crate::policy::Cap::BranchWrite)
+            {
+                let _ = out_tx
+                    .send(error_frame(
+                        "branch changes are withheld by policy",
+                        Some(frame_type.clone()),
+                    ))
+                    .await;
+                continue;
+            }
+            if crate::workspace_api::handles(&frame_type) {
+                let write = matches!(
+                    frame_type.as_str(),
+                    "workspace-write"
+                        | "workspace-mkdir"
+                        | "workspace-delete"
+                        | "workspace-move"
+                        | "workspace-rename"
+                );
+                let denied = principal.policy.denies(if write {
+                    crate::policy::Cap::WorkspaceWrite
+                } else {
+                    crate::policy::Cap::Workspace
+                });
+                if denied {
+                    let _ = out_tx
+                        .send(error_frame(
+                            "workspace access is withheld by policy",
+                            Some(frame_type.clone()),
+                        ))
+                        .await;
+                    continue;
+                }
+            }
+        }
+
         // Inspection and turn control answer off to the side, concurrently.
         // These are the frames that must work *while* something else is slow —
         // the stop button most of all — and they are order-independent: they
@@ -1197,7 +1353,9 @@ async fn connection(socket: WebSocket, grip: Arc<Grip>, principal: Arc<crate::au
                     }
                 }
                 GatewayAction::Unsubscribe(session_id) => {
-                    watching.write().await.remove(&session_id);
+                    if crate::auth::may_access(&grip, &principal, &session_id).is_ok() {
+                        watching.write().await.remove(&session_id);
+                    }
                 }
             }
         }

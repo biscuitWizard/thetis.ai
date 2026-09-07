@@ -508,14 +508,39 @@ impl Grip {
         budget: Budget,
         id: &str,
     ) -> wasmtime::Store<crate::runtime::HostState> {
-        let policy = match self.persist.owner_of_root(id).await {
-            Ok(Some(o)) => self.cfg.auth.policy_for(&o),
-            _ => self.cfg.auth.local_policy.clone(),
+        let policy = if matches!(&self.role, Role::Worker(_)) {
+            self.persist.session_policy(id).await.map(Arc::new).unwrap_or_else(|error| {
+                tracing::warn!(session = id, %error, "could not load session policy; denying worker capabilities");
+                let mut denied = self.cfg.auth.local_policy.as_ref().clone();
+                denied.admin = false;
+                denied.read_only = true;
+                denied.see_all_sessions = false;
+                denied.denied.extend(crate::policy::Cap::all().iter().copied());
+                Arc::new(denied)
+            })
+        } else {
+            match self.persist.owner_of_root(id).await {
+                Ok(Some(owner)) => self.cfg.auth.policy_for(&owner),
+                _ => self.cfg.auth.local_policy.clone(),
+            }
         };
+        let owner = self.persist.owner_of_root(id).await.ok().flatten();
+        let principal = owner.map(|owner| {
+            let user = self.cfg.auth.user(&owner);
+            Arc::new(crate::auth::Principal {
+                display_name: user
+                    .map(|u| u.name.clone())
+                    .unwrap_or_else(|| owner.clone()),
+                role: user.map(|u| u.role.clone()).unwrap_or_default(),
+                user_id: owner,
+                policy: policy.clone(),
+            })
+        });
         let mut s = self
             .runtime
             .new_store(self.clone(), caps, budget, Some(id.into()));
         s.data_mut().policy = policy;
+        s.data_mut().principal = principal;
         s
     }
 
@@ -598,12 +623,7 @@ impl Grip {
         };
 
         let budget = Budget::probe("agent list-tools", self.cfg.probe_budget);
-        let mut store = self.runtime.new_store(
-            self.clone(),
-            Caps::Agent,
-            budget,
-            Some(session_id.to_string()),
-        );
+        let mut store = self.session_store(Caps::Agent, budget, session_id).await;
 
         let result = async {
             let agent = crate::bindings::agent::Agent::instantiate_async(
@@ -864,12 +884,7 @@ impl Grip {
         let config_json = self.cfg.tool_config_json(name);
 
         let budget = Budget::new(format!("tool {name}"), self.cfg.tool_budget);
-        let mut store = self.runtime.new_store(
-            self.clone(),
-            Caps::Tool,
-            budget,
-            Some(session_id.to_string()),
-        );
+        let mut store = self.session_store(Caps::Tool, budget, session_id).await;
 
         let result = async {
             let tool = crate::bindings::tool::Tool::instantiate_async(

@@ -1,6 +1,46 @@
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
+fn read_password_from_tty() -> Result<String> {
+    use std::io::{BufRead, Write};
+    use std::os::fd::AsRawFd;
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
+    let fd = tty.as_raw_fd();
+    let mut old = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut hidden = old;
+    hidden.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &hidden) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut writer = &tty;
+    write!(writer, "Password: ")?;
+    writer.flush()?;
+    let mut password = String::new();
+    let read = std::io::BufReader::new(&tty).read_line(&mut password);
+    let restored = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &old) };
+    writeln!(writer)?;
+    read?;
+    if restored != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(password.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(not(unix))]
+fn read_password_from_tty() -> Result<String> {
+    Err(anyhow::anyhow!(
+        "hash-password needs --stdin on this platform"
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -47,7 +87,7 @@ async fn main() -> Result<()> {
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
                 s.trim_end().to_string()
             } else {
-                return Err(anyhow::anyhow!("hash-password requires --stdin"));
+                read_password_from_tty()?
             };
             println!("{}", thetis::auth::hash_password(&password)?);
             Ok(())

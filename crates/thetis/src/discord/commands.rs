@@ -189,7 +189,11 @@ pub async fn run(
 
         "new" => {
             let kv_key = format!("discord.session.{key}");
-            let owner = format!("discord:{key}");
+            let synthetic_owner = format!("discord:{key}");
+            let owner = grip
+                .cfg
+                .auth
+                .owner_for_discord(&invoker.user_id, &synthetic_owner);
             let meta = grip
                 .persist
                 .create_session(Some(format!("Discord {key}")), &cfg.mode, &owner)
@@ -199,7 +203,7 @@ pub async fn run(
         }
 
         "stop" => {
-            let session_id = session_for(grip, key).await?;
+            let session_id = session_for(grip, key, &invoker.user_id).await?;
             if grip.cancel(&session_id).await {
                 "Stopping.".to_string()
             } else {
@@ -208,7 +212,7 @@ pub async fn run(
         }
 
         "status" => {
-            let session_id = session_for(grip, key).await?;
+            let session_id = session_for(grip, key, &invoker.user_id).await?;
             let meta = grip
                 .persist
                 .get_session(&session_id)
@@ -243,7 +247,7 @@ pub async fn run(
         }
 
         "model" => {
-            let session_id = session_for(grip, key).await?;
+            let session_id = session_for(grip, key, &invoker.user_id).await?;
             if argument.is_empty() {
                 let meta = grip.persist.get_session(&session_id).await?;
                 let current = meta

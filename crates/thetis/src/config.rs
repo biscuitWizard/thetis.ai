@@ -105,12 +105,30 @@ impl AuthSettings {
     pub fn user(&self, id: &str) -> Option<&UserSpec> {
         self.users.iter().find(|u| u.id.eq_ignore_ascii_case(id))
     }
+    pub fn owner_for_discord(&self, discord_id: &str, fallback: &str) -> String {
+        self.users
+            .iter()
+            .find(|u| !u.discord_id.is_empty() && u.discord_id == discord_id)
+            .map(|u| u.id.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
     pub fn policy_for(&self, owner: &str) -> std::sync::Arc<crate::policy::EffectivePolicy> {
         self.user(owner)
             .map(|u| u.policy.clone())
             .unwrap_or_else(|| {
                 if owner.starts_with("discord:") {
-                    self.discord_policy.clone()
+                    return self.discord_policy.clone();
+                }
+                if self.users_mode {
+                    let mut fallback = self.local_policy.as_ref().clone();
+                    fallback.admin = false;
+                    fallback.read_only = true;
+                    fallback.see_all_sessions = false;
+                    fallback.denied.insert(crate::policy::Cap::Transcripts);
+                    fallback.denied.insert(crate::policy::Cap::Delegation);
+                    fallback.denied.insert(crate::policy::Cap::WorkspaceWrite);
+                    std::sync::Arc::new(fallback)
                 } else {
                     self.local_policy.clone()
                 }
@@ -2336,10 +2354,20 @@ impl Config {
             let rp = auth_roles
                 .get(&u.role)
                 .with_context(|| format!("user `{}` names missing role `{}`", u.id, u.role))?;
-            let env_hash = if u.password_env.is_empty() {
-                None
-            } else {
+            let convenience_env = format!(
+                "THETIS_USER_{}_PASSWORD_HASH",
+                u.id.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            );
+            let env_hash = if !u.password_env.is_empty() {
                 env.string(&u.password_env)
+            } else {
+                env.string(&convenience_env)
             };
             anyhow::ensure!(
                 (!u.password_hash.is_empty()) ^ env_hash.is_some(),
@@ -2385,11 +2413,28 @@ impl Config {
                 "users mode bound off loopback needs server.public_origin"
             );
         }
-        let discord_policy = file.auth.discord_role.as_str();
-        let discord_policy = auth_roles
-            .get(discord_policy)
-            .cloned()
-            .unwrap_or_else(|| local_policy.clone());
+        let discord_policy = if file.auth.discord_role.is_empty() {
+            let mut policy = (*local_policy).clone();
+            policy.admin = false;
+            policy.read_only = true;
+            policy.see_all_sessions = false;
+            policy.denied.extend([
+                crate::policy::Cap::Transcripts,
+                crate::policy::Cap::Delegation,
+                crate::policy::Cap::WorkspaceWrite,
+            ]);
+            std::sync::Arc::new(policy)
+        } else {
+            auth_roles
+                .get(&file.auth.discord_role)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "auth.discord_role names missing role `{}`",
+                        file.auth.discord_role
+                    )
+                })?
+        };
         let auth = AuthSettings {
             users_mode,
             session_ttl: Duration::from_secs(file.auth.session_ttl_hours * 3600),
@@ -2989,6 +3034,56 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFz
             cfg.models.len(),
             "switching on accounts must not quietly cost somebody their models"
         );
+    }
+
+    #[test]
+    fn users_mode_validates_accounts_and_resolves_policy() {
+        let cfg = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "alice"
+
+            [[roles]]
+            id = "admin"
+            admin = true
+            deny_capabilities = ["ssh"]
+
+            [[users]]
+            id = "alice"
+            name = "Alice"
+            role = "admin"
+            password_hash = "not-a-real-hash"
+            "#,
+        )
+        .unwrap();
+        let alice = cfg.auth.user("alice").unwrap();
+        assert_eq!(alice.name, "Alice");
+        assert!(alice.policy.admin);
+        assert!(alice.policy.denies(crate::policy::Cap::Ssh));
+    }
+
+    #[test]
+    fn users_mode_rejects_incomplete_account_configuration() {
+        let no_users = from_toml("[auth]\nmode = \"users\"\nclaim_unowned = \"admin\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(no_users.contains("no [[users]]"), "{no_users}");
+
+        let missing_role = from_toml(
+            r#"
+            [auth]
+            mode = "users"
+            claim_unowned = "alice"
+            [[users]]
+            id = "alice"
+            role = "ghost"
+            password_hash = "x"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_role.contains("role `ghost`"), "{missing_role}");
     }
 
     #[test]

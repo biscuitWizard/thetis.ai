@@ -100,6 +100,36 @@ impl Persist {
         )
     }
 
+    /// Resolves the policy for a session on the trusted gateway. Workers must
+    /// not derive this from the configuration in their rewritable checkout.
+    pub async fn session_policy(&self, id: &str) -> Result<crate::policy::EffectivePolicy> {
+        match self {
+            Persist::Remote(peer) => {
+                peer.call_as("store.session_policy", json!({"id": id}))
+                    .await
+            }
+            Persist::Local(_) => anyhow::bail!("session policy is resolved from gateway config"),
+        }
+    }
+
+    pub async fn get_user_spend(&self, user: &str) -> Result<f64> {
+        delegate!(
+            self,
+            "store.get_user_spend",
+            |s| s.get_user_spend(user),
+            json!({"user": user})
+        )
+    }
+
+    pub async fn add_user_spend(&self, user: &str, usd: f64) -> Result<f64> {
+        delegate!(
+            self,
+            "store.add_user_spend",
+            |s| s.add_user_spend(user, usd),
+            json!({"user": user, "usd": usd})
+        )
+    }
+
     pub async fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
         delegate!(
             self,
@@ -471,17 +501,19 @@ impl Persist {
 /// the arms above.
 pub async fn serve_store_call(
     store: &Store,
+    cfg: Option<&crate::config::Config>,
     method: &str,
     params: Value,
     caller_session: &str,
 ) -> Result<Value> {
     // Every arm below is a synchronous redb call, served on the gateway for a
     // worker that is waiting on a 60s RPC.
-    crate::offload::blocking(|| serve_store_call_inner(store, method, params, caller_session))
+    crate::offload::blocking(|| serve_store_call_inner(store, cfg, method, params, caller_session))
 }
 
 fn serve_store_call_inner(
     store: &Store,
+    cfg: Option<&crate::config::Config>,
     method: &str,
     params: Value,
     caller_session: &str,
@@ -519,6 +551,30 @@ fn serve_store_call_inner(
             }
         }
         anyhow::bail!("a worker may only act on its own session or one of its sub-agents")
+    }
+
+    fn own_owner<'v>(store: &Store, id: &'v str, owner: Option<&str>) -> Result<&'v str> {
+        if let Some(owner) = owner {
+            anyhow::ensure!(
+                store.owner_of_root(id)?.as_deref() == Some(owner),
+                "conversation belongs to another user"
+            );
+        }
+        Ok(id)
+    }
+
+    fn own_scope<'v>(store: &Store, scope: &'v str, owner: Option<&str>) -> Result<&'v str> {
+        let Some(owner) = owner else {
+            return Ok(scope);
+        };
+        if scope == "global" || scope == format!("user:{owner}") {
+            return Ok(scope);
+        }
+        anyhow::ensure!(
+            !scope.starts_with("user:"),
+            "user settings belong to another user"
+        );
+        own_owner(store, scope, Some(owner))
     }
 
     let caller_owner = if caller_session.is_empty() {
@@ -563,14 +619,50 @@ fn serve_store_call_inner(
             to_value(store.get_session(id)?)
         }
         "store.owner_of_root" => to_value(store.owner_of_root(get_str(&params, "id")?)?),
+        "store.session_policy" => {
+            let id = get_str(&params, "id")?;
+            let scoped = serde_json::json!({ "session": id });
+            own_session(store, &scoped, caller_session)?;
+            let owner = store
+                .owner_of_root(id)?
+                .ok_or_else(|| anyhow::anyhow!("conversation has no owner"))?;
+            let cfg = cfg.ok_or_else(|| anyhow::anyhow!("session policy needs gateway config"))?;
+            to_value(cfg.auth.policy_for(&owner).as_ref())
+        }
+        "store.get_user_spend" => {
+            let owner = caller_owner.as_deref().unwrap_or(get_str(&params, "user")?);
+            if caller_owner.is_some() {
+                anyhow::ensure!(
+                    get_str(&params, "user")? == owner,
+                    "cannot read another user's spend"
+                );
+            }
+            to_value(store.get_user_spend(owner)?)
+        }
+        "store.add_user_spend" => {
+            let owner = caller_owner.as_deref().unwrap_or(get_str(&params, "user")?);
+            if caller_owner.is_some() {
+                anyhow::ensure!(
+                    get_str(&params, "user")? == owner,
+                    "cannot write another user's spend"
+                );
+            }
+            let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
+            to_value(store.add_user_spend(owner, usd)?)
+        }
         "store.list_sessions_owned" => {
             let include = params
                 .get("include_archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            to_value(
-                store.list_sessions_owned(params.get("owner").and_then(Value::as_str), include)?,
-            )
+            let requested = params.get("owner").and_then(Value::as_str);
+            if let Some(caller) = caller_owner.as_deref() {
+                anyhow::ensure!(
+                    requested == Some(caller),
+                    "cannot list another user's sessions"
+                );
+            }
+            to_value(store.list_sessions_owned(requested, include)?)
         }
         "store.list_sessions" => {
             let include = params
@@ -580,20 +672,24 @@ fn serve_store_call_inner(
             to_value(store.list_sessions_owned(caller_owner.as_deref(), include)?)
         }
         "store.rename_session" => {
-            to_value(store.rename_session(get_str(&params, "id")?, get_str(&params, "title")?)?)
+            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
+            to_value(store.rename_session(id, get_str(&params, "title")?)?)
         }
         "store.archive_session" => {
+            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
             let archived = params
                 .get("archived")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            to_value(store.archive_session(get_str(&params, "id")?, archived)?)
+            to_value(store.archive_session(id, archived)?)
         }
         "store.set_mode" => {
-            to_value(store.set_mode(get_str(&params, "id")?, get_str(&params, "mode")?)?)
+            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
+            to_value(store.set_mode(id, get_str(&params, "mode")?)?)
         }
         "store.set_model" => {
-            to_value(store.set_model(get_str(&params, "id")?, get_str(&params, "model")?)?)
+            let id = own_owner(store, get_str(&params, "id")?, caller_owner.as_deref())?;
+            to_value(store.set_model(id, get_str(&params, "model")?)?)
         }
         "store.clear_resume_attempts" => {
             to_value(store.clear_resume_attempts(own_session(store, &params, caller_session)?)?)
@@ -609,19 +705,22 @@ fn serve_store_call_inner(
             to_value(store.set_no_resume(own_session(store, &params, caller_session)?, flag)?)
         }
         "store.kv_get" => {
-            to_value(store.kv_get(get_str(&params, "scope")?, get_str(&params, "key")?)?)
+            let scope = own_scope(store, get_str(&params, "scope")?, caller_owner.as_deref())?;
+            to_value(store.kv_get(scope, get_str(&params, "key")?)?)
         }
-        "store.kv_put" => to_value(store.kv_put(
-            get_str(&params, "scope")?,
-            get_str(&params, "key")?,
-            get_str(&params, "value")?,
-        )?),
-        "store.kv_swap" => to_value(store.kv_swap(
-            get_str(&params, "scope")?,
-            get_str(&params, "key")?,
-            get_str(&params, "expected")?,
-            get_str(&params, "value")?,
-        )?),
+        "store.kv_put" => {
+            let scope = own_scope(store, get_str(&params, "scope")?, caller_owner.as_deref())?;
+            to_value(store.kv_put(scope, get_str(&params, "key")?, get_str(&params, "value")?)?)
+        }
+        "store.kv_swap" => {
+            let scope = own_scope(store, get_str(&params, "scope")?, caller_owner.as_deref())?;
+            to_value(store.kv_swap(
+                scope,
+                get_str(&params, "key")?,
+                get_str(&params, "expected")?,
+                get_str(&params, "value")?,
+            )?)
+        }
         "store.get_spend" => {
             to_value(store.get_spend(own_session(store, &params, caller_session)?)?)
         }
@@ -770,7 +869,7 @@ mod tests {
                 }
                 // The test grip is not a session-bound worker; an empty
                 // caller skips the own-session check.
-                serve_store_call(&store, &method, params, "").await
+                serve_store_call(&store, None, &method, params, "").await
             })
         }
         fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}

@@ -151,6 +151,12 @@ body { display: flex; flex-direction: column; }
 }
 
 .quiet-link {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
   color: var(--text-faint);
   text-decoration: none;
   transition: color var(--fast) var(--ease);
