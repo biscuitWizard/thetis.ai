@@ -137,11 +137,6 @@ pub const ASSETS: &[Asset] = &[
         mime: JS,
         body: include_str!("ui/views/participants.js"),
     },
-    Asset {
-        path: "/views/admin.js",
-        mime: JS,
-        body: include_str!("ui/views/admin.js"),
-    },
     // The centre stage's tab strip: the conversation first and always, then a
     // tab per sub-agent and per open file. Owns which pane is showing, the
     // conversation's title and rename, and the file editors.

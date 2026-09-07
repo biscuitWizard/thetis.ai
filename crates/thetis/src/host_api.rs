@@ -580,18 +580,17 @@ impl session::Host for HostState {
     async fn archive_session(&mut self, session_id: String, archived: bool) -> Result<()> {
         self.budget.entered_host("archive_session");
         self.scope_ok(&session_id)?;
-        // Archiving is the owner's disposition of their own conversation, and
-        // `scope_ok` is not enough to establish that any more: it admits
-        // participants now, so inviting somebody used to hand them the power to
-        // retire the conversation out from under you. That is not a shared
-        // setting like the mode — it shuts the worker down, releases the
-        // worktree, and is the cross-surface "start over". A guest's way out is
-        // to remove themselves.
-        let me = self.principal.as_ref().map(|p| p.user_id.clone());
-        if let Some(me) = me {
-            if !self.owns(&session_id, &me).await? {
+        // Archiving is normally the owner's disposition of their own
+        // conversation. `scope_ok` is not enough to establish that any more: it
+        // admits participants now, so inviting somebody must not hand them the
+        // power to retire the conversation out from under the owner. An
+        // administrator is the deliberate exception: their blanket access also
+        // carries authority to archive any conversation they can inspect.
+        let principal = self.principal.clone();
+        if let Some(principal) = principal {
+            if !principal.is_admin() && !self.owns(&session_id, &principal.user_id).await? {
                 return Err(err(
-                    "only the owner can archive a conversation; \
+                    "only the owner or an administrator can archive a conversation; \
                      you can remove yourself from it instead",
                 ));
             }
@@ -3229,15 +3228,24 @@ mod tests {
                 .nth(1)
                 .unwrap_or_else(|| panic!("`{method}` is gone from the session impl"));
             let body = body.split("    async fn ").next().unwrap_or(body);
-            assert!(
-                body.contains("self.owns(&session_id, &me).await?"),
-                "`{method}` does not check ownership, so a participant can use \
-                 it on a conversation somebody else shared with them. \
-                 `may_access` is not enough — it admits participants by \
-                 design. Call `self.owns(&session_id, &me).await?` here, in \
-                 this file: the matching guard in the `store.*` IPC arm is \
-                 reached only from a worker, never from a browser."
-            );
+            if method == "async fn archive_session(" {
+                assert!(
+                    body.contains("principal.is_admin()")
+                        && body.contains("self.owns(&session_id, &principal.user_id).await?"),
+                    "archive must admit administrators while still requiring ordinary \
+                     participants to own the conversation"
+                );
+            } else {
+                assert!(
+                    body.contains("self.owns(&session_id, &me).await?"),
+                    "`{method}` does not check ownership, so a participant can use \
+                     it on a conversation somebody else shared with them. \
+                     `may_access` is not enough — it admits participants by \
+                     design. Call `self.owns(&session_id, &me).await?` here, in \
+                     this file: the matching guard in the `store.*` IPC arm is \
+                     reached only from a worker, never from a browser."
+                );
+            }
         }
     }
 
