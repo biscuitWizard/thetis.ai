@@ -318,21 +318,89 @@ pub struct CapturedInvocation {
 pub fn decode_captured(response: &HttpResponse, path: &str) -> Result<CapturedInvocation, String> {
     if !response.ok() { return Err(explain_status(response, path)); }
     let body = response.json()?;
-    let outcome = find_key(&body, &["InvocationSuccess", "InvocationError"])
-        .ok_or_else(|| format!("{path} returned no InvocationSuccess or InvocationError: {}", clip(&body.to_string(), 600)))?;
-    let success = outcome.0 == "InvocationSuccess";
-    let node = outcome.1;
-    let output = body.get("output").or_else(|| find_named(&body, "output"))
-        .and_then(Value::as_array).cloned().unwrap_or_default();
+
+    // Current web hosts return a bare InvocationResponse containing an
+    // InvocationSuccess/InvocationError outcome. Older deployed hosts wrap a
+    // successful captured eval/command as ReplyResult -> ClientSuccess ->
+    // EvalResult. Accept both wire shapes while preserving genuine errors.
+    let explicit = find_key(&body, &["InvocationSuccess", "InvocationError", "VerbCallSuccess", "VerbCallError"]);
+    let legacy_success = find_named(&body, "EvalResult")
+        .and_then(|node| find_named(node, "result"));
+    let legacy_error = find_key(&body, &["ClientFailure", "TaskError", "SchedulerError"]);
+
+    let (success, node) = if let Some((kind, node)) = explicit {
+        (kind == "InvocationSuccess" || kind == "VerbCallSuccess", node)
+    } else if let Some(node) = legacy_success {
+        (true, node)
+    } else if let Some((_, node)) = legacy_error {
+        (false, node)
+    } else {
+        return Err(format!(
+            "{path} returned an unrecognised captured-invocation envelope: {}",
+            clip(&body.to_string(), 1200)
+        ));
+    };
+
+    let output = find_named(&body, "output")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(decode_wire_value).collect())
+        .unwrap_or_default();
     let text = node.to_string().to_ascii_lowercase();
+    let value = if success {
+        let raw = find_named(node, "result").unwrap_or(node);
+        Some(decode_wire_value(raw))
+    } else {
+        None
+    };
     Ok(CapturedInvocation {
         success,
-        value: if success { find_named(node, "value").cloned().or_else(|| find_named(node, "result").cloned()) } else { None },
-        error: if success { None } else { Some(node.clone()) },
+        value,
+        error: if success { None } else { Some(decode_wire_value(node)) },
         output,
         timed_out: text.contains("taskabortedlimit") || text.contains("timeout") || text.contains("time limit"),
         cancelled: text.contains("cancel"),
     })
+}
+
+/// Convert mooR's tagged JSON representation of a Var into ordinary JSON.
+/// Unknown tags are retained rather than discarded so protocol additions are
+/// visible to callers instead of becoming null.
+fn decode_wire_value(value: &Value) -> Value {
+    let Some(variant) = value.get("variant").and_then(Value::as_object) else {
+        return match value {
+            Value::Array(items) => Value::Array(items.iter().map(decode_wire_value).collect()),
+            Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), decode_wire_value(v))).collect()),
+            _ => value.clone(),
+        };
+    };
+    let Some((tag, payload)) = variant.iter().next() else { return value.clone(); };
+    match tag.as_str() {
+        "VarNone" => Value::Null,
+        "VarBool" => payload.get("value").cloned().unwrap_or(Value::Bool(false)),
+        "VarInt" | "VarFloat" | "VarStr" => payload.get("value").cloned().unwrap_or(Value::Null),
+        "VarObj" => decode_wire_object(payload).unwrap_or_else(|| value.clone()),
+        "VarList" => payload.get("elements").and_then(Value::as_array)
+            .map(|a| Value::Array(a.iter().map(decode_wire_value).collect()))
+            .unwrap_or_else(|| value.clone()),
+        "VarMap" => {
+            let Some(pairs) = payload.get("pairs").and_then(Value::as_array) else { return value.clone(); };
+            let decoded: Vec<(Value, Value)> = pairs.iter().filter_map(|pair| {
+                Some((decode_wire_value(pair.get("key")?), decode_wire_value(pair.get("value")?)))
+            }).collect();
+            if decoded.iter().all(|(k, _)| k.is_string()) {
+                Value::Object(decoded.into_iter().map(|(k, v)| (k.as_str().unwrap().to_string(), v)).collect())
+            } else {
+                Value::Array(decoded.into_iter().map(|(k, v)| json!({"key": k, "value": v})).collect())
+            }
+        }
+        _ => value.clone(),
+    }
+}
+
+fn decode_wire_object(payload: &Value) -> Option<Value> {
+    let obj = find_named(payload, "ObjId")?;
+    let id = obj.get("id")?;
+    Some(Value::String(format!("#{}", id)))
 }
 
 fn find_named<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
@@ -361,6 +429,23 @@ pub fn path_segment(value: &str) -> String {
         else { out.push_str(&format!("%{b:02X}")); }
     }
     out
+}
+
+/// Normalize the human-facing object notation accepted by Thetis tools to the
+/// CURIE notation required by mooR's HTTP routes. MOO expressions still use
+/// `#123`; only REST path/query parameters need `oid:123`.
+pub fn object_path_segment(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if let Some(id) = value.strip_prefix('#') {
+        if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return Ok(path_segment(&format!("oid:{id}")));
+        }
+        return Err("invalid numeric object reference".into());
+    }
+    if value.starts_with("oid:") || value.starts_with("uuid:") || value.starts_with("sysobj:") || value.starts_with("match(\"") {
+        return Ok(path_segment(value));
+    }
+    Err("object must be #number or a mooR CURIE such as oid:36, uuid:..., or sysobj:system".into())
 }
 
 pub fn dynamic_tools(value: &Value) -> Result<Vec<Value>, String> {
