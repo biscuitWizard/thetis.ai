@@ -15,7 +15,7 @@
 
 import { $, clear, el, setHidden } from "./lib/dom.js";
 import { Connection } from "./lib/socket.js";
-import { store } from "./lib/store.js";
+import { store, denied } from "./lib/store.js";
 import { toast, popover } from "./lib/toast.js";
 import { mountBranch } from "./views/branch.js";
 import { mountComposer } from "./views/composer.js";
@@ -99,6 +99,10 @@ avatars.mountAvatars((frame) => connection.send({ id: store.current, ...frame })
 
 connection.onOpen(() => {
   connection.send({ type: "hello" });
+  // The "everyone's conversations" switch lives on the socket's principal,
+  // so a reconnect starts personal again; put it back before the sidebar
+  // draws a list that quietly lost half its rows.
+  if (store.viewAll) connection.send({ type: "list", all: true });
   if (store.current) connection.send({ type: "open", id: store.current });
   // `hello` already replies with the stored avatar, but it is asked for
   // explicitly too: another tab can have changed it while this socket was down,
@@ -153,16 +157,55 @@ function revealInlineAgent(id) {
 // short-circuits — so the drawer would keep whatever it had from before the
 // socket dropped, having missed every feed frame in between. Re-ask here.
 connection.onOpen(() => {
-  if (store.current) connection.send({ type: "terminals", id: store.current });
+  // Not for someone whose role withholds terminals: the host would answer
+  // every open with an error toast, for a drawer they cannot use.
+  if (store.current && !denied("terminal")) connection.send({ type: "terminals", id: store.current });
 });
 
+// The "everyone's conversations" switch. Host-enforced: the frame flips a
+// per-connection flag on the principal, and `list_sessions` reads it. The
+// button only appears for a role that grants `see_all_sessions`.
+$("see-all")?.addEventListener("click", () => {
+  const on = !store.viewAll;
+  if (!connection.send({ type: "list", all: on })) {
+    return toast("Not connected.", { tone: "error" });
+  }
+  applyViewAll(on);
+});
+
+function applyViewAll(on) {
+  store.set({ viewAll: on });
+  const button = $("see-all");
+  if (!button) return;
+  button.setAttribute("aria-pressed", on ? "true" : "false");
+  button.title = on ? "Showing everyone's conversations — click for just yours" : "Show everyone's conversations";
+}
+
 connection
+  /* Who this socket is for. The host sends it before anything else, so every
+   * view can ask `store.user` when it draws. Everything identity-shaped on
+   * screen follows from here: the footer, the admin link, the logout form,
+   * the see-all switch, and which rail tabs exist at all. */
   .on("user", (frame) => {
     store.set({ user: frame });
     const name = $("user-name");
-    if (name) name.textContent = frame.name || frame.id || "";
+    if (name) {
+      name.textContent = frame.local ? "" : frame.name || frame.id || "";
+      name.title = frame.local ? "" : `Signed in as ${frame.id}${frame.role ? ` (${frame.role})` : ""}`;
+    }
     setHidden($("admin-link"), !frame.admin);
-    setHidden($("logout"), frame.id === "local");
+    setHidden($("logout"), Boolean(frame.local));
+    setHidden($("see-all"), !frame.see_all);
+    applyViewAll(Boolean(frame.see_all && frame.viewing_all));
+    // A tab for something the role withholds is not offered. The host refuses
+    // the frames anyway; this is so the refusal is never the first thing seen.
+    rail.setTabHidden("workspace", frame.workspace === "none");
+    rail.setTabHidden("branch", false);
+    if (frame.read_only) {
+      document.body.classList.add("is-read-only");
+    } else {
+      document.body.classList.remove("is-read-only");
+    }
   })
 
   .on("catalog", (frame) => {
@@ -873,11 +916,17 @@ function drawTools() {
     );
   }
 
-  const policyNote = store.user?.read_only
+  // One line when the role is doing any withholding, because a tool whose
+  // capability is denied is simply absent from the list and nothing else on
+  // this tab says why.
+  const withheld = store.user?.read_only || (store.user?.denied || []).length > 0;
+  const policyNote = withheld
     ? el(
         "p",
         { class: "panel-note is-inline" },
-        "Some tools are withheld by your role."
+        store.user?.read_only
+          ? "Your role is read-only: tools that change things are withheld."
+          : "Some tools are withheld by your role."
       )
     : null;
 

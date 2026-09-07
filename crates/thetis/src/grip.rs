@@ -527,14 +527,13 @@ impl Grip {
         let owner = self.persist.owner_of_root(id).await.ok().flatten();
         let principal = owner.map(|owner| {
             let user = self.cfg.auth.user(&owner);
-            Arc::new(crate::auth::Principal {
-                display_name: user
-                    .map(|u| u.name.clone())
+            Arc::new(crate::auth::Principal::new(
+                owner.clone(),
+                user.map(|u| u.name.clone())
                     .unwrap_or_else(|| owner.clone()),
-                role: user.map(|u| u.role.clone()).unwrap_or_default(),
-                user_id: owner,
-                policy: policy.clone(),
-            })
+                user.map(|u| u.role.clone()).unwrap_or_default(),
+                policy.clone(),
+            ))
         });
         let mut s = self
             .runtime

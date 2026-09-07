@@ -56,6 +56,17 @@ export function close(byUser = false) {
   drawStrip();
 }
 
+/** Takes a tab out of the strip (or puts it back). A tab the user's role
+ *  cannot use — Files for someone denied the workspace — is not shown at
+ *  all rather than shown and refused. Closing it if it was open. */
+export function setTabHidden(id, hidden) {
+  const tab = tabs.find((t) => t.id === id);
+  if (!tab || Boolean(tab.hidden) === Boolean(hidden)) return;
+  tab.hidden = Boolean(hidden);
+  if (hidden && current === id) close(false);
+  else drawStrip();
+}
+
 /** Activates a tab by id — the tab's own `activate` does the drawing. */
 export function show(id) {
   tabs.find((t) => t.id === id)?.activate();
@@ -109,7 +120,7 @@ export function open(config) {
 function drawStrip() {
   if (!strip) return;
   clear(strip).append(
-    ...tabs.map((tab) =>
+    ...tabs.filter((tab) => !tab.hidden).map((tab) =>
       el(
         "button",
         {

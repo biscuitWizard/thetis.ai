@@ -23,11 +23,33 @@ To enable accounts:
 3. For remote access, set `server.bind` and `server.public_origin`, then put
    Thetis behind a TLS reverse proxy which preserves `Host`.
 
+Or, for the common case of one administrator to start with, run
+`scripts/enable-users-auth.sh <user-id>` — it prompts for the password, writes
+the overlay, checks the configuration loads, and tells you to restart.
+
 Thetis itself serves plain HTTP and deliberately does not trust
 `X-Forwarded-*`. Do not expose it directly to the public internet. Sessions use
 an HttpOnly, SameSite=Lax cookie with sliding expiry. Conversations and recall
 are owner-scoped. The workspace remains shared between accounts; deny its
 capabilities to roles that must not see or modify it.
+
+What signing in looks like: `/login` is host-rendered (no WebAssembly in its
+path, so it works when the gateway guest is broken), the sidebar footer shows
+the account with a **log out** link, and an expired login sends the tab back to
+`/login` rather than leaving it "reconnecting…". An account whose role sets
+`see_all_sessions = true` gets a switch beside **New chat** for everyone's
+conversations; the sidebar is personal until it is pressed. `/admin` lists the
+accounts with their live logins and cumulative spend, and can sign one out
+everywhere.
+
+To check an installation end to end, run the ignored live test against it with
+two accounts (one admin, one plain user):
+
+```sh
+THETIS_WS_URL=ws://127.0.0.1:7777/ws \
+THETIS_AUTH_ADMIN=alice:password THETIS_AUTH_USER=bob:password \
+  cargo test -p thetis --test ws_auth -- --ignored --nocapture
+```
 
 ---
 

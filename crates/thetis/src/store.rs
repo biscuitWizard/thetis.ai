@@ -428,6 +428,21 @@ impl Store {
         tx.commit()?;
         Ok(n)
     }
+    /// How many live logins each user holds right now. One read transaction;
+    /// expired rows are left for `prune_expired_logins` and not counted.
+    pub fn active_logins_by_user(&self, now: u64) -> Result<HashMap<String, usize>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LOGINS)?;
+        let mut out = HashMap::new();
+        for row in t.iter()? {
+            let (_, v) = row?;
+            let r: LoginRow = serde_json::from_slice(v.value())?;
+            if r.expires_ms > now {
+                *out.entry(r.user_id).or_insert(0) += 1;
+            }
+        }
+        Ok(out)
+    }
     pub fn prune_expired_logins(&self, now: u64) -> Result<usize> {
         let tx = self.db.begin_write()?;
         let mut n = 0;
@@ -1320,7 +1335,19 @@ mod tests {
         assert_eq!(store.get_login("token").unwrap(), Some(row.clone()));
         store.touch_login("token", 15, 30).unwrap();
         assert_eq!(store.get_login("token").unwrap().unwrap().expires_ms, 30);
-        assert_eq!(store.prune_expired_logins(31).unwrap(), 1);
+        // A second device for alice and one for bob; the count is per user
+        // and leaves out anything already expired.
+        store.put_login("token2", &LoginRow { expires_ms: 30, ..row.clone() }).unwrap();
+        store
+            .put_login("stale", &LoginRow { user_id: "bob".into(), expires_ms: 5, ..row.clone() })
+            .unwrap();
+        let counts = store.active_logins_by_user(20).unwrap();
+        assert_eq!(counts.get("alice"), Some(&2));
+        assert_eq!(counts.get("bob"), None);
+        assert_eq!(store.remove_logins_for("alice").unwrap(), 2);
+        assert!(store.get_login("token2").unwrap().is_none());
+        store.put_login("token", &LoginRow { expires_ms: 30, ..row.clone() }).unwrap();
+        assert_eq!(store.prune_expired_logins(31).unwrap(), 2, "alice's and bob's stale one");
         assert!(store.get_login("token").unwrap().is_none());
 
         assert_eq!(store.add_user_spend("alice", 1.25).unwrap(), 1.25);

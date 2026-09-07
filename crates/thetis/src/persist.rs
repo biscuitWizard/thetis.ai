@@ -875,6 +875,28 @@ mod tests {
         fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}
     }
 
+    /// The gateway side as a *session-bound* worker sees it: every call is
+    /// pinned to `caller_session`, exactly as `roles::gateway` serves a
+    /// worker's IPC.
+    struct GatewayAs(Arc<Store>, String);
+    impl Handler for GatewayAs {
+        fn handle(
+            self: Arc<Self>,
+            method: String,
+            params: Value,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> {
+            let store = self.0.clone();
+            let caller = self.1.clone();
+            Box::pin(async move {
+                if method == "hello" {
+                    return Ok(ipc::hello_response());
+                }
+                serve_store_call(&store, None, &method, params, &caller).await
+            })
+        }
+        fn handle_note(self: Arc<Self>, _name: String, _params: Value) {}
+    }
+
     struct Mute;
     impl Handler for Mute {
         fn handle(
@@ -941,6 +963,110 @@ mod tests {
 
         // Errors cross the boundary as errors.
         assert!(remote.rename_session("nope", "t").await.is_err());
+    }
+
+    /// A worker is pinned to its session's owner, and the gateway applies that
+    /// to every arm that used to be open across the whole database.
+    ///
+    /// This is the multi-user leak the gateway side exists to close: an agent
+    /// in Alice's conversation asking for the catalogue, another session, a
+    /// transcript or a search must never see Bob's. The check lives on the
+    /// gateway side of the IPC precisely so a branch running a modified kernel
+    /// cannot undo it — which is why it is asserted across the wire and not
+    /// through the local arm.
+    #[tokio::test]
+    async fn a_worker_sees_only_its_owners_conversations() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(&tmp.path().join("t.redb")).unwrap());
+
+        let alice = store
+            .create_session(Some("alice's".into()), &"agent", "alice")
+            .unwrap();
+        let bob = store
+            .create_session(Some("bob's".into()), &"agent", "bob")
+            .unwrap();
+        store
+            .append_event(&bob.id, SessionEvent::Nudge("the zebra password".into()))
+            .unwrap();
+        store
+            .append_event(&alice.id, SessionEvent::Nudge("nothing about zebras".into()))
+            .unwrap();
+
+        // A worker running Alice's conversation.
+        let (gw_stream, wk_stream) = UnixStream::pair().unwrap();
+        let (_gw_peer, gw_done) = ipc::Peer::spawn(
+            gw_stream,
+            Arc::new(GatewayAs(store.clone(), alice.id.clone())),
+        );
+        let (wk_peer, wk_done) = ipc::Peer::spawn(wk_stream, Arc::new(Mute));
+        tokio::spawn(gw_done);
+        tokio::spawn(wk_done);
+        let remote = Persist::Remote(wk_peer);
+
+        // Listing, by either name the wire knows.
+        let listed = remote.list_sessions(true).await.unwrap();
+        assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![alice.id.as_str()]);
+        let listed = remote.list_sessions_owned(None, true).await.unwrap();
+        assert_eq!(listed.len(), 1, "asking for everyone's still gets only the owner's");
+        // A worker cannot name an owner at all: the remote arm drops the
+        // argument and the gateway lists for the caller's owner, so asking
+        // for bob's gets alice's.
+        let listed = remote.list_sessions_owned(Some("bob"), true).await.unwrap();
+        assert_eq!(listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![alice.id.as_str()]);
+
+        // Fetching by id.
+        assert!(remote.get_session(&alice.id).await.unwrap().is_some());
+        assert!(remote.get_session(&bob.id).await.is_err(), "bob's is refused, not None");
+        assert_eq!(remote.owner_of_root(&alice.id).await.unwrap().as_deref(), Some("alice"));
+
+        // Recall: the catalogue, a read and a search.
+        let convs = remote.conversations(true, false, 0).await.unwrap();
+        assert!(convs.iter().any(|c| c.id == alice.id));
+        assert!(!convs.iter().any(|c| c.id == bob.id));
+        assert!(remote.read_transcript(&bob.id, 0, 0, 0).await.is_err());
+        assert!(remote.conversation_subagents(&bob.id).await.is_err());
+        let report = remote
+            .search_transcripts(&crate::transcripts::SearchQuery {
+                pattern: "zebra".into(),
+                include_archived: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.total_matches, 1, "{report:?}");
+        assert!(report.hits.iter().all(|h| h.session_id == alice.id));
+        let report = remote
+            .search_transcripts(&crate::transcripts::SearchQuery {
+                pattern: "zebra".into(),
+                session_id: bob.id.clone(),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            report.map(|r| r.total_matches == 0).unwrap_or(true),
+            "naming bob's conversation outright finds nothing in it"
+        );
+
+        // A session this worker creates (delegation) belongs to its owner,
+        // whatever owner the params claim.
+        let child = remote
+            .create_session(Some("child".into()), &"agent", "bob")
+            .await
+            .unwrap();
+        assert_eq!(store.owner_of(&child.id).unwrap().as_deref(), Some("alice"));
+
+        // Spend: only the owner's row is reachable, either way.
+        remote.add_user_spend("alice", 0.5).await.unwrap();
+        assert!(remote.add_user_spend("bob", 0.5).await.is_err());
+        assert!(remote.get_user_spend("bob").await.is_err());
+        assert_eq!(remote.get_user_spend("alice").await.unwrap(), 0.5);
+        assert_eq!(store.get_user_spend("bob").unwrap(), 0.0);
+
+        // User-scoped KV: only the owner's scope is reachable.
+        remote.kv_put("user:alice", "k", "mine").await.unwrap();
+        assert!(remote.kv_put("user:bob", "k", "theirs").await.is_err());
+        assert!(remote.kv_get("user:bob", "k").await.is_err());
+        assert_eq!(store.kv_get("user:alice", "k").unwrap().as_deref(), Some("mine"));
     }
 
     /// The transcript arms must work through the *remote* arm specifically.

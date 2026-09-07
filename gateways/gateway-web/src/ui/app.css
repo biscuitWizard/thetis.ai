@@ -150,6 +150,37 @@ body { display: flex; flex-direction: column; }
   font-size: var(--text-xs);
 }
 
+/* Name and logout read as one item: "bob · log out". */
+.foot-user {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gap-2);
+  min-width: 0;
+}
+.foot-user:empty { display: none; }
+.foot-user #user-name {
+  max-width: 11ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.foot-user #user-name:empty { display: none; }
+.foot-user form { display: inline-flex; margin: 0; }
+.foot-user #user-name:not(:empty) + form:not([hidden])::before {
+  content: "·";
+  color: var(--text-faint);
+  margin-right: var(--gap-2);
+}
+
+/* The "everyone's conversations" switch stays lit while it is on, so the
+ * sidebar's contents are never a mystery. */
+#see-all[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--accent-wash);
+  border-color: var(--accent-edge);
+}
+
 .quiet-link {
   appearance: none;
   border: 0;
@@ -160,6 +191,18 @@ body { display: flex; flex-direction: column; }
   color: var(--text-faint);
   text-decoration: none;
   transition: color var(--fast) var(--ease);
+}
+
+/* A role that can read the shared workspace but not change it: the pill says
+ * so where the write buttons would have been. */
+.ws-readonly {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  white-space: nowrap;
+  align-self: center;
 }
 
 /* --- branch view -----------------------------------------------------------

@@ -81,7 +81,23 @@ a security boundary. Deny the underlying capability for authoritative control.
 
 `spend_limit_usd` is cumulative across the user's conversations. The global
 session ceiling remains a separate limit. `see_all_sessions` is opt-in even for
-admins.
+admins, and even then the sidebar starts personal: the account gets a switch
+beside **New chat** (the browser sends `{type:"list", all:true}`, which flips a
+per-connection flag on the principal that the host's `list_sessions` reads).
+Someone without the grant can send that frame all day; it is inert.
+
+## What the browser is told
+
+The first frame on every socket is `user`, the same JSON as `GET /api/me`
+(`Principal::describe` in `auth.rs`): id, name, role, `admin`, `read_only`,
+`see_all`, `viewing_all`, `workspace` (`write` / `read` / `none`), `denied`
+(capability ids), `models_restricted`, `local`. The UI draws from it: the
+footer badge and log-out form, the admin link, the see-all switch, the Files
+tab (absent when `workspace` is `none`, read-only controls when `read`), the
+branch tab's merge/update/resolve buttons (absent under `branch_write`), and
+the terminal drawer (never requested under `terminal`). None of that is
+enforcement — the host refuses the frames regardless — it is so a withheld
+control is never offered and then refused.
 
 Set `discord_id` on a web user to bind that Discord identity to the same owner.
 Unbound Discord conversations receive synthetic `discord:*` owners and the
@@ -97,10 +113,20 @@ cargo test --manifest-path agents/agent-core/Cargo.toml
 cargo test --manifest-path gateways/gateway-web/Cargo.toml
 ```
 
-In a scratch users-mode instance, log in as two users and verify each sidebar
-and transcript recall excludes the other's conversation; opening or subscribing
-to the other's id must fail. Verify `/admin` is forbidden to a non-admin and
-`/ws` returns 401 without a cookie.
+Against a users-mode instance with two accounts (one admin, one plain), the
+ignored live test does the two-user check end to end: cookies, `/api/me`,
+`/admin` 403, `/ws` 401 without a cookie, sidebar isolation, a foreign `open`
+and `rename` answered with `error`, and logout ending the login:
+
+```sh
+THETIS_WS_URL=ws://127.0.0.1:7777/ws \
+THETIS_AUTH_ADMIN=alice:pw THETIS_AUTH_USER=bob:pw \
+  cargo test -p thetis --test ws_auth -- --ignored --nocapture
+```
+
+`/admin` shows each account's live logins, conversations and spend, with a
+"sign out everywhere" button (`Store::remove_logins_for`). Expired logins are
+pruned hourly.
 
 ## Known gaps
 

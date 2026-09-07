@@ -47,29 +47,38 @@ pub const LAST_REQUEST_KEY: &str = "__llm_request";
 const MAX_CAPTURED_REQUEST: usize = 8 * 1024 * 1024;
 
 impl HostState {
-    /// Rejects attempts to touch a session other than the one this call is for.
+    /// Rejects attempts to touch a session this call may not.
     ///
-    /// Gateway calls run unscoped (`session_id == None`) because managing every
-    /// session is their job; agent turns are pinned to a single session.
+    /// An agent or tool store is pinned to one session and may touch only
+    /// that. A gateway store is pinned to a *person*: it may touch any
+    /// session that person owns (or everything, with `see_all_sessions`) and
+    /// nothing else — the guest hands back whatever id the browser sent, so
+    /// this is where a foreign `rename`, `archive`, `submit` or `events` is
+    /// stopped. A store with neither, a probe or the renderer, is host
+    /// business and unscoped.
+    ///
+    /// One rule for every call site on purpose: the first version kept the
+    /// ownership check in a separate `may_access` and left the pre-existing
+    /// `scope_ok` callers on the old "gateway is unscoped" rule, and a user
+    /// could rename another's conversation by id.
     fn scope_ok(&self, session_id: &str) -> Result<()> {
         match &self.session_id {
             Some(mine) if mine != session_id => Err(err(format!(
                 "session {session_id} is out of scope for this call (scoped to {mine})"
             ))),
-            _ => Ok(()),
+            Some(_) => Ok(()),
+            None => match &self.principal {
+                Some(p) => crate::auth::may_access(self.grip(), p, session_id)
+                    .map_err(|e| err(e.to_string())),
+                None => Ok(()),
+            },
         }
     }
 
+    /// `scope_ok` by its ownership-flavoured name, for call sites that read
+    /// better saying what they check.
     fn may_access(&self, session_id: &str) -> Result<()> {
-        if self.session_id.is_some() {
-            return self.scope_ok(session_id);
-        }
-        match &self.principal {
-            Some(p) => {
-                crate::auth::may_access(self.grip(), p, session_id).map_err(|e| err(e.to_string()))
-            }
-            None => self.scope_ok(session_id),
-        }
+        self.scope_ok(session_id)
     }
     fn require(&self, cap: crate::policy::Cap) -> Result<()> {
         if self.policy.denies(cap) {
@@ -427,10 +436,13 @@ impl session::Host for HostState {
         // what the picker offers, not the set of ids the provider accepts, so
         // silently swapping an unlisted one for the default made a deliberate
         // choice look like it had been ignored.
-        let owned = if self.policy.see_all_sessions {
-            None
-        } else if let Some(p) = &self.principal {
-            Some(p.user_id.clone())
+        //
+        // Whose conversations: the principal's own, unless this connection has
+        // asked for everyone's and the policy lets it (`Principal::list_owner`).
+        // An agent store lists its owner's; a store with neither — a
+        // local-mode probe — lists all.
+        let owned = if let Some(p) = &self.principal {
+            p.list_owner().map(str::to_string)
         } else if let Some(id) = &self.session_id {
             self.grip().persist.owner_of_root(id).await.wt()?
         } else {
@@ -2448,6 +2460,130 @@ mod tests {
                  it genuinely must be unscoped — say why in a comment and \
                  remove it from this list."
             );
+        }
+    }
+
+    /// Every host import that can change something or reach something calls
+    /// `require` with the capability the policy table names for it. This is
+    /// the hard boundary of multi-user mode: the agent is rewritable, so a
+    /// tool it withholds is advisory, and only a refusal here is authoritative.
+    ///
+    /// Checked textually for the same reason `every_session_mutator_is_scoped`
+    /// is: the bug this guards against is a new import written without the
+    /// line, and a source check catches exactly that. The pairs mirror the
+    /// enforcement matrix in `docs/plans/multi-user.md` §3.7.
+    #[test]
+    fn every_guarded_import_requires_its_capability() {
+        let src = include_str!("host_api.rs");
+        let matrix: &[(&str, &[(&str, &str)])] = &[
+            ("impl hostfs::Host for HostState {", &[
+                ("async fn read_file(", "FilesystemRead"),
+                ("async fn read_file_range(", "FilesystemRead"),
+                ("async fn list_dir(", "FilesystemRead"),
+                ("async fn search_files(", "FilesystemRead"),
+                ("async fn find_files(", "FilesystemRead"),
+                ("async fn write_file(", "FilesystemWrite"),
+                ("async fn edit_file(", "FilesystemWrite"),
+                ("async fn delete_path(", "FilesystemDelete"),
+            ]),
+            ("impl terminal::Host for HostState {", &[
+                ("async fn open(", "Terminal"),
+                ("async fn run(", "Terminal"),
+                ("async fn read(", "Terminal"),
+                ("async fn send(", "Terminal"),
+                ("async fn signal(", "Terminal"),
+                ("async fn close(", "Terminal"),
+                ("async fn sessions(", "Terminal"),
+                ("async fn ssh_hosts(", "Ssh"),
+                ("async fn ssh_host_set(", "Ssh"),
+                ("async fn ssh_host_remove(", "Ssh"),
+                ("async fn ssh_host_rename(", "Ssh"),
+            ]),
+            ("impl control::Host for HostState {", &[("async fn restart(", "Control")]),
+            ("impl configuration::Host for HostState {", &[("async fn set(", "ConfigWrite")]),
+            ("impl devkit::Host for HostState {", &[
+                ("async fn new_tool(", "Devkit"),
+                ("async fn write_file(", "Devkit"),
+                ("async fn patch_file(", "Devkit"),
+                ("async fn add_dependency(", "Devkit"),
+                ("async fn remove_dependency(", "Devkit"),
+            ]),
+            ("impl branch::Host for HostState {", &[
+                ("async fn update_from_trunk(", "BranchWrite"),
+                ("async fn reset_to(", "BranchWrite"),
+                ("async fn complete_merge(", "BranchWrite"),
+                ("async fn abort_merge(", "BranchWrite"),
+            ]),
+            ("impl delegation::Host for HostState {", &[("async fn spawn(", "Delegation")]),
+            ("impl skills::Host for HostState {", &[
+                ("async fn upsert(", "SkillsWrite"),
+                ("async fn remove(", "SkillsWrite"),
+            ]),
+            ("impl transcripts::Host for HostState {", &[
+                ("async fn conversations(", "Transcripts"),
+                ("async fn conversation(", "Transcripts"),
+                ("async fn subagents(", "Transcripts"),
+                ("async fn read(", "Transcripts"),
+                ("async fn search(", "Transcripts"),
+            ]),
+            ("impl tooling::Host for HostState {", &[("async fn invoke(", "ComponentTools")]),
+        ];
+        for (marker, methods) in matrix {
+            let block = src
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{marker}` moved or was renamed"));
+            // Up to the next impl block, so a method of the same name on
+            // another interface cannot satisfy this.
+            let block = block.split("\nimpl ").next().unwrap_or(block);
+            for (method, cap) in *methods {
+                let body = block
+                    .split(method)
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("`{method}` is gone from `{marker}`"));
+                let body = body.split("    async fn ").next().unwrap_or(body);
+                let want = format!("self.require(crate::policy::Cap::{cap})?");
+                assert!(
+                    body.contains(&want),
+                    "`{method}` in `{marker}` does not call `{want}`, so a role that \
+                     withholds `{cap}` is not enforced there. Add it after the \
+                     budget line, or remove the row from the matrix and say why."
+                );
+            }
+        }
+
+        // The `available()` probes are what make a withheld family vanish
+        // from the agent's prompt; each must consult the policy.
+        for (marker, cap) in [
+            ("impl hostfs::Host for HostState {", "FilesystemRead"),
+            ("impl terminal::Host for HostState {", "Terminal"),
+            ("impl control::Host for HostState {", "Control"),
+            ("impl delegation::Host for HostState {", "Delegation"),
+        ] {
+            let block = src.split(marker).nth(1).unwrap();
+            let block = block.split("\nimpl ").next().unwrap_or(block);
+            let body = block.split("async fn available(").nth(1).unwrap();
+            let body = body.split("    async fn ").next().unwrap_or(body);
+            assert!(
+                body.contains(&format!("Cap::{cap}")),
+                "`available()` under `{marker}` does not consult `Cap::{cap}`"
+            );
+        }
+        let terminal = src.split("impl terminal::Host for HostState {").nth(1).unwrap();
+        let ssh = terminal.split("async fn ssh_available(").nth(1).unwrap();
+        assert!(ssh.split("    async fn ").next().unwrap().contains("Cap::Ssh"));
+
+        // Catalogues and the model gate.
+        let sys = src.split("impl sys::Host for HostState {").nth(1).unwrap();
+        let sys = sys.split("\nimpl ").next().unwrap();
+        assert!(sys.split("async fn list_models(").nth(1).unwrap().split("    async fn ").next().unwrap().contains("allows_model"));
+        assert!(sys.split("async fn list_modes(").nth(1).unwrap().split("    async fn ").next().unwrap().contains("allows_mode"));
+        let llm = src.split("impl llm::Host for HostState {").nth(1).unwrap();
+        let llm = llm.split("\nimpl ").next().unwrap();
+        for method in ["async fn chat(", "async fn stream_open("] {
+            let body = llm.split(method).nth(1).unwrap().split("    async fn ").next().unwrap();
+            assert!(body.contains("check_model("), "`{method}` does not gate the model");
+            assert!(body.contains("check_budget("), "`{method}` does not gate spend");
         }
     }
 
