@@ -64,7 +64,15 @@ pub async fn publish_bench(git: &GitCtl, staging: &std::path::Path) -> Result<Op
 
     // The series is the one file that is not simply taken from staging: its
     // previous content has to survive, or the branch stops being a history.
-    let parent = git.rev_parse(BENCH_REF).await?;
+    //
+    // Which means parenting off the *remote* head, not just the local ref. A
+    // fresh checkout has no local ref at all, so parenting off it alone built a
+    // root commit and pushed it over whatever history the remote held — and the
+    // lease then refused with "stale info", a message about the lease that says
+    // nothing about the real problem. Worse, a checkout whose local ref lagged
+    // would have silently dropped the datapoints in between. Results published
+    // from another machine are just as real as ours, so the remote is the base.
+    let parent = bench_parent(git).await?;
     let pending = files
         .iter()
         .position(|(rel, _)| rel == PENDING)
@@ -114,13 +122,15 @@ pub async fn publish_bench(git: &GitCtl, staging: &std::path::Path) -> Result<Op
 
     git.update_ref(BENCH_REF, &head).await?;
 
-    // Results are derived and regenerated wholesale, so the remote branch is
-    // ours to replace. The lease still guards against clobbering a push we
-    // never saw: a second checkout publishing results is a real conflict, and
-    // the right answer is to fetch and re-run rather than overwrite.
-    let refspec = format!("{BENCH_REMOTE_BRANCH}:{BENCH_REMOTE_BRANCH}");
+    // Because the commit above is parented on the fetched remote head, this is
+    // an ordinary fast-forward and needs no force. That is the point: a plain
+    // push cannot destroy a datapoint, whereas a force could, and the series is
+    // the whole reason this branch exists. If someone else published between
+    // our fetch and this push, git rejects it as non-fast-forward and the next
+    // publish picks up their work as its parent.
+    let refspec = format!("{BENCH_REF}:refs/heads/{BENCH_REMOTE_BRANCH}");
     let push = git
-        .run_hooked_status(&["push", "--force-with-lease", "origin", &refspec], &[])
+        .run_hooked_status(&["push", "origin", &refspec], &[])
         .await?;
     if !push.status.success() {
         let err = String::from_utf8_lossy(&push.stderr);
@@ -132,6 +142,62 @@ pub async fn publish_bench(git: &GitCtl, staging: &std::path::Path) -> Result<Op
         datapoints,
         files: count,
     }))
+}
+
+/// What the next results commit should be parented on.
+///
+/// The remote's head, when it has one, so the series accumulates across every
+/// machine that publishes rather than each one overwriting the others. Falls
+/// back to the local ref when the remote cannot be reached, so a publish
+/// without network still records locally and pushes on a later attempt, and to
+/// `None` when neither exists, which is a genuinely new branch.
+///
+/// The local ref is moved to the remote head when the remote is ahead. Without
+/// that, the ref this checkout pushes from would still be the old chain and the
+/// push would be rejected as non-fast-forward every time.
+async fn bench_parent(git: &GitCtl) -> Result<Option<String>> {
+    let fetch = git
+        .run_hooked_status(&["fetch", "origin", BENCH_REMOTE_BRANCH], &[])
+        .await?;
+    let local = git.rev_parse(BENCH_REF).await?;
+
+    if !fetch.status.success() {
+        let err = String::from_utf8_lossy(&fetch.stderr);
+        // A remote nobody has published results to yet is the ordinary state on
+        // a new repository, not a failure. Anything else — no network, no
+        // credentials — leaves us with whatever we have locally, because
+        // failing to publish results must not fail the publish itself.
+        if !crate::publish::missing_remote_branch(err.trim()) {
+            tracing::warn!(
+                error = %err.trim(),
+                "could not fetch {BENCH_REMOTE_BRANCH}; parenting results on the local ref"
+            );
+        }
+        return Ok(local);
+    }
+
+    let remote = match git
+        .rev_parse(&format!("refs/remotes/origin/{BENCH_REMOTE_BRANCH}"))
+        .await?
+    {
+        Some(head) => Some(head),
+        // A remote configured without a fetch refspec updates no tracking ref.
+        None => git.rev_parse("FETCH_HEAD").await?,
+    };
+
+    let Some(remote) = remote else {
+        return Ok(local);
+    };
+
+    // Keep whichever is further along. A local ref the remote already contains
+    // is stale; a local ref containing the remote is our own unpushed work.
+    match &local {
+        Some(local) if git.is_ancestor(&remote, local).await? => Ok(Some(local.clone())),
+        _ => {
+            git.update_ref(BENCH_REF, &remote).await?;
+            Ok(Some(remote))
+        }
+    }
 }
 
 /// Appends `line` to `previous`, keeping exactly one trailing newline and
@@ -353,6 +419,121 @@ mod tests {
 
         std::fs::create_dir_all(&missing).unwrap();
         assert!(publish_bench(&git, &missing).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_remote_series_this_checkout_has_never_seen_is_built_on() {
+        // The bug as it was actually hit. CI had published datapoints to the
+        // branch; this checkout had no local ref at all, so it built a root
+        // commit and tried to force it over them. The lease refused with
+        // "stale info" and no datapoint was ever recorded.
+        let (tmp, git, bare) = repo_with_remote().await;
+        let staging = tmp.path().join("staging");
+
+        // Somebody else's history, arriving on the remote without us.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let other = GitCtl::new(&elsewhere);
+        other
+            .run_raw(&["clone", bare.dir().to_str().unwrap(), "."])
+            .await
+            .unwrap();
+        other.run_raw(&["config", "user.name", "o"]).await.unwrap();
+        other
+            .run_raw(&["config", "user.email", "o@example.com"])
+            .await
+            .unwrap();
+        let their_staging = elsewhere.join("staging");
+        stage(&their_staging, r#"{"n":"theirs"}"#, "<svg>theirs</svg>");
+        publish_bench(&other, &their_staging).await.unwrap().unwrap();
+
+        // We have never fetched, and hold no local ref for the branch.
+        assert!(
+            git.rev_parse(BENCH_REF).await.unwrap().is_none(),
+            "precondition: this checkout knows nothing of the branch"
+        );
+
+        stage(&staging, r#"{"n":"ours"}"#, "<svg>ours</svg>");
+        let ours = publish_bench(&git, &staging).await.unwrap().unwrap();
+
+        assert_eq!(
+            ours.datapoints, 2,
+            "their datapoint must survive ours being added"
+        );
+        let series = show_blob(&bare, BENCH_REMOTE_BRANCH, SERIES)
+            .await
+            .unwrap()
+            .expect("the series is on the remote");
+        let lines: Vec<&str> = series.lines().collect();
+        assert_eq!(lines, vec![r#"{"n":"theirs"}"#, r#"{"n":"ours"}"#]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_local_ref_does_not_drop_datapoints() {
+        // The quieter half of the same bug. Here the local ref exists but lags
+        // the remote, so parenting on it would have pushed a chain missing
+        // everything published in between — and a force would have landed it.
+        let (tmp, git, bare) = repo_with_remote().await;
+        let staging = tmp.path().join("staging");
+
+        stage(&staging, r#"{"n":1}"#, "<svg/>");
+        publish_bench(&git, &staging).await.unwrap().unwrap();
+        let stale = git.rev_parse(BENCH_REF).await.unwrap().unwrap();
+
+        // Another machine adds a datapoint we do not have.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let other = GitCtl::new(&elsewhere);
+        other
+            .run_raw(&["clone", bare.dir().to_str().unwrap(), "."])
+            .await
+            .unwrap();
+        other.run_raw(&["config", "user.name", "o"]).await.unwrap();
+        other
+            .run_raw(&["config", "user.email", "o@example.com"])
+            .await
+            .unwrap();
+        let their_staging = elsewhere.join("staging");
+        stage(&their_staging, r#"{"n":2}"#, "<svg/>");
+        publish_bench(&other, &their_staging).await.unwrap().unwrap();
+
+        // Wind our ref back to before their publish, as an unfetched checkout
+        // would be, and publish a third.
+        git.update_ref(BENCH_REF, &stale).await.unwrap();
+        stage(&staging, r#"{"n":3}"#, "<svg/>");
+        let third = publish_bench(&git, &staging).await.unwrap().unwrap();
+
+        assert_eq!(third.datapoints, 3, "the middle datapoint must not vanish");
+        let series = show_blob(&bare, BENCH_REMOTE_BRANCH, SERIES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            series.lines().collect::<Vec<_>>(),
+            vec![r#"{"n":1}"#, r#"{"n":2}"#, r#"{"n":3}"#]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_remote_still_records_locally() {
+        // No network must not mean no measurement: the datapoint is committed
+        // and the push failure is what surfaces, so a later publish sends it.
+        let (tmp, git, _bare) = repo_with_remote().await;
+        let staging = tmp.path().join("staging");
+        git.run_raw(&["remote", "set-url", "origin", "/nonexistent-remote.git"])
+            .await
+            .unwrap();
+
+        stage(&staging, r#"{"n":1}"#, "<svg/>");
+        let err = publish_bench(&git, &staging).await.unwrap_err();
+        assert!(
+            err.to_string().contains("failed"),
+            "the push failure is reported: {err}"
+        );
+        assert!(
+            git.rev_parse(BENCH_REF).await.unwrap().is_some(),
+            "the datapoint is committed locally even though the push failed"
+        );
     }
 
     #[tokio::test]

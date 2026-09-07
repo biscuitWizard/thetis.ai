@@ -726,7 +726,7 @@ fn conflicted(paths: &[String]) -> String {
 }
 
 /// Whether a failed fetch means only that the remote has no such branch.
-fn missing_remote_branch(stderr: &str) -> bool {
+pub(crate) fn missing_remote_branch(stderr: &str) -> bool {
     stderr.contains("couldn't find remote ref")
 }
 
