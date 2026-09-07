@@ -298,15 +298,62 @@ interface types {
     output: string,
     timed-out: bool,
     truncated: bool,
+    /// The command's exit status, when the shell reported one. A field rather
+    /// than text in `output`, so success and failure can be told apart without
+    /// parsing prose.
+    exit-code: option<s32>,
+    /// The ssh host this ran on, empty for a local session. Never let a remote
+    /// result be mistaken for a local one.
+    host: string,
+  }
+
+  record env-var {
+    key: string,
+    value: string,
+  }
+
+  record terminal-open {
+    /// Local working directory, confined to the filesystem roots. Ignored for
+    /// a remote session, which starts where its host says.
+    cwd: option<string>,
+    /// A label of the caller's choosing, for listings.
+    name: option<string>,
+    env: list<env-var>,
+    /// The name of a registered ssh host. Absent opens a local shell.
+    host: option<string>,
   }
 
   record terminal-info {
     id: string,
+    name: string,
     cwd: string,
     shell: string,
+    /// The ssh host, empty for a local session.
+    remote: string,
     alive: bool,
     /// Commands run in this session so far.
     commands: u32,
+    /// The background command still running, empty when the session is idle.
+    busy: string,
+  }
+
+  /// Where a remote session connects. Stored outside the committed config so it
+  /// cannot be published by accident, and never carries a key's contents —
+  /// only the path to one.
+  record ssh-host-info {
+    name: string,
+    host: string,
+    /// 0 leaves the choice to ssh, which respects ~/.ssh/config.
+    port: u32,
+    user: string,
+    identity-file: string,
+    /// Complete ssh arguments, e.g. `-oStrictHostKeyChecking=accept-new`.
+    options: list<string>,
+    remote-cwd: string,
+    /// Allocate a remote terminal. Needed to interrupt a remote command, at
+    /// the cost of echoed commands and prompts in the output.
+    pty: bool,
+    description: string,
   }
 
   // --- execution ------------------------------------------------------------
@@ -591,14 +638,38 @@ interface hostfs {
 // A session keeps its working directory and shell state between commands,
 // which is what separates it from a one-shot exec.
 interface terminal {
-  use types.{terminal-output, terminal-info};
+  use types.{terminal-output, terminal-info, terminal-open, ssh-host-info};
 
   available: func() -> bool;
-  open: func(cwd: option<string>) -> result<string, string>;
-  run: func(id: string, command: string, timeout-ms: u32) -> result<terminal-output, string>;
+  open: func(spec: terminal-open) -> result<string, string>;
+  // `background` returns as soon as the command is started; the session
+  // remembers it and `read` reports when it finished.
+  run: func(
+    id: string,
+    command: string,
+    timeout-ms: u32,
+    background: bool,
+  ) -> result<terminal-output, string>;
   read: func(id: string) -> result<string, string>;
+  // Signals what the session is running, sparing the shell. Local sessions get
+  // a real signal; a remote one needs a pty, where the control byte is the
+  // signal.
+  signal: func(id: string, signal: string) -> result<string, string>;
+  // Raw input, with no marker and no wait: the way to answer a prompt or drive
+  // a REPL, which `run` cannot do because such a command never completes.
+  send: func(id: string, text: string, submit: bool) -> result<string, string>;
   close: func(id: string) -> result<string, string>;
   sessions: func() -> list<terminal-info>;
+
+  // The named-host registry, kept in a gitignored file that the config loader
+  // never reads — so it cannot be published by accident, and a bad entry
+  // cannot stop Thetis from starting.
+  ssh-available: func() -> bool;
+  ssh-hosts: func() -> result<list<ssh-host-info>, string>;
+  // `merge` keeps fields the caller left empty, for editing one at a time.
+  ssh-host-set: func(host: ssh-host-info, merge: bool) -> result<string, string>;
+  ssh-host-remove: func(name: string) -> result<string, string>;
+  ssh-host-rename: func(old-name: string, new-name: string) -> result<string, string>;
 }
 
 // Control over the orchestrator process itself.

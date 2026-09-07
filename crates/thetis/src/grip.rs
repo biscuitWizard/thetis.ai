@@ -123,9 +123,29 @@ pub struct Grip {
     /// the one that never got built — the agent's last change silently did not
     /// take effect, and nothing said so.
     rebuild_wanted: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Source fingerprints that already failed to build, per aspect.
+    ///
+    /// Without this a failing tree is retried on every file event forever:
+    /// a failure never commits and never reaches the build cache, so nothing
+    /// upstream remembers it and the next event looks brand new. One agent
+    /// stuck on a contract mismatch held a core at 100% for hours this way.
+    ///
+    /// Keyed by the aspect, holding the fingerprint of the source that failed
+    /// and why. A *different* fingerprint always builds — the point is to
+    /// refuse repeats of known-bad input, never to refuse new work.
+    build_failures: std::sync::Mutex<std::collections::HashMap<String, FailedBuild>>,
     /// Turns currently in flight. What "idle" means for a worker: a long
     /// agentic turn generates no inbound traffic, and must not read as quiet.
     turns_running: std::sync::atomic::AtomicUsize,
+}
+
+/// A build that failed, remembered so the identical source is not retried.
+#[derive(Clone)]
+pub struct FailedBuild {
+    /// Fingerprint of the source tree that failed.
+    pub fingerprint: String,
+    /// Why it failed, for the message when a retry is refused.
+    pub detail: String,
 }
 
 /// Marks a turn as running for as long as it is held.
@@ -263,6 +283,7 @@ impl Grip {
             tool_manifests: std::sync::RwLock::new(std::collections::HashMap::new()),
             building: std::sync::Mutex::new(std::collections::HashSet::new()),
             rebuild_wanted: std::sync::Mutex::new(std::collections::HashSet::new()),
+            build_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             turns_running: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
@@ -361,6 +382,40 @@ impl Grip {
             grip: self.clone(),
             aspect: aspect.key(),
         })
+    }
+
+    /// Why this exact source last failed to build, if it did.
+    ///
+    /// A fingerprint that does not match the remembered one returns `None`:
+    /// the source moved on, so it deserves a real attempt.
+    pub fn known_bad_build(&self, aspect: &Aspect, fingerprint: &str) -> Option<String> {
+        let map = self.build_failures.lock().ok()?;
+        let failed = map.get(&aspect.key())?;
+        (failed.fingerprint == fingerprint).then(|| failed.detail.clone())
+    }
+
+    /// Remembers that this source failed, so an identical retry is refused.
+    pub fn record_build_failure(&self, aspect: &Aspect, fingerprint: &str, detail: &str) {
+        if let Ok(mut map) = self.build_failures.lock() {
+            map.insert(
+                aspect.key(),
+                FailedBuild {
+                    fingerprint: fingerprint.to_string(),
+                    detail: detail.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Forgets an aspect's remembered failure, after a build succeeds.
+    ///
+    /// Also called when a build is *attempted* on new source, so a tree that
+    /// fails differently each time still reports its newest error rather than
+    /// the first one.
+    pub fn clear_build_failure(&self, aspect: &Aspect) {
+        if let Ok(mut map) = self.build_failures.lock() {
+            map.remove(&aspect.key());
+        }
     }
 
     // --- events ------------------------------------------------------------
