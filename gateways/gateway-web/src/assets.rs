@@ -89,6 +89,137 @@ pub const ASSETS: &[Asset] = &[
     Asset { path: "/vendor/mermaid.js", mime: JS, body: include_str!("ui/vendor/mermaid.js") },
 ];
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every embedded script must actually parse.
+    ///
+    /// There is no build step and no bundler, so nothing between a text editor
+    /// and the browser ever reads this JavaScript. `cargo build` compiles the
+    /// Rust that embeds it and says nothing about its contents, and the guest's
+    /// smoke test exercises the wire protocol rather than the page — so a
+    /// syntax error here ships green and bricks the entire front end at
+    /// runtime, with no error anywhere on the host.
+    ///
+    /// One did. A comment's first line gained a `*/`, closing the block early
+    /// and leaving three lines of prose as code:
+    ///
+    /// ```text
+    /// /* The websocket, with reconnect and login-expiry recovery. */
+    ///  *
+    ///  * Frames are handed to whoever registers for their `type` ...
+    ///  */
+    /// ```
+    ///
+    /// `lib/socket.js` failed to parse, so `app.js` never loaded, so nothing
+    /// ran — and the page sat on the word "connecting", which is simply the
+    /// static text in `index.html` that the script would have replaced. The
+    /// whole UI was down, from one line of a comment, and the only symptom was
+    /// a status that never changed.
+    ///
+    /// Skipped where node is absent rather than failed: this checks the
+    /// assets, and a machine without a JavaScript engine has not made them
+    /// wrong.
+    #[test]
+    fn every_embedded_script_parses() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no node on PATH to parse with");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("thetis-assets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+
+        let mut broken: Vec<String> = Vec::new();
+        for asset in ASSETS.iter().filter(|a| a.mime == JS) {
+            // Flattened, because the check only needs one file per asset and
+            // the real paths would mean creating the tree.
+            let file = dir.join(asset.path.replace('/', "_"));
+            std::fs::write(&file, asset.body).expect("writing the asset out");
+            let out = std::process::Command::new("node")
+                .arg("--check")
+                .arg(&file)
+                .output()
+                .expect("running node");
+            if !out.status.success() {
+                broken.push(format!(
+                    "{}:\n{}",
+                    asset.path,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            broken.is_empty(),
+            "embedded JavaScript that does not parse — the browser would load none of it:\n\n{}",
+            broken.join("\n\n")
+        );
+    }
+
+    /// Every module the app imports has to be in the table.
+    ///
+    /// A file missing from `ASSETS` 404s, and a 404 on an ES module stops the
+    /// whole graph loading — the same dead page, from the other direction. The
+    /// table's own doc comment warns about this; the warning is worth a test.
+    #[test]
+    fn every_imported_module_is_served() {
+        let mut missing: Vec<String> = Vec::new();
+        for asset in ASSETS.iter().filter(|a| a.mime == JS) {
+            let dir = asset.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            for spec in relative_imports(asset.body) {
+                let resolved = resolve(dir, &spec);
+                if find(&resolved).is_none() {
+                    missing.push(format!("{} imports {spec} -> {resolved}", asset.path));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "imports with nothing behind them:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    /// The `./x.js` and `../x.js` specifiers in a module, ignoring bare and
+    /// absolute ones. Deliberately crude — it only has to find the specifiers
+    /// this codebase actually writes.
+    fn relative_imports(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (idx, _) in body.match_indices("from \"") {
+            let rest = &body[idx + 6..];
+            if let Some(end) = rest.find('"') {
+                let spec = &rest[..end];
+                if spec.starts_with("./") || spec.starts_with("../") {
+                    out.push(spec.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Joins a relative specifier onto the directory of the importing module.
+    fn resolve(dir: &str, spec: &str) -> String {
+        let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+        for segment in spec.split('/') {
+            match segment {
+                "." | "" => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        format!("/{}", parts.join("/"))
+    }
+}
+
 /// Looks an asset up by request path. Linear over a table of a couple of dozen
 /// entries, which costs less than hashing the string a map would have to hash.
 /// A miss is a 404, so a new file added above is the difference between the
