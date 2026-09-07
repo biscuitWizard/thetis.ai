@@ -430,6 +430,13 @@ pub fn all() -> &'static [ToolGroup] {
             members: &[],
         },
         ToolGroup {
+            id: "moo",
+            brief: "Torchship mooR: inspect and modify the live world through its web-host API.",
+            tags: &["moo", "moor", "torchship", "object", "verb", "objdef"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
             id: "github",
             brief: "The GitHub API: reading and committing files, repos, branches, PRs.",
             // "commit" is a `branch` tag and means the local branch more often;
@@ -474,6 +481,7 @@ const PREFIX_RULES: &[(&str, &str)] = &[
     ("web-browser-", "browser"),
     ("web-", "web"),
     ("git-", "github"),
+    ("moo-", "moo"),
 ];
 
 /// Which group a hot-loaded component belongs to: its own declaration first,
@@ -993,6 +1001,13 @@ mod tests {
 
     fn group(id: &str) -> &'static ToolGroup {
         all().iter().find(|g| g.id == id).expect("group exists")
+    }
+
+    #[test]
+    fn moo_components_have_a_first_class_group() {
+        assert_eq!(component_group("moo-eval", &[]), "moo");
+        assert_eq!(component_group("anything", &["group:moo".into()]), "moo");
+        assert!(group("moo").tags.contains(&"torchship"));
     }
 
     /// The placement that the comment beside `wait` argues for, asserted so a
