@@ -232,7 +232,13 @@ its own branch of the source tree in its own process.
 `/admin` is rendered by the orchestrator in native code with no WebAssembly in
 its path. It shows trunk's history and every conversation's branch with
 stop/abort/reset controls, and it keeps working when every guest and every
-worker is broken.
+worker is broken. The same controls, plus every setting, are in the web UI's
+control panel (sidebar footer, administrators only), which the gateway guest
+reaches through the `admin` host interface; both draw on `admin.rs` and
+`settings/`, so a control exists once. Configuration writes from either the
+agent's `set_config` or the panel go to `thetis.local.toml` for secrets,
+accounts and keys already set there, and to `thetis.toml` otherwise; both files
+are validated together before anything is written.
 
 ## Recovery procedure
 

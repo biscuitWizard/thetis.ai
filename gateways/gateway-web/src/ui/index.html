@@ -87,7 +87,12 @@
           <button type="submit" class="quiet-link" title="Sign out of this account on this browser">log out</button>
         </form>
       </span>
-      <a id="admin-link" href="/admin" target="_blank" rel="noopener" class="quiet-link" hidden>admin</a>
+      <!-- The control panel, for administrators: a tab on the stage with
+           every operator control and every setting. The host-rendered /admin
+           page is linked from inside it, for when this UI is the thing that
+           is broken. -->
+      <button type="button" id="admin-link" class="quiet-link" hidden
+              title="Open the control panel: settings, accounts, models, trunk and workers">control panel</button>
       <!-- Your own face, and the way to change it. Sits beside `admin` because
            this is the footer's "who and what am I" corner, and because an
            avatar is settings rather than navigation — it must not be a row in

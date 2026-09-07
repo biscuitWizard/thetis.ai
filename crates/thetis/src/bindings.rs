@@ -85,8 +85,8 @@ pub use agent::thetis::grip::{
 #[allow(unused_imports)]
 pub use gateway::thetis::grip::skills_view;
 
-/// The operator's controls. Staged: implemented and linked for the gateway
-/// ahead of `world gateway` importing it. Once it graduates, this becomes
-/// `gateway::thetis::grip::admin` and nothing else changes.
+/// The operator's controls, for the chat surface's control panel. Gateway-only
+/// for the same reason as `skills-view`: the agent has `configuration` and
+/// `control` of its own, scoped by policy rather than by administrator.
 #[allow(unused_imports)]
-pub use staging::thetis::grip::admin;
+pub use gateway::thetis::grip::admin;

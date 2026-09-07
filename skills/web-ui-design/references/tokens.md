@@ -340,13 +340,14 @@ resolved colour strings and cannot read a custom property itself.
 |---|---|
 | `assets.rs` | The served-file table. A new `ui/` file must be added here |
 | `handlers.rs` | Guest-side frame dispatch, one function per client action; `tool_group` |
+| `admin.rs` | The `admin` frame's ops, one arm each, over the host's `admin` import; answers `admin-overview` / `admin-fields` / `admin-entries` / `admin-waits` / `admin-result` |
 | `render.rs` | Session events → wire frames, one arm per `kind` |
 | `ui/index.html` | The shell: three zones and every mount point, by id |
 | `ui/theme.css` | Tokens. The only file with literal colour |
 | `ui/app.css` | Layout and components |
 | `ui/app.js` | Wiring: frame handlers, the rail tab list, `INVALIDATED_BY`, header, actions |
 | `ui/lib/` | `dom` · `socket` · `store` · `markdown` · `toast` |
-| `ui/views/` | `rail` · `panel` · `transcript` · `composer` · `sessions` · `branch` · `workspace` · `context` · `picker` |
+| `ui/views/` | `rail` · `panel` · `transcript` · `composer` · `sessions` · `branch` · `workspace` · `context` · `picker` · `admin` (the control panel: a stage tab via `stage.openTab`, a `SECTIONS` registry, forms rendered from the host's field and column descriptions) |
 
 ### Host — `crates/thetis/src/`
 
@@ -367,7 +368,8 @@ resolved colour strings and cannot read a custom property itself.
 incident, modification, branch-op, turn-started, turn-finished) · `skills` ·
 `tools` · `branch-status` · `branch-graph` · `branch-log` · `branch-trunk-log` ·
 `branch-result` · `workspace-list` · `workspace-file` · `workspace-result` ·
-`debug-request` · `turn-cancel` · `error`.
+`debug-request` · `turn-cancel` · `admin-overview` · `admin-waits` ·
+`admin-fields` · `admin-entries` · `admin-result` · `error`.
 
 Frames with no registered handler are dropped silently, so a typo in a
 `.on("…")` name shows up as a feature that quietly never works.

@@ -1366,6 +1366,9 @@ world gateway {
   import sys;
   import session;
   import skills-view;
+  // The operator's controls. Refused per call for anyone who is not an
+  // administrator; see the interface.
+  import admin;
 
   record broadcast-frame {
     session-id: string,
@@ -1402,11 +1405,9 @@ world gateway {
 // Nothing exports from here and no guest builds it. Entries are temporary: an
 // interface graduates to the world that needs it.
 world host-staging {
-  // `admin` is staged: the host answers it before the gateway world imports
-  // it, so a running kernel is never asked for an import it lacks.
-  import admin;
-  // `delegation` and `transcripts` both graduated to `world agent` once
-  // the host was live. Leave the world here: the next contract addition needs
+  // Empty. `delegation` and `transcripts` graduated to `world agent`, and
+  // `admin` to `world gateway`, once the host was live. Leave the world here:
+  // the next contract addition needs
   // the same staging step, and rediscovering why is more expensive than
   // keeping four lines.
 }

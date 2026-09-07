@@ -124,9 +124,11 @@ THETIS_AUTH_ADMIN=alice:pw THETIS_AUTH_USER=bob:pw \
   cargo test -p thetis --test ws_auth -- --ignored --nocapture
 ```
 
-`/admin` shows each account's live logins, conversations and spend, with a
-"sign out everywhere" button (`Store::remove_logins_for`). Expired logins are
-pruned hourly.
+`/admin` and the control panel's Accounts section show each account's live
+logins, conversations and spend, with a "sign out everywhere" button
+(`Store::remove_logins_for`); the panel also adds, edits and removes
+`[[users]]` and `[[roles]]` in `thetis.local.toml`, hashing a typed password
+on the way in (`settings::save_entry`). Expired logins are pruned hourly.
 
 ## Known gaps
 
