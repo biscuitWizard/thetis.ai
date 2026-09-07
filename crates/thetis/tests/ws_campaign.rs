@@ -102,18 +102,101 @@ async fn campaign_protocol_walkthrough() {
         json!({"type":"play-state","campaign":campaign}),
     )
     .await;
-    wait_state(&mut socket, &campaign, "combat").await;
-    send(&mut socket, json!({"type":"play-combat-act","campaign":campaign,"actor":"pc","action":"attack","target":"sentinel"})).await;
-    wait_for(&mut socket, "resolved combat", |f| {
-        (f["type"] == "play-turn-done").then_some(())
+    let initial = wait_for(&mut socket, "settled player combat turn", |f| {
+        let state = &f["state"];
+        let c = &state["combat"];
+        let current = c["turn_index"]
+            .as_u64()
+            .and_then(|i| c["order"].get(i as usize));
+        (f["type"] == "play-state"
+            && f["campaign"] == campaign
+            && state["phase"] == "combat"
+            && state["busy"] == false
+            && current == Some(&json!("pc")))
+        .then(|| state.clone())
     })
     .await;
+    let actors = initial["combat"]["actors"].as_array().unwrap();
+    let pc = actors.iter().find(|a| a["id"] == "pc").unwrap()["position_m"]
+        .as_i64()
+        .unwrap();
+    let foe = actors.iter().find(|a| a["id"] == "sentinel").unwrap()["position_m"]
+        .as_i64()
+        .unwrap();
+    let direction = if foe >= pc { 1 } else { -1 };
+    let destination = if (foe - pc).abs() > 2 {
+        foe - direction * 2
+    } else {
+        pc + direction
+    };
+    send(&mut socket,json!({"type":"play-combat-act","campaign":campaign,"actor":"pc","action":"move","position_m":destination})).await;
+    wait_for(&mut socket, "resolved movement", |f| {
+        let player = f["state"]["combat"]["actors"]
+            .as_array()
+            .and_then(|a| a.iter().find(|a| a["id"] == "pc"));
+        (f["type"] == "play-state"
+            && f["campaign"] == campaign
+            && f["state"]["busy"] == false
+            && player.is_some_and(|a| a["position_m"] == destination))
+        .then_some(())
+    })
+    .await;
+    let mut attacks = 0;
+    for _ in 0..60 {
+        send(
+            &mut socket,
+            json!({"type":"play-state","campaign":campaign}),
+        )
+        .await;
+        let state = wait_for(&mut socket, "tactical state", |f| {
+            (f["type"] == "play-state" && f["campaign"] == campaign && f["state"]["busy"] == false)
+                .then(|| f["state"].clone())
+        })
+        .await;
+        if state["combat"]["outcome"] == "victory" {
+            assert_eq!(state["phase"], "narrative");
+            break;
+        }
+        assert_eq!(state["phase"], "combat");
+        let player = state["combat"]["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "pc")
+            .unwrap();
+        assert_eq!(player["position_m"], destination);
+        let event_count = state["combat"]["events"].as_array().unwrap().len();
+        let action = if state["combat"]["economy"]["action_units_spent"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+        {
+            "wait"
+        } else {
+            attacks += 1;
+            "attack"
+        };
+        send(&mut socket,json!({"type":"play-combat-act","campaign":campaign,"actor":"pc","action":action,"target":"sentinel"})).await;
+        wait_for(&mut socket, "combat action completion", |f| {
+            let local = f["type"] == "play-state"
+                && f["state"]["busy"] == false
+                && f["state"]["combat"]["events"]
+                    .as_array()
+                    .is_some_and(|e| e.len() > event_count);
+            (local || f["type"] == "play-turn-done").then_some(())
+        })
+        .await;
+    }
+    assert!(attacks > 0, "player must attack");
     send(
         &mut socket,
         json!({"type":"play-state","campaign":campaign}),
     )
     .await;
-    wait_state(&mut socket, &campaign, "narrative").await;
+    wait_for(&mut socket, "combat victory", |f| {
+        (f["type"] == "play-state" && f["state"]["combat"]["outcome"] == "victory").then_some(())
+    })
+    .await;
 
     send(
         &mut socket,

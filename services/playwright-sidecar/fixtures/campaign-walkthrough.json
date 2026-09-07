@@ -1,5 +1,47 @@
 [
   {
+    "when": "(?is)player:\\s*talk to the shopkeeper:",
+    "reply": {
+      "text": "The shopkeeper speaks.",
+      "tool_calls": [
+        {
+          "name": "rpg-scene-present",
+          "arguments": {
+            "location_id": "lantern-stair",
+            "present": [
+              "mara"
+            ],
+            "beats": [],
+            "narration": "Mara leans over the counter. \u201cSomeone came through yesterday carrying a lantern with blue glass. Try the observatory.\u201d",
+            "dialogue": [
+              {
+                "speaker_id": "mara",
+                "text": "Watch the light, not the shadows.",
+                "delivery": "quietly"
+              }
+            ],
+            "choices": [
+              {
+                "id": "supplies",
+                "label": "Browse supplies"
+              },
+              {
+                "id": "ask",
+                "label": "Ask about the lantern"
+              },
+              {
+                "id": "leave",
+                "label": "Leave the shop"
+              }
+            ],
+            "input_mode": "both",
+            "phase": "shop"
+          }
+        }
+      ]
+    }
+  },
+  {
     "when": "(?is)player:\\s*follow the lantern trail",
     "reply": {
       "text": "Rain taps against the windows of the Lantern Inn. Below the floorboards, something stirs.",
@@ -8,7 +50,9 @@
           "name": "rpg-scene-present",
           "arguments": {
             "location_id": "sealed-observatory",
-            "present": ["person2"],
+            "present": [
+              "person2"
+            ],
             "beats": [],
             "narration": "The lantern trail ends at an abandoned observatory. A quiet stranger waits beside the door.",
             "choices": [
@@ -32,7 +76,8 @@
             "transition": {
               "button": "",
               "narration": ""
-            }
+            },
+            "downtime": true
           }
         }
       ]
@@ -69,7 +114,9 @@
           "arguments": {
             "player_summary": "You reflected on what the lantern stair has taught you.",
             "gm_summary": "The player is prepared to explore.",
-            "decisions": ["Prepared for the descent"],
+            "decisions": [
+              "Prepared for the descent"
+            ],
             "time_passed": 1
           }
         },
@@ -101,7 +148,8 @@
             "transition": {
               "button": "",
               "narration": ""
-            }
+            },
+            "downtime": true
           }
         }
       ]
@@ -152,7 +200,9 @@
             "id": "faction0",
             "name": "Order 0",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
-            "goals": ["Control the old route"],
+            "goals": [
+              "Control the old route"
+            ],
             "public_description": "A local society.",
             "known_to_player": false
           }
@@ -164,7 +214,9 @@
             "id": "faction1",
             "name": "Order 1",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
-            "goals": ["Control the old route"],
+            "goals": [
+              "Control the old route"
+            ],
             "public_description": "A local society.",
             "known_to_player": false
           }
@@ -177,9 +229,15 @@
             "name": "Mara",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -194,9 +252,15 @@
             "name": "Ivo",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -211,9 +275,15 @@
             "name": "Hidden Architect",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -228,9 +298,15 @@
             "name": "Stranger 3",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -245,9 +321,15 @@
             "name": "Stranger 4",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -262,9 +344,15 @@
             "name": "Stranger 5",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -279,9 +367,15 @@
             "name": "Stranger 6",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -296,9 +390,15 @@
             "name": "Stranger 7",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "street-goon",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -317,7 +417,9 @@
               "An ally may reveal a route",
               "A rival offers a bargain"
             ],
-            "conclusions": ["The player can expose or bargain with the rival"],
+            "conclusions": [
+              "The player can expose or bargain with the rival"
+            ],
             "state": "dormant"
           }
         },
@@ -333,7 +435,9 @@
               "An ally may reveal a route",
               "A rival offers a bargain"
             ],
-            "conclusions": ["The player can expose or bargain with the rival"],
+            "conclusions": [
+              "The player can expose or bargain with the rival"
+            ],
             "state": "dormant"
           }
         },
@@ -349,7 +453,9 @@
               "An ally may reveal a route",
               "A rival offers a bargain"
             ],
-            "conclusions": ["The player can expose or bargain with the rival"],
+            "conclusions": [
+              "The player can expose or bargain with the rival"
+            ],
             "state": "dormant"
           }
         },
@@ -469,7 +575,9 @@
             "id": "faction0",
             "name": "Order 0",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
-            "goals": ["Control the old route"],
+            "goals": [
+              "Control the old route"
+            ],
             "public_description": "A local society.",
             "known_to_player": false
           }
@@ -481,7 +589,9 @@
             "id": "faction1",
             "name": "Order 1",
             "details": "SECRET_CLOCKMAKER_BETRAYAL: the order has a secret agenda.",
-            "goals": ["Control the old route"],
+            "goals": [
+              "Control the old route"
+            ],
             "public_description": "A local society.",
             "known_to_player": false
           }
@@ -494,9 +604,15 @@
             "name": "Mara",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -511,9 +627,15 @@
             "name": "Ivo",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -528,9 +650,15 @@
             "name": "Hidden Architect",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -545,9 +673,15 @@
             "name": "Stranger 3",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -562,9 +696,15 @@
             "name": "Stranger 4",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -579,9 +719,15 @@
             "name": "Stranger 5",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -596,9 +742,15 @@
             "name": "Stranger 6",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -613,9 +765,15 @@
             "name": "Stranger 7",
             "background": "Raised around the old inn and its hidden passages.",
             "personality": "Patient and observant.",
-            "motivations": ["SECRET_CLOCKMAKER_BETRAYAL"],
-            "flaws": ["Keeps dangerous promises"],
-            "quirks": ["Counts passing bells"],
+            "motivations": [
+              "SECRET_CLOCKMAKER_BETRAYAL"
+            ],
+            "flaws": [
+              "Keeps dangerous promises"
+            ],
+            "quirks": [
+              "Counts passing bells"
+            ],
             "statblock_id": "bandit",
             "notes_gm": "SECRET_CLOCKMAKER_BETRAYAL",
             "public_description": "A familiar face near the inn.",
@@ -634,7 +792,9 @@
               "An ally may reveal a route",
               "A rival offers a bargain"
             ],
-            "conclusions": ["The player can expose or bargain with the rival"],
+            "conclusions": [
+              "The player can expose or bargain with the rival"
+            ],
             "state": "dormant"
           }
         },
@@ -650,7 +810,9 @@
               "An ally may reveal a route",
               "A rival offers a bargain"
             ],
-            "conclusions": ["The player can expose or bargain with the rival"],
+            "conclusions": [
+              "The player can expose or bargain with the rival"
+            ],
             "state": "dormant"
           }
         },
@@ -666,7 +828,9 @@
               "An ally may reveal a route",
               "A rival offers a bargain"
             ],
-            "conclusions": ["The player can expose or bargain with the rival"],
+            "conclusions": [
+              "The player can expose or bargain with the rival"
+            ],
             "state": "dormant"
           }
         },
@@ -768,7 +932,9 @@
                 "affinity": 5,
                 "familiarity": 10
               },
-              "statuses": ["acquaintance"]
+              "statuses": [
+                "acquaintance"
+              ]
             }
           }
         },
@@ -787,7 +953,9 @@
                 "affinity": 3,
                 "familiarity": 5
               },
-              "statuses": ["cautious ally"]
+              "statuses": [
+                "cautious ally"
+              ]
             }
           }
         },
@@ -819,7 +987,8 @@
             "transition": {
               "button": "",
               "narration": ""
-            }
+            },
+            "downtime": true
           }
         }
       ]
@@ -856,7 +1025,7 @@
                 "initiative": 0,
                 "attack": 2,
                 "defense": 1,
-                "damage": "1d1",
+                "damage": "1d2",
                 "npc": true
               }
             ]
@@ -929,14 +1098,15 @@
             "transition": {
               "button": "",
               "narration": ""
-            }
+            },
+            "downtime": true
           }
         }
       ]
     }
   },
   {
-    "when": "(?is)System: cyberpunk-red.*Player:\\s*visit the lantern shop",
+    "when": "(?is)System: cyberpunk-red.*Player:\\s*(?:visit the lantern shop|find a nearby shop for supplies)",
     "reply": {
       "text": "Mara opens a cabinet of expedition supplies.",
       "tool_calls": [
@@ -944,7 +1114,11 @@
           "name": "rpg-shop-open",
           "arguments": {
             "vendor_id": "mara",
-            "items": ["medium-pistol", "heavy-pistol", "smg"],
+            "items": [
+              "medium-pistol",
+              "heavy-pistol",
+              "smg"
+            ],
             "multiplier": 1.0
           }
         },
@@ -983,7 +1157,7 @@
     }
   },
   {
-    "when": "(?is)player:\\s*visit the lantern shop",
+    "when": "(?is)player:\\s*(?:visit the lantern shop|find a nearby shop for supplies)",
     "reply": {
       "text": "Mara opens a cabinet of expedition supplies.",
       "tool_calls": [
@@ -991,7 +1165,11 @@
           "name": "rpg-shop-open",
           "arguments": {
             "vendor_id": "mara",
-            "items": ["dagger", "shortbow", "longsword"],
+            "items": [
+              "dagger",
+              "shortbow",
+              "longsword"
+            ],
             "multiplier": 1.0
           }
         },
@@ -1049,7 +1227,9 @@
                 "affinity": 5,
                 "familiarity": 5
               },
-              "statuses": ["acquaintance"]
+              "statuses": [
+                "acquaintance"
+              ]
             }
           }
         },
@@ -1058,7 +1238,9 @@
           "arguments": {
             "player_summary": "You traded supplies with Mara before returning to the lantern stair.",
             "gm_summary": "The player is prepared to explore.",
-            "decisions": ["Prepared for the descent"],
+            "decisions": [
+              "Prepared for the descent"
+            ],
             "time_passed": 1
           }
         },
@@ -1090,7 +1272,8 @@
             "transition": {
               "button": "",
               "narration": ""
-            }
+            },
+            "downtime": true
           }
         }
       ]
@@ -1129,7 +1312,8 @@
             "transition": {
               "button": "",
               "narration": ""
-            }
+            },
+            "downtime": true
           }
         }
       ]

@@ -403,7 +403,11 @@ reveal a fact the character cannot know, future plot possibilities, or private \
 NPC motives. Use public_description for introductions; private notes guide \
 behavior without being recited. Begin play in a concrete immediate situation \
 with subtle hooks and room to explore, not a summary of the campaign plan. \
-Present only NPCs and locations actually encountered; update known_to_player \
+Use rpg-scene-present dialogue for character speech: speaker_id is a registered \
+NPC in present, text contains spoken words, and delivery is a short audible cue. \
+Keep narration for atmosphere and action, asides for observable details, and \
+never put private thoughts in dialogue or asides. Offer downtime=true when a \
+safe interval allows rest, training or errands. Present only NPCs and locations actually encountered; update known_to_player \
 when an entity becomes known through play.
 
 Use `rpg-world-link` interactions to record meaningful changes in directed \
