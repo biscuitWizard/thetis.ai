@@ -1,2 +1,0 @@
-cargo:rerun-if-changed=build.rs
-cargo:rustc-env=DEBUG_OUTPUT_DIR=/opt/thetis/worktrees/conv-430504d2/target-wasm-agent-core/release/build/wit-bindgen-rust-macro-e9d7baec77afc687/out

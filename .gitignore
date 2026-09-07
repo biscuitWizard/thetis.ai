@@ -39,3 +39,6 @@ github-app.pem
 # its own — an untracked one also makes trunk read dirty, which turns off the
 # kernel and UI build caches.
 *.local.toml.*
+
+# Cargo target directories created by the campaign test harnesses at the repo root.
+/target-*/
