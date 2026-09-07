@@ -119,10 +119,11 @@
   --sidebar-w: 272px;
   --measure: 48rem;
   /* A turn's avatar, and the gutter beside the conversation that it lives in.
-     The gutter is reserved space to the left of the text column, so the picture
-     sits outside the conversation rather than inside the byline. It is the
-     avatar plus its breathing room, and the two move together: change one and
-     the other should follow. */
+     One gutter of this width is reserved on each side of the text column — the
+     agent's face goes in the left, yours in the right — so a picture sits
+     outside the conversation rather than inside the byline, and the column
+     stays visually centred. It is the avatar plus its breathing room, and the
+     two move together: change one and the other should follow. */
   --avatar-lg: 44px;
   --avatar-gutter: 56px;
   /* The system status bar's height. Anything that pins itself to the bottom of

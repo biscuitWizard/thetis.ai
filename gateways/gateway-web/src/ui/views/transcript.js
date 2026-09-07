@@ -166,9 +166,10 @@ function toBottom(instant) {
 /* One turn: an avatar in the gutter, a byline, then whatever the turn said.
  *
  * The avatar is a child of the row rather than of the byline, and CSS lifts it
- * out of flow into the transcript's left gutter. That is what puts it outside
- * the conversation instead of inline with the name, and it means the byline's
- * own layout is unaffected by whether a face is present.
+ * out of flow into one of the transcript's two gutters — the agent's to the
+ * left, yours to the right, which is also the side your byline aligns to. That
+ * is what puts it outside the conversation instead of inline with the name, and
+ * it means the byline's own layout is unaffected by whether a face is present.
  *
  * `role` picks the avatar as well as the colour — "user" and "assistant" are
  * the two that have a face, and any other role (a system note, a tool) gets no
