@@ -261,6 +261,27 @@ impl Terminals {
     ) -> Result<TerminalOutput> {
         Self::require_enabled(cfg)?;
 
+        // The shell is confined at `open`, but nothing stopped it walking out
+        // afterwards, and in practice that is what happened: 38% of the
+        // commands three self-modifying agents ran began `cd` into the shared
+        // trunk checkout, so "one worktree per conversation" stopped being
+        // isolation the moment a build started. Refused up front, with the
+        // reason, because the alternative is three agents in one cargo target
+        // directory finding out the hard way.
+        if let Some(escape) = escapes_the_roots(cfg, command) {
+            return Err(anyhow!(
+                "this command would leave your workspace by changing directory to {escape}. \
+                 Your own checkout is {}, and it is the only tree you should build or edit — \
+                 it is a full checkout of the project, not a fragment. Working in the shared \
+                 one collides with the other conversations doing the same thing.",
+                cfg.filesystem
+                    .roots
+                    .first()
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_else(|| cfg.root.display().to_string()),
+            ));
+        }
+
         let marker = format!(
             "__thetis_done_{}__",
             self.counter
@@ -409,6 +430,32 @@ impl Terminals {
             session.terminate().await;
         }
     }
+}
+
+/// The first `cd` target in `command` that lands outside the configured roots.
+///
+/// Deliberately a text check on the command rather than a check after the
+/// fact: by the time the shell reports its new directory the build has already
+/// run in the wrong tree. Only absolute targets are judged — a relative `cd`
+/// cannot escape a root without `..`, which `hostfs::resolve` already refuses.
+fn escapes_the_roots(cfg: &Config, command: &str) -> Option<String> {
+    for raw in command.split(|c| c == ';' || c == '&' || c == '|' || c == '\n') {
+        let mut words = raw.split_whitespace();
+        if words.next().map(str::trim) != Some("cd") {
+            continue;
+        }
+        let Some(target) = words.next() else { continue };
+        // `cd -`, `cd ~`, `cd $VAR`: not statically knowable, and none of them
+        // is the pattern this is here to stop.
+        let target = target.trim_matches(|c| c == '"' || c == '\'');
+        if !target.starts_with('/') {
+            continue;
+        }
+        if crate::hostfs::resolve(cfg, target).is_err() {
+            return Some(target.to_string());
+        }
+    }
+    None
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -661,6 +708,37 @@ mod tests {
     /// `while let Ok(Some(line))` loop treated `Err(InvalidData)` exactly like
     /// end-of-stream, so every later command in the session timed out with no
     /// output and the terminal was silently dead.
+    #[tokio::test]
+    async fn a_command_that_leaves_the_workspace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::load().unwrap();
+        cfg.terminal.enabled = true;
+        cfg.filesystem.enabled = true;
+        cfg.filesystem.roots = vec![dir.path().canonicalize().unwrap()];
+
+        let terminals = Terminals::new();
+        let id = terminals.open(&cfg, None).await.unwrap();
+        let wait = Duration::from_secs(10);
+
+        // The exact shape three agents used to reach the shared checkout.
+        let err = terminals
+            .run(&cfg, &id, "cd /usr/share && cargo build --release", wait)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("leave your workspace"), "{err}");
+        assert!(err.contains("/usr/share"), "it must name where it would have gone: {err}");
+
+        // The session survives the refusal and still works.
+        let ok = terminals.run(&cfg, &id, "echo still-usable", wait).await.unwrap();
+        assert_eq!(ok.output, "still-usable");
+
+        // Moving around *inside* the workspace is untouched.
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let moved = terminals.run(&cfg, &id, "cd sub && pwd", wait).await.unwrap();
+        assert!(moved.output.contains("sub"), "{moved:?}");
+    }
+
     #[tokio::test]
     async fn a_binary_byte_does_not_kill_the_session() {
         let dir = tempfile::tempdir().unwrap();

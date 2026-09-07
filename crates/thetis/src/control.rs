@@ -270,6 +270,122 @@ pub fn uptime() -> Duration {
     STARTED.get().map(|t| t.elapsed()).unwrap_or_default()
 }
 
+/// Whether the kernel binary in this checkout is older than the source it is
+/// built from.
+///
+/// Compared by modification time rather than anything cleverer: the question
+/// is only "has the agent edited the orchestrator since this binary was
+/// built", and a false positive costs one build that the cache mostly serves
+/// anyway.
+/// Closes the shells and asks whoever owns the process tree to bounce us.
+async fn finish_restart(grip: &Arc<Grip>, reason: String) {
+    let delay = grip.cfg.control.restart_delay;
+    tracing::warn!(reason = %reason, "restart requested; the process will replace itself shortly");
+
+    let grip = grip.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        // Shells outlive the process otherwise, and would hold their pipes open.
+        grip.terminals.close_all().await;
+
+        match &grip.role {
+            crate::grip::Role::Worker(peer) => {
+                // A worker restart touches nobody else. If this branch has
+                // built its own kernel, the gateway probes it and respawns
+                // the worker on it; otherwise the worker just comes back on
+                // the binary it was started with.
+                let built = grip.cfg.root.join("target/release/thetis");
+                let kernel = built.is_file().then(|| built.display().to_string());
+                peer.notify(
+                    "restart_worker",
+                    serde_json::json!({ "reason": reason, "kernel": kernel }),
+                )
+                .await;
+                // The gateway takes it from here: probe, cache, shutdown,
+                // respawn, resume.
+            }
+            crate::grip::Role::Gateway(_) => respawn_process(),
+        }
+    });
+}
+
+fn kernel_is_stale(cfg: &crate::config::Config) -> bool {
+    let built = kernel_binary(&cfg.root);
+    let Ok(built_at) = std::fs::metadata(&built).and_then(|m| m.modified()) else {
+        return true; // never built here
+    };
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    let mut stack = vec![cfg.root.join("crates"), cfg.root.join("wit")];
+    for f in ["Cargo.toml", "Cargo.lock"] {
+        if let Ok(m) = std::fs::metadata(cfg.root.join(f)).and_then(|m| m.modified()) {
+            newest = newest.max(m);
+        }
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if let Ok(m) = entry.metadata().and_then(|m| m.modified()) {
+                newest = newest.max(m);
+            }
+        }
+    }
+    newest > built_at
+}
+
+/// Builds this checkout's kernel, then restarts onto it.
+///
+/// Spawned, because a release build takes minutes while the call that asked
+/// for it must return in seconds — so the verdict arrives in the session log
+/// instead of as a return value. A build that fails does *not* restart: the
+/// conversation keeps the process it has and reads the compiler error.
+fn build_then_restart(grip: Arc<Grip>, reason: String, session_id: String) {
+    tokio::spawn(async move {
+        let note = |text: String| {
+            let grip = grip.clone();
+            let session = session_id.clone();
+            async move {
+                let _ = grip
+                    .append_event(&session, crate::bindings::types::SessionEvent::Incident(text))
+                    .await;
+            }
+        };
+
+        tracing::info!(session = %session_id, "building this branch's kernel before restarting");
+        match build_kernel(&grip.cfg).await {
+            Ok(path) => {
+                if let Err(e) = probe_kernel(&path).await {
+                    note(format!(
+                        "The orchestrator built, but the new binary would not start, so nothing \
+                         was restarted and you are still on the previous one: {e:#}"
+                    ))
+                    .await;
+                    return;
+                }
+                note(
+                    "The orchestrator rebuilt from your changes and passed its startup probe. \
+                     Restarting onto it now."
+                        .to_string(),
+                )
+                .await;
+                finish_restart(&grip, reason).await;
+            }
+            Err(e) => {
+                note(format!(
+                    "The orchestrator did not build, so nothing was restarted and you are still \
+                     on the previous one. Fix this and ask again:\n\n{e:#}"
+                ))
+                .await;
+            }
+        }
+    });
+}
+
 /// Schedules a restart and returns immediately.
 ///
 /// The delay matters: the call has to return so the turn can finish and the
@@ -317,38 +433,39 @@ pub async fn request_restart(
         if let Err(e) = grip.persist.set_no_resume(session, !resume).await {
             tracing::warn!(error = %e, "could not record the resume preference");
         }
+        if resume {
+            // This interruption is ours, so it must not be charged against the
+            // turn's resume budget. Adopting a kernel you just built means
+            // restarting mid-turn, and an agent doing that twice would
+            // otherwise have its turn abandoned for working as intended.
+            if let Err(e) = grip.persist.expect_restart(session).await {
+                tracing::warn!(error = %e, "could not record the expected restart");
+            }
+        }
     }
 
     let reason = reason.trim().to_string();
-    let delay = cfg.control.restart_delay;
-    tracing::warn!(reason = %reason, "restart requested; the process will replace itself shortly");
 
-    let grip = grip.clone();
-    let note_reason = reason.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        // Shells outlive the process otherwise, and would hold their pipes open.
-        grip.terminals.close_all().await;
-
-        match &grip.role {
-            crate::grip::Role::Worker(peer) => {
-                // A worker restart touches nobody else. If this branch has
-                // built its own kernel, the gateway probes it and respawns
-                // the worker on it; otherwise the worker just comes back on
-                // the binary it was started with.
-                let built = grip.cfg.root.join("target/release/thetis");
-                let kernel = built.is_file().then(|| built.display().to_string());
-                peer.notify(
-                    "restart_worker",
-                    serde_json::json!({ "reason": note_reason, "kernel": kernel }),
-                )
-                .await;
-                // The gateway takes it from here: probe, cache, shutdown,
-                // respawn, resume.
-            }
-            crate::grip::Role::Gateway(_) => respawn_process(),
+    // The orchestrator's own source is the one thing the dev-kit cannot
+    // rebuild, so an agent that edited `crates/` had no supported way to run
+    // its change: it shelled out to cargo, hit the tool timeout, backgrounded
+    // the build with `setsid` and polled a log file — which is where orphaned
+    // builds came from. Restarting *is* the moment that build is needed, so
+    // this is where it belongs.
+    if let (Some(session), true) = (session_id, kernel_is_stale(cfg)) {
+        if matches!(grip.role, crate::grip::Role::Worker(_)) {
+            build_then_restart(grip.clone(), reason.clone(), session.to_string());
+            return Ok(format!(
+                "you have changed the orchestrator's own source, so it is being rebuilt before \
+                 anything restarts: {reason}. This takes a few minutes and does not block you — \
+                 the result arrives in this conversation, and a build that fails restarts \
+                 nothing."
+            ));
         }
-    });
+    }
+
+    let delay = cfg.control.restart_delay;
+    finish_restart(grip, reason.clone()).await;
 
     Ok(format!(
         "restarting in {:.1}s: {reason}. {}",
