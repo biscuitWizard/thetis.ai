@@ -125,8 +125,8 @@ fn all_builtins() -> Vec<ToolDef> {
         tools.extend(terminal_tools());
         tools.extend(git_tools());
     }
-    // Classification must cover it either way: whether `ssh_host` is offered
-    // depends on config, but it is mutating in every configuration.
+    // Classification must cover them either way: whether the ssh_host_* tools
+    // are offered depends on config, but each one's mutating flag does not.
     if !(terminal_available() && terminal::ssh_available()) {
         tools.extend(ssh_host_tools());
     }
@@ -609,7 +609,7 @@ fn terminal_tools() -> Vec<ToolDef> {
                 "Open a shell session and return its id. Reuse the id for related commands so \
                  the working directory and environment carry over. Pass `host` to open the \
                  session on a remote machine over ssh, naming a host you registered with \
-                 `ssh_host`.\n\nThe terminal is for running programs — builds, tests, git, \
+                 `ssh_host_set`.\n\nThe terminal is for running programs — builds, tests, git, \
                  package managers, processes, anything whose output you need. It is not the way \
                  to look at or change files: `search_files`, `find_files`, `read_path` and \
                  `edit_path` do that far more cheaply and reliably than grep, sed and heredocs, \
@@ -624,7 +624,7 @@ fn terminal_tools() -> Vec<ToolDef> {
                     "host": string_prop(
                         "Name of a registered ssh host, to open the session on that machine \
                          instead of this one. Omit for a local shell. List the names with \
-                         `ssh_host action=list`.",
+                         `ssh_host_list`.",
                     ),
                     "name": string_prop(
                         "A label for this session, so listings read as something better than \
@@ -796,68 +796,115 @@ fn git_tools() -> Vec<ToolDef> {
     }]
 }
 
-/// The named-host registry, offered only when remote sessions are actually
-/// possible — a tool for managing hosts nothing can connect to is noise.
+/// The named-host registry, split one tool per operation, offered only when
+/// remote sessions are actually
+/// possible — tools for managing hosts nothing can connect to are noise.
 ///
 /// Connection details live here once and are referred to by name, so a session
 /// is opened with `host: "build-box"` rather than a line of ssh arguments.
+///
+/// One tool per operation rather than one tool with an `action` enum: the two
+/// readers can then be offered in a read-only mode, which a single mutating
+/// mega-tool could not be, each schema requires exactly the fields its own
+/// operation needs, and a mistyped action becomes an unknown tool name instead
+/// of a runtime error.
 fn ssh_host_tools() -> Vec<ToolDef> {
-    vec![ToolDef {
-        name: "ssh_host",
-        description:
-            "Manage the named ssh hosts that `terminal_open` can open a session on. Add, edit, \
-             rename, remove and list them.\n\nA name here is all `terminal_open` needs, so \
-             connection details are stated once. They are kept in a gitignored file that the \
-             config loader never reads: it cannot be published by accident, it never appears in \
-             `list_config`, and a bad entry cannot stop Thetis from starting. Only the *path* to \
-             a private key is stored, never a key or a password — ssh runs with BatchMode on and \
-             will not prompt, so a host must authenticate by key.",
-        mutating: true,
-        parameters: obj(
-            json!({
-                "action": {
-                    "type": "string",
-                    "description": "What to do. `set` adds a host or edits one, keeping any \
-                                    field you leave out.",
-                    "enum": ["list", "get", "set", "remove", "rename"],
-                },
-                "name": string_prop(
-                    "The host's name, for every action except list. Letters, digits, '-', '_' \
-                     and '.'.",
-                ),
-                "host": string_prop("Hostname or address. Required when first adding."),
-                "port": {
-                    "type": "integer",
-                    "description": "Port. Omit to let ssh decide, which respects ~/.ssh/config.",
-                },
-                "user": string_prop("Login user. Omit to let ssh decide."),
-                "identity_file": string_prop(
-                    "Path to the private key to authenticate with. Omit for ssh's own key \
-                     discovery.",
-                ),
-                "options": {
-                    "type": "array",
-                    "description": "Extra ssh arguments, each complete, e.g. \
-                                    \"-oStrictHostKeyChecking=accept-new\".",
-                    "items": { "type": "string" },
-                },
-                "remote_cwd": string_prop(
-                    "Directory to enter on connecting. A session refuses to start if it does \
-                     not exist, rather than landing in the login directory.",
-                ),
-                "pty": {
-                    "type": "boolean",
-                    "description": "Allocate a remote terminal. Needed for `terminal_signal` to \
-                                    reach that host, and for anything that demands a tty such \
-                                    as sudo. Costs echoed commands and prompts mixed into \
-                                    output, so leave it off unless you need it.",
-                },
-                "description": string_prop("A note to yourself about what this host is."),
-                "to": string_prop("The new name, for rename."),
-            }),
-            &["action"],
-        ),
-    }]
+    vec![
+        ToolDef {
+            name: "ssh_host_list",
+            description:
+                "List the named ssh hosts `terminal_open` can open a session on, with each \
+                 one's connection details. Start here when you need a host name.",
+            mutating: false,
+            parameters: obj(json!({}), &[]),
+        },
+        ToolDef {
+            name: "ssh_host_get",
+            description:
+                "Show one registered ssh host's connection details. Use `ssh_host_list` when \
+                 you do not know the name.",
+            mutating: false,
+            parameters: obj(
+                json!({ "name": string_prop("The host's name.") }),
+                &["name"],
+            ),
+        },
+        ToolDef {
+            name: "ssh_host_set",
+            description:
+                "Register a new ssh host for `terminal_open`, or edit one that exists. Fields \
+                 you leave out keep their current value, so this is how to change just the port \
+                 or just the pty setting.\n\nA name here is all `terminal_open` needs, so \
+                 connection details are stated once. Hosts live in a gitignored file the config \
+                 loader never reads: it cannot be published by accident, it never appears in \
+                 `list_config`, and a bad entry cannot stop Thetis from starting. Only the \
+                 *path* to a private key is stored, never a key or a password — ssh runs with \
+                 BatchMode on and will not prompt, so a host must authenticate by key.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "name": string_prop(
+                        "The host's name, as `terminal_open` will refer to it. Letters, digits, \
+                         '-', '_' and '.'.",
+                    ),
+                    "host": string_prop("Hostname or address. Required when first adding."),
+                    "port": {
+                        "type": "integer",
+                        "description": "Port. Omit to let ssh decide, which respects ~/.ssh/config.",
+                    },
+                    "user": string_prop("Login user. Omit to let ssh decide."),
+                    "identity_file": string_prop(
+                        "Path to the private key to authenticate with. Omit for ssh's own key \
+                         discovery.",
+                    ),
+                    "options": {
+                        "type": "array",
+                        "description": "Extra ssh arguments, each complete, e.g. \
+                                        \"-oStrictHostKeyChecking=accept-new\".",
+                        "items": { "type": "string" },
+                    },
+                    "remote_cwd": string_prop(
+                        "Directory to enter on connecting. A session refuses to start if it does \
+                         not exist, rather than landing in the login directory.",
+                    ),
+                    "pty": {
+                        "type": "boolean",
+                        "description": "Allocate a remote terminal. Needed for `terminal_signal` \
+                                        to reach that host, and for anything that demands a tty \
+                                        such as sudo. Costs echoed commands and prompts mixed \
+                                        into output, so leave it off unless you need it.",
+                    },
+                    "description": string_prop("A note to yourself about what this host is."),
+                }),
+                &["name"],
+            ),
+        },
+        ToolDef {
+            name: "ssh_host_remove",
+            description:
+                "Delete a registered ssh host. Sessions already open on it keep running; \
+                 nothing new can be opened by that name afterwards.",
+            mutating: true,
+            parameters: obj(
+                json!({ "name": string_prop("The host's name.") }),
+                &["name"],
+            ),
+        },
+        ToolDef {
+            name: "ssh_host_rename",
+            description:
+                "Rename a registered ssh host, keeping its connection details. The old name \
+                 stops working, so update anything that refers to it.",
+            mutating: true,
+            parameters: obj(
+                json!({
+                    "name": string_prop("The host's current name."),
+                    "to": string_prop("The new name. Letters, digits, '-', '_' and '.'."),
+                }),
+                &["name", "to"],
+            ),
+        },
+    ]
 }
 
 /// Tools that edit the running system. Every mutating one rebuilds immediately
@@ -1403,75 +1450,66 @@ pub fn invoke(
                 .join("\n"))
         }
 
-        "ssh_host" => {
-            let action = req_str(&args, "action")?;
-            match action.as_str() {
-                "list" => {
-                    let hosts = terminal::ssh_hosts()?;
+        "ssh_host_list" => {
+            let hosts = terminal::ssh_hosts()?;
+            if hosts.is_empty() {
+                return Ok("no ssh hosts defined. Add one with ssh_host_set, giving at least \
+                           name and host."
+                    .to_string());
+            }
+            Ok(hosts
+                .iter()
+                .map(format_ssh_host)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "ssh_host_get" => {
+            let name = req_str(&args, "name")?;
+            let hosts = terminal::ssh_hosts()?;
+            match hosts.iter().find(|h| h.name == name) {
+                Some(host) => Ok(format_ssh_host(host)),
+                None => Err(format!(
+                    "no ssh host named {name:?}. Defined: {}",
                     if hosts.is_empty() {
-                        return Ok("no ssh hosts defined. Add one with ssh_host action=set, \
-                                   giving at least name and host."
-                            .to_string());
+                        "none".to_string()
+                    } else {
+                        hosts
+                            .iter()
+                            .map(|h| h.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
-                    Ok(hosts
-                        .iter()
-                        .map(format_ssh_host)
-                        .collect::<Vec<_>>()
-                        .join("\n"))
-                }
-                "get" => {
-                    let name = req_str(&args, "name")?;
-                    let hosts = terminal::ssh_hosts()?;
-                    match hosts.iter().find(|h| h.name == name) {
-                        Some(host) => Ok(format_ssh_host(host)),
-                        None => Err(format!(
-                            "no ssh host named {name:?}. Defined: {}",
-                            if hosts.is_empty() {
-                                "none".to_string()
-                            } else {
-                                hosts
-                                    .iter()
-                                    .map(|h| h.name.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            }
-                        )),
-                    }
-                }
-                "set" => terminal::ssh_host_set(
-                    &SshHostInfo {
-                        name: req_str(&args, "name")?,
-                        host: opt_str(&args, "host"),
-                        port: args.get("port").and_then(Value::as_u64).unwrap_or(0) as u32,
-                        user: opt_str(&args, "user"),
-                        identity_file: opt_str(&args, "identity_file"),
-                        options: args
-                            .get("options")
-                            .and_then(Value::as_array)
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_string)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        remote_cwd: opt_str(&args, "remote_cwd"),
-                        pty: args.get("pty").and_then(Value::as_bool).unwrap_or(false),
-                        description: opt_str(&args, "description"),
-                    },
-                    // Always a merge: editing one field of a host should not
-                    // silently clear the rest, and there is no plausible reason
-                    // to want that.
-                    true,
-                ),
-                "remove" => terminal::ssh_host_remove(&req_str(&args, "name")?),
-                "rename" => {
-                    terminal::ssh_host_rename(&req_str(&args, "name")?, &req_str(&args, "to")?)
-                }
-                other => Err(format!(
-                    "unknown action {other:?}; use list, get, set, remove or rename"
                 )),
             }
+        }
+        "ssh_host_set" => terminal::ssh_host_set(
+            &SshHostInfo {
+                name: req_str(&args, "name")?,
+                host: opt_str(&args, "host"),
+                port: args.get("port").and_then(Value::as_u64).unwrap_or(0) as u32,
+                user: opt_str(&args, "user"),
+                identity_file: opt_str(&args, "identity_file"),
+                options: args
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                remote_cwd: opt_str(&args, "remote_cwd"),
+                pty: args.get("pty").and_then(Value::as_bool).unwrap_or(false),
+                description: opt_str(&args, "description"),
+            },
+            // Always a merge: editing one field of a host should not silently
+            // clear the rest, and there is no plausible reason to want that.
+            true,
+        ),
+        "ssh_host_remove" => terminal::ssh_host_remove(&req_str(&args, "name")?),
+        "ssh_host_rename" => {
+            terminal::ssh_host_rename(&req_str(&args, "name")?, &req_str(&args, "to")?)
         }
 
         "list_config" => {
