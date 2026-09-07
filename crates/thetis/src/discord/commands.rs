@@ -85,15 +85,47 @@ const SPECS: &[Spec] = &[
 
 /// The payload for a bulk overwrite of the application's global commands.
 ///
-/// `integration_types` and `contexts` are deliberately omitted so each command
-/// inherits whatever installation contexts the application is configured for.
-/// Naming them looks more precise and is worse: asking for the user-install
-/// context on an app that only has guild install makes Discord answer "Unknown
-/// integration", and the registration fails wholesale. The default already
-/// covers what this connector handles — guild channels and DMs with the bot.
+/// Both context fields are named explicitly, and that is load-bearing.
+///
+/// Omitting them is the obvious-looking choice — the documentation says each
+/// command then inherits the application's configured contexts, and `contexts`
+/// is documented to default to every interaction context. Discord does not
+/// behave that way. A bulk overwrite that leaves them out stores
+/// `contexts: null`, which is not "all contexts": the command lands in a limbo
+/// state where the client's picker never offers it. Nothing is rejected, the
+/// PUT answers 200 with all eight commands echoed back, and the connector logs
+/// a successful registration — but no `INTERACTION_CREATE` ever arrives,
+/// because the client never lets the invocation be sent. That is exactly what
+/// "the slash commands do not work" looks like from a guild, and it is
+/// indistinguishable from a propagation delay until the stored objects are read
+/// back. Discord acknowledges the mismatch as a bug in their own tracker
+/// (discord-api-docs #7108, #6744, #7396), fixed only for commands created
+/// after the fix and never backfilled, so anything registered before it stays
+/// broken until a write names the fields.
+///
+/// - `integration_types: [GUILD_INSTALL]` — guild install only. User install
+///   (`1`) would make this agent invocable in any DM or server the *installing
+///   user* can reach, including ones the operator has no part in. The connector
+///   authorizes by user id, so that is not an authentication hole, but it is a
+///   surface with no reason to exist.
+/// - `contexts: [GUILD, BOT_DM]` — the two places this connector actually
+///   answers. `PRIVATE_CHANNEL` (`2`) is omitted because it is only meaningful
+///   for a user-installed command, which this is not.
+///
+/// The earlier warning that naming these fields risks an "Unknown integration"
+/// failure was the wrong lesson from a real failure: that happens when a
+/// command asks for an installation context the *application* does not have
+/// enabled. Asking only for guild install, which every application supports,
+/// cannot hit it. Verified live: the PUT answers 200 and Discord echoes
+/// `contexts: [0, 1]` and `integration_types: [0]` on all eight commands.
 pub fn schema() -> Value {
     const CHAT_INPUT: u64 = 1;
     const STRING_OPTION: u64 = 3;
+    /// Installation context: the app was installed to a server.
+    const GUILD_INSTALL: u64 = 0;
+    /// Interaction contexts: a guild channel, and a DM with the bot itself.
+    const CONTEXT_GUILD: u64 = 0;
+    const CONTEXT_BOT_DM: u64 = 1;
     Value::Array(
         SPECS
             .iter()
@@ -102,6 +134,8 @@ pub fn schema() -> Value {
                     "name": spec.name,
                     "type": CHAT_INPUT,
                     "description": spec.description,
+                    "integration_types": [GUILD_INSTALL],
+                    "contexts": [CONTEXT_GUILD, CONTEXT_BOT_DM],
                 });
                 if let Some((name, description)) = spec.argument {
                     command["options"] = json!([{
@@ -308,10 +342,56 @@ mod tests {
                 "the description of {name} is the wrong length"
             );
             assert_eq!(command["type"], 1);
-            // Installation contexts are left to the application's own
-            // configuration; naming them can fail the whole registration.
-            assert!(command.get("integration_types").is_none());
-            assert!(command.get("contexts").is_none());
+        }
+    }
+
+    #[test]
+    fn every_command_names_its_contexts_explicitly() {
+        // The bug this pins down: omitting these fields makes Discord store
+        // `contexts: null`, which is not the documented "all contexts" default.
+        // The registration still answers 200, so the connector logs success
+        // while the client's picker silently refuses to offer the command and
+        // no INTERACTION_CREATE is ever sent. Leaving them out is what made
+        // every slash command dead on a guild.
+        for command in schema().as_array().expect("an array of commands") {
+            let name = command["name"].as_str().unwrap();
+            assert_eq!(
+                command["contexts"],
+                json!([0, 1]),
+                "/{name} must name GUILD and BOT_DM, or its picker entry never appears"
+            );
+            assert_eq!(
+                command["integration_types"],
+                json!([0]),
+                "/{name} must be guild-install only; user install would let this \
+                 agent be invoked anywhere the installing user can reach"
+            );
+        }
+    }
+
+    #[test]
+    fn no_command_asks_for_the_user_install_context() {
+        // Guarding the direction of the fix, not just its presence. Widening to
+        // [0, 1] would "work" and would quietly add a surface: a user-installed
+        // command travels with the person, into servers and DMs the operator
+        // never approved.
+        for command in schema().as_array().unwrap() {
+            let types = command["integration_types"].as_array().unwrap();
+            assert!(
+                !types.contains(&json!(1)),
+                "/{} must not be user-installable",
+                command["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn the_private_channel_context_is_not_requested() {
+        // PRIVATE_CHANNEL (2) is only meaningful for a user-installed command.
+        // Asking for it on a guild-install-only command is incoherent.
+        for command in schema().as_array().unwrap() {
+            let contexts = command["contexts"].as_array().unwrap();
+            assert!(!contexts.contains(&json!(2)));
         }
     }
 

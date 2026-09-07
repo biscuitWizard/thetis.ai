@@ -70,10 +70,35 @@ stale entry in the picker. Details that matter:
   picker. Say the propagation delay out loud — otherwise it reads as a bug.
 - **Register once per process, not per reconnect.** A reconnect does not clear
   commands, and the endpoint is globally rate-limited.
-- **Do not name `integration_types` or `contexts`.** Omitted, each command
-  inherits the application's configured installation contexts. Asking for the
-  user-install context on an app that only has guild install makes Discord
-  answer "Unknown integration" and fails the whole registration.
+- **Always name `integration_types` and `contexts`.** This is the opposite of
+  what this file said until a `/help` that had never worked was traced to it,
+  and it is the whole reason slash commands can be registered yet unusable.
+  Omitting them does *not* inherit the application's contexts: Discord stores
+  `contexts: null`, which is not the documented "all contexts" default but a
+  limbo state the client's picker never offers. The registration returns 200,
+  `GET /applications/{app}/commands` lists all of them, the journal logs a
+  cheerful count — and typing `/` in a guild shows nothing, so no
+  `INTERACTION_CREATE` is ever sent and no error appears anywhere. Discord's own
+  tracker carries this as discord-api-docs #7108, #6744 and #7396; the fixes
+  applied to newly created commands and never backfilled existing ones.
+  Send `"integration_types": [0]` (guild install) and `"contexts": [0, 1]`
+  (guild, bot DM). Verified live: Discord echoes both fields back on all eight.
+  - **`[0]`, not `[0, 1]`, for `integration_types`** — deliberately. User
+    install would let this privileged agent be invoked in any server or DM the
+    installing user can reach, outside the channel authorization in `policy.rs`.
+  - **Context 2 (private channel) is not requested,** for the same reason, and a
+    test pins that.
+  - The "Unknown integration" failure that motivated the old advice happens only
+    when a command asks for an installation context the *application* does not
+    have enabled. Guild install is always available, so naming `[0]` is safe.
+  - **The guild-scoped endpoint stores `contexts: null` no matter what you
+    send.** Proven live against both guilds. It is moot under the global-only
+    design, but do not use guild scope to work around a contexts problem.
+  - **A 200 is not evidence of success here.** `api::register_commands`
+    therefore inspects the response, warns naming any command that came back
+    without contexts, and returns only the count of *usable* ones, so an
+    all-limbo registration logs an error instead of "registered 8 commands".
+    `commands_without_contexts` is pure and unit-tested on that exact shape.
 - **The bot needs the `applications.commands` OAuth scope** in its invite URL. It
   comes free with the `bot` scope, so an ordinary invite already has it, but a
   bot invited with a hand-built URL may not.
@@ -305,9 +330,19 @@ curl -X POST -H 'Content-Type: application/json' -d '{"type":4,"data":{}}' \
 `401` on the first proves the path is right and only the credential is wrong.
 `404 Unknown interaction` rather than `401` on the second is the evidence that
 the callback wants no Authorization header. `cargo test -p thetis --test
-discord_schema -- --nocapture` prints the exact registration payload. Everything past authentication — streaming edit cadence, `/pair`
-round trip, threads — is unproven until a real token exists. Say so rather than
-implying it works.
+discord_schema -- --nocapture` prints the exact registration payload.
+
+But do not stop there and call the rest unverifiable: **the token is on this
+box**, so what the command set actually looks like to Discord is one call away.
+See `discord-connector/live-probing`. The check that matters after touching
+`schema()` is `GET /applications/{app}/commands` with the real token, reading
+`contexts` and `integration_types` off every entry — that is the only thing that
+distinguishes a registration Discord accepted from one a user can invoke, and it
+is what the 200 hides. What genuinely needs a human at a client is the last hop:
+that typing `/help` in a guild produces an `INTERACTION_CREATE`. Its absence in
+the journal (`grep -iE "refused a slash command|failed to handle a Discord slash
+command"` finding nothing over days, while ordinary chat worked) is what proved
+the commands were never reaching the handler in the first place.
 
 ## Kernel builds
 
