@@ -361,7 +361,14 @@ as possibilities, not inevitable outcomes. For each NPC provide personality,
 background, motivations, flaws, quirks, a readable speech color and appropriate
 statblock_id from rpg-npc-stat/rules lookup. Every person also needs an
 appearance — what anyone in the room can see, in concrete nouns — and a
-one-line impression, the read you get in a moment. Both are player-safe. Factions need goals and private pressures.
+one-line impression, the read you get in a moment. Both are player-safe.
+Every person also needs a voice sheet, which is GM state: diction (the register
+and vocabulary they reach for, and what they never say), tempo (sentence length
+and rhythm), wants (what they are after in conversation), and optionally at most
+two verbal tics, what they know, and what they withhold and say instead when
+pushed. Write voices that differ from each other along those axes; ten people
+with one distinct habit each read as ten people, ten with elaborate accents read
+as one writer. Factions need goals and private pressures.
 Use rpg-world-link for alliances, rivalries, membership, location ties and causal
 connections between storylines; include details explaining each link. Give major
 beats links to the people, places and factions that can move them. World generation
@@ -473,6 +480,14 @@ behavior without being recited. Begin play in a concrete immediate situation \
 with subtle hooks and room to explore, not a summary of the campaign plan. \
 Use rpg-scene-present dialogue for character speech: speaker_id is a registered \
 NPC in present, text contains spoken words, and delivery is a short audible cue. \
+Before you write a line for a character who matters, call `rpg-npc-speak` with \
+their id and the moment they are answering — what was just said or done to them, \
+and by whom. It answers in that character's own voice, from their voice sheet \
+and the scene as the player saw it. Put the words it returns in the dialogue \
+line verbatim and add the delivery cue yourself; it cannot see the room. When it \
+comes back silent, that character says nothing and the beat shows it — a shrug \
+is an answer. Write the line yourself for a walk-on, a crowd, or when the tool \
+says no local model is available. \
 Keep narration for atmosphere and action, asides for observable details, and \
 never put private thoughts in dialogue or asides. Offer downtime=true when a \
 safe interval allows rest, training or errands. Present only NPCs and locations actually encountered; update known_to_player \

@@ -400,6 +400,21 @@ impl sys::Host for HostState {
                 })
                 .to_string()
             }),
+            // Where a *keyless* provider listens, so a guest that has to make
+            // its own model call — the campaign's per-character voice pass —
+            // can reach a local llama-server. Deliberately silent for any
+            // provider with an api_key: a wasm guest never receives a secret,
+            // which is why the knowledge sidecar exists at all. A caller that
+            // gets `None` here falls back to doing the work itself.
+            key if key.starts_with("provider:") => {
+                let id = key.trim_start_matches("provider:");
+                cfg.providers
+                    .iter()
+                    .find(|p| p.id == id && p.api_key.is_none())
+                    .map(|p| {
+                        serde_json::json!({ "base_url": p.base_url() }).to_string()
+                    })
+            }
             _ => None,
         })
     }
