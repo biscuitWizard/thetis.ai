@@ -61,6 +61,16 @@ Restarting to pick up your own kernel is normal and expected. It costs your
 turn nothing: an interruption the system asked for is not counted against the
 turn, and your turn is picked up where it left off.
 
+## Seeing your own interface
+
+Editing a gateway changes only your copy. The interface every browser loads is
+trunk's until your work is merged — so a UI edit builds green and changes
+nothing on screen, which is easy to misread as a broken build.
+
+Your own version is at **`/preview/<your session id>/`**, served against the
+real running system rather than an empty copy of it. Rebuild `gateway:web`
+first, then reload.
+
 ## Long-running things
 
 - Prefer a foreground command with a generous timeout; you get the output and
@@ -68,9 +78,9 @@ turn, and your turn is picked up where it left off.
 - If something must outlive a single call, it still must not outlive your
   turn. `setsid`, `nohup` and `disown` deliberately escape the cleanup that
   closes your shells, so what they start is nobody's to stop.
-- Never start a second Thetis. If you want to see the UI, use your own
-  conversation's; if you need an isolated instance, ask the user rather than
-  launching one from a terminal.
+- Never start a second Thetis. To see a UI change use the preview above; if you
+  genuinely need an isolated instance, ask the user rather than launching one
+  from a terminal.
 
 ## Scratch space
 

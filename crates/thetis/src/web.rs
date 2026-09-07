@@ -27,6 +27,11 @@ pub async fn serve(grip: Arc<Grip>) -> Result<()> {
         .route("/ws", get(ws_upgrade))
         .route("/admin", get(admin_page))
         .route("/admin/waits", get(admin_waits))
+        // One conversation's own UI build, so an agent working on the
+        // interface can see its work without launching a second orchestrator.
+        .route("/preview/{session}", get(preview_root))
+        .route("/preview/{session}/", get(preview_root))
+        .route("/preview/{session}/{*path}", get(preview_asset))
         .route("/admin/branch", post(admin_branch))
         .route("/admin/rollback", post(admin_rollback_legacy))
         // Raw workspace bytes. Separate from the frame protocol because these
@@ -665,6 +670,115 @@ async fn admin_waits(State(grip): State<Arc<Grip>>) -> Response {
         .into_response()
 }
 
+/// Serves `/` from a conversation's own gateway build.
+async fn preview_root(
+    State(grip): State<Arc<Grip>>,
+    Path(session): Path<String>,
+) -> Response {
+    preview_response(&grip, &session, "/").await
+}
+
+async fn preview_asset(
+    State(grip): State<Arc<Grip>>,
+    Path((session, path)): Path<(String, String)>,
+) -> Response {
+    preview_response(&grip, &session, &format!("/{path}")).await
+}
+
+/// The UI a browser normally loads is trunk's, on purpose. This serves a
+/// single conversation's instead, read from the shared build cache.
+///
+/// Assets only: the websocket, the workspace routes and everything else stay
+/// on the real system, so the previewed interface drives the running Thetis
+/// rather than a copy of it. That is the point — an agent wants to see its
+/// interface against real conversations, which is exactly what a second
+/// orchestrator on another port could not give it.
+async fn preview_response(grip: &Arc<Grip>, session: &str, path: &str) -> Response {
+    let loaded = match gateway::preview_component(grip, session).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html(fallback_page(&format!("{e:#}"))),
+            )
+                .into_response()
+        }
+    };
+    match gateway::serve_preview_asset(grip, loaded, path).await {
+        Ok(Some(mut asset)) => {
+            if asset.mime.starts_with("text/html") {
+                asset.bytes = rewrite_preview_html(&asset.bytes, session);
+            }
+            (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, asset.mime),
+                // A preview is a moving target; a cached copy of yesterday's
+                // build is the one thing it must never show.
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            asset.bytes,
+        )
+            .into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            let detail = format!("{e:#}");
+            tracing::warn!(error = %detail, path, session, "preview asset request failed");
+            (StatusCode::SERVICE_UNAVAILABLE, Html(fallback_page(&detail))).into_response()
+        }
+    }
+}
+
+/// Points the previewed page's own assets at the preview, and leaves
+/// everything else pointing at the real system.
+///
+/// The UI asks for `/app.js` absolutely, so without this a preview would serve
+/// the branch's HTML and then trunk's script and stylesheet — the confusing
+/// half-and-half that is worse than not working. Only references that name a
+/// file are rewritten: `/admin`, `/ws` and the workspace routes are host
+/// routes, and the preview is meant to drive the running system through them.
+/// The scripts themselves import relatively (`./lib/dom.js`), so once the
+/// entry point is under the prefix the rest follows on its own.
+fn rewrite_preview_html(bytes: &[u8], session: &str) -> Vec<u8> {
+    let Ok(html) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    let prefix = format!("/preview/{session}");
+    let mut out = String::with_capacity(html.len() + 128);
+    let mut rest = html;
+    loop {
+        let Some((at, pat)) = ["src=\"/", "href=\"/"]
+            .iter()
+            .filter_map(|pat| rest.find(pat).map(|i| (i, *pat)))
+            .min_by_key(|(i, _)| *i)
+        else {
+            break;
+        };
+        // Everything up to and including the opening quote.
+        let attr_end = at + pat.len() - 1;
+        out.push_str(&rest[..attr_end]);
+
+        let tail = &rest[attr_end..];
+        let Some(end) = tail.find('"') else {
+            out.push_str(tail);
+            return out.into_bytes();
+        };
+        let url = &tail[..end];
+        // A path whose last segment has an extension is an asset this gateway
+        // serves; anything else is a route on the host.
+        let is_asset = url.rsplit('/').next().is_some_and(|last| last.contains('.'));
+        if is_asset {
+            out.push_str(&prefix);
+        }
+        out.push_str(url);
+        out.push('"');
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out.into_bytes()
+}
+
 async fn ws_upgrade(ws: WebSocketUpgrade, State(grip): State<Arc<Grip>>) -> Response {
     // The protocol is small JSON frames; the one bulky payload is a
     // `workspace-write` of an edited text file (bounded well under this once
@@ -885,6 +999,45 @@ fn inbound_type(text: &str) -> Option<String> {
         .get("type")?
         .as_str()
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::rewrite_preview_html;
+
+    fn rewrite(html: &str) -> String {
+        String::from_utf8(rewrite_preview_html(html.as_bytes(), "abc123")).unwrap()
+    }
+
+    #[test]
+    fn the_pages_own_assets_are_pointed_at_the_preview() {
+        // Without this the preview serves the branch's HTML and then trunk's
+        // script — the half-and-half that is worse than not working at all.
+        let out = rewrite(r#"<link href="/app.css"><script src="/app.js"></script>"#);
+        assert!(out.contains(r#"href="/preview/abc123/app.css""#), "{out}");
+        assert!(out.contains(r#"src="/preview/abc123/app.js""#), "{out}");
+    }
+
+    #[test]
+    fn host_routes_are_left_alone() {
+        // `/admin` and `/ws` are the real system's, and the whole point of a
+        // preview is that it drives the real system.
+        let out = rewrite(r#"<a href="/admin">admin</a><a href="/">home</a>"#);
+        assert!(out.contains(r#"href="/admin""#), "{out}");
+        assert!(!out.contains("/preview/abc123/admin"), "{out}");
+    }
+
+    #[test]
+    fn inline_data_urls_and_relative_paths_are_untouched() {
+        let html = r#"<link href="data:image/svg+xml,<svg/>"><script src="./lib/dom.js">"#;
+        assert_eq!(rewrite(html), html);
+    }
+
+    #[test]
+    fn a_page_with_nothing_to_rewrite_survives_intact() {
+        let html = "<html><body>hello</body></html>";
+        assert_eq!(rewrite(html), html);
+    }
 }
 
 #[cfg(test)]
