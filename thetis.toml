@@ -49,9 +49,42 @@ max_retries = 3
 # Tool-call rounds allowed in a single turn.
 max_iterations = 32
 default_mode = "agent"
+# What the agent calls itself.
+#
+# This is the *agent's* name, not the harness's. The harness -- this process,
+# the branch and revision machinery, the version in the status bar -- is always
+# called Thetis. The agent that answers you is named here, and defaults to
+# Thetis as well, which is why the two were easy to confuse.
+#
+# Changing it renames the agent in three places: the system prompt, the brand in
+# the top left of the web UI, and the Discord bot's username. THETIS_AGENT_NAME
+# overrides it.
+#
+# The Discord rename is best-effort. Discord allows roughly two username changes
+# an hour and refuses a name already taken; either way the bot keeps working
+# under its old name and the reason is logged.
+# name = "Thetis"
+# An avatar for the agent, shown beside the brand in the top left of the web UI.
+#
+# A URL, or a `data:` URI if you would rather not depend on a remote fetch:
+#   avatar = "https://example.com/ada.png"
+#   avatar = "data:image/png;base64,iVBORw0KGgo..."
+#
+# It is rendered into a 20px rounded slot, cropped to fill, so a square image
+# looks best. Leave it empty for the built-in mark, which tints itself with the
+# UI accent colour. A URL that fails to load falls back to that mark rather than
+# showing a broken image. THETIS_AGENT_AVATAR overrides it.
+#
+# This is the web UI only -- it does not set the Discord avatar, which Discord
+# rate-limits far more aggressively than the username.
+# avatar = ""
 # The system prompt. Use `system_prompt_file` to keep it in its own file
 # (recommended once it grows), or `system_prompt` for a short inline one.
 # Leaving both empty uses the built-in prompt.
+#
+# `{agent_name}` anywhere in the prompt -- here, in a prompt file, or in a mode's
+# `prompt` below -- is replaced with the name above, so a rename reaches a custom
+# prompt without it having to hardcode the word.
 # system_prompt_file = "prompts/system.md"
 
 # Models offered in the chat surface's picker. Providers change their

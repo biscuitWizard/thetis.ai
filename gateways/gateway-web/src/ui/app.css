@@ -79,6 +79,19 @@ body { display: flex; flex-direction: column; }
   letter-spacing: -.01em;
 }
 .brand-mark { width: 20px; height: 20px; color: var(--accent); }
+/* The avatar occupies the same 20px slot as the mark it replaces, so the brand
+ * does not shift when one is configured. `cover` because a supplied image is
+ * rarely square, and a hairline keeps a pale or white-edged image from bleeding
+ * into the sidebar. */
+.brand-avatar {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
 
 .sidebar-search {
   display: flex;

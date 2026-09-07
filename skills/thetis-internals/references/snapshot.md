@@ -139,9 +139,20 @@ Remake with: read `config_get` in `crates/thetis/src/host_api.rs`.
 
 `config_get` is a small allow-list, not the whole configuration:
 
-`model`, `system_prompt`, `max_iterations`, `max_tool_output_bytes`,
-`sandbox_available`, `devkit_available`, `compact_enabled`, `context_window`,
-`compact_threshold`, `compact_target`, `summary_model`, `keep_head`, `keep_tail`.
+`model`, `agent_name`, `agent_avatar`, `system_prompt`, `max_iterations`,
+`max_tool_output_bytes`, `sandbox_available`, `devkit_available`,
+`compact_enabled`, `context_window`, `compact_threshold`, `compact_target`,
+`summary_model`, `keep_head`, `keep_tail`.
+
+`agent_name` is what the *agent* calls itself, from `agent.name` in the config,
+defaulting to `Thetis`. It is not the harness's name: the harness is always
+Thetis. `system_prompt` already has `{agent_name}` substituted by the host, so a
+guest never has to do it.
+
+`agent_avatar` is an image URL or `data:` URI from `agent.avatar`, empty when
+none is set. The web gateway substitutes both into `index.html` at serve time
+in `fill_identity`, which also decides which of the avatar `<img>` and the
+built-in `<svg>` mark carries `hidden`.
 
 Any other key returns nothing. If you need a new one in your loop, you must add
 it to `host_api.rs` and restart, because that is kernel code.

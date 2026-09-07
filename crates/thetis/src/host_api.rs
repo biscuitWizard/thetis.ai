@@ -188,6 +188,12 @@ impl sys::Host for HostState {
         let cfg = &self.grip().cfg;
         Ok(match key.as_str() {
             "model" => Some(cfg.model.clone()),
+            // What the agent calls itself. The harness is always Thetis; this
+            // is the name the agent answers to in a prompt or on screen.
+            "agent_name" => Some(cfg.agent_name.clone()),
+            // Image URL or data: URI for the agent's avatar; empty means the
+            // gateway draws its built-in mark.
+            "agent_avatar" => Some(cfg.agent_avatar.clone()),
             "system_prompt" => Some(cfg.system_prompt.clone()),
             "max_iterations" => Some(cfg.max_iterations.to_string()),
             "max_tool_output_bytes" => Some(cfg.max_tool_output_bytes.to_string()),

@@ -135,6 +135,9 @@ pub enum Event {
     Ready {
         bot_id: String,
         application_id: String,
+        /// The bot's current Discord username, so a rename can be skipped when
+        /// it already matches and the rate limit is not spent for nothing.
+        bot_name: String,
     },
     Message(Incoming),
     /// A slash command was invoked.
@@ -574,9 +577,16 @@ impl Shard {
                                 .and_then(Value::as_str)
                                 .unwrap_or(&bot_id)
                                 .to_string();
+                            let bot_name = d
+                                .get("user")
+                                .and_then(|u| u.get("username"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
                             return Ok(Event::Ready {
                                 bot_id,
                                 application_id,
+                                bot_name,
                             });
                         }
                         "MESSAGE_CREATE" => {
@@ -655,6 +665,23 @@ impl Rest {
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
+    async fn patch(&self, path: &str, body: Value) -> Result<Value> {
+        let response = self
+            .http
+            .patch(format!("{API_BASE}{path}"))
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {path}"))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("Discord rejected PATCH {path}: {status} {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
     async fn put(&self, path: &str, body: Value) -> Result<Value> {
         let response = self
             .http
@@ -670,6 +697,27 @@ impl Rest {
             return Err(anyhow!("Discord rejected PUT {path}: {status} {text}"));
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// Renames the bot user, so it appears in Discord under the configured
+    /// agent name rather than whatever the developer portal was set to.
+    ///
+    /// Best-effort by design, and the caller treats a failure as a warning. Two
+    /// things routinely make this fail and neither is worth stopping the
+    /// connector for: Discord rate-limits username changes to roughly two per
+    /// hour and answers 429, and a name already taken at that discriminator
+    /// comes back 400. In both cases the bot keeps working under its old name.
+    ///
+    /// Returns the name Discord says it now has.
+    pub async fn set_username(&self, username: &str) -> Result<String> {
+        let updated = self
+            .patch("/users/@me", json!({ "username": username }))
+            .await?;
+        Ok(updated
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or(username)
+            .to_string())
     }
 
     /// Registers the slash commands, replacing whatever was registered before.

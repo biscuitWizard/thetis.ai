@@ -107,6 +107,9 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
     // Commands only need registering once per process: a reconnect does not
     // clear them, and Discord rate-limits the endpoint globally.
     let mut commands_registered = false;
+    // Likewise the rename: Discord allows roughly two username changes an hour,
+    // so a reconnect loop must not spend that budget on every READY.
+    let mut rename_attempted = false;
 
     loop {
         match Shard::connect(&token, resume.clone()).await {
@@ -116,6 +119,7 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                         Ok(Event::Ready {
                             bot_id: id,
                             application_id,
+                            bot_name,
                         }) => {
                             // Reset the backoff *here*, not on `connect`.
                             // `Shard::connect` returns as soon as the socket is
@@ -128,6 +132,36 @@ async fn run(grip: Arc<Grip>, token: String) -> Result<()> {
                                 bot_id = id;
                             }
                             tracing::info!(bot = %bot_id, "connected to Discord");
+
+                            // Show up under the configured agent name. Skipped
+                            // when it already matches, because the rate limit
+                            // here is about two changes an hour and a restart
+                            // must not burn it re-setting the same name.
+                            let wanted = grip.cfg.agent_name.clone();
+                            if !rename_attempted && !wanted.is_empty() && bot_name != wanted {
+                                rename_attempted = true;
+                                match rest.set_username(&wanted).await {
+                                    Ok(now) => tracing::info!(
+                                        from = %bot_name,
+                                        to = %now,
+                                        "renamed the Discord bot to the configured agent name"
+                                    ),
+                                    // Never fatal: the bot answers perfectly
+                                    // well under its old name, and the two
+                                    // usual causes -- the hourly rate limit and
+                                    // a name already taken -- are not something
+                                    // retrying now would fix.
+                                    Err(e) => tracing::warn!(
+                                        error = %format!("{e:#}"),
+                                        wanted = %wanted,
+                                        current = %bot_name,
+                                        "could not rename the Discord bot; it keeps its \
+                                         current username. Discord allows about two \
+                                         username changes an hour and rejects a name \
+                                         already taken"
+                                    ),
+                                }
+                            }
 
                             // Without this the Discord client has nothing to
                             // match `/new` against, so it refuses to send it
