@@ -8,11 +8,9 @@ mode=${1:---browser}
 scratch=${THETIS_CAMPAIGN_SCRATCH:-$(mktemp -d /tmp/thetis-campaign.XXXXXX)}
 artifacts=${THETIS_WALKTHROUGH_ARTIFACTS:-$scratch/artifacts}
 mock_pid=
-bootstrap_pid=
 thetis_pid=
 cleanup() {
   [[ -z ${thetis_pid:-} ]] || kill -- -"$thetis_pid" 2>/dev/null || true
-  [[ -z ${bootstrap_pid:-} ]] || kill -- -"$bootstrap_pid" 2>/dev/null || true
   [[ -z ${mock_pid:-} ]] || kill -- -"$mock_pid" 2>/dev/null || true
   if [[ -z ${THETIS_CAMPAIGN_KEEP_SCRATCH:-} ]]; then rm -rf "$scratch"; else echo "scratch kept at $scratch"; fi
 }
@@ -72,49 +70,7 @@ EOF
 if [[ -z ${THETIS_CAMPAIGN_SKIP_BUILD:-} ]]; then
   cargo build --manifest-path "$root/Cargo.toml" -p thetis --bins
 fi
-# A fresh gateway bootstraps only its primary UI. Briefly make campaign primary
-# in a separate scratch process to compile, smoke-test, and cache that artifact;
-# the real walkthrough process remains gateway-web with campaign mounted at
-# /play. Both use only the disposable data/artifact/config directories.
-cat >"$scratch/bootstrap.toml" <<EOF
-[server]
-bind = "127.0.0.1:7798"
-primary_gateway = "campaign"
-
-[paths]
-data = "$scratch/data-bootstrap"
-artifacts = "$scratch/artifacts"
-worktrees = "$scratch/worktrees-bootstrap"
-
-[browser]
-enabled = false
-
-[discord]
-enabled = false
-EOF
-mkdir -p "$scratch/data-bootstrap" "$scratch/worktrees-bootstrap"
-THETIS_ROOT="$scratch/source" THETIS_CONFIG="$scratch/bootstrap.toml" THETIS_LOCAL_CONFIG="" \
-  THETIS_BIND="127.0.0.1:7798" THETIS_DATA_DIR="$scratch/data-bootstrap" \
-  THETIS_ARTIFACTS_DIR="$scratch/artifacts" THETIS_WORKTREES_DIR="$scratch/worktrees-bootstrap" \
-  setsid "$root/target/debug/thetis" >"$scratch/bootstrap.log" 2>&1 &
-bootstrap_pid=$!
-for _ in $(seq 1 180); do
-  if grep -Eq '(UI bootstrapped and serving|serving trunk.s UI from the build cache).*gateway/campaign' "$scratch/bootstrap.log"; then break; fi
-  if ! kill -0 "$bootstrap_pid" 2>/dev/null; then
-    cat "$scratch/bootstrap.log" >&2
-    exit 1
-  fi
-  sleep 1
-done
-if ! grep -Eq '(UI bootstrapped and serving|serving trunk.s UI from the build cache).*gateway/campaign' "$scratch/bootstrap.log"; then
-  echo "campaign gateway bootstrap did not finish" >&2
-  cat "$scratch/bootstrap.log" >&2
-  exit 1
-fi
-kill -- -"$bootstrap_pid" 2>/dev/null || true
-wait "$bootstrap_pid" 2>/dev/null || true
-bootstrap_pid=
-
+# Exercise normal startup: mounted gateways must bootstrap without a prebuilt cache.
 MOCK_LLM_SCRIPT="$root/services/playwright-sidecar/fixtures/campaign-walkthrough.json" \
   setsid "$root/target/debug/mock-llm" >"$scratch/mock-llm.log" 2>&1 &
 mock_pid=$!

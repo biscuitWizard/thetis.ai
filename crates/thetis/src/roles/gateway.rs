@@ -242,16 +242,20 @@ async fn load_gateway(grip: &Arc<Grip>, aspect: Aspect) {
     }
 }
 
-/// Builds the UI gateway once, in the background, when no artifact exists
-/// anywhere. Bootstrap only: every later UI build happens in a conversation's
+/// Builds each missing configured gateway, including secondary HTTP mounts,
+/// in the background. Bootstrap only: every later UI build happens in a conversation's
 /// worker and reaches trunk by merging — but on a truly fresh deployment
 /// nothing else can break the deadlock, because workers only spawn for
 /// messages that arrive through this very UI.
 fn bootstrap_ui_if_missing(grip: Arc<Grip>) {
-    let aspect = Aspect::gateway(&grip.cfg().primary_gateway);
-    if grip.loader.get(&aspect).is_some() {
-        return;
+    for aspect in grip.gateway_aspects() {
+        if grip.loader.get(&aspect).is_none() {
+            bootstrap_gateway(grip.clone(), aspect);
+        }
     }
+}
+
+fn bootstrap_gateway(grip: Arc<Grip>, aspect: Aspect) {
     tokio::spawn(async move {
         tracing::info!(%aspect, "no UI build exists anywhere; bootstrapping one from trunk");
         let build = match grip.builder.build(&grip.cfg(), &aspect).await {
