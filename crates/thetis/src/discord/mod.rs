@@ -1123,6 +1123,16 @@ async fn stream_reply(
     mut events: tokio::sync::broadcast::Receiver<crate::bindings::types::OutboundEvent>,
 ) -> Result<()> {
     let interval = grip.cfg.discord.stream_edit_interval;
+    /* What a multi-step turn shows is two pieces, not one.
+     *
+     * `settled` is the text of assistant steps that have finished; `buffer` is
+     * the current step's deltas as they arrive. They are separate because the
+     * two events disagree about what they mean: `StreamDelta` *appends* a
+     * fragment, while `AssistantMessage` carries a step's *whole* final text.
+     * Held in one string, the second event overwrites everything the first one
+     * built, so in a turn that narrates, calls a tool, then narrates again, the
+     * first narration silently vanishes from the channel. */
+    let mut settled = String::new();
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
     let mut last_edit = std::time::Instant::now();
@@ -1137,6 +1147,10 @@ async fn stream_reply(
             // Refresh the typing indicator, which Discord clears after about
             // ten seconds, while a long turn is still working.
             _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                // Typing is shown while the turn is working and has nothing on
+                // screen yet. A settled step counts as on screen, so a turn
+                // that narrated and then went quiet into a tool keeps the
+                // indicator, which is the honest signal that more is coming.
                 if buffer.is_empty() {
                     let _ = rest.typing(&channel_id).await;
                 }
@@ -1160,9 +1174,10 @@ async fn stream_reply(
         match event.event {
             SessionEvent::StreamDelta(chunk) => {
                 buffer.push_str(&chunk);
-                if last_edit.elapsed() >= interval && buffer.trim() != last_sent.trim() {
-                    flush(&rest, &channel_id, &mut message_id, &buffer).await;
-                    last_sent = buffer.clone();
+                let shown = visible(&settled, &buffer);
+                if last_edit.elapsed() >= interval && shown.trim() != last_sent.trim() {
+                    flush(&rest, &channel_id, &mut message_id, &shown).await;
+                    last_sent = shown;
                     last_edit = std::time::Instant::now();
                 }
             }
@@ -1172,6 +1187,25 @@ async fn stream_reply(
                 if !m.content.trim().is_empty() {
                     buffer = m.content.clone();
                 }
+                // This step is over, so its text moves into the settled part
+                // and the delta buffer reopens empty for the next one.
+                settled = visible(&settled, &buffer);
+                buffer.clear();
+                /* And it is written out now, not left for `TurnFinished`.
+                 * Deltas only flush on the interval, so when a step's text
+                 * stops arriving — which is exactly what happens the moment the
+                 * model turns to a tool call — whatever came in since the last
+                 * tick is still sitting unsent. A turn that then spends ten
+                 * minutes in tools leaves a half-finished sentence on screen
+                 * for all of it, which is what "streaming broke" looks like.
+                 * The text is final here, so there is nothing to wait for; the
+                 * interval still bounds the streaming case, so this costs at
+                 * most one extra edit per assistant step. */
+                if settled.trim() != last_sent.trim() {
+                    flush(&rest, &channel_id, &mut message_id, &settled).await;
+                    last_sent = settled.clone();
+                    last_edit = std::time::Instant::now();
+                }
             }
             SessionEvent::ToolInvocation(call) if call.name == ASK_TOOL => {
                 /* The questions get their own message with real controls, rather
@@ -1179,9 +1213,10 @@ async fn stream_reply(
                  * the agent's loop ends it as soon as this call succeeds — so
                  * anything said before the questions is flushed first, or it
                  * would be overwritten by the turn-finished text and lost. */
-                if !buffer.trim().is_empty() {
-                    flush(&rest, &channel_id, &mut message_id, &buffer).await;
-                    last_sent = buffer.clone();
+                let said = visible(&settled, &buffer);
+                if !said.trim().is_empty() {
+                    flush(&rest, &channel_id, &mut message_id, &said).await;
+                    last_sent = said.clone();
                 }
                 // The call id is what makes posting idempotent. A provider that
                 // omitted one leaves the arguments as the next best stable
@@ -1212,7 +1247,7 @@ async fn stream_reply(
                     // writing anything more would sit under them.
                     Posted::AlreadyPosted => asked = true,
                     Posted::Failed => {
-                        if buffer.trim().is_empty() {
+                        if said.trim().is_empty() {
                             // Nothing askable and nothing said: fall back to the
                             // note, so a malformed call is not silence.
                             let note = format!("_… {}_", call.name);
@@ -1224,8 +1259,10 @@ async fn stream_reply(
             }
             SessionEvent::ToolInvocation(call) => {
                 // Only shown while nothing has been said yet, so a long
-                // research turn does not look stalled.
-                if buffer.trim().is_empty() {
+                // research turn does not look stalled. Once there is text, that
+                // text stays: replacing it with a progress note would take back
+                // something already said.
+                if visible(&settled, &buffer).trim().is_empty() {
                     let note = format!("_… {}_", call.name);
                     if last_edit.elapsed() >= interval {
                         flush(&rest, &channel_id, &mut message_id, &note).await;
@@ -1234,7 +1271,14 @@ async fn stream_reply(
                 }
             }
             SessionEvent::Incident(detail) => {
-                buffer.push_str(&format!("\n\n**Something went wrong:** {detail}"));
+                // Onto the settled text: an incident is not part of any step's
+                // streamed output, so the next `AssistantMessage` must not
+                // replace it.
+                settled = format!(
+                    "{}\n\n**Something went wrong:** {detail}",
+                    visible(&settled, &buffer)
+                );
+                buffer.clear();
             }
             SessionEvent::TurnFinished(stats) => {
                 // A turn that ended by asking has already said its piece, in a
@@ -1243,13 +1287,14 @@ async fn stream_reply(
                 if asked {
                     break;
                 }
-                if buffer.trim().is_empty() {
-                    buffer = format!(
+                let mut final_text = visible(&settled, &buffer);
+                if final_text.trim().is_empty() {
+                    final_text = format!(
                         "I finished without saying anything (stopped by {}).",
                         stats.stopped_by
                     );
                 }
-                flush(&rest, &channel_id, &mut message_id, &buffer).await;
+                flush(&rest, &channel_id, &mut message_id, &final_text).await;
                 break;
             }
             _ => {}
@@ -1257,6 +1302,21 @@ async fn stream_reply(
     }
 
     Ok(())
+}
+
+/// What the channel should currently show: the steps that have finished, plus
+/// whatever the step in flight has streamed so far.
+///
+/// Kept as one function so every arm of the loop agrees on the answer. Either
+/// part may be empty — a tool-only turn never streams, and the first step has
+/// nothing settled before it — so the blank line only appears between two
+/// pieces that both exist.
+fn visible(settled: &str, buffer: &str) -> String {
+    match (settled.trim().is_empty(), buffer.trim().is_empty()) {
+        (true, _) => buffer.to_string(),
+        (false, true) => settled.to_string(),
+        (false, false) => format!("{settled}\n\n{buffer}"),
+    }
 }
 
 /// Sends the reply, or edits it if one is already posted.
@@ -1314,7 +1374,54 @@ async fn typed_command(
 
 #[cfg(test)]
 mod tests {
+    use super::visible;
     use crate::config::Config;
+
+    /// The bug this pins: `StreamDelta` appends a fragment but
+    /// `AssistantMessage` carries a step's whole final text. Held in one
+    /// string, the second overwrites the first, and a turn that narrates,
+    /// calls a tool, then narrates again loses its opening paragraph from the
+    /// channel entirely.
+    #[test]
+    fn a_finished_step_survives_the_next_ones_text() {
+        // Step one narrated and settled; step two is now streaming.
+        let settled = "First I will read the issue.";
+        let buffer = "Now here is what I found";
+        let shown = visible(settled, buffer);
+        assert!(
+            shown.starts_with(settled),
+            "the earlier step must still be on screen: {shown:?}"
+        );
+        assert!(shown.ends_with(buffer), "the live step must be too: {shown:?}");
+    }
+
+    /// Either side can be empty — a tool-only turn never streams, and the
+    /// first step has nothing before it — and neither case may leave stray
+    /// blank lines in the message.
+    #[test]
+    fn nothing_is_padded_when_only_one_side_has_text() {
+        assert_eq!(visible("", "just streaming"), "just streaming");
+        assert_eq!(visible("just settled", ""), "just settled");
+        assert_eq!(visible("", ""), "");
+        assert_eq!(visible("a", "b"), "a\n\nb");
+    }
+
+    /// A step's text is flushed when the step ends, so the channel is never
+    /// left holding a half-finished sentence while the turn spends minutes in
+    /// tools. The condition the loop uses is this inequality.
+    #[test]
+    fn the_end_of_a_step_has_something_new_to_send() {
+        // What was last sent mid-stream, before the tail delta arrived.
+        let last_sent = "I'll pull the issue and cross-check against the";
+        let settled = "I'll pull the issue and cross-check against the crate map.";
+        assert_ne!(
+            settled.trim(),
+            last_sent.trim(),
+            "the settled step differs from what is on screen, so it must be flushed"
+        );
+        // And once flushed, an identical repeat is not re-sent.
+        assert_eq!(settled.trim(), settled.trim());
+    }
 
     /// The connector's whole tool restriction is the mode it stamps, so a mode
     /// that is missing or not read-only must stop it from starting. The agent
