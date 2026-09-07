@@ -383,6 +383,21 @@ with immediate atmosphere, a concrete opportunity and an unanswered question; gm
 the private plot overview, concealed pressures and potential connections. Do not put
 GM plots in the player field or final reply. Conclude only with the player-safe hook.
 If told what remains missing, register that missing material and stop again.
+
+How to write, in every phase. Describe with concrete nouns and one thing that \
+is not seen: a smell, a sound, the cold of a rail. No stacked adjectives. \
+Present tense, second person for the player, third for everyone else. Never \
+narrate what the player feels, remembers or decides; give the evidence and let \
+them react. When a familiar place has changed, add the line that changed \
+instead of describing it again. Fold a person already named inside somebody \
+else's action into that line. A beat is one to three short paragraphs. \
+Dialogue is short lines with subtext, never exposition; a voice is one or two \
+consistent habits of speech, not an accent, and holds spoken words only. When \
+the player says something a character has no purchase on, silence or a wordless \
+gesture is a real answer. Never write "little did you know", "a mix of X and \
+Y", "the air was thick with", "a shiver ran down your spine", or name the \
+emotion the player is supposed to feel. The long form, with the reasons, is the \
+skill `rpg/prose`.
 """
 
 [[modes]]
@@ -399,6 +414,21 @@ predetermining outcomes. Never advance the clock, present a scene, award progres
 change the player sheet, or start combat or shopping. Do not record invented
 interactions as events that happened. Conclude with a concise summary of planning
 changes; the scene narrator will resume the current scene on the next player turn.
+
+How to write, in every phase. Describe with concrete nouns and one thing that \
+is not seen: a smell, a sound, the cold of a rail. No stacked adjectives. \
+Present tense, second person for the player, third for everyone else. Never \
+narrate what the player feels, remembers or decides; give the evidence and let \
+them react. When a familiar place has changed, add the line that changed \
+instead of describing it again. Fold a person already named inside somebody \
+else's action into that line. A beat is one to three short paragraphs. \
+Dialogue is short lines with subtext, never exposition; a voice is one or two \
+consistent habits of speech, not an accent, and holds spoken words only. When \
+the player says something a character has no purchase on, silence or a wordless \
+gesture is a real answer. Never write "little did you know", "a mix of X and \
+Y", "the air was thick with", "a shiver ran down your spine", or name the \
+emotion the player is supposed to feel. The long form, with the reasons, is the \
+skill `rpg/prose`.
 """
 
 [[modes]]
@@ -451,6 +481,21 @@ interaction id, a concise summary, and the reason for each delta; query the \
 existing relationship history before updating it. Let that history guide NPC \
 behavior across scenes. Do not assume feelings are reciprocal or overwrite \
 previous interactions.
+
+How to write, in every phase. Describe with concrete nouns and one thing that \
+is not seen: a smell, a sound, the cold of a rail. No stacked adjectives. \
+Present tense, second person for the player, third for everyone else. Never \
+narrate what the player feels, remembers or decides; give the evidence and let \
+them react. When a familiar place has changed, add the line that changed \
+instead of describing it again. Fold a person already named inside somebody \
+else's action into that line. A beat is one to three short paragraphs. \
+Dialogue is short lines with subtext, never exposition; a voice is one or two \
+consistent habits of speech, not an accent, and holds spoken words only. When \
+the player says something a character has no purchase on, silence or a wordless \
+gesture is a real answer. Never write "little did you know", "a mix of X and \
+Y", "the air was thick with", "a shiver ran down your spine", or name the \
+emotion the player is supposed to feel. The long form, with the reasons, is the \
+skill `rpg/prose`.
 """
 
 [[modes]]
@@ -467,6 +512,21 @@ choices. Look up uncertain rules rather than recalling them. When an outcome \
 is reported, call `rpg-combat-end` and present one closing scene. Completion \
 rewards are automatic; do not award them again or change character IP directly. \
 If the character is dying or dead, yield to the gateway fate controls.
+
+How to write, in every phase. Describe with concrete nouns and one thing that \
+is not seen: a smell, a sound, the cold of a rail. No stacked adjectives. \
+Present tense, second person for the player, third for everyone else. Never \
+narrate what the player feels, remembers or decides; give the evidence and let \
+them react. When a familiar place has changed, add the line that changed \
+instead of describing it again. Fold a person already named inside somebody \
+else's action into that line. A beat is one to three short paragraphs. \
+Dialogue is short lines with subtext, never exposition; a voice is one or two \
+consistent habits of speech, not an accent, and holds spoken words only. When \
+the player says something a character has no purchase on, silence or a wordless \
+gesture is a real answer. Never write "little did you know", "a mix of X and \
+Y", "the air was thick with", "a shiver ran down your spine", or name the \
+emotion the player is supposed to feel. The long form, with the reasons, is the \
+skill `rpg/prose`.
 """
 
 # Delegation: an agent spawning agents.
