@@ -52,6 +52,38 @@ async fn main() -> Result<()> {
             println!("{}", thetis::auth::hash_password(&password)?);
             Ok(())
         }
+        // A dry run of the one thing that decides whether the process can
+        // start at all. Configuration is validated during boot, so a mistyped
+        // key or a half-written `[[users]]` block is otherwise discovered by
+        // restarting and finding Thetis gone — which is the worst moment to
+        // learn it, and the moment people are in when they edit auth.
+        Some("check-config") => {
+            let cfg = thetis::config::Config::load()?;
+            println!("configuration loads.");
+            println!("  auth mode:     {}", if cfg.auth.users_mode { "users" } else { "local" });
+            if cfg.auth.users_mode {
+                println!("  users:         {}", cfg.auth.users.len());
+                for u in &cfg.auth.users {
+                    let policy = &u.policy;
+                    println!(
+                        "    - {} ({}) role={}{} models={}",
+                        u.id,
+                        u.name,
+                        u.role,
+                        if policy.admin { ", admin" } else { "" },
+                        if policy.models_restricted {
+                            format!("{} of {}", policy.models.len(), cfg.models.len())
+                        } else {
+                            format!("all {}", policy.models.len())
+                        },
+                    );
+                }
+                println!("  claim_unowned: {}", cfg.auth.claim_unowned);
+            }
+            println!("  models:        {}", cfg.models.len());
+            println!("  bind:          {}", cfg.bind_addr);
+            Ok(())
+        }
         _ => thetis::roles::gateway::run().await,
     }
 }
