@@ -448,6 +448,13 @@ pub fn all() -> &'static [ToolGroup] {
             members: &[],
         },
         ToolGroup {
+            id: "miro",
+            brief: "Miro: boards, items, connectors, tags, members and resources.",
+            tags: &["miro", "whiteboard"],
+            always_on: false,
+            members: &[],
+        },
+        ToolGroup {
             id: "notion",
             brief: "Notion: pages, databases, comments and users in a workspace.",
             // "page", "workspace", "database" and "doc" all mean something else
@@ -584,6 +591,7 @@ pub fn all_ids() -> Vec<String> {
 /// mentioned an article.
 const PREFIX_RULES: &[(&str, &str)] = &[
     ("bq-", "bigquery"),
+    ("miro-", "miro"),
     ("notion-", "notion"),
     ("web-browser-", "browser"),
     ("web-", "web"),

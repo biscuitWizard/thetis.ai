@@ -747,6 +747,7 @@ fn tool_group_id(table: &Value, name: &str, capabilities: &[String]) -> String {
     // step with PREFIX_RULES in agents/agent-core/src/groups.rs.
     for (prefix, id) in [
         ("bq-", "bigquery"),
+        ("miro-", "miro"),
         ("notion-", "notion"),
         ("web-browser-", "browser"),
         ("web-", "web"),
