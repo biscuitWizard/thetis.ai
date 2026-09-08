@@ -897,3 +897,7 @@ always_on = []
 # threshold admits on a single match. Deliberately generous: a group admitted
 # needlessly costs tokens, one wrongly withheld costs a capability.
 route_threshold = 0.15
+
+[browser]
+node = "/home/bitmuse/thetis/workspace/miro-gantt-browser/node/bin/node"
+npm = "/home/bitmuse/thetis/workspace/miro-gantt-browser/node/bin/npm"
