@@ -754,8 +754,16 @@ pub const SECTIONS: &[(&str, &str, &str)] = &[
     ("sandbox", "Sandbox", "The command sandbox."),
     ("devkit", "Dev kit", "Self-modification."),
     ("browser", "Browser", "The headless browser sidecar."),
-    ("rpg_kb", "Campaign knowledge", "The retrieval sidecar behind the rpg-kb tools."),
-    ("rpg_images", "Campaign images", "Portraits and scene backdrops, rendered by the knowledge sidecar."),
+    (
+        "rpg_kb",
+        "Campaign knowledge",
+        "The retrieval sidecar behind the rpg-kb tools.",
+    ),
+    (
+        "rpg_images",
+        "Campaign images",
+        "Portraits and scene backdrops, rendered by the knowledge sidecar.",
+    ),
     ("discord", "Discord", "The Discord connector."),
     ("build", "Build", "How guests are compiled."),
     ("watchdog", "Watchdog", "Failure detection and rollback."),

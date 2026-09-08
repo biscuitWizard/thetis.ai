@@ -1313,18 +1313,28 @@ mod tests {
         // A module is written, with no marker: it is public at this point.
         let module = tmp.path().join("gateways/gateway-secret");
         std::fs::create_dir_all(&module).unwrap();
-        std::fs::write(module.join("lib.rs"), "the whole module
-").unwrap();
+        std::fs::write(
+            module.join("lib.rs"),
+            "the whole module
+",
+        )
+        .unwrap();
         git.add_all_and_commit("write the module").await.unwrap();
 
         // It is worked on for a while, still unmarked.
-        std::fs::write(module.join("more.rs"), "and more of it
-").unwrap();
+        std::fs::write(
+            module.join("more.rs"),
+            "and more of it
+",
+        )
+        .unwrap();
         git.add_all_and_commit("keep working on it").await.unwrap();
 
         // Only now is it marked private — and only now is anything exported.
         std::fs::write(module.join(PRIVATE_MARKER), "").unwrap();
-        git.add_all_and_commit("mark the module private").await.unwrap();
+        git.add_all_and_commit("mark the module private")
+            .await
+            .unwrap();
 
         export_public(&git).await.unwrap();
 

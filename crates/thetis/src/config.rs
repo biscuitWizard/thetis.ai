@@ -4609,7 +4609,10 @@ prompt = "Run the atlas."
             vec!["agent", "plan", "atlas-run"],
             "the module's mode is appended to the ones everybody has"
         );
-        assert!(cfg.mode("plan").unwrap().read_only, "unchanged by a fragment");
+        assert!(
+            cfg.mode("plan").unwrap().read_only,
+            "unchanged by a fragment"
+        );
     }
 
     /// A module owns a directory, and the directory can be nested. The order
@@ -4680,7 +4683,10 @@ prompt = "Run the atlas."
             toml::from_str("[cache]\nexplicit_vendors = [\"c\"]\n").unwrap(),
         );
         assert_eq!(
-            merged["cache"]["explicit_vendors"].as_array().unwrap().len(),
+            merged["cache"]["explicit_vendors"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -4722,4 +4728,3 @@ prompt = "Run the atlas."
         );
     }
 }
-

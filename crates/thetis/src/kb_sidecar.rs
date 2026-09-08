@@ -121,10 +121,7 @@ pub fn spawn(cfg: Arc<Config>) {
 pub async fn ensure_ready(cfg: &RpgKbSettings) -> Result<()> {
     let dir = &cfg.service_dir;
     if !dir.join("server.py").is_file() {
-        anyhow::bail!(
-            "no sidecar at {} — expected server.py there",
-            dir.display()
-        );
+        anyhow::bail!("no sidecar at {} — expected server.py there", dir.display());
     }
     let out = Command::new(cfg.python_bin())
         .arg("--version")
@@ -152,7 +149,10 @@ pub async fn ensure_ready(cfg: &RpgKbSettings) -> Result<()> {
 
 /// `Python 3.11.2` → true; anything below 3.11, or unparseable, → false.
 fn python_is_recent(version: &str) -> bool {
-    let nums = version.trim().strip_prefix("Python ").unwrap_or(version.trim());
+    let nums = version
+        .trim()
+        .strip_prefix("Python ")
+        .unwrap_or(version.trim());
     let mut parts = nums.split('.').map(|p| p.trim().parse::<u32>().ok());
     match (parts.next().flatten(), parts.next().flatten()) {
         (Some(major), Some(minor)) => major > 3 || (major == 3 && minor >= 11),
@@ -311,7 +311,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(token_path(&dir)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(token_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);
