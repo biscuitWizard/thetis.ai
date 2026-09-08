@@ -127,29 +127,27 @@ async fn guard_local(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// Whether an HTTP authority may reach this server: loopback always, plus
-/// every authority `server.public_origin` names. Nothing else — a reverse
-/// proxy in front is expected to forward `Host` unchanged, and
-/// `X-Forwarded-*` is not read.
-fn authority_allowed(public_origins: &[crate::config::Origin], authority: &str) -> bool {
-    is_loopback_authority(authority) || public_origins.iter().any(|o| o.authority == authority)
+/// Whether an HTTP authority may reach this server: loopback always, plus the
+/// one `server.public_origin` names. Nothing else — a reverse proxy in front
+/// is expected to forward `Host` unchanged, and `X-Forwarded-*` is not read.
+fn authority_allowed(public_origin: Option<&crate::config::Origin>, authority: &str) -> bool {
+    is_loopback_authority(authority) || public_origin.is_some_and(|o| o.authority == authority)
 }
 
 /// Whether an `Origin` header (`scheme://authority`) may reach this server.
 /// An opaque or malformed origin (`null`) is not trusted.
-fn origin_allowed(public_origins: &[crate::config::Origin], origin: &str) -> bool {
+fn origin_allowed(public_origin: Option<&crate::config::Origin>, origin: &str) -> bool {
     match origin.split_once("://") {
-        Some((_, authority)) => authority_allowed(public_origins, authority),
+        Some((_, authority)) => authority_allowed(public_origin, authority),
         None => false,
     }
 }
 
-/// `guard_local` with the configured public authorities also allowed. In
-/// local mode there are none, and the behaviour is byte for byte the
-/// loopback-only rule above.
+/// `guard_local` with one extra allowed authority. In local mode there is
+/// none, and the behaviour is byte for byte the loopback-only rule above.
 async fn guard_origin(State(grip): State<Arc<Grip>>, req: Request, next: Next) -> Response {
     let cfg = grip.cfg();
-    let public = cfg.public_origins.as_slice();
+    let public = cfg.public_origin.as_ref();
     let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !origin_allowed(public, origin) {
@@ -1569,12 +1567,12 @@ mod guard_tests {
     /// Local mode: no public origin, and the rule is exactly loopback-only.
     #[test]
     fn without_a_public_origin_only_loopback_is_allowed() {
-        assert!(authority_allowed(&[], "127.0.0.1:7777"));
-        assert!(authority_allowed(&[], "localhost"));
-        assert!(!authority_allowed(&[], "thetis.example.com"));
-        assert!(origin_allowed(&[], "http://localhost:7777"));
-        assert!(!origin_allowed(&[], "https://thetis.example.com"));
-        assert!(!origin_allowed(&[], "null"));
+        assert!(authority_allowed(None, "127.0.0.1:7777"));
+        assert!(authority_allowed(None, "localhost"));
+        assert!(!authority_allowed(None, "thetis.example.com"));
+        assert!(origin_allowed(None, "http://localhost:7777"));
+        assert!(!origin_allowed(None, "https://thetis.example.com"));
+        assert!(!origin_allowed(None, "null"));
     }
 
     /// Users mode behind a proxy: the configured authority is admitted, and
@@ -1582,40 +1580,21 @@ mod guard_tests {
     /// loopback rule is unchanged.
     #[test]
     fn the_public_origin_is_admitted_exactly() {
-        let p = [public()];
-        assert!(authority_allowed(&p, "thetis.example.com"));
-        assert!(!authority_allowed(&p, "thetis.example.com:8443"));
-        assert!(!authority_allowed(&p, "evil.example.com"));
-        assert!(!authority_allowed(&p, "thetis.example.com.evil.com"));
+        let p = public();
+        assert!(authority_allowed(Some(&p), "thetis.example.com"));
+        assert!(!authority_allowed(Some(&p), "thetis.example.com:8443"));
+        assert!(!authority_allowed(Some(&p), "evil.example.com"));
+        assert!(!authority_allowed(Some(&p), "thetis.example.com.evil.com"));
         assert!(
-            authority_allowed(&p, "127.0.0.1:7777"),
+            authority_allowed(Some(&p), "127.0.0.1:7777"),
             "loopback still works behind a proxy"
         );
-        assert!(origin_allowed(&p, "https://thetis.example.com"));
+        assert!(origin_allowed(Some(&p), "https://thetis.example.com"));
         // The scheme is not part of the check: TLS is the proxy's business
         // and the origin guard is about *which site* the request is from.
-        assert!(origin_allowed(&p, "http://thetis.example.com"));
-        assert!(!origin_allowed(&p, "https://evil.example.com"));
-        assert!(!origin_allowed(&p, "null"));
-    }
-
-    /// One server answering to several names: each is admitted, and the list
-    /// widens nothing beyond the names actually in it.
-    #[test]
-    fn every_configured_origin_is_admitted_and_no_more() {
-        let ps = [
-            public(),
-            Origin {
-                scheme: "https".into(),
-                authority: "play.example.com".into(),
-            },
-        ];
-        assert!(authority_allowed(&ps, "thetis.example.com"));
-        assert!(authority_allowed(&ps, "play.example.com"));
-        assert!(!authority_allowed(&ps, "other.example.com"));
-        assert!(authority_allowed(&ps, "localhost:7777"));
-        assert!(origin_allowed(&ps, "https://play.example.com"));
-        assert!(!origin_allowed(&ps, "https://play.example.com.evil.com"));
+        assert!(origin_allowed(Some(&p), "http://thetis.example.com"));
+        assert!(!origin_allowed(Some(&p), "https://evil.example.com"));
+        assert!(!origin_allowed(Some(&p), "null"));
     }
 
     #[test]

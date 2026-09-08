@@ -21,8 +21,7 @@ To enable accounts:
    tracked `thetis.toml`). Set `[auth] mode = "users"` and `claim_unowned` to
    an administrator's user id.
 3. For remote access, set `server.bind` and `server.public_origin`, then put
-   Thetis behind a TLS reverse proxy which preserves `Host`. `public_origin`
-   takes one origin or a list of them, and a name not on the list is refused.
+   Thetis behind a TLS reverse proxy which preserves `Host`.
 
 Or, for the common case of one administrator to start with, run
 `scripts/enable-users-auth.sh <user-id>` — it prompts for the password, writes

@@ -21,10 +21,8 @@ primary_gateway = "web"
 # that still works when every WebAssembly guest is broken.
 admin_enabled = true
 # Required when auth.mode = "users" and bind is not loopback. TLS belongs at
-# a reverse proxy; Thetis does not trust X-Forwarded-* headers, so every name
-# the server answers to has to be listed here by hand.
+# a reverse proxy; Thetis does not trust X-Forwarded-* headers.
 # public_origin = "https://thetis.example.com"
-# public_origin = ["https://thetis.example.com", "https://play.example.com"]
 
 [auth]
 # "local" preserves the single implicit administrator and loopback-only access.

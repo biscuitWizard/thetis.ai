@@ -329,7 +329,6 @@ Anything in the file can be overridden per run. The common ones:
 | `THETIS_CONFIG` | which config file to read |
 | `THETIS_ROOT` | the project root |
 | `THETIS_BIND` | `server.bind` |
-| `THETIS_PUBLIC_ORIGIN` | `server.public_origin`; several are separated by commas |
 | `THETIS_MODEL` | `llm.model` |
 | `THETIS_MODELS` | the model picker, as `id=Label` pairs |
 | `THETIS_DEFAULT_MODE` | `agent.default_mode` |
@@ -386,14 +385,7 @@ For multiple users, set `mode = "users"`, define `[[roles]]` and `[[users]]` in
 is omitted from every other account's list and transcript recall.
 
 When binding off loopback, `server.public_origin` is required. Put Thetis behind
-a TLS reverse proxy that preserves `Host`; proxy headers are not trusted. One
-server may answer to several names — write `public_origin` as a list and each
-is admitted, and only those:
-
-```toml
-[server]
-public_origin = ["https://thetis.example.com", "https://play.example.com"]
-``` Role
+a TLS reverse proxy that preserves `Host`; proxy headers are not trusted. Role
 capability denials are enforced in native host imports. Per-name denials of
 agent-internal built-ins are advisory; deny their capability family for a hard
 boundary. Tool-group denials are likewise soft, but agent-core applies them
