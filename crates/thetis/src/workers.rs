@@ -178,6 +178,22 @@ impl WorkerRouter {
         }
     }
 
+    /// Whether this session's worker is on its way up: being materialized, or
+    /// spawned and not yet ready. A message submitted to such a session is
+    /// waiting on it, so "no live worker" would be the wrong answer to "is
+    /// anything happening here" — and the campaign gateway would offer to
+    /// abandon a turn that was about to start.
+    pub async fn starting(&self, session_id: &str) -> bool {
+        if let Some(entry) = self.entry(session_id).await {
+            if !entry.peer.is_closed() && !*entry.ready.borrow() {
+                return true;
+            }
+        }
+        let map = self.materializing.lock().await;
+        map.get(session_id)
+            .is_some_and(|aspect| aspect.try_lock().is_err())
+    }
+
     /// The live peer for a session, if any — for operations that must not
     /// spawn a worker as a side effect (admin actions on stopped ones).
     pub async fn live_peer(&self, session_id: &str) -> Option<Arc<Peer>> {

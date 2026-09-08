@@ -113,13 +113,33 @@ async fn dispatch(
         // Deliberately never spawns a worker: a session with no live worker has
         // no turn to stop, so materializing one to tell it to do nothing would
         // be both slow and pointless.
+        //
+        // `stopped` is a promise, and the reply is honest about it: true means
+        // a turn was in flight and its `turn-finished` will follow the stop;
+        // false means nothing was running and no such event is coming, which
+        // is the campaign gateway's cue to close the turn itself. A worker on
+        // its way up is neither — the message that spawned it has not been
+        // run yet — and is reported as `starting` so nobody abandons a turn
+        // that is about to begin.
         "turn-cancel" => {
+            if router.starting(session).await {
+                return Ok(json!({
+                    "type": "turn-cancel",
+                    "session": session,
+                    "ok": true,
+                    "stopped": false,
+                    "starting": true,
+                    "message": "the conversation's runtime is still starting",
+                })
+                .to_string());
+            }
             let Some(peer) = router.live_peer(session).await else {
                 return Ok(json!({
                     "type": "turn-cancel",
                     "session": session,
                     "ok": true,
                     "stopped": false,
+                    "starting": false,
                     "message": "nothing running",
                 })
                 .to_string());
@@ -138,6 +158,7 @@ async fn dispatch(
                 "session": session,
                 "ok": true,
                 "stopped": stopped,
+                "starting": false,
             })
             .to_string())
         }

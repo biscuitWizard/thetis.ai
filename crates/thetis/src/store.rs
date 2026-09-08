@@ -1140,6 +1140,23 @@ impl Store {
                         "This turn has been interrupted {attempts} times; not resuming it again."
                     )),
                 )?;
+                // The incident says why; the terminator says it is over.
+                // Without the second, the log ended on a dangling
+                // `turn-started` and everything reading turn boundaries from
+                // it — the campaign gateway's busy state above all — saw a
+                // turn still running, with no worker under it and nothing
+                // left that would ever write the event they were waiting on.
+                self.append_event(
+                    &meta.id,
+                    SessionEvent::TurnFinished(TurnStats {
+                        iterations: 0,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        cost_usd: 0.0,
+                        tools_used: Vec::new(),
+                        stopped_by: "interrupted".to_string(),
+                    }),
+                )?;
                 self.clear_resume_attempts(&meta.id)?;
             } else if resume && !expected {
                 self.kv_put(&meta.id, RESUME_ATTEMPTS_KEY, &(attempts + 1).to_string())?;
@@ -2239,11 +2256,20 @@ mod tests {
             store.append_event(&id, SessionEvent::TurnStarted).unwrap();
         }
 
-        assert!(store
-            .events(&id, 0)
-            .unwrap()
+        let events = store.events(&id, 0).unwrap();
+        let gave_up = events
             .iter()
-            .any(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming"))));
+            .position(|r| matches!(&r.event, SessionEvent::Incident(t) if t.contains("not resuming")))
+            .expect("the log says why the turn was abandoned");
+        // And that it is over: the turn ends with a terminator, so nothing
+        // reading turn boundaries from the log waits on a worker that is gone.
+        assert!(
+            matches!(
+                events.get(gave_up + 1).map(|r| &r.event),
+                Some(SessionEvent::TurnFinished(stats)) if stats.stopped_by == "interrupted"
+            ),
+            "an abandoned turn must end with turn-finished, not a dangling turn-started"
+        );
     }
 
     #[test]

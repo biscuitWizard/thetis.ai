@@ -193,6 +193,17 @@ struct Handle {
     /// that one: stopping the owner's work because a guest was removed would
     /// make removal a denial-of-service.
     speaker: Arc<Mutex<Option<String>>>,
+    /// Whether this session has a turn in flight, or one accepted and about
+    /// to start. Kept beside the cancel flag because `cancel` used to answer
+    /// "was there a session to stop", which is true from the first message
+    /// onwards and stays true forever: a campaign whose turn had died with
+    /// the worker still alive asked to stop it, heard "stopped", and waited
+    /// for a `turn-finished` that nothing was going to write. Raised the
+    /// moment a message is accepted rather than when the actor gets round to
+    /// it, so that a turn the host has agreed to run reads as running from
+    /// the caller's first opportunity to ask; lowered only after the turn's
+    /// terminator is in the log, so "not running" means the log is settled.
+    running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -219,6 +230,7 @@ impl SessionActors {
         author: Option<crate::bindings::types::Author>,
     ) {
         let tx = self.ensure(grip, session_id);
+        self.mark_running(session_id);
         // The speaker is derived from the author rather than passed beside it,
         // so the identity the transcript records and the identity the
         // permissions come from cannot disagree.
@@ -236,7 +248,27 @@ impl SessionActors {
     /// Picks up a turn that was interrupted, spawning the actor if needed.
     pub fn resume(&self, grip: &Arc<Grip>, session_id: &str) {
         let tx = self.ensure(grip, session_id);
+        self.mark_running(session_id);
         let _ = tx.send(SessionMsg::Resume);
+    }
+
+    /// Records that a turn is on its way for this session. See `Handle::running`.
+    fn mark_running(&self, session_id: &str) {
+        if let Ok(handles) = self.handles.read() {
+            if let Some(h) = handles.get(session_id) {
+                h.running.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Whether a turn is running, or accepted and about to run, for this
+    /// session. False for a session this worker has never heard of.
+    pub fn running(&self, session_id: &str) -> bool {
+        self.handles
+            .read()
+            .ok()
+            .and_then(|handles| handles.get(session_id).map(|h| h.running.load(Ordering::SeqCst)))
+            .unwrap_or(false)
     }
 
     /// Stops the turn running for this session, if there is one.
@@ -248,8 +280,11 @@ impl SessionActors {
     /// broken: the message sat in the queue behind the very thing it was meant
     /// to interrupt.
     ///
-    /// Reports whether a live session was found, so the caller can tell the
-    /// user "stopping" from "nothing was running".
+    /// Reports whether a turn was actually running — not merely whether the
+    /// session was known here. The caller's next move depends on the
+    /// difference: a running turn will write its own `turn-finished` once the
+    /// stop lands, and nothing else will, so "nothing was running" is the
+    /// signal to close the turn by other means.
     pub fn cancel(&self, session_id: &str) -> bool {
         let Ok(handles) = self.handles.read() else {
             return false;
@@ -263,7 +298,7 @@ impl SessionActors {
         // The inbox item too, so a well-behaved guest stops at its next
         // checkpoint with a tidy "cancelled" rather than by trapping.
         push(&h.inbox, InboxItem::Cancel);
-        true
+        h.running.load(Ordering::SeqCst)
     }
 
     /// Stops the running turn only if `account` is the one who started it.
@@ -335,6 +370,7 @@ impl SessionActors {
         let inbox = Arc::new(Mutex::new(VecDeque::new()));
         let cancel = Arc::new(CancelFlag::default());
         let speaker = Arc::new(Mutex::new(None));
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         handles.insert(
             session_id.to_string(),
             Handle {
@@ -342,6 +378,7 @@ impl SessionActors {
                 inbox: inbox.clone(),
                 cancel: cancel.clone(),
                 speaker: speaker.clone(),
+                running: running.clone(),
             },
         );
 
@@ -352,6 +389,7 @@ impl SessionActors {
             inbox,
             cancel,
             speaker,
+            running,
         ));
         tx
     }
@@ -364,6 +402,7 @@ async fn actor(
     inbox: Arc<Mutex<VecDeque<InboxItem>>>,
     cancel: Arc<CancelFlag>,
     published_speaker: Arc<Mutex<Option<String>>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Set when a turn ends with unconsumed nudges: those are user input that
     // never reached the model, so they start a follow-up turn instead of being
@@ -387,6 +426,8 @@ async fn actor(
                     .await
                 {
                     tracing::error!(session = %session_id, error = %e, "failed to log user message");
+                    // Nothing will run for this message, so nothing is running.
+                    running.store(false, Ordering::SeqCst);
                     continue;
                 }
             } else {
@@ -406,6 +447,8 @@ async fn actor(
                             .await
                         {
                             tracing::error!(session = %session_id, error = %e, "failed to log user message");
+                            // Nothing will run for this message, so nothing is running.
+                            running.store(false, Ordering::SeqCst);
                             continue;
                         }
                     }
@@ -413,6 +456,9 @@ async fn actor(
             }
         }
         start_immediately = false;
+        // A deferred message or a leftover nudge starts a turn without passing
+        // through `submit`, so the flag is raised here as well as there.
+        running.store(true, Ordering::SeqCst);
 
         // Anything a previous turn left unread would otherwise stop this one
         // before it says a word. Whatever is worth carrying forward was already
@@ -658,6 +704,10 @@ async fn actor(
         if let Ok(mut published) = published_speaker.lock() {
             *published = None;
         }
+        // After the terminator, never before it: a caller told "nothing is
+        // running" may close the turn itself, and two terminators for one
+        // turn is worse than a short wait.
+        running.store(false, Ordering::SeqCst);
 
         // Anything the agent never picked up becomes the seed of the next turn.
         let leftovers = take_all(&inbox);
@@ -978,6 +1028,7 @@ mod tests {
                 inbox: Arc::new(Mutex::new(VecDeque::new())),
                 cancel: cancel.clone(),
                 speaker: speaker.clone(),
+                running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
 
@@ -1002,5 +1053,40 @@ mod tests {
             .map(|h| h.cancel = idle.clone());
         assert!(!actors.cancel_turn_by("s1", "guest"));
         assert!(!idle.raised());
+    }
+
+    /// A stop reports whether it stopped anything. The campaign gateway acts
+    /// on the difference: "stopped" means a `turn-finished` is coming and the
+    /// turn will close itself; "nothing running" means the turn died without
+    /// one and has to be closed by hand. Answering "stopped" for a session
+    /// that was merely known here left a campaign waiting on an event that
+    /// nothing was going to write.
+    #[test]
+    fn a_stop_says_whether_a_turn_was_running() {
+        let actors = SessionActors::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(CancelFlag::default());
+        cancel.begin_turn();
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        actors.handles.write().unwrap().insert(
+            "s1".to_string(),
+            Handle {
+                tx,
+                inbox: Arc::new(Mutex::new(VecDeque::new())),
+                cancel: cancel.clone(),
+                speaker: Arc::new(Mutex::new(None)),
+                running: running.clone(),
+            },
+        );
+        assert!(!actors.running("s1"));
+        assert!(
+            !actors.cancel("s1"),
+            "a known session with no turn in flight has nothing to stop"
+        );
+        assert!(cancel.raised(), "the flag is still raised, harmlessly: the next turn makes it stale");
+
+        running.store(true, Ordering::SeqCst);
+        assert!(actors.running("s1"));
+        assert!(actors.cancel("s1"), "a turn in flight is what a stop stops");
     }
 }
