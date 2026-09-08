@@ -737,6 +737,12 @@ project = "market-party-289715"
 location = "US"
 max_bytes_billed = 53687091200
 
+[tools.miro]
+max_retries = 3
+retries = 3
+base_url = "https://api.miro.com/v2"
+timeout_secs = 30
+
 # The Discord bot. Off until a token is set.
 #
 # The safety property here is the *ceiling*: every conversation the bot creates

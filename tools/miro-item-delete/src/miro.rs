@@ -77,7 +77,7 @@ pub fn req<'a>(v:&'a Value,k:&str)->Result<&'a str,String>{v.get(k).and_then(Val
 pub fn opt(v:&Value,k:&str)->Option<String>{v.get(k).and_then(Value::as_str).map(str::trim).filter(|s|!s.is_empty()).map(str::to_string)}
 pub fn obj(v:&Value,k:&str)->Result<Value,String>{v.get(k).filter(|x|x.is_object()).cloned().ok_or_else(||format!("{k} must be an object"))}
 pub fn limit(v:&Value)->usize{v.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1,200) as usize}
-pub fn q(v:&Value,names:&[&str])->Vec<(String,String)>{names.iter().filter_map(|k|v.get(*k).and_then(|x|if x.is_string(){x.as_str().map(str::to_string)}else if x.is_number()||x.is_boolean(){Some(x.to_string())}else{None}).map(|x|((*k).to_string(),x))).collect()}
+pub fn q(v:&Value,names:&[&str])->Vec<(String,String)>{names.iter().filter_map(|k|v.get(*k).and_then(|x|if let Some(s)=x.as_str(){let s=s.trim();if s.is_empty(){None}else{Some(s.to_string())}}else if x.is_number()||x.is_boolean(){Some(x.to_string())}else{None}).map(|x|((*k).to_string(),x))).collect()}
 pub fn enc(s:&str)->String{s.bytes().map(|b|if b.is_ascii_alphanumeric()||b"-._~".contains(&b){(b as char).to_string()}else{format!("%{b:02X}")}).collect()}
 pub fn plural(t:&str)->Result<&'static str,String>{match t{"sticky_note"=>Ok("sticky_notes"),"shape"=>Ok("shapes"),"text"=>Ok("texts"),"card"=>Ok("cards"),"image"=>Ok("images"),"document"=>Ok("documents"),"app_card"=>Ok("app_cards"),"frame"=>Ok("frames"),"embed"=>Ok("embeds"),"preview"=>Ok("previews"),_=>Err("item_type must be sticky_note, shape, text, card, image, document, app_card, frame, embed, or preview".into())}}
 pub fn normalized(v:&Value)->String{
