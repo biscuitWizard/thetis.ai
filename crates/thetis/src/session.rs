@@ -47,6 +47,32 @@ fn usage_since(events: &[crate::bindings::types::EventRecord], since: u64) -> (u
     (prompt, completion, cost)
 }
 
+/// The incident a failed turn leaves behind, with the model that ran it named.
+///
+/// The agent's error says "transport error: … connection refused" and never
+/// which model refused: a campaign pointed at a stopped local server failed
+/// every turn with one sentence that did not contain the word "model", and no
+/// surface could say what to change. The facts go in a bracketed tail at the
+/// end, so a transcript reads it as an aside and a surface can lift it out
+/// without parsing prose — the campaign gateway turns it into "the game master
+/// (…, a local server) could not be reached. Pick another model in Options →
+/// Models."
+///
+/// Nothing is appended when the session carries no model of its own (the grip
+/// default, which a surface has nothing to point at) or when the error already
+/// carries a tail.
+pub(crate) fn failure_incident(error: &str, model: &str, mode: &str) -> String {
+    let (error, model, mode) = (error.trim(), model.trim(), mode.trim());
+    if model.is_empty() || error.contains("[model:") {
+        return error.to_string();
+    }
+    if mode.is_empty() {
+        format!("{error} [model: {model}]")
+    } else {
+        format!("{error} [model: {model}; mode: {mode}]")
+    }
+}
+
 /// Fills in a terminator for a turn that produced no stats of its own.
 ///
 /// A stop and a fault both used to append an all-zero `TurnStats`, which the UI
@@ -607,8 +633,21 @@ async fn actor(
             }
             Err(err) => {
                 tracing::warn!(session = %session_id, error = %err, "turn failed");
+                // Which model was running it, so the incident says what to
+                // change rather than only that something went wrong.
+                let (model, mode) = grip
+                    .persist
+                    .get_session(&session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|m| (m.model, m.mode))
+                    .unwrap_or_default();
                 let _ = grip
-                    .append_event(&session_id, SessionEvent::Incident(err.to_string()))
+                    .append_event(
+                        &session_id,
+                        SessionEvent::Incident(failure_incident(&err.to_string(), &model, &mode)),
+                    )
                     .await;
                 // Every turn ends with exactly one terminator, success or not.
                 // Anything waiting on "the turn is over" watches for this one
@@ -1088,5 +1127,28 @@ mod tests {
         running.store(true, Ordering::SeqCst);
         assert!(actors.running("s1"));
         assert!(actors.cancel("s1"), "a turn in flight is what a stop stops");
+    }
+
+    /// A campaign pointed at a stopped local server failed every turn with a
+    /// sentence that never said which model, so nothing on the screen could
+    /// point at the setting that fixes it.
+    #[test]
+    fn a_failed_turn_names_the_model_that_was_running_it() {
+        assert_eq!(
+            failure_incident("transport error: connection refused", "local-qwen/qwen3-27b", "rpg-gm"),
+            "transport error: connection refused [model: local-qwen/qwen3-27b; mode: rpg-gm]"
+        );
+        // No mode is still worth the model.
+        assert_eq!(
+            failure_incident("model error: http 500", "openai/gpt-4o", "  "),
+            "model error: http 500 [model: openai/gpt-4o]"
+        );
+        // A session on the grip default has nothing a surface could offer to
+        // change, and a text that already carries a tail is left alone.
+        assert_eq!(failure_incident("it fell over", "", "agent"), "it fell over");
+        assert_eq!(
+            failure_incident("boom [model: a/b]", "c/d", "agent"),
+            "boom [model: a/b]"
+        );
     }
 }
