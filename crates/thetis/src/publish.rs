@@ -115,8 +115,13 @@ pub async fn export_public(git: &GitCtl) -> Result<Export> {
     let mut parent = git.rev_parse(PUBLIC_REF).await?;
     let mut exported = 0usize;
 
-    for commit in git.rev_list(&range).await? {
-        let filtered = filtered_tree(git, &commit).await?;
+    // One set for the whole export, gathered before any of it is written: what
+    // is private at the tip is private in every commit this run touches.
+    let commits = git.rev_list(&range).await?;
+    let private = private_dirs_through(git, &head, &commits).await?;
+
+    for commit in commits {
+        let filtered = filtered_tree(git, &commit, &private).await?;
 
         // An empty filter delta against the parent would still get its own
         // commit: the one-to-one mapping is what makes the export idempotent
@@ -156,12 +161,45 @@ pub async fn export_public(git: &GitCtl) -> Result<Export> {
     })
 }
 
-/// `commit`'s tree with the private paths of *that commit* removed.
-async fn filtered_tree(git: &GitCtl, commit: &str) -> Result<String> {
-    let private = private_dirs(git, commit).await?;
-    strip_private(git, commit, &private)
+/// `commit`'s tree with `private` removed.
+///
+/// The caller supplies the set, and it is deliberately not `commit`'s own: see
+/// [`private_dirs_through`].
+async fn filtered_tree(git: &GitCtl, commit: &str, private: &[String]) -> Result<String> {
+    strip_private(git, commit, private)
         .await
         .with_context(|| format!("filtering commit {commit}"))
+}
+
+/// Every directory marked private *anywhere* in `commits`, plus at `head`.
+///
+/// Filtering each commit by the markers in that same commit is the obvious
+/// reading of "private", and it is wrong in the one case that matters. A
+/// module is usually written first and marked private afterwards, so every
+/// commit between the two carries no marker, and a per-commit filter exports
+/// the module in full from all of them. The tip comes out clean and the
+/// history does not, which is exactly how it passes a spot check.
+///
+/// This happened: a campaign module written on 2026-09-06 and marked private on
+/// 2026-09-07 reached the remote in 101 commits, because each of those commits
+/// predated its own marker. Marking a directory private has to mean the
+/// material never leaves, including from the commits that were written before
+/// anybody thought to mark it.
+///
+/// The union also holds a marker that is later *removed*: un-marking a
+/// directory publishes it from that commit forward, and never retroactively.
+/// Making something public is a decision worth taking deliberately, commit by
+/// commit, rather than one that reaches back through history on its own.
+pub async fn private_dirs_through(
+    git: &GitCtl,
+    head: &str,
+    commits: &[String],
+) -> Result<Vec<String>> {
+    let mut all = std::collections::BTreeSet::new();
+    for rev in std::iter::once(&head.to_string()).chain(commits.iter()) {
+        all.extend(private_dirs(git, rev).await?);
+    }
+    Ok(all.into_iter().collect())
 }
 
 /// `tree_ish`'s tree without `private`, built in a temporary index so the
@@ -1262,6 +1300,44 @@ mod tests {
             !files.iter().any(|f| f.starts_with("tools/legacy-secret")),
             "the old marker must still hide its directory: {files:?}"
         );
+    }
+
+    /// The failure that put 101 commits of a campaign module on a public
+    /// remote: written first, marked private later, and every commit in
+    /// between filtered against its own absent marker. The tip was clean, so a
+    /// spot check of the tip said everything was fine.
+    #[tokio::test]
+    async fn a_marker_added_late_still_strips_the_history_before_it() {
+        let (tmp, git) = repo().await;
+
+        // A module is written, with no marker: it is public at this point.
+        let module = tmp.path().join("gateways/gateway-secret");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("lib.rs"), "the whole module
+").unwrap();
+        git.add_all_and_commit("write the module").await.unwrap();
+
+        // It is worked on for a while, still unmarked.
+        std::fs::write(module.join("more.rs"), "and more of it
+").unwrap();
+        git.add_all_and_commit("keep working on it").await.unwrap();
+
+        // Only now is it marked private — and only now is anything exported.
+        std::fs::write(module.join(PRIVATE_MARKER), "").unwrap();
+        git.add_all_and_commit("mark the module private").await.unwrap();
+
+        export_public(&git).await.unwrap();
+
+        // Every published commit, not merely the tip.
+        let commits = git.rev_list("public").await.unwrap();
+        assert!(commits.len() >= 4, "base plus three: {commits:?}");
+        for commit in &commits {
+            let files = git.tree_files(commit).await.unwrap();
+            assert!(
+                !files.iter().any(|p| p.contains("gateway-secret")),
+                "commit {commit} published the module: {files:?}"
+            );
+        }
     }
 
     #[tokio::test]
