@@ -30,12 +30,12 @@ Values at the time of the snapshot, grouped. All are marked `[needs restart]`.
 | `cache.explicit_vendors` | `anthropic` |
 | `cache.ttl` | `5m` |
 | `context.compact_target` | 0.25 |
-| `context.compact_threshold` | 0.6 |
+| `context.compact_threshold` | 0.75 |
 | `context.enabled` | true |
 | `context.keep_head` | 4 |
 | `context.keep_tail` | 30 |
 | `context.summary_model` | empty, so the main model |
-| `context.window_tokens` | 200000 |
+| `context.window_tokens` | 128000 (fallback for an unknown model; a listed model has its own) |
 | `control.allow_restart` | true |
 | `control.min_uptime_secs` | 20 |
 | `devkit.enabled` | true |
@@ -143,7 +143,7 @@ Remake with: read `config_get` in `crates/thetis/src/host_api.rs`.
 
 `model`, `agent_name`, `agent_avatar`, `system_prompt`, `max_iterations`,
 `max_tool_output_bytes`, `sandbox_available`, `devkit_available`,
-`compact_enabled`, `context_window`, `compact_threshold`, `compact_target`,
+`compact_enabled`, `context_window`, `context_window:<model>`, `compact_threshold`, `compact_target`,
 `summary_model`, `keep_head`, `keep_tail`.
 
 `agent_name` is what the *agent* calls itself, from `agent.name` in the config,

@@ -231,30 +231,51 @@ default_mode = "agent"
 # label = "Qwen3 30B (local)"
 # provider = "local"
 # wire_model = "qwen3-30b-a3b"
+#
+#   context_window = the window compaction plans against for this model, in
+#                    tokens. Omit it for a model on a keyless local server: the
+#                    server is asked for the n_ctx it was started with, which
+#                    changes whenever it is restarted with a different -c and
+#                    which nobody would keep a file in step with. A hosted model
+#                    without one gets [context] window_tokens.
+#
+# The hosted entries below are set to 200000 on purpose, well under their real
+# windows (OpenRouter reports 1000000 and more for every one of them but
+# GPT-4o). That is the ceiling this installation was already compacting at, and
+# a conversation that fills a million tokens before it is summarized costs a
+# million tokens a turn. Raise one when that is wanted; it is a fact about this
+# installation's budget, not about the model.
 
 [[models]]
 id = "anthropic/claude-opus-5"
 label = "Claude Opus 5"
+context_window = 200000
 
 [[models]]
 id = "anthropic/claude-sonnet-5"
 label = "Claude Sonnet 5"
+context_window = 200000
 
 [[models]]
 id = "openai/gpt-5.6-sol"
 label = "GPT-5.6 Sol"
+context_window = 200000
 
 [[models]]
 id = "openai/gpt-4o"
 label = "GPT-4o"
+# Its real window.
+context_window = 128000
 
 [[models]]
 id = "google/gemini-2.5-pro"
 label = "Gemini 2.5 Pro"
+context_window = 200000
 
 [[models]]
 id = "z-ai/glm-5.3"
 label = "GLM 5.3"
+context_window = 200000
 
 # The local llama.cpp server, offered in the picker beside the hosted models.
 [[models]]
@@ -445,11 +466,23 @@ compile you did not run is a claim you should not make.
 # what actually costs money rather than estimating one part of it.
 [context]
 enabled = true
-# Assumed usable window. Deliberately under any real one: compaction should
-# happen well before the provider starts refusing, not at the cliff edge.
-window_tokens = 200000
-# Compact when the context passes this fraction of the window...
-compact_threshold = 1.0
+# The window assumed for a model nothing is known about. The window compaction
+# actually plans against is per model: a [[models]] entry with a
+# `context_window` uses that, and a model on a keyless local server is asked
+# for the `n_ctx` it was started with. This is only the fallback, and it is
+# deliberately the smallest window in the hosted catalogue rather than a large
+# one, because an unknown model has to be assumed small enough to be safe.
+#
+# It was 200000, one number for every model, and the local llama-server here
+# runs at 65536: compaction could not fire before that server refused, and
+# every context failure of 2026-09-07 -- a build refused at 67960 tokens, a hub
+# turn at 71048, a fight whose tool call was cut off mid-argument with 490
+# tokens of room -- was that one gap.
+window_tokens = 128000
+# Compact when the context passes this fraction of the window. Well before it:
+# at 1.0 compaction could only fire once the request was already refused,
+# which is the cliff edge the note above is about.
+compact_threshold = 0.75
 # ...and shed until it is back under this one. Summarizing stops at the first
 # round boundary that gets under the target, so a long conversation sheds what
 # it must and keeps the rest.

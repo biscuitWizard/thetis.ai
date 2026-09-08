@@ -80,6 +80,8 @@ fn has_tool_calls(msg: &Value) -> bool {
 /// Settings, read from the host rather than assumed.
 pub struct Policy {
     pub enabled: bool,
+    /// The window of the model this conversation runs on — not of the
+    /// installation. See `resolve`.
     pub window: u32,
     pub threshold: f64,
     pub target: f64,
@@ -88,19 +90,47 @@ pub struct Policy {
     pub keep_tail: usize,
 }
 
+/// The window assumed when the host answers nothing about it at all: neither
+/// the model's own key nor the bare one. Never the case against a host that
+/// serves `context_window`; small on purpose against one that does not, since
+/// a window guessed large is a window the provider refuses first.
+const FALLBACK_WINDOW: f64 = 32_000.0;
+
 impl Policy {
-    pub fn load() -> Self {
+    /// Settings for the model this conversation is running on.
+    pub fn load(model: &str) -> Self {
+        Self::resolve(model, sys::config_get)
+    }
+
+    /// `load` with the host replaced, so the resolution can be tested.
+    ///
+    /// The window is the model's. The host answers `context_window:<model>`
+    /// from the model's own entry, from what a keyless local server reports
+    /// for itself, or from its conservative fallback — and it is the reason
+    /// this takes a model at all. The one number the installation used to
+    /// carry, 200,000, was three times the window of the local server it ran
+    /// on, so with the threshold at 1.0 compaction could not fire before that
+    /// server refused; and the refusals did not all announce themselves as
+    /// context errors. A model left five hundred tokens of room emits a tool
+    /// call cut off mid-argument, which reads as a broken schema and cost an
+    /// hour of looking at one. The bare `context_window` is only for a host
+    /// that does not know the per-model key.
+    pub fn resolve(model: &str, lookup: impl Fn(&str) -> Option<String>) -> Self {
         let num = |key: &str, fallback: f64| -> f64 {
-            sys::config_get(key)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(fallback)
+            lookup(key).and_then(|v| v.parse().ok()).unwrap_or(fallback)
         };
+        let window = lookup(&format!("context_window:{}", model.trim()))
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|w| *w >= 1.0)
+            .unwrap_or_else(|| num("context_window", FALLBACK_WINDOW));
         Self {
-            enabled: sys::config_get("compact_enabled").as_deref() != Some("false"),
-            window: num("context_window", 200_000.0) as u32,
-            threshold: num("compact_threshold", 1.0),
+            enabled: lookup("compact_enabled").as_deref() != Some("false"),
+            window: window as u32,
+            // Well before the window, never at it: at 1.0 the trigger is the
+            // request the provider refuses.
+            threshold: num("compact_threshold", 0.75),
             target: num("compact_target", 0.25),
-            summary_model: sys::config_get("summary_model").unwrap_or_default(),
+            summary_model: lookup("summary_model").unwrap_or_default(),
             keep_head: num("keep_head", 4.0) as usize,
             keep_tail: num("keep_tail", 30.0) as usize,
         }
@@ -751,6 +781,45 @@ mod tests {
         assert_eq!(policy.target_tokens(), 250);
         // An unknown context size is not a reason to compact.
         assert!(!policy.should_compact(0));
+    }
+
+    /// The effect, per model: the same context size compacts on a policy
+    /// resolved for a small-window model and does not on one resolved for a
+    /// large-window model, because the window came from the model and not
+    /// from the installation. A model the host knows nothing about gets the
+    /// host's conservative fallback, and a host that knows no window at all
+    /// gets the guest's own, which is smaller still.
+    #[test]
+    fn a_policy_is_resolved_for_the_model_in_use() {
+        let host = |key: &str| -> Option<String> {
+            match key {
+                "context_window:local-qwen/qwen3.8-27b" => Some("65536".into()),
+                "context_window:openai/gpt-5.6-sol" => Some("200000".into()),
+                "context_window" => Some("128000".into()),
+                "compact_threshold" => Some("0.75".into()),
+                _ => None,
+            }
+        };
+        let small = Policy::resolve("local-qwen/qwen3.8-27b", host);
+        let large = Policy::resolve("openai/gpt-5.6-sol", host);
+        let unknown = Policy::resolve("nobody/knows", host);
+        assert_eq!(small.window, 65_536);
+        assert_eq!(large.window, 200_000);
+        assert_eq!(unknown.window, 128_000);
+        // 50k tokens: past three quarters of the local window, nowhere near
+        // the hosted one. This is the size the fight died at minus what it
+        // needed to finish its tool call.
+        assert!(small.should_compact(50_000));
+        assert!(!large.should_compact(50_000));
+        assert!(!unknown.should_compact(50_000));
+        assert!(unknown.should_compact(97_000));
+        // And the trigger is under the window, not at it.
+        assert!(small.trigger_tokens() < small.window);
+
+        let older_host = |_: &str| -> Option<String> { None };
+        let blind = Policy::resolve("anything", older_host);
+        assert_eq!(blind.window, FALLBACK_WINDOW as u32);
+        assert!(blind.threshold < 1.0);
     }
 
     #[test]

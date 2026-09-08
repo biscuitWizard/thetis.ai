@@ -149,6 +149,13 @@ pub struct ModelSpec {
     /// A local llama.cpp server usually wants a bare name where the picker
     /// wants something namespaced, so the two are allowed to differ.
     pub wire_model: String,
+    /// The context window compaction plans against for this model, in
+    /// tokens. `None` means nothing is configured: a keyless local server is
+    /// then asked for its own (`context_window::resolve`), and anything else
+    /// gets `context.window_tokens`. An operator may set this *below* the
+    /// model's real window on purpose — a hosted model with a million-token
+    /// window is not one anyone wants to fill before summarizing.
+    pub context_window: Option<u32>,
 }
 
 impl ModelSpec {
@@ -431,7 +438,9 @@ pub enum CacheStrategy {
 #[derive(Debug, Clone)]
 pub struct ContextSettings {
     pub enabled: bool,
-    /// Assumed usable context window, in tokens.
+    /// The context window assumed for a model nothing is known about, in
+    /// tokens. The window actually planned against is per model — see
+    /// `context_window::resolve` — and this is only what it falls back to.
     pub window: u32,
     /// Fraction of the window that triggers compaction.
     pub compact_threshold: f64,
@@ -881,6 +890,18 @@ impl Config {
     /// A provider by id, or `None` when nothing is configured under that name.
     pub fn provider(&self, id: &str) -> Option<&ProviderSpec> {
         self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// The context window an operator wrote down for a model, if any. Not the
+    /// whole answer — `context_window::resolve` also asks a local server —
+    /// but the part that is a matter of configuration.
+    pub fn configured_window(&self, model: &str) -> Option<u32> {
+        let model = model.trim();
+        self.models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context_window)
+            .filter(|w| *w > 0)
     }
 
     /// The provider used when a model names none. Falls back to the first
@@ -1477,6 +1498,11 @@ mod spec {
         /// What to send as `model` when it differs from `id`.
         #[serde(default)]
         pub wire_model: String,
+        /// The context window compaction plans against, in tokens. 0 means
+        /// unknown: a keyless local server is asked, anything else falls
+        /// back to `context.window_tokens`.
+        #[serde(default)]
+        pub context_window: u32,
     }
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -1589,10 +1615,20 @@ mod spec {
         fn default() -> Self {
             Self {
                 enabled: true,
-                // Deliberately below any real window: the point is to compact
-                // well before the provider starts refusing, not at the cliff.
-                window_tokens: 200_000,
-                compact_threshold: 1.0,
+                // Only for a model nothing is known about: a listed model
+                // carries its own `context_window`, and a keyless local
+                // server is asked for its `n_ctx`. So this is deliberately the
+                // smallest window in the hosted catalogue rather than a large
+                // one — an unknown model must be assumed small enough to be
+                // safe. It was 200,000, which no local model has, and the
+                // local model this was found on refused at 65,536.
+                window_tokens: 128_000,
+                // Well before the window, not at it. At 1.0 compaction could
+                // only fire once the request was already refused, and the
+                // failures did not even look like context failures: a model
+                // left five hundred tokens of room emits a tool call cut off
+                // mid-argument, which reads as a broken schema.
+                compact_threshold: 0.75,
                 compact_target: 0.25,
                 // Empty means "whatever the session is using".
                 summary_model: String::new(),
@@ -1965,7 +2001,7 @@ fn env_string(key: &str) -> Option<String> {
 /// Tests that mean "this file, and nothing else" pass [`Env::None`]. Nothing
 /// else changes: the overrides still apply everywhere they did before.
 #[derive(Clone, Copy, Debug)]
-enum Env {
+pub(crate) enum Env {
     /// The process environment, as the running orchestrator sees it.
     Process,
     /// No overrides at all — the configuration file speaks for itself.
@@ -2383,7 +2419,7 @@ impl Config {
         toml::to_string(&spec::File::default()).unwrap_or_default()
     }
 
-    fn assemble(root: PathBuf, config_path: PathBuf, file: spec::File, env: Env) -> Result<Self> {
+    pub(crate) fn assemble(root: PathBuf, config_path: PathBuf, file: spec::File, env: Env) -> Result<Self> {
         // A worker's config is rooted at its worktree, but some paths name
         // state the whole fleet shares. The gateway pins those over the
         // environment at spawn, so a branch cannot retarget them by editing
@@ -2475,6 +2511,7 @@ impl Config {
                     id: m.id,
                     provider: m.provider,
                     wire_model: m.wire_model,
+                    context_window: (m.context_window > 0).then_some(m.context_window),
                 })
                 .collect(),
             None => builtin_models(),
@@ -3183,6 +3220,7 @@ fn parse_models_env(raw: &str) -> Vec<ModelSpec> {
                 // An env-declared model routes by id prefix, if at all.
                 provider: String::new(),
                 wire_model: String::new(),
+                context_window: None,
             }
         })
         .collect();
@@ -3210,6 +3248,7 @@ fn builtin_models() -> Vec<ModelSpec> {
         label: label.to_string(),
         provider: String::new(),
         wire_model: String::new(),
+        context_window: None,
     })
     .collect()
 }
@@ -3832,7 +3871,23 @@ max_universal = 3
         label = "Qwen3 30B (local)"
         provider = "local"
         wire_model = "qwen3-30b-a3b"
+        context_window = 32768
     "#;
+
+    /// A window is read from the model's own entry and nowhere else: a model
+    /// without one is unknown to the configuration, whatever the global
+    /// fallback says, so the resolver can go on to ask the server.
+    #[test]
+    fn a_models_window_is_its_own_and_absence_is_unknown() {
+        let cfg = from_toml(LOCAL_PROVIDER).unwrap();
+        assert_eq!(cfg.configured_window("local/qwen3-30b"), Some(32_768));
+        assert_eq!(cfg.configured_window(" local/qwen3-30b "), Some(32_768));
+        assert_eq!(cfg.configured_window("anthropic/claude-sonnet-4.5"), None);
+        assert_eq!(cfg.configured_window("nobody/knows"), None);
+        // The fallback is the conservative one, not the old 200,000.
+        assert_eq!(cfg.context.window, 128_000);
+        assert!(cfg.context.compact_threshold < 1.0);
+    }
 
     #[test]
     fn openrouter_is_always_a_provider_even_with_none_configured() {

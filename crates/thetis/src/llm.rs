@@ -1106,6 +1106,7 @@ mod tests {
             label: "Qwen3 (local)".into(),
             provider: "local".into(),
             wire_model: "qwen3-30b-a3b".into(),
+            context_window: None,
         }];
         LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).expect("client builds")
     }
@@ -1188,6 +1189,7 @@ mod tests {
             label: "DeepSeek (local)".into(),
             provider: "local".into(),
             wire_model: "deepseek-v4-flash".into(),
+            context_window: None,
         }];
         let client = LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap();
 

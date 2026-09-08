@@ -268,7 +268,7 @@ pub const FIELDS: &[Field] = &[
     fe("limits.max_attachments", Kind::Int, "limits", "Most attachments on one message.", "THETIS_MAX_ATTACHMENTS"),
     // --- context ------------------------------------------------------------
     fe("context.enabled", Kind::Bool, "context", "Compact the conversation when it nears the window, instead of failing at the cliff.", "THETIS_COMPACT"),
-    fe("context.window_tokens", Kind::Int, "context", "The context window compaction plans against. Deliberately below any real window.", "THETIS_CONTEXT_WINDOW"),
+    fe("context.window_tokens", Kind::Int, "context", "The window assumed for a model nothing is known about. A listed model uses its own context_window; a keyless local server is asked for its n_ctx.", "THETIS_CONTEXT_WINDOW"),
     f("context.compact_threshold", Kind::Float, "context", "Fraction of the window at which compaction starts (0.05 to 1.0)."),
     f("context.compact_target", Kind::Float, "context", "Fraction of the window to compact down to (0.01 to 0.95)."),
     fc("context.summary_model", Kind::ModelId, "context", "The model that writes the summary. Empty means the conversation's own.", Some("THETIS_SUMMARY_MODEL"), Choices::Models),
@@ -550,6 +550,11 @@ const MODEL_COLUMNS: &[Column] = &[
         "wire_model",
         Kind::Text,
         "What to send as `model` when it differs from the id.",
+    ),
+    c(
+        "context_window",
+        Kind::Int,
+        "Tokens compaction plans against for this model. Empty asks a keyless local server, else uses context.window_tokens.",
     ),
 ];
 

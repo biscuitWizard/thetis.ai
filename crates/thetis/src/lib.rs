@@ -19,6 +19,7 @@ pub mod buildcache;
 pub mod builder;
 pub mod cache;
 pub mod config;
+pub mod context_window;
 pub mod control;
 pub mod debug_api;
 pub mod delegation;

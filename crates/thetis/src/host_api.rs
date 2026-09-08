@@ -389,7 +389,27 @@ impl sys::Host for HostState {
             // Context compaction. The agent owns the decision of what to shed,
             // so it needs the thresholds rather than being told when to act.
             "compact_enabled" => Some(cfg.context.enabled.to_string()),
+            // The window for a model nothing is known about. A guest that
+            // knows which model it is running should ask for that model's
+            // instead, below: a local llama-server is a third the size of
+            // this, and compaction planned against this number could never
+            // fire before that server refused.
             "context_window" => Some(cfg.context.window.to_string()),
+            // The window compaction should plan against for one model — its
+            // own entry, else what a keyless local server reports for itself,
+            // else `context_window`. The campaign gateway reads the same key
+            // for the model of the phase it is in, so its cut on size and the
+            // agent's compaction cannot drift apart. No new import: a key
+            // with a prefix, like `provider:` below.
+            key if key.starts_with("context_window:") => {
+                let model = key.trim_start_matches("context_window:").trim();
+                if model.is_empty() {
+                    Some(cfg.context.window.to_string())
+                } else {
+                    let (window, _) = crate::context_window::resolve(cfg, model).await;
+                    Some(window.to_string())
+                }
+            }
             "compact_threshold" => Some(cfg.context.compact_threshold.to_string()),
             "compact_target" => Some(cfg.context.compact_target.to_string()),
             "summary_model" => Some(if cfg.context.summary_model.is_empty() {

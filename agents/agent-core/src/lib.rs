@@ -599,7 +599,7 @@ impl Turn {
     /// A failure is not fatal: the conversation simply stays long, which is
     /// worse than compacting and better than not answering.
     fn maybe_compact(&mut self) {
-        let policy = compaction::Policy::load();
+        let policy = compaction::Policy::load(&self.model);
         if !policy.enabled {
             return;
         }

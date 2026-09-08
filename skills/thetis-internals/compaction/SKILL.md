@@ -33,18 +33,26 @@ read the log. This is why there is no separate offload store.
 
 ## The trigger
 
-`Policy::load()` reads these values from the host with `config_get`. The host
-key names are different from the config file names.
+`Policy::load(model)` reads these values from the host with `config_get`. The
+host key names are different from the config file names.
 
 | Policy field | Host key | Config file key |
 |---|---|---|
 | `enabled` | `compact_enabled` | `context.enabled` |
-| `window` | `context_window` | `context.window_tokens` |
+| `window` | `context_window:<model>` | `models[].context_window`, else probed, else `context.window_tokens` |
 | `threshold` | `compact_threshold` | `context.compact_threshold` |
 | `target` | `compact_target` | `context.compact_target` |
 | `summary_model` | `summary_model` | `context.summary_model` |
 | `keep_head` | `keep_head` | `context.keep_head` |
 | `keep_tail` | `keep_tail` | `context.keep_tail` |
+
+The window is the model's, not the installation's. The host answers
+`context_window:<model>` from the model's `[[models]]` entry, else — for a
+provider with no API key, which is a local llama-server — from what the server
+reports on `/props` (`default_generation_settings.n_ctx`), cached per endpoint,
+else from `context.window_tokens`, which is the conservative fallback for a
+model nothing is known about. `crates/thetis/src/context_window.rs` is the
+resolver. The campaign gateway reads the same key for its cut on size.
 
 Compaction starts when the context size exceeds `window * threshold`. It tries to
 get to `window * target`. An unknown context size, which is `0`, is not a reason
