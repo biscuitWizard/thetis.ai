@@ -221,6 +221,22 @@ interface types {
     branch-op(branch-op),
     // Transient, like `stream-delta`: never persisted, only rendered.
     compaction-progress(compaction-progress),
+    /// The start of a fresh conversation on the same session. The payload is a
+    /// short label for it ("build", "pitch", "play").
+    ///
+    /// A session is a state scope; a conversation is the slice of its log the
+    /// model is shown. When the agent rebuilds its messages it treats the
+    /// *last* of these as a floor and projects nothing at or before it, so
+    /// everything earlier stays in the log — for the transcript, for search,
+    /// for an operator — and simply stops being sent to the model. Bookkeeping
+    /// in the log, like `context-compacted`, and appended by any guest through
+    /// `session.append`: there is no host call for it on purpose.
+    ///
+    /// A guest may start a conversation only if the module's continuity lives
+    /// in documents rather than in its transcript. The campaign qualifies — it
+    /// rebuilds the whole state block from world, sheet, clock and scene on
+    /// every turn. A module that keeps meaning in its history would lose it.
+    conversation-started(string),
   }
 
   record event-record {

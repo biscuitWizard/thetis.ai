@@ -81,6 +81,10 @@ fn config_str(key: &str, fallback: &str) -> String {
 // --- conversation projection ------------------------------------------------
 
 struct Projection {
+    /// The seq of the last `ConversationStarted` in the log, or 0 when the
+    /// session has only ever had one conversation. Nothing at or below it is
+    /// shown to the model.
+    floor: u64,
     covered: Vec<(u64, u64)>,
     hidden: hidden::Hidden,
     notes: Vec<(u64, Value)>,
@@ -90,12 +94,29 @@ struct Projection {
 
 impl Projection {
     fn skips(&self, seq: u64) -> bool {
-        self.hidden.contains(seq)
+        seq <= self.floor
+            || self.hidden.contains(seq)
             || self.covered.iter().any(|&(from, through)| seq >= from && seq <= through)
     }
 }
 
+/// Where the current conversation begins: the seq of the last
+/// `ConversationStarted`, or 0 when there has never been one.
+///
+/// Read from the raw log, not the hidden-filtered one. A gateway that hides a
+/// regenerated turn hides the boundary that turn opened along with it, and the
+/// regenerated turn is still the first of its conversation — un-flooring it
+/// would hand the model the conversation the boundary was there to drop.
+fn conversation_floor(records: &[EventRecord]) -> u64 {
+    records
+        .iter()
+        .rev()
+        .find(|r| matches!(r.event, SessionEvent::ConversationStarted(_)))
+        .map_or(0, |r| r.seq)
+}
+
 fn plan_projection(records: &[EventRecord], hidden: hidden::Hidden) -> Projection {
+    let floor = conversation_floor(records);
     let mut covered = Vec::new();
     let mut notes = Vec::new();
     let mut last_compaction_seq = 0;
@@ -107,9 +128,15 @@ fn plan_projection(records: &[EventRecord], hidden: hidden::Hidden) -> Projectio
             last_usage_seq = record.seq;
         }
         // Compactions describe the shared prefix and remain authoritative even
-        // when their bookkeeping event happens to be hidden.
+        // when their bookkeeping event happens to be hidden. One recorded
+        // before the conversation began is a different matter: it summarises
+        // what the floor already drops, so its note has nothing to stand in
+        // for and is not placed.
         if let SessionEvent::ContextCompacted(c) = &record.event {
             last_compaction_seq = record.seq;
+            if record.seq <= floor {
+                continue;
+            }
             if let (Some(first), Some(last)) = (c.spans.first(), c.spans.last()) {
                 covered.extend(c.spans.iter().map(|s| (s.from_seq, s.through_seq)));
                 notes.push((
@@ -124,12 +151,22 @@ fn plan_projection(records: &[EventRecord], hidden: hidden::Hidden) -> Projectio
             }
         }
     }
+    // Only what the model will actually see decides whether speakers need
+    // naming: a second voice that spoke only before the floor is not in the
+    // room any more.
+    let visible = match records.iter().position(|r| r.seq > floor) {
+        Some(i) => &records[i..],
+        None => &[],
+    };
     Projection {
+        floor,
         covered,
         hidden,
         notes,
-        usage_is_current: last_usage_seq > last_compaction_seq,
-        attribute: needs_attribution(records),
+        // A provider count taken before a compaction or a conversation boundary
+        // priced a longer conversation than the one being rebuilt.
+        usage_is_current: last_usage_seq > last_compaction_seq.max(floor),
+        attribute: needs_attribution(visible),
     }
 }
 
@@ -507,8 +544,12 @@ impl Turn {
     /// Rebuilds the model's view of the conversation from the event log.
     ///
     /// Compactions are applied as a projection: the events they cover are
-    /// skipped and a summary note takes their place. Nothing is deleted, so an
-    /// earlier compaction never costs us the ability to read the original.
+    /// skipped and a summary note takes their place. A `ConversationStarted`
+    /// is a projection too — everything before the last one is skipped
+    /// outright, with no summary, because the guest that appended it has its
+    /// continuity in documents and asked for none. Nothing is deleted, so an
+    /// earlier compaction or conversation never costs us the ability to read
+    /// the original.
     fn rehydrate(&mut self) {
         self.messages.clear();
         self.origins.clear();
@@ -861,11 +902,14 @@ impl Turn {
         self.offered = (defs.len(), chars / 4);
     }
 
-    /// The text of the first thing the user said in this conversation.
+    /// The text of the first thing the user said in this conversation — the
+    /// current one, when the session has had several.
     fn first_user_message(&self) -> Option<String> {
         let hidden = hidden::Hidden::load(&self.session_id);
-        host::events(&self.session_id, 0).into_iter().find_map(|r| {
-            if hidden.contains(r.seq) {
+        let records = host::events(&self.session_id, 0);
+        let floor = conversation_floor(&records);
+        records.into_iter().find_map(|r| {
+            if r.seq <= floor || hidden.contains(r.seq) {
                 return None;
             }
             if let SessionEvent::UserMessage(msg) = r.event {
@@ -1168,6 +1212,88 @@ mod projection_tests {
         assert_eq!(shown.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(), vec![1, 8]);
         assert!(shown[0].0.to_string().contains("summary"));
         assert_eq!(billing, None);
+    }
+
+    fn started(seq: u64, label: &str) -> EventRecord {
+        event(seq, SessionEvent::ConversationStarted(label.into()))
+    }
+    fn compacted(seq: u64, from: u64, through: u64, summary: &str) -> EventRecord {
+        event(seq, SessionEvent::ContextCompacted(Compaction {
+            spans: vec![SeqSpan { from_seq: from, through_seq: through }],
+            summary: summary.into(), messages_replaced: 1, tokens_before: 10,
+        }))
+    }
+    fn seqs(shown: &[(Value, u64)]) -> Vec<u64> {
+        shown.iter().map(|(_, seq)| *seq).collect()
+    }
+
+    #[test]
+    fn a_conversation_boundary_drops_everything_at_or_before_it() {
+        let records = vec![
+            user(1, "build"), assistant(2, "built", None), started(3, "pitch"),
+            user(4, "pitch"), assistant(5, "pitched", None),
+        ];
+        let projection = plan_projection(&records, hidden::Hidden::default());
+        let (shown, _) = project(records, projection, 1);
+        assert_eq!(seqs(&shown), vec![4, 5]);
+    }
+
+    #[test]
+    fn the_later_of_two_boundaries_is_the_floor() {
+        let records = vec![
+            user(1, "build"), started(2, "pitch"), user(3, "pitch"),
+            started(4, "play"), user(5, "play"), assistant(6, "narrated", None),
+        ];
+        let projection = plan_projection(&records, hidden::Hidden::default());
+        let (shown, _) = project(records, projection, 1);
+        assert_eq!(seqs(&shown), vec![5, 6]);
+    }
+
+    #[test]
+    fn a_compaction_before_the_boundary_leaves_no_note_and_one_after_still_applies() {
+        let records = vec![
+            user(1, "old"), assistant(2, "older", None),
+            compacted(3, 1, 2, "before the floor"),
+            started(4, "play"),
+            user(5, "a"), assistant(6, "b", None), user(7, "c"),
+            compacted(8, 5, 6, "after the floor"),
+            user(9, "d"),
+        ];
+        let projection = plan_projection(&records, hidden::Hidden::default());
+        let (shown, _) = project(records, projection, 1);
+        assert_eq!(seqs(&shown), vec![5, 7, 9]);
+        let text = shown[0].0.to_string();
+        assert!(text.contains("after the floor"));
+        assert!(!shown.iter().any(|(m, _)| m.to_string().contains("before the floor")));
+    }
+
+    #[test]
+    fn usage_recorded_before_a_boundary_is_not_carried_across() {
+        let usage = TokenUsage {
+            prompt_tokens: 60_000, completion_tokens: 1, cost_usd: 0.0,
+            cached_tokens: 0, cache_write_tokens: 0,
+        };
+        let records = vec![
+            user(1, "build"), assistant(2, "built", Some(usage.clone())),
+            started(3, "play"), user(4, "play"), assistant(5, "narrated", None),
+        ];
+        let projection = plan_projection(&records, hidden::Hidden::default());
+        assert!(!projection.usage_is_current);
+        let (_, billing) = project(records, projection, 1);
+        assert_eq!(billing, None);
+
+        // The same count on the far side of the boundary describes this
+        // conversation and is kept.
+        let records = vec![
+            user(1, "build"), started(2, "play"), user(3, "play"),
+            assistant(4, "narrated", Some(usage)),
+        ];
+        let projection = plan_projection(&records, hidden::Hidden::default());
+        assert!(projection.usage_is_current);
+        let (shown, billing) = project(records, projection, 1);
+        assert_eq!(seqs(&shown), vec![3, 4]);
+        // Priced at the system prompt plus the one message before it.
+        assert_eq!(billing, Some((60_000, 2)));
     }
 }
 

@@ -119,6 +119,15 @@ pub fn event(ev: &OutboundEvent) -> Option<Value> {
             "summary": c.summary,
         }),
 
+        // The model's context was cut here; the reader's transcript was not.
+        // Sent as its own kind so the view may one day draw a rule across the
+        // page — today it has no renderer for it and drops the frame, which is
+        // the right thing for a chat surface that never starts one.
+        SessionEvent::ConversationStarted(label) => json!({
+            "kind": "conversation-started",
+            "label": label,
+        }),
+
         // Transient, like a token delta: the transcript draws one progress card
         // and updates it in place rather than appending a row per frame. The
         // `compacted` event above is what finally replaces it.

@@ -177,6 +177,7 @@ pub mod kind {
     pub const BRANCH_OP: &str = "branch-op";
     pub const TURN_FINISHED: &str = "turn-finished";
     pub const COMPACTED: &str = "compacted";
+    pub const CONVERSATION_STARTED: &str = "conversation-started";
 }
 
 /// What one search asks for.
@@ -525,6 +526,14 @@ pub fn entries_of(event: &SessionEvent, include_tool_output: bool) -> Vec<(&'sta
                 "[{} messages summarised] {}",
                 c.messages_replaced, c.summary
             ),
+        )],
+        // Kept in the transcript on purpose. The boundary hides what precedes
+        // it from the model only; an operator reading or searching a session
+        // still gets every conversation, and this line is where one gave way
+        // to the next.
+        SessionEvent::ConversationStarted(label) => vec![(
+            kind::CONVERSATION_STARTED,
+            format!("new conversation: {label}"),
         )],
         // Nothing to say, or never persisted.
         SessionEvent::TurnStarted
