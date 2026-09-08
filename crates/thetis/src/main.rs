@@ -131,6 +131,48 @@ async fn main() -> Result<()> {
             println!("  bind:          {}", cfg.bind_addr);
             Ok(())
         }
+        // Who owns what, for the operator. `thetis owners` lists every root
+        // session with its surface and owner; `thetis owners set <id> <user>`
+        // hands one to an account. Campaigns belong to one user and nobody
+        // else can reach them, so a campaign made before ownership was per
+        // player, or under the wrong account, has no other way to move. Run
+        // it with the gateway stopped: the store is one process's at a time.
+        Some("owners") => {
+            use anyhow::Context;
+            let cfg = thetis::config::Config::load()?;
+            let store = thetis::store::Store::open(&cfg.db_path())
+                .context("open the store (is the gateway stopped?)")?;
+            match args.next().as_deref() {
+                None => {
+                    let owners = store.owners_map()?;
+                    for meta in store.list_sessions(true)? {
+                        println!(
+                            "{}  {:<9} {:<10} {}{}",
+                            meta.id,
+                            meta.surface.as_deref().unwrap_or("-"),
+                            owners.get(&meta.id).map(String::as_str).unwrap_or("-"),
+                            meta.title,
+                            if meta.archived { "  (archived)" } else { "" },
+                        );
+                    }
+                }
+                Some("set") => {
+                    let id = args.next().context("owners set needs <session-id> <user>")?;
+                    let user = args.next().context("owners set needs <session-id> <user>")?;
+                    anyhow::ensure!(
+                        !cfg.auth.users_mode || cfg.auth.users.iter().any(|u| u.id == user),
+                        "no such user: {user}"
+                    );
+                    let meta = store
+                        .get_session(&id)?
+                        .with_context(|| format!("no such session: {id}"))?;
+                    store.set_owner(&id, &user)?;
+                    println!("{} ({}) now belongs to {user}", meta.id, meta.title);
+                }
+                Some(other) => anyhow::bail!("owners: unknown subcommand {other}; use `owners` or `owners set <id> <user>`"),
+            }
+            Ok(())
+        }
         _ => thetis::roles::gateway::run().await,
     }
 }
