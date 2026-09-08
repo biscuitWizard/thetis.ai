@@ -169,7 +169,14 @@ async fn authenticate(State(grip): State<Arc<Grip>>, mut req: Request, next: Nex
     let public = matches!(req.uri().path(), "/login" | "/logout");
     match crate::auth::resolve(&grip, req.headers()).await {
         Some(p) => {
-            if req.uri().path() == "/login" && grip.cfg().auth.users_mode {
+            // Someone already signed in has no business at the door — but a
+            // *posted* sign-in goes through: the campaign UI's in-page form
+            // may be submitted after a login in another tab has already
+            // fixed the cookie, and its `next` must still be honoured.
+            if req.uri().path() == "/login"
+                && req.method() == axum::http::Method::GET
+                && grip.cfg().auth.users_mode
+            {
                 return Redirect::to("/").into_response();
             }
             if req.uri().path().starts_with("/admin")
@@ -313,7 +320,9 @@ async fn login_submit(
 async fn logout(
     State(g): State<Arc<Grip>>,
     headers: HeaderMap,
-    Query(q): Query<LoginQuery>,
+    // A query that will not parse is not a reason to stay signed in: the
+    // extractor's failure is taken as "no next", never as a refusal.
+    query: Result<Query<LoginQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     if !g.cfg().auth.users_mode {
         return StatusCode::NOT_FOUND.into_response();
@@ -321,9 +330,10 @@ async fn logout(
     if let (Some(t), Some(s)) = (crate::auth::cookie_value(&headers), g.local_store()) {
         let _ = s.remove_login(&crate::auth::token_hash(&t));
     }
+    let next = query.map(|q| q.0.next).unwrap_or_default();
     (
         [(header::SET_COOKIE, crate::auth::clear_cookie())],
-        Redirect::to(&door_after_logout(&q.next)),
+        Redirect::to(&door_after_logout(&next)),
     )
         .into_response()
 }
@@ -1495,11 +1505,23 @@ fn frame_for_socket(frame_gateway: Option<&str>, socket_gateway: &str) -> bool {
     frame_gateway.map_or(true, |gateway| gateway == socket_gateway)
 }
 
-/// What a browser is told when a guest call fails: the innermost cause, which
-/// for a host refusal is the host's own sentence. The contexts wrapped around
-/// it are for the log.
+/// What a browser is told when a guest call fails: the chain, minus the two
+/// layers every trap wears — the call's own context and the wasm backtrace.
+/// A host refusal is then its own sentence; an infrastructure failure keeps
+/// the contexts that say what was being attempted.
 fn user_facing(e: &anyhow::Error) -> String {
-    e.root_cause().to_string()
+    let telling = e
+        .chain()
+        .map(|layer| layer.to_string())
+        .filter(|text| {
+            text != "gateway on-client-message" && !text.starts_with("error while executing")
+        })
+        .collect::<Vec<_>>();
+    if telling.is_empty() {
+        e.root_cause().to_string()
+    } else {
+        telling.join(": ")
+    }
 }
 
 fn error_frame(detail: &str, replying_to: Option<String>) -> String {
@@ -1548,8 +1570,25 @@ mod preview_tests {
         let e = anyhow::anyhow!("this campaign belongs to another user")
             .context("error while executing at wasm backtrace:\n    0: 0x5aaf24 - <unknown>")
             .context("gateway on-client-message");
-        assert_eq!(super::user_facing(&e), "this campaign belongs to another user");
-        assert!(format!("{e:#}").contains("wasm backtrace"), "the log keeps the chain");
+        assert_eq!(
+            super::user_facing(&e),
+            "this campaign belongs to another user"
+        );
+        assert!(
+            format!("{e:#}").contains("wasm backtrace"),
+            "the log keeps the chain"
+        );
+        // A failure with something to say keeps saying it.
+        let e = anyhow::anyhow!("No such file or directory (os error 2)")
+            .context("spawning worker")
+            .context("error while executing at wasm backtrace:\n    0: 0x1 - <unknown>")
+            .context("gateway on-client-message");
+        assert_eq!(
+            super::user_facing(&e),
+            "spawning worker: No such file or directory (os error 2)"
+        );
+        let e = anyhow::anyhow!("instantiating gateway").context("gateway on-client-message");
+        assert_eq!(super::user_facing(&e), "instantiating gateway");
     }
 
     #[test]

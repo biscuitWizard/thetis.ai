@@ -614,20 +614,13 @@ impl session::Host for HostState {
         // no filter, exactly as before.
         let surface = self.surface_scope();
         // Whose conversations: the principal's own, unless this connection has
-        // asked for everyone's and the policy lets it (`Principal::list_owner`).
-        // An agent store lists its owner's; a store with neither — a
-        // local-mode probe — lists all.
-        //
-        // A private surface (a mounted gateway: the campaign) has no
-        // "everyone's": its sessions are their owner's alone, so the see-all
-        // switch is inert there and an administrator's library holds their
-        // own campaigns like anybody's.
+        // asked for everyone's and the policy lets it — and a private surface
+        // (a mounted gateway: the campaign) has no "everyone's", so there an
+        // administrator's library holds their own campaigns like anybody's
+        // (`Principal::list_owner_in`). An agent store lists its owner's; a
+        // store with neither — a local-mode probe — lists all.
         let owned = if let Some(p) = &self.principal {
-            if surface.as_ref().is_some_and(|scope| scope.private) {
-                Some(p.user_id.clone())
-            } else {
-                p.list_owner().map(str::to_string)
-            }
+            p.list_owner_in(surface.as_ref()).map(str::to_string)
         } else if let Some(id) = &self.session_id {
             self.grip().persist.owner_of_root(id).await.wt()?
         } else {

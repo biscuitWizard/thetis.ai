@@ -95,6 +95,18 @@ impl Principal {
             Some(self.user_id.as_str())
         }
     }
+    /// The same, for a listing scoped to a surface. A private surface's
+    /// sessions are their owner's alone, so there the answer is this account
+    /// whatever the see-all switch says. The implicit principal of local mode
+    /// is not an account and keeps the unfiltered view: there is nobody else
+    /// its sessions could belong to.
+    pub fn list_owner_in(&self, scope: Option<&crate::store::SurfaceScope>) -> Option<&str> {
+        if scope.is_some_and(|s| s.private) && self.is_account() {
+            Some(self.user_id.as_str())
+        } else {
+            self.list_owner()
+        }
+    }
     /// The identity and policy summary the browser gets, both as the `user`
     /// frame on a fresh socket and from `GET /api/me`. One function so the
     /// two never disagree about a field name.
@@ -278,40 +290,51 @@ pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
 /// mounted gateway, so a campaign) has one way in: ownership. No invitation
 /// reaches it and the blanket grant stops at its door, so an administrator
 /// plays their own campaigns at `/play` like anyone else and sees everyone's
-/// only from `/admin`.
+/// only from `/admin`. The implicit principal of local mode is exempt: it is
+/// the one person there is, and a deployment switched back from users mode
+/// must not lose the campaigns its accounts made.
 pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
     let st = g.local_store().context("ownership is gateway-only")?;
-    let surface = st.surface_of_root(id)?;
-    let private = crate::store::SurfaceScope::is_private(
-        surface.as_deref(),
-        &g.cfg().primary_gateway,
+    // One walk to the root; every fact below is read at it.
+    let root = st.root_of(id)?;
+    let primary = g.cfg().primary_gateway.clone();
+    decide(
+        p,
+        st.owner_of(&root)?,
+        || {
+            if !p.is_account() {
+                return Ok(None);
+            }
+            Ok(st
+                .get_session(&root)?
+                .and_then(|meta| meta.surface)
+                .filter(|s| crate::store::SurfaceScope::is_private(Some(s), &primary)))
+        },
+        || st.is_participant(&root, &p.user_id),
     )
-    .then_some(surface.as_deref().unwrap_or_default());
-    // The surface is read before the blanket grant, and the owner before the
-    // guest list, so the common case — one's own conversation — costs one
-    // table read and a private session never reaches the participant table.
-    decide(p, private, || st.owner_of_root(id), || {
-        st.is_participant(id, &p.user_id)
-    })
 }
 
 /// The access rule itself, apart from the store it reads.
 ///
-/// `private` names the surface when the session is private to its owner, and
-/// is `None` for a chat conversation. The owner is read only when the answer
-/// depends on it, and the invitation only after ownership has failed.
+/// The owner is known; the surface is read only when the caller is not the
+/// owner (it names the surface when the session is private to its owner, and
+/// is `None` for a chat conversation), and the invitation only after the
+/// blanket grant has not applied. So one's own conversation costs one table
+/// read, and a private session never reaches the participant table.
 fn decide(
     p: &Principal,
-    private: Option<&str>,
-    owner: impl FnOnce() -> Result<Option<String>>,
+    owner: Option<String>,
+    private: impl FnOnce() -> Result<Option<String>>,
     invited: impl FnOnce() -> Result<bool>,
 ) -> Result<()> {
-    if let Some(surface) = private {
-        return match owner()? {
-            Some(o) if o == p.user_id => Ok(()),
-            Some(_) => bail!("this {surface} belongs to another user"),
-            None => bail!("no such {surface}"),
-        };
+    if owner.as_deref() == Some(p.user_id.as_str()) {
+        return Ok(());
+    }
+    if let Some(surface) = private()? {
+        if owner.is_some() {
+            bail!("this {surface} belongs to another user");
+        }
+        bail!("no such {surface}");
     }
     // Administrators have the blanket grant intrinsically. Checking the raw
     // see-all bit here disagreed with `Principal::may_see_all`: a custom admin
@@ -320,8 +343,7 @@ fn decide(
     if p.may_see_all() {
         return Ok(());
     }
-    match owner()? {
-        Some(o) if o == p.user_id => Ok(()),
+    match owner {
         Some(_) => {
             if invited()? {
                 Ok(())
@@ -630,35 +652,77 @@ mod tests {
         plain.admin = false;
         plain.see_all_sessions = false;
         let bob = Principal::new("bob".into(), "Bob".into(), "dev".into(), Arc::new(plain));
-        let owned_by = |who: &'static str| move || Ok(Some(who.to_string()));
+        let owned_by = |who: &str| Some(who.to_string());
+        let campaign = || Ok(Some("campaign".to_string()));
+        let chat = || Ok(None);
         let invited = || Ok(true);
         let not_invited = || Ok(false);
         let never = || -> Result<bool> { panic!("a private session never reads the guest list") };
+        let unread =
+            || -> Result<Option<String>> { panic!("an owner's own session reads no surface") };
 
-        assert!(decide(&bob, Some("campaign"), owned_by("bob"), never).is_ok());
-        let refused = decide(&bob, Some("campaign"), owned_by("ada"), never).unwrap_err();
+        assert!(decide(&bob, owned_by("bob"), unread, never).is_ok());
+        let refused = decide(&bob, owned_by("ada"), campaign, never).unwrap_err();
         assert_eq!(refused.to_string(), "this campaign belongs to another user");
         // Being invited, or being an administrator, changes nothing here.
-        assert!(decide(&bob, Some("campaign"), owned_by("ada"), invited).is_err());
-        let refused = decide(&admin, Some("campaign"), owned_by("bob"), never).unwrap_err();
+        assert!(decide(&bob, owned_by("ada"), campaign, invited).is_err());
+        let refused = decide(&admin, owned_by("bob"), campaign, never).unwrap_err();
         assert_eq!(refused.to_string(), "this campaign belongs to another user");
-        assert!(decide(&admin, Some("campaign"), owned_by("ada"), never).is_ok());
+        assert!(decide(&admin, owned_by("ada"), unread, never).is_ok());
         assert_eq!(
-            decide(&bob, Some("campaign"), || Ok(None), never)
-                .unwrap_err()
-                .to_string(),
+            decide(&bob, None, campaign, never).unwrap_err().to_string(),
             "no such campaign"
         );
 
         // A chat conversation keeps its three ways in.
-        assert!(decide(&admin, None, owned_by("bob"), never).is_ok());
-        assert!(decide(&bob, None, owned_by("bob"), never).is_ok());
-        assert!(decide(&bob, None, owned_by("ada"), invited).is_ok());
+        assert!(decide(&admin, owned_by("bob"), chat, never).is_ok());
+        assert!(decide(&bob, owned_by("bob"), unread, never).is_ok());
+        assert!(decide(&bob, owned_by("ada"), chat, invited).is_ok());
         assert_eq!(
-            decide(&bob, None, owned_by("ada"), not_invited)
+            decide(&bob, owned_by("ada"), chat, not_invited)
                 .unwrap_err()
                 .to_string(),
             "conversation belongs to another user"
         );
+    }
+
+    /// The implicit principal of local mode is not an account: it lists and
+    /// opens everything, campaigns included, so switching a deployment back
+    /// from users mode does not strand what the accounts made.
+    #[test]
+    fn the_local_principal_is_exempt_from_the_private_rule() {
+        use crate::store::SurfaceScope;
+        // What `Principal::local` builds, without a Config to build it from.
+        let local = Principal::new(
+            LOCAL_OWNER.into(),
+            LOCAL_OWNER.into(),
+            "admin".into(),
+            Arc::new(crate::policy::EffectivePolicy::unrestricted(
+                &[],
+                "m",
+                &[],
+                "agent",
+                2,
+            )),
+        );
+        assert!(!local.is_account());
+        let play = SurfaceScope::for_gateway("campaign", "web");
+        assert_eq!(local.list_owner_in(Some(&play)), None);
+
+        let mut policy = crate::policy::EffectivePolicy::unrestricted(&[], "m", &[], "agent", 2);
+        policy.admin = true;
+        let ada = Principal::new("ada".into(), "Ada".into(), "admin".into(), Arc::new(policy));
+        assert_eq!(ada.list_owner(), None, "an admin's chat list is everyone's");
+        assert_eq!(
+            ada.list_owner_in(Some(&play)),
+            Some("ada"),
+            "their library is their own"
+        );
+        assert_eq!(
+            ada.list_owner_in(Some(&SurfaceScope::for_gateway("web", "web"))),
+            None
+        );
+        ada.set_view_all(false);
+        assert_eq!(ada.list_owner_in(None), Some("ada"));
     }
 }

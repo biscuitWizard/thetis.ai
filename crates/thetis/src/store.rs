@@ -375,8 +375,9 @@ impl Store {
     }
 
     /// The conversation a session answers to: itself, or the top of its
-    /// sub-agent chain.
-    fn root_of(&self, id: &str) -> Result<String> {
+    /// sub-agent chain. Access is decided at the root — owner and surface
+    /// are both read there — so a sub-agent answers as its parent does.
+    pub fn root_of(&self, id: &str) -> Result<String> {
         let mut root = id.to_owned();
         while let Some(row) = self.get_subagent(&root)? {
             root = row.parent_id;
@@ -387,15 +388,6 @@ impl Store {
     pub fn owner_of_root(&self, id: &str) -> Result<Option<String>> {
         let root = self.root_of(id)?;
         self.owner_of(&root)
-    }
-
-    /// The surface that created a session's root conversation, or `None` for
-    /// one written before the field existed or made by no surface at all.
-    /// Read beside the owner when deciding access, because a private
-    /// surface's sessions answer to their owner alone.
-    pub fn surface_of_root(&self, id: &str) -> Result<Option<String>> {
-        let root = self.root_of(id)?;
-        Ok(self.get_session(&root)?.and_then(|meta| meta.surface))
     }
 
     /// Whether an account may speak in a conversation it does not own.
@@ -599,24 +591,27 @@ impl Store {
         let children = tx.open_table(SUBAGENTS)?;
         let owners = tx.open_table(OWNERS)?;
         let invited = tx.open_table(PARTICIPANTS)?;
+        // An invitation opens a chat conversation to its guest; a private
+        // surface's sessions have no guests.
+        let shared = surface.is_none_or(|scope| !scope.private);
         let mut out = Vec::new();
         for row in sessions.iter()? {
             let (id, v) = row?;
             if children.get(id.value())?.is_some() {
                 continue;
             }
-            let meta: SessionMeta = serde_json::from_slice(v.value())?;
-            if let Some(scope) = surface {
-                if !scope.claims(meta.surface.as_deref()) {
+            // Ownership is decided from the index tables before the row is
+            // parsed: somebody else's rows cost nothing, and a row that will
+            // not parse fails only the listings it belongs to.
+            if let Some(want) = owner {
+                let owned = owners.get(id.value())?.as_ref().map(|v| v.value()) == Some(want);
+                if !owned && (!shared || invited.get((id.value(), want))?.is_none()) {
                     continue;
                 }
             }
-            if let Some(want) = owner {
-                let owned = owners.get(id.value())?.as_ref().map(|v| v.value()) == Some(want);
-                // An invitation opens a chat conversation to its guest; a
-                // private surface's sessions have no guests.
-                let shared = surface.is_none_or(|scope| !scope.private);
-                if !owned && (!shared || invited.get((id.value(), want))?.is_none()) {
+            let meta: SessionMeta = serde_json::from_slice(v.value())?;
+            if let Some(scope) = surface {
+                if !scope.claims(meta.surface.as_deref()) {
                     continue;
                 }
             }
@@ -2873,7 +2868,9 @@ mod tests {
             .create_session(Some("chat".into()), "agent", "alice", Some("web"))
             .unwrap();
         store.add_participant(&game.id, "bob", "alice").unwrap();
-        store.add_participant(&chat_convo.id, "bob", "alice").unwrap();
+        store
+            .add_participant(&chat_convo.id, "bob", "alice")
+            .unwrap();
 
         let ids = |scope: Option<&SurfaceScope>| {
             store
@@ -2897,10 +2894,10 @@ mod tests {
         );
     }
 
-    /// Access reads the surface at the root, so a campaign's sub-agent
-    /// answers as the campaign does.
+    /// Access reads owner and surface at the root, so a campaign's sub-agent
+    /// answers as the campaign does — and an id nobody knows is its own root.
     #[test]
-    fn the_surface_is_read_at_the_root_of_a_sub_agent_chain() {
+    fn a_sub_agent_answers_to_the_root_of_its_chain() {
         let (store, _d) = temp_store();
         let game = store
             .create_session(Some("game".into()), "agent", "alice", Some("campaign"))
@@ -2909,11 +2906,16 @@ mod tests {
         crate::subagents::Subagents::new(&store)
             .register(&game.id, &child.id, "k", "helper", "", "", "agent", 8)
             .unwrap();
+        assert_eq!(store.root_of(&child.id).unwrap(), game.id);
+        assert_eq!(store.root_of(&game.id).unwrap(), game.id);
+        assert_eq!(store.root_of("nothing").unwrap(), "nothing");
         assert_eq!(
-            store.surface_of_root(&child.id).unwrap().as_deref(),
+            store
+                .get_session(&store.root_of(&child.id).unwrap())
+                .unwrap()
+                .and_then(|m| m.surface)
+                .as_deref(),
             Some("campaign")
         );
-        assert_eq!(store.surface_of_root(&game.id).unwrap().as_deref(), Some("campaign"));
-        assert_eq!(store.surface_of_root("nothing").unwrap(), None);
     }
 }
