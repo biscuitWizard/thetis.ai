@@ -164,10 +164,10 @@ pub fn set_cookie(c: &Config, t: &str) -> String {
     format!(
         "{COOKIE}={t}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
         c.auth.session_ttl.as_secs(),
-        if c.public_origin
-            .as_ref()
-            .is_some_and(|o| o.scheme == "https")
-        {
+        // Any https origin marks the cookie Secure. A mixed http/https list
+        // is a misconfiguration either way; this way the http name breaks
+        // loudly instead of the session cookie travelling in the clear.
+        if c.public_origins.iter().any(|o| o.scheme == "https") {
             "; Secure"
         } else {
             ""
