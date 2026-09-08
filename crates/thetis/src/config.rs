@@ -811,7 +811,11 @@ pub struct Config {
     pub tools: std::collections::BTreeMap<String, toml::Value>,
     pub paths: Paths,
     pub bind_addr: SocketAddr,
-    pub public_origin: Option<Origin>,
+    /// Every authority the UI may be reached at through a reverse proxy.
+    /// Empty means loopback only. More than one because a single server can
+    /// answer to several names, and each has to be admitted by name:
+    /// `X-Forwarded-*` is not trusted.
+    pub public_origins: Vec<Origin>,
     pub auth: AuthSettings,
     /// Gateway aspect that serves the browser UI.
     pub primary_gateway: String,
@@ -1315,7 +1319,36 @@ mod spec {
         pub bind: String,
         pub primary_gateway: String,
         pub admin_enabled: bool,
-        pub public_origin: String,
+        pub public_origin: PublicOrigin,
+    }
+
+    /// What `server.public_origin` may be written as: one origin, or a list of
+    /// them. A bare string is what every config said before more than one name
+    /// could reach the same server, and it still means exactly what it did.
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(untagged)]
+    pub enum PublicOrigin {
+        One(String),
+        Many(Vec<String>),
+    }
+    impl Default for PublicOrigin {
+        fn default() -> Self {
+            Self::One(String::new())
+        }
+    }
+    impl PublicOrigin {
+        /// The origins as written, trimmed, with blanks dropped -- so the
+        /// default `One("")` reads as none configured at all.
+        pub fn entries(&self) -> Vec<String> {
+            let raw: &[String] = match self {
+                Self::One(s) => std::slice::from_ref(s),
+                Self::Many(v) => v.as_slice(),
+            };
+            raw.iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
     }
     impl Default for Server {
         fn default() -> Self {
@@ -1323,7 +1356,7 @@ mod spec {
                 bind: "127.0.0.1:7777".into(),
                 primary_gateway: "web".into(),
                 admin_enabled: true,
-                public_origin: String::new(),
+                public_origin: PublicOrigin::default(),
             }
         }
     }
@@ -2455,20 +2488,29 @@ impl Config {
         };
 
         let bind_raw = env.string("THETIS_BIND").unwrap_or(file.server.bind);
-        let public_origin_raw = env
-            .string("THETIS_PUBLIC_ORIGIN")
-            .unwrap_or(file.server.public_origin.clone());
-        let public_origin = if public_origin_raw.trim().is_empty() {
-            None
-        } else {
-            let (scheme, authority) = public_origin_raw
-                .split_once("://")
-                .context("server.public_origin must be scheme://authority")?;
-            Some(Origin {
-                scheme: scheme.into(),
-                authority: authority.trim_end_matches('/').into(),
-            })
+        // The environment spells a list with commas, which is all a single
+        // variable can carry; the file may use either form.
+        let public_origin_raw: Vec<String> = match env.string("THETIS_PUBLIC_ORIGIN") {
+            Some(s) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => file.server.public_origin.entries(),
         };
+        let public_origins = public_origin_raw
+            .iter()
+            .map(|raw| {
+                let (scheme, authority) = raw
+                    .split_once("://")
+                    .context("server.public_origin must be scheme://authority")?;
+                anyhow::Ok(Origin {
+                    scheme: scheme.into(),
+                    authority: authority.trim_end_matches('/').into(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let bind_addr: SocketAddr = bind_raw
             .parse()
             .with_context(|| format!("`{bind_raw}` is not a valid host:port"))?;
@@ -2768,7 +2810,7 @@ impl Config {
                 "auth.claim_unowned must name a user"
             );
             anyhow::ensure!(
-                bind_addr.ip().is_loopback() || public_origin.is_some(),
+                bind_addr.ip().is_loopback() || !public_origins.is_empty(),
                 "users mode bound off loopback needs server.public_origin"
             );
         }
@@ -2860,7 +2902,7 @@ impl Config {
         let config = Self {
             paths,
             bind_addr,
-            public_origin,
+            public_origins,
             auth,
             primary_gateway: env
                 .string("THETIS_GATEWAY")
@@ -3383,6 +3425,53 @@ role = "admin"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaGhhc2g"
 "#
         )
+    }
+
+    /// One server can answer to several names behind a proxy, so
+    /// `public_origin` takes a list -- and the bare string every config wrote
+    /// before that still means the one origin it always did.
+    #[test]
+    fn public_origin_reads_either_one_name_or_several() {
+        let one = from_toml("[server]\npublic_origin = \"https://a.example.com/\"\n").unwrap();
+        assert_eq!(one.public_origins.len(), 1);
+        assert_eq!(one.public_origins[0].scheme, "https");
+        // A trailing slash is not part of the authority the Host header carries.
+        assert_eq!(one.public_origins[0].authority, "a.example.com");
+
+        let many = from_toml(
+            "[server]\npublic_origin = [\"https://a.example.com\", \"https://b.example.com\"]\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = many
+            .public_origins
+            .iter()
+            .map(|o| o.authority.as_str())
+            .collect();
+        assert_eq!(names, ["a.example.com", "b.example.com"]);
+
+        // Unset, in either spelling, is no origin at all rather than a blank one.
+        let empty_list = from_toml("[server]\npublic_origin = []\n").unwrap();
+        assert!(from_toml("").unwrap().public_origins.is_empty());
+        assert!(empty_list.public_origins.is_empty());
+    }
+
+    /// The off-loopback requirement counts the list, so a users-mode server
+    /// bound to a LAN address is configured once it names any origin.
+    #[test]
+    fn users_mode_off_loopback_is_satisfied_by_a_list() {
+        let bound = format!(
+            "[server]\nbind = \"10.0.0.2:8777\"\n{}",
+            one_user("someone")
+        );
+        let err = from_toml(&bound).unwrap_err().to_string();
+        assert!(err.contains("public_origin"), "got: {err}");
+
+        let with_origins = format!(
+            "[server]\nbind = \"10.0.0.2:8777\"\npublic_origin = [\"https://a.example.com\", \"https://b.example.com\"]\n{}",
+            one_user("someone")
+        );
+        let cfg = from_toml(&with_origins).unwrap();
+        assert_eq!(cfg.public_origins.len(), 2);
     }
 
     // The id is what somebody types into a login form, and they type their name

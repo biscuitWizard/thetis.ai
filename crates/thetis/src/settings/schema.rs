@@ -214,7 +214,7 @@ pub const FIELDS: &[Field] = &[
     fe("server.bind", Kind::Text, "server", "Address and port the HTTP server listens on. Off loopback needs auth.mode = \"users\" and a public origin.", "THETIS_BIND"),
     fe("server.primary_gateway", Kind::Text, "server", "Which gateway component serves the browser UI: the crate at <paths.gateways>/<gateway_prefix><name>.", "THETIS_GATEWAY"),
     fe("server.admin_enabled", Kind::Bool, "server", "The host-rendered /admin recovery console and this control panel. Keep it on: it is the control surface that still works when every guest is broken.", "THETIS_ADMIN"),
-    fe("server.public_origin", Kind::Url, "server", "scheme://authority the UI is reached at through a reverse proxy. Required when bind is not loopback in users mode; https here marks the login cookie Secure.", "THETIS_PUBLIC_ORIGIN"),
+    fe("server.public_origin", Kind::List, "server", "Every scheme://authority the UI is reached at through a reverse proxy; a bare string is still one origin. Required when bind is not loopback in users mode; https here marks the login cookie Secure.", "THETIS_PUBLIC_ORIGIN"),
     // --- auth ---------------------------------------------------------------
     fc("auth.mode", Kind::Text, "auth", "\"local\" is one implicit administrator on loopback; \"users\" requires roles and users with password hashes.", Some("THETIS_AUTH_MODE"), Choices::Static(&["local", "users"])),
     f("auth.session_ttl_hours", Kind::Int, "auth", "How long a login cookie lives. Sliding: activity extends it."),
