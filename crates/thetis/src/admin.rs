@@ -51,6 +51,11 @@ pub struct AccountRow {
     pub conversations: u32,
     pub logins: u32,
     pub spend_usd: f64,
+    /// Whether the account holds its own OpenRouter key: set or unset is
+    /// all an administrator sees of it.
+    pub own_key: bool,
+    /// Spend on that key — the account's bill, kept apart from `spend_usd`.
+    pub own_spend_usd: f64,
 }
 
 /// Everything the overview shows, gathered in one pass.
@@ -263,6 +268,15 @@ pub async fn overview(grip: &Arc<Grip>) -> Overview {
             spend_usd: grip
                 .local_store()
                 .and_then(|store| store.get_user_spend(&user.id).ok())
+                .unwrap_or(0.0),
+            own_key: grip
+                .local_store()
+                .and_then(|store| store.user_key_status(&user.id).ok())
+                .flatten()
+                .is_some(),
+            own_spend_usd: grip
+                .local_store()
+                .and_then(|store| store.get_user_own_spend(&user.id).ok())
                 .unwrap_or(0.0),
         })
         .collect();

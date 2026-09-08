@@ -229,6 +229,54 @@ impl Persist {
         )
     }
 
+    // --- an account's own API key --------------------------------------------
+    //
+    // The whole key crosses the IPC only on the way *to* a worker, which needs
+    // it to make the request, and only for the owner of the conversation that
+    // worker is running (the gateway side checks). Setting and clearing are
+    // the gateway's alone: a worker has no principal to act for.
+
+    pub async fn get_user_key(&self, user: &str) -> Result<Option<String>> {
+        delegate!(
+            self,
+            "store.get_user_key",
+            |s| s.get_user_key(user),
+            json!({"user": user})
+        )
+    }
+
+    pub async fn user_key_status(&self, user: &str) -> Result<Option<String>> {
+        delegate!(
+            self,
+            "store.user_key_status",
+            |s| s.user_key_status(user),
+            json!({"user": user})
+        )
+    }
+
+    pub async fn set_user_key(&self, user: &str, key: &str) -> Result<()> {
+        match self {
+            Persist::Local(store) => crate::offload::blocking(|| store.set_user_key(user, key)),
+            Persist::Remote(_) => anyhow::bail!("a worker cannot set an account's key"),
+        }
+    }
+
+    pub async fn clear_user_key(&self, user: &str) -> Result<()> {
+        match self {
+            Persist::Local(store) => crate::offload::blocking(|| store.clear_user_key(user)),
+            Persist::Remote(_) => anyhow::bail!("a worker cannot clear an account's key"),
+        }
+    }
+
+    pub async fn add_user_own_spend(&self, user: &str, usd: f64) -> Result<f64> {
+        delegate!(
+            self,
+            "store.add_user_own_spend",
+            |s| s.add_user_own_spend(user, usd),
+            json!({"user": user, "usd": usd})
+        )
+    }
+
     pub async fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
         delegate!(
             self,
@@ -879,6 +927,31 @@ fn serve_store_call_inner(
             let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
             to_value(store.add_user_spend(owner, usd)?)
         }
+        // A worker may fetch one key: the one belonging to the owner of the
+        // conversation it is running. Stricter than spend, which lets an
+        // unowned caller name a user: a key is not something to hand to a
+        // caller that cannot say whose it is.
+        "store.get_user_key" | "store.user_key_status" => {
+            let user = get_str(&params, "user")?;
+            anyhow::ensure!(
+                caller_owner.as_deref() == Some(user),
+                "cannot read another user's key"
+            );
+            if method == "store.get_user_key" {
+                to_value(store.get_user_key(user)?)
+            } else {
+                to_value(store.user_key_status(user)?)
+            }
+        }
+        "store.add_user_own_spend" => {
+            let user = get_str(&params, "user")?;
+            anyhow::ensure!(
+                caller_owner.as_deref() == Some(user),
+                "cannot write another user's spend"
+            );
+            let usd = params.get("usd").and_then(Value::as_f64).unwrap_or(0.0);
+            to_value(store.add_user_own_spend(user, usd)?)
+        }
         "store.list_sessions_owned" => {
             let include = params
                 .get("include_archived")
@@ -1125,6 +1198,83 @@ mod tests {
     use crate::ipc::{self, Handler};
     use std::pin::Pin;
     use tempfile::TempDir;
+
+    /// A worker gets exactly one key over the wire: its conversation's
+    /// owner's. Naming anyone else, or calling from an unowned conversation,
+    /// is refused; and no worker can set or clear a key at all.
+    #[tokio::test]
+    async fn a_worker_reads_only_its_own_owners_key_and_writes_none() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&tmp.path().join("t.redb")).unwrap();
+        store.set_user_key("alice", "sk-or-alice-1234").unwrap();
+        let alice = store
+            .create_session(Some("a".into()), "agent", "alice", None)
+            .unwrap();
+        let bob = store
+            .create_session(Some("b".into()), "agent", "bob", None)
+            .unwrap();
+
+        let call = |method: &str, user: &str, session: &str| {
+            serve_store_call_inner(&store, None, method, json!({ "user": user }), session)
+        };
+        assert_eq!(
+            call("store.get_user_key", "alice", &alice.id).unwrap(),
+            json!("sk-or-alice-1234")
+        );
+        assert_eq!(
+            call("store.user_key_status", "alice", &alice.id).unwrap(),
+            json!("1234")
+        );
+        assert!(call("store.get_user_key", "alice", &bob.id).is_err());
+        assert!(call("store.user_key_status", "alice", &bob.id).is_err());
+        assert!(call("store.get_user_key", "alice", "").is_err());
+        assert!(call("store.get_user_key", "alice", "no-such-session").is_err());
+        assert_eq!(call("store.get_user_key", "bob", &bob.id).unwrap(), json!(null));
+
+        // Own-key spend follows the same rule.
+        assert!(serve_store_call_inner(
+            &store,
+            None,
+            "store.add_user_own_spend",
+            json!({ "user": "alice", "usd": 0.5 }),
+            &bob.id
+        )
+        .is_err());
+        assert_eq!(
+            serve_store_call_inner(
+                &store,
+                None,
+                "store.add_user_own_spend",
+                json!({ "user": "alice", "usd": 0.5 }),
+                &alice.id
+            )
+            .unwrap(),
+            json!(0.5)
+        );
+        assert_eq!(store.get_user_spend("alice").unwrap(), 0.0);
+
+        // There is no wire method for writing a key.
+        assert!(serve_store_call_inner(
+            &store,
+            None,
+            "store.set_user_key",
+            json!({ "user": "alice", "key": "sk-or-new" }),
+            &alice.id
+        )
+        .is_err());
+        assert!(serve_store_call_inner(
+            &store,
+            None,
+            "store.clear_user_key",
+            json!({ "user": "alice" }),
+            &alice.id
+        )
+        .is_err());
+        assert_eq!(
+            store.get_user_key("alice").unwrap().as_deref(),
+            Some("sk-or-alice-1234")
+        );
+    }
     use tokio::net::UnixStream;
 
     struct GatewaySide(Arc<Store>);

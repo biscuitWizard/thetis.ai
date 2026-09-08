@@ -30,7 +30,12 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("MOCK_LLM_BIND").unwrap_or_else(|_| "127.0.0.1:7788".to_string());
-    let app = Router::new().route("/chat/completions", post(completions));
+    // Any prefix, so a base URL with a path in it (`.../openrouter.ai/api/v1`,
+    // which is how a test makes the orchestrator treat the mock as OpenRouter)
+    // still lands here: completions are the only thing the mock serves.
+    let app = Router::new()
+        .route("/chat/completions", post(completions))
+        .fallback(post(completions));
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("mock llm listening on http://{addr}");
     axum::serve(listener, app).await?;
@@ -38,10 +43,22 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn completions(
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Which key the orchestrator sent, by its tail: enough to tell an
+    // account's own key from the operator's in a test, and no more of it.
+    let key = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|k| {
+            let n = k.chars().count();
+            format!("…{}", k.chars().skip(n.saturating_sub(4)).collect::<String>())
+        })
+        .unwrap_or_else(|| "none".into());
     if let Some(model) = body.get("model").and_then(Value::as_str) {
-        println!("mock request model={model}");
+        println!("mock request model={model} key={key}");
     }
     let last_user_content = body
         .get("messages")

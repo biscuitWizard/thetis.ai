@@ -589,6 +589,24 @@ interface sys {
   // Catalogues the chat surface offers the user.
   list-models: func() -> list<model-info>;
   list-modes: func() -> list<mode-info>;
+
+  // The calling account's own OpenRouter key.
+  //
+  // Held natively, keyed by account, and used in place of the operator's key
+  // for every request the host makes on that account's behalf to OpenRouter.
+  // All three answer only for the account on this connection: there is no
+  // way to name another account, an administrator included, and a call with
+  // no account behind it (local mode, a worker, a tool) is refused. The key
+  // itself crosses this boundary exactly once, inbound, in `set`; what comes
+  // back is whether one is held and its last four characters, so a guest can
+  // say "your key ending 1234" and nothing more.
+  record account-key {
+    set: bool,
+    last4: string,
+  }
+  account-key-status: func() -> result<account-key, string>;
+  account-key-set: func(key: string) -> result<account-key, string>;
+  account-key-clear: func() -> result<account-key, string>;
 }
 
 interface session {
@@ -1071,6 +1089,12 @@ interface admin {
     conversations: u32,
     logins: u32,
     spend-usd: f64,
+    /// Whether the account has its own OpenRouter key on file. Set or unset
+    /// is all an administrator learns of it.
+    own-key: bool,
+    /// What the account has spent on that key. Its bill, not the operator's;
+    /// shown apart from `spend-usd`, which is the operator's.
+    own-spend-usd: f64,
   }
   /// A manual override, described for whoever draws the button.
   record action-info {

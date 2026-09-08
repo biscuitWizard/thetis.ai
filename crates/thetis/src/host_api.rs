@@ -509,6 +509,92 @@ impl sys::Host for HostState {
             })
             .collect())
     }
+
+    // The calling account's own OpenRouter key. All three go through
+    // `key_account`, which is the whole of the authorisation: the account on
+    // this connection, or nothing. There is no parameter that names an
+    // account, so there is nothing for an administrator to widen.
+
+    async fn account_key_status(
+        &mut self,
+    ) -> Result<std::result::Result<sys::AccountKey, String>> {
+        self.budget.entered_host("account_key_status");
+        let account = match self.key_account() {
+            Ok(account) => account,
+            Err(why) => return Ok(Err(why)),
+        };
+        self.describe_key(&account).await
+    }
+
+    async fn account_key_set(
+        &mut self,
+        key: String,
+    ) -> Result<std::result::Result<sys::AccountKey, String>> {
+        self.budget.entered_host("account_key_set");
+        let account = match self.key_account() {
+            Ok(account) => account,
+            Err(why) => return Ok(Err(why)),
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Ok(Err("paste a key first".into()));
+        }
+        // What OpenRouter issues; a key that does not look like one is more
+        // likely a paste of the wrong field than a new key format, and
+        // saving it would fail every turn with a 401 rather than here.
+        if !key.starts_with("sk-or-") || key.chars().any(char::is_whitespace) || key.len() > 512
+        {
+            return Ok(Err(
+                "that does not look like an OpenRouter key (they start with sk-or-)".into(),
+            ));
+        }
+        if let Err(e) = self.grip().persist.set_user_key(&account, key).await {
+            tracing::warn!(error = %e, "an account's key was not saved");
+            return Ok(Err("the key could not be saved".into()));
+        }
+        tracing::info!(account = %account, "an account set its own OpenRouter key");
+        self.describe_key(&account).await
+    }
+
+    async fn account_key_clear(
+        &mut self,
+    ) -> Result<std::result::Result<sys::AccountKey, String>> {
+        self.budget.entered_host("account_key_clear");
+        let account = match self.key_account() {
+            Ok(account) => account,
+            Err(why) => return Ok(Err(why)),
+        };
+        if let Err(e) = self.grip().persist.clear_user_key(&account).await {
+            tracing::warn!(error = %e, "an account's key was not cleared");
+            return Ok(Err("the key could not be cleared".into()));
+        }
+        tracing::info!(account = %account, "an account cleared its own OpenRouter key");
+        self.describe_key(&account).await
+    }
+}
+
+impl HostState {
+    /// The one account a key call may concern: the principal on this
+    /// connection, and only when it is a real account. A worker (no
+    /// principal), local mode (a placeholder) and a tool are all refused,
+    /// which is what keeps the key out of the model's reach.
+    fn key_account(&self) -> std::result::Result<String, String> {
+        match &self.principal {
+            Some(p) if p.is_account() => Ok(p.user_id.clone()),
+            _ => Err("only a signed-in account can hold its own key".into()),
+        }
+    }
+
+    async fn describe_key(
+        &mut self,
+        account: &str,
+    ) -> Result<std::result::Result<sys::AccountKey, String>> {
+        let tail = self.grip().persist.user_key_status(account).await.wt()?;
+        Ok(Ok(sys::AccountKey {
+            set: tail.is_some(),
+            last4: tail.unwrap_or_default(),
+        }))
+    }
 }
 
 // --- session ---------------------------------------------------------------
@@ -1115,7 +1201,45 @@ impl HostState {
         });
     }
 
-    fn record_usage(&self, chunk: &StreamChunk) {
+    /// The account this call acts for, if it is one: the connection's
+    /// principal, else the owner of the conversation (a worker has no
+    /// principal, and answers for the conversation it was started for).
+    /// Local mode's placeholder is not an account and gives `None`.
+    async fn acting_account(&mut self) -> Option<String> {
+        if let Some(p) = &self.principal {
+            return p.is_account().then(|| p.user_id.clone());
+        }
+        let sid = self.session_id.as_deref()?;
+        self.grip
+            .persist
+            .owner_of_root(sid)
+            .await
+            .ok()
+            .flatten()
+            .filter(|owner| owner != crate::auth::LOCAL_OWNER)
+    }
+
+    /// The acting account's own OpenRouter key, when the request would go to
+    /// OpenRouter and the account holds one. `None` means the system's
+    /// arrangement applies: the operator's key, the operator's limits.
+    ///
+    /// The key is fetched here, natively, and handed straight to the client;
+    /// it is never a return value of any host function.
+    async fn own_key_for(&mut self, request_json: &str) -> Option<crate::config::Secret> {
+        if !self.grip.llm.request_goes_to_openrouter(request_json) {
+            return None;
+        }
+        let account = self.acting_account().await?;
+        match self.grip.persist.get_user_key(&account).await {
+            Ok(key) => key.map(crate::config::Secret::new),
+            Err(e) => {
+                tracing::warn!(error = %e, "the account's own key could not be read; using the system key");
+                None
+            }
+        }
+    }
+
+    fn record_usage(&self, chunk: &StreamChunk, key: crate::llm::KeyClass) {
         let (StreamChunk::Finished(info), Some(sid)) = (chunk, &self.session_id) else {
             return;
         };
@@ -1126,13 +1250,25 @@ impl HostState {
                 let cost = usage.cost_usd;
                 let principal_owner = self.principal.as_ref().map(|p| p.user_id.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = persist.add_spend(&sid, cost).await {
-                        tracing::warn!(error = %e, "spend was not recorded");
-                    }
                     let owner = match principal_owner {
                         Some(owner) => Some(owner),
                         None => persist.owner_of_root(&sid).await.ok().flatten(),
                     };
+                    // A turn on the account's own key is the account's bill.
+                    // It goes on its own ledger and on neither of the two the
+                    // operator's limits read, so a user paying their own way
+                    // is never stopped by a budget that was never theirs.
+                    if key == crate::llm::KeyClass::Own {
+                        if let Some(owner) = owner {
+                            if let Err(e) = persist.add_user_own_spend(&owner, cost).await {
+                                tracing::warn!(error = %e, "own-key spend was not recorded");
+                            }
+                        }
+                        return;
+                    }
+                    if let Err(e) = persist.add_spend(&sid, cost).await {
+                        tracing::warn!(error = %e, "spend was not recorded");
+                    }
                     if let Some(owner) = owner {
                         if let Err(e) = persist.add_user_spend(&owner, cost).await {
                             tracing::warn!(error = %e, "user spend was not recorded");
@@ -1153,9 +1289,16 @@ impl llm::Host for HostState {
         if let Err(e) = self.check_model(&request_json) {
             return Ok(Err(e));
         }
+        // On the account's own key the operator's limits do not apply: they
+        // cap the operator's bill, and this request is not on it.
+        let own_key = self.own_key_for(&request_json).await;
         let (persist, sid, session_limit, owner, user_limit) = self.budget_inputs();
-        if let Err(e) = Self::check_budget(persist, sid, session_limit, owner, user_limit).await {
-            return Ok(Err(e));
+        if own_key.is_none() {
+            if let Err(e) =
+                Self::check_budget(persist, sid, session_limit, owner, user_limit).await
+            {
+                return Ok(Err(e));
+            }
         }
         let llm = self.grip.llm.clone();
         // Interruptible, unlike `stream_next`'s own hand-rolled race, because
@@ -1168,7 +1311,7 @@ impl llm::Host for HostState {
         let result = self
             .interruptible(
                 "the completion",
-                llm.chat_for(&request_json, session.as_deref()),
+                llm.chat_as(&request_json, session.as_deref(), own_key.as_ref()),
             )
             .await;
         self.yielded();
@@ -1186,13 +1329,23 @@ impl llm::Host for HostState {
         if let Err(e) = self.check_model(&request_json) {
             return Ok(Err(e));
         }
+        // See `chat`: the operator's limits are for the operator's key.
+        let own_key = self.own_key_for(&request_json).await;
         let (persist, sid, session_limit, owner, user_limit) = self.budget_inputs();
-        if let Err(e) = Self::check_budget(persist, sid, session_limit, owner, user_limit).await {
-            return Ok(Err(e));
+        if own_key.is_none() {
+            if let Err(e) =
+                Self::check_budget(persist, sid, session_limit, owner, user_limit).await
+            {
+                return Ok(Err(e));
+            }
         }
         let llm = self.grip.llm.clone();
         let opened = llm
-            .open_stream_for(&request_json, self.session_id.as_deref())
+            .open_stream_as(
+                &request_json,
+                self.session_id.as_deref(),
+                own_key.as_ref(),
+            )
             .await;
         self.yielded();
         self.capture_request(&llm);
@@ -1223,13 +1376,14 @@ impl llm::Host for HostState {
         }
 
         let flag = self.cancel_flag();
-        let chunk = {
+        let (chunk, key) = {
             let Some(handle) = self.streams.get_mut(&stream_id) else {
                 return Ok(Err(LlmError::BadRequest(format!(
                     "unknown stream id {stream_id}"
                 ))));
             };
-            match flag {
+            let key = handle.key;
+            let chunk = match flag {
                 Some(flag) => {
                     tokio::select! {
                         biased;
@@ -1240,7 +1394,8 @@ impl llm::Host for HostState {
                     }
                 }
                 None => handle.next().await,
-            }
+            };
+            (chunk, key)
         };
         // Time spent waiting on the model is not the guest spinning.
         self.yielded();
@@ -1253,7 +1408,7 @@ impl llm::Host for HostState {
         }
 
         if let Ok(chunk) = &chunk {
-            self.record_usage(chunk);
+            self.record_usage(chunk, key);
         }
         Ok(chunk)
     }
@@ -3001,6 +3156,8 @@ impl admin::Host for HostState {
                     conversations: a.conversations,
                     logins: a.logins,
                     spend_usd: a.spend_usd,
+                    own_key: a.own_key,
+                    own_spend_usd: a.own_spend_usd,
                 })
                 .collect(),
             private_dirs: view.private_dirs,
@@ -3680,6 +3837,59 @@ mod tests {
                 "`{method}` does not gate spend"
             );
         }
+    }
+
+    /// An account's own key answers only to that account, and never leaves.
+    /// Each of the three key functions resolves its account through
+    /// `key_account` — the principal on the connection, or a refusal — and
+    /// none of them, nor anything else a guest can call, reads the whole key:
+    /// the request path is the only reader, and it is not a host function.
+    #[test]
+    fn an_accounts_key_is_scoped_to_its_connection_and_never_returned() {
+        let src = include_str!("host_api.rs");
+        let sys = src.split("impl sys::Host for HostState {").nth(1).unwrap();
+        let sys = sys.split("\nimpl ").next().unwrap();
+        for method in [
+            "async fn account_key_status(",
+            "async fn account_key_set(",
+            "async fn account_key_clear(",
+        ] {
+            let body = sys
+                .split(method)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{method} is missing"))
+                .split("    async fn ")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains("self.key_account()"),
+                "`{method}` does not resolve its account through `key_account`"
+            );
+            assert!(
+                !body.contains("get_user_key("),
+                "`{method}` reads the whole key; only the request path may"
+            );
+        }
+        // The resolver insists on a real account, so a worker (no principal)
+        // and local mode (a placeholder) get nothing.
+        let resolver = src.split("fn key_account(&self)").nth(1).unwrap();
+        let resolver = resolver.split("\n    }\n").next().unwrap();
+        assert!(resolver.contains("p.is_account()"), "{resolver}");
+        // The whole key is read in exactly one place: on the way to the
+        // request, in `own_key_for`, and that function is not a host import.
+        // Count in the shipping code only: this test names the call twice
+        // itself, and a test that counts its own text always fails.
+        let shipping = src.split("\n#[cfg(test)]").next().unwrap();
+        let reads = shipping.matches("persist.get_user_key(").count();
+        assert_eq!(reads, 1, "the whole key is read somewhere new");
+        assert!(src
+            .split("async fn own_key_for(")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap()
+            .contains("persist.get_user_key("));
     }
 
     /// An agent must not be able to mint a conversation. `spawn_agent` is the

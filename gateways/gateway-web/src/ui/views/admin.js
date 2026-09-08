@@ -891,9 +891,9 @@ function renderAccounts() {
       el(
         "section",
         { class: "admin-block" },
-        heading("Accounts", "What the database says about each configured account. \"Sign out everywhere\" ends every login the account holds, on every device. Spend is cumulative across the account's conversations."),
+        heading("Accounts", "What the database says about each configured account. \"Sign out everywhere\" ends every login the account holds, on every device. Spend is cumulative across the account's conversations on the system key; \"own key\" says whether the account has put its own OpenRouter key on file (set or unset is all that is visible here) and what it has spent on it."),
         table(
-          ["user", "name", "role", "policy", "conversations", "logins", "spend", ""],
+          ["user", "name", "role", "policy", "conversations", "logins", "spend", "own key", ""],
           o.accounts.map((a) => {
             const flags = [a.admin && "admin", a.read_only && "read-only", a.sees_all && "sees all"].filter(Boolean).join(", ");
             const button = el(
@@ -913,7 +913,7 @@ function renderAccounts() {
               "sign out everywhere"
             );
             button.disabled = a.logins === 0;
-            return [el("span", { class: "mono" }, a.id), a.name, a.role, el("span", { class: "quiet" }, flags), String(a.conversations), String(a.logins), money(a.spend_usd), el("span", {}, button, resultNote(`sign-out:${a.id}`))];
+            return [el("span", { class: "mono" }, a.id), a.name, a.role, el("span", { class: "quiet" }, flags), String(a.conversations), String(a.logins), money(a.spend_usd), a.own_key ? `set · ${money(a.own_spend_usd)}` : el("span", { class: "quiet" }, "—"), el("span", {}, button, resultNote(`sign-out:${a.id}`))];
           })
         )
       )

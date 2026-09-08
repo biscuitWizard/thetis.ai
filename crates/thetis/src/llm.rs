@@ -74,11 +74,37 @@ pub struct StoredRequest {
     pub body: Arc<serde_json::Value>,
 }
 
+/// Whose key a request went out under.
+///
+/// `Own` is an account's own OpenRouter key, held for it in the store; it is
+/// only ever used against a provider that *is* OpenRouter, so a local server
+/// never sees it. `System` is the operator's key from `thetis.toml`, or no key
+/// at all for a keyless provider. The spend of a request follows its class:
+/// `Own` is the account's bill and is tallied apart, never against the
+/// operator's limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyClass {
+    System,
+    Own,
+}
+
+impl std::fmt::Display for KeyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            KeyClass::System => "system",
+            KeyClass::Own => "own",
+        })
+    }
+}
+
 /// Receiving end of one in-flight completion.
 pub struct StreamHandle {
     rx: mpsc::Receiver<Result<StreamChunk, LlmError>>,
     /// Set once a `finished` chunk has been handed to the guest.
     pub finished: bool,
+    /// Whose key the request was sent with, so its cost lands on the right
+    /// ledger when the final chunk arrives.
+    pub key: KeyClass,
 }
 
 impl StreamHandle {
@@ -288,27 +314,44 @@ impl LlmClient {
         Ok((body, provider_id))
     }
 
-    async fn send(
-        &self,
-        body: &serde_json::Value,
-        provider_id: &str,
-        streaming: bool,
-    ) -> Result<reqwest::Response, LlmError> {
-        self.send_for(body, provider_id, streaming, None).await
+    /// Whether a request would go to OpenRouter, which is the one provider an
+    /// account's own key applies to. Read off the request's `model` the way
+    /// `prepare_body` resolves it, so the answer cannot differ from where the
+    /// request then goes; a caller asks this before deciding whose budget a
+    /// request is checked against.
+    pub fn request_goes_to_openrouter(&self, request_json: &str) -> bool {
+        let cfg = self.cfg.load_full();
+        let requested = serde_json::from_str::<serde_json::Value>(request_json)
+            .ok()
+            .and_then(|v| v.get("model")?.as_str().map(str::to_string))
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| cfg.model.clone());
+        cfg.resolve_model(&requested).provider.is_openrouter()
     }
 
-    /// As [`Self::send`], but keeps one conversation on one replica.
+    /// Sends a prepared body to its provider, keeping one conversation on one
+    /// replica, and sends the account's own key instead of the system's when
+    /// there is one and the provider is OpenRouter. Says which it did.
     async fn send_for(
         &self,
         body: &serde_json::Value,
         provider_id: &str,
         streaming: bool,
         session: Option<&str>,
-    ) -> Result<reqwest::Response, LlmError> {
+        own_key: Option<&crate::config::Secret>,
+    ) -> Result<(reqwest::Response, KeyClass), LlmError> {
         let cfg = self.cfg.load_full();
         let provider = cfg
             .provider(provider_id)
             .unwrap_or_else(|| cfg.fallback_provider());
+        // An account's own key goes to OpenRouter and nowhere else. A local
+        // server gets what it always got — no header — and a hosted provider
+        // that is not OpenRouter keeps the operator's arrangement with it;
+        // the key was given for one bill, and this is where that bill is.
+        let (api_key, key_class) = match own_key {
+            Some(key) if provider.is_openrouter() => (Some(key), KeyClass::Own),
+            _ => (provider.api_key.as_ref(), KeyClass::System),
+        };
         // Which replica serves this. A rotating counter spreads load evenly,
         // which is right for throughput and wrong for caching: the prompt cache
         // is per-endpoint, so a conversation that rotates pays a full cache
@@ -333,12 +376,21 @@ impl LlmClient {
         // worse than none: some endpoints reject it outright. OpenRouter, by
         // contrast, cannot serve anything without one, so say so early rather
         // than letting it come back as an opaque 401.
-        if provider.api_key.is_none() && provider.is_openrouter() {
+        if api_key.is_none() && provider.is_openrouter() {
             return Err(LlmError::Auth(
                 "no API key: set llm.api_key in thetis.toml, or OPENROUTER_API_KEY in the environment"
                     .into(),
             ));
         }
+        // Which key class, never which key. `debug` is on by default for this
+        // crate, so a log answers "was that turn on the user's key" without
+        // a change of filter.
+        tracing::debug!(
+            provider = %provider.id,
+            key = %key_class,
+            session = session.unwrap_or_default(),
+            "llm request"
+        );
 
         let mut attempt = 0;
         loop {
@@ -353,7 +405,7 @@ impl LlmClient {
                 // is meaningful and is what the setting has always meant.
                 req = req.timeout(self.cfg.load().request_timeout);
             }
-            if let Some(key) = &provider.api_key {
+            if let Some(key) = api_key {
                 req = req.bearer_auth(key.expose());
             }
             if provider.is_openrouter() {
@@ -414,7 +466,7 @@ impl LlmClient {
             let resp = result.map_err(|e| LlmError::Transport(e.to_string()))?;
             let status = resp.status();
             if status.is_success() {
-                return Ok(resp);
+                return Ok((resp, key_class));
             }
 
             let detail = resp.text().await.unwrap_or_default();
@@ -444,8 +496,22 @@ impl LlmClient {
         request_json: &str,
         session: Option<&str>,
     ) -> Result<String, LlmError> {
+        self.chat_as(request_json, session, None).await
+    }
+
+    /// As [`Self::chat_for`], on behalf of an account that may hold its own
+    /// OpenRouter key. `own_key` is used when the request goes to OpenRouter
+    /// and ignored otherwise; see [`KeyClass`].
+    pub async fn chat_as(
+        &self,
+        request_json: &str,
+        session: Option<&str>,
+        own_key: Option<&crate::config::Secret>,
+    ) -> Result<String, LlmError> {
         let (body, provider) = self.prepare_body_for(request_json, false, session)?;
-        let resp = self.send_for(&body, &provider, false, session).await?;
+        let (resp, _) = self
+            .send_for(&body, &provider, false, session, own_key)
+            .await?;
         resp.text()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))
@@ -464,6 +530,17 @@ impl LlmClient {
         request_json: &str,
         session: Option<&str>,
     ) -> Result<StreamHandle, LlmError> {
+        self.open_stream_as(request_json, session, None).await
+    }
+
+    /// As [`Self::open_stream_for`], on behalf of an account that may hold
+    /// its own OpenRouter key; the handle says which key class was used.
+    pub async fn open_stream_as(
+        &self,
+        request_json: &str,
+        session: Option<&str>,
+        own_key: Option<&crate::config::Secret>,
+    ) -> Result<StreamHandle, LlmError> {
         let (body, provider) = self.prepare_body_for(request_json, true, session)?;
         // Streaming requests are the turns themselves (compaction goes through
         // `chat`), so this is the one the inspector wants.
@@ -477,7 +554,9 @@ impl LlmClient {
                 body: body.clone(),
             });
         }
-        let resp = self.send_for(&body, &provider, true, session).await?;
+        let (resp, key) = self
+            .send_for(&body, &provider, true, session, own_key)
+            .await?;
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
@@ -506,6 +585,7 @@ impl LlmClient {
         Ok(StreamHandle {
             rx,
             finished: false,
+            key,
         })
     }
 }
@@ -1227,6 +1307,113 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
         assert_eq!(sent["model"], "deepseek-v4-flash");
         assert_eq!(sent["stream"], true);
+    }
+
+    /// A client whose "OpenRouter" is the stub, plus a keyless local server.
+    /// `is_openrouter` reads the base URL for the host name, and the stub's
+    /// path carries it, so the routing rule under test is the real one.
+    fn own_key_client(openrouter_url: &str, local_url: &str) -> LlmClient {
+        let mut cfg = Config::load().expect("the shipped config loads");
+        cfg.model = "anthropic/claude-sonnet-4.5".into();
+        cfg.providers = vec![
+            crate::config::ProviderSpec {
+                id: "openrouter".into(),
+                label: "OpenRouter".into(),
+                base_urls: vec![format!("{openrouter_url}/openrouter.ai/api/v1")],
+                api_key: Some(crate::config::Secret::new("sk-or-system-key")),
+                headers: Vec::new(),
+            },
+            crate::config::ProviderSpec {
+                id: "local".into(),
+                label: "llama.cpp".into(),
+                base_urls: vec![local_url.to_string()],
+                api_key: None,
+                headers: Vec::new(),
+            },
+        ];
+        cfg.default_provider = "openrouter".into();
+        cfg.models = vec![crate::config::ModelSpec {
+            id: "local/qwen3".into(),
+            label: "Qwen3 (local)".into(),
+            provider: "local".into(),
+            wire_model: "qwen3-30b-a3b".into(),
+            context_window: None,
+        }];
+        LlmClient::new(Arc::new(arc_swap::ArcSwap::from_pointee(cfg))).unwrap()
+    }
+
+    const HOSTED: &str = r#"{"model":"anthropic/claude-sonnet-4.5","messages":[{"role":"user","content":"hi"}]}"#;
+    const LOCAL: &str = r#"{"model":"local/qwen3","messages":[{"role":"user","content":"hi"}]}"#;
+
+    #[tokio::test]
+    async fn an_accounts_own_key_replaces_the_system_key_at_openrouter() {
+        let (base_url, server) = stub_server().await;
+        let client = own_key_client(&base_url, "http://127.0.0.1:9/v1");
+        assert!(client.request_goes_to_openrouter(HOSTED));
+
+        let own = crate::config::Secret::new("sk-or-own-key");
+        let stream = client
+            .open_stream_as(HOSTED, Some("conv-1"), Some(&own))
+            .await
+            .expect("the stub answers");
+        assert_eq!(stream.key, KeyClass::Own);
+
+        let request = server.await.unwrap();
+        let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-or-own-key"), "{head}");
+        assert!(!request.contains("sk-or-system-key"), "{head}");
+        // Still OpenRouter, so still attributed.
+        assert!(head.contains("x-title: thetis"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn without_an_own_key_the_system_key_is_sent_as_before() {
+        let (base_url, server) = stub_server().await;
+        let client = own_key_client(&base_url, "http://127.0.0.1:9/v1");
+
+        let stream = client
+            .open_stream_as(HOSTED, Some("conv-1"), None)
+            .await
+            .expect("the stub answers");
+        assert_eq!(stream.key, KeyClass::System);
+
+        let request = server.await.unwrap();
+        let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-or-system-key"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn an_own_key_is_never_sent_to_a_provider_that_is_not_openrouter() {
+        let (base_url, server) = stub_server().await;
+        let client = own_key_client("http://127.0.0.1:9", &format!("{base_url}/v1"));
+        assert!(!client.request_goes_to_openrouter(LOCAL));
+
+        let own = crate::config::Secret::new("sk-or-own-key");
+        let stream = client
+            .open_stream_as(LOCAL, Some("conv-1"), Some(&own))
+            .await
+            .expect("the stub answers");
+        // A keyless provider is the system's arrangement, whoever is asking.
+        assert_eq!(stream.key, KeyClass::System);
+
+        let request = server.await.unwrap();
+        let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+        assert!(!head.contains("authorization"), "{head}");
+        assert!(!request.contains("sk-or-own-key"));
+        assert!(!request.contains("sk-or-system-key"));
+    }
+
+    /// The non-streaming path (compaction's summaries) takes the same key.
+    #[tokio::test]
+    async fn the_non_streaming_call_takes_the_own_key_too() {
+        let (base_url, server) = stub_server().await;
+        let client = own_key_client(&base_url, "http://127.0.0.1:9/v1");
+        let own = crate::config::Secret::new("sk-or-own-key");
+        let _ = client.chat_as(HOSTED, Some("conv-1"), Some(&own)).await;
+        let request = server.await.unwrap();
+        let head = request.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer sk-or-own-key"), "{head}");
+        assert!(!request.contains("sk-or-system-key"));
     }
 
     #[test]

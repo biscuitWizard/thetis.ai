@@ -90,6 +90,16 @@ const OWNERS: TableDefinition<&str, &str> = TableDefinition::new("owners");
 const LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("logins");
 /// principal id -> cumulative USD spend
 const USER_SPEND: TableDefinition<&str, f64> = TableDefinition::new("user_spend");
+/// principal id -> the account's own OpenRouter key. Plain text, like the
+/// operator's key in `thetis.toml`: this crate has no secret-at-rest scheme,
+/// and a key stored beside the key that would unlock it is not encrypted,
+/// only obscured. What protects a row is access: the only reader that ever
+/// sees the whole value is the request path, and the only writer is the
+/// account's own connection.
+const USER_KEYS: TableDefinition<&str, &str> = TableDefinition::new("user_keys");
+/// principal id -> cumulative USD spent on the account's *own* key, apart
+/// from `user_spend` so nothing here counts against the operator's limits.
+const USER_OWN_SPEND: TableDefinition<&str, f64> = TableDefinition::new("user_own_spend");
 /// (aspect key, revision) -> RevisionRow (json)
 pub(crate) const REVISIONS: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("revisions");
 /// snapshot id -> SystemSnapshot (json)
@@ -189,6 +199,13 @@ impl SurfaceScope {
 /// overwrite.
 pub const DEFAULT_TITLE: &str = "New chat";
 
+/// The last four characters of a key: all a display line ever gets of one.
+/// A key shorter than that is shown whole; there is nothing in it to hide.
+pub fn key_tail(key: &str) -> String {
+    let n = key.chars().count();
+    key.chars().skip(n.saturating_sub(4)).collect()
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -220,6 +237,8 @@ impl Store {
             txn.open_table(OWNERS)?;
             txn.open_table(LOGINS)?;
             txn.open_table(USER_SPEND)?;
+            txn.open_table(USER_KEYS)?;
+            txn.open_table(USER_OWN_SPEND)?;
             txn.open_table(REVISIONS)?;
             txn.open_table(SNAPSHOTS)?;
             txn.open_table(SKILL_VECTORS)?;
@@ -722,6 +741,59 @@ impl Store {
         let total;
         {
             let mut table = tx.open_table(USER_SPEND)?;
+            total = table.get(user)?.map(|v| v.value()).unwrap_or(0.0) + usd;
+            table.insert(user, total)?;
+        }
+        tx.commit()?;
+        Ok(total)
+    }
+
+    // --- an account's own API key --------------------------------------------
+
+    /// The account's own OpenRouter key, whole. For the request path only;
+    /// anything that shows a person something asks `user_key_status`.
+    pub fn get_user_key(&self, user: &str) -> Result<Option<String>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(USER_KEYS)?;
+        Ok(t.get(user)?.map(|v| v.value().to_owned()))
+    }
+    /// The tail of the account's key for a display line, or `None` when it
+    /// holds no key. Never more of the key than that once it is saved.
+    pub fn user_key_status(&self, user: &str) -> Result<Option<String>> {
+        Ok(self.get_user_key(user)?.map(|k| key_tail(&k)))
+    }
+    /// Replaces the account's key. Surrounding whitespace is not part of a
+    /// key, and a blank one is a clear, so a pasted empty box never stores "".
+    pub fn set_user_key(&self, user: &str, key: &str) -> Result<()> {
+        let key = key.trim();
+        if key.is_empty() {
+            return self.clear_user_key(user);
+        }
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(USER_KEYS)?.insert(user, key)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn clear_user_key(&self, user: &str) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(USER_KEYS)?.remove(user)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn get_user_own_spend(&self, user: &str) -> Result<f64> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(USER_OWN_SPEND)?;
+        Ok(t.get(user)?.map(|v| v.value()).unwrap_or(0.0))
+    }
+    pub fn add_user_own_spend(&self, user: &str, usd: f64) -> Result<f64> {
+        let tx = self.db.begin_write()?;
+        let total;
+        {
+            let mut table = tx.open_table(USER_OWN_SPEND)?;
             total = table.get(user)?.map(|v| v.value()).unwrap_or(0.0) + usd;
             table.insert(user, total)?;
         }
@@ -1872,6 +1944,42 @@ mod tests {
         assert_eq!(store.add_user_spend("alice", 1.25).unwrap(), 1.25);
         assert_eq!(store.add_user_spend("alice", 0.75).unwrap(), 2.0);
         assert_eq!(store.get_user_spend("alice").unwrap(), 2.0);
+    }
+
+    /// An account's own key is its own row: setting alice's leaves bob
+    /// without one, the status line gets the tail and nothing more, a blank
+    /// save is a clear, and spend on the key never touches `user_spend`.
+    #[test]
+    fn an_accounts_own_key_and_own_spend_round_trip() {
+        let (store, _d) = temp_store();
+        assert_eq!(store.get_user_key("alice").unwrap(), None);
+        assert_eq!(store.user_key_status("alice").unwrap(), None);
+
+        store.set_user_key("alice", "  sk-or-v1-abcdef1234  ").unwrap();
+        assert_eq!(
+            store.get_user_key("alice").unwrap().as_deref(),
+            Some("sk-or-v1-abcdef1234")
+        );
+        assert_eq!(
+            store.user_key_status("alice").unwrap().as_deref(),
+            Some("1234")
+        );
+        assert_eq!(store.get_user_key("bob").unwrap(), None);
+
+        store.set_user_key("alice", "   ").unwrap();
+        assert_eq!(store.get_user_key("alice").unwrap(), None);
+
+        store.set_user_key("alice", "sk-or-second").unwrap();
+        store.clear_user_key("alice").unwrap();
+        assert_eq!(store.user_key_status("alice").unwrap(), None);
+
+        assert_eq!(store.add_user_own_spend("alice", 0.5).unwrap(), 0.5);
+        assert_eq!(store.add_user_own_spend("alice", 0.25).unwrap(), 0.75);
+        assert_eq!(store.get_user_own_spend("alice").unwrap(), 0.75);
+        assert_eq!(store.get_user_spend("alice").unwrap(), 0.0);
+
+        assert_eq!(key_tail("abc"), "abc");
+        assert_eq!(key_tail(""), "");
     }
 
     #[test]

@@ -764,7 +764,7 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
             .collect::<Vec<_>>()
             .join(", ");
             format!(
-                r#"<tr><td class=mono>{}</td><td>{}</td><td>{}</td><td class=note>{}</td><td>{}</td><td>{}</td><td>${:.4}</td><td class=actions><form method=post action="/admin/user/logout"><input type=hidden name=user value="{}"><button{}>sign out everywhere</button></form></td></tr>"#,
+                r#"<tr><td class=mono>{}</td><td>{}</td><td>{}</td><td class=note>{}</td><td>{}</td><td>{}</td><td>${:.4}</td><td>{}</td><td class=actions><form method=post action="/admin/user/logout"><input type=hidden name=user value="{}"><button{}>sign out everywhere</button></form></td></tr>"#,
                 html_escape(&user.id),
                 html_escape(&user.name),
                 html_escape(&user.role),
@@ -772,6 +772,12 @@ async fn render_admin(grip: &Arc<Grip>, banner: &str) -> String {
                 user.conversations,
                 user.logins,
                 user.spend_usd,
+                // Set or unset, and what went on it: never the key.
+                if user.own_key {
+                    format!("set (${:.4})", user.own_spend_usd)
+                } else {
+                    "—".to_string()
+                },
                 html_escape(&user.id),
                 if user.logins == 0 { " disabled" } else { "" },
             )
@@ -829,7 +835,7 @@ Stopping a worker loses nothing — branch state is on disk and in the log.</p>
 <p class=note>Accounts are configuration (<code>[[users]]</code> in <code>thetis.local.toml</code>);
 this is what the database says about them. "Sign out everywhere" ends every login the
 account holds, on every device. Spend is cumulative across all of the account's conversations.</p>
-<table><tr><th>user</th><th>name</th><th>role</th><th>policy</th><th>conversations</th><th>logins</th><th>spend (USD)</th><th></th></tr>
+<table><tr><th>user</th><th>name</th><th>role</th><th>policy</th><th>conversations</th><th>logins</th><th>spend (USD)</th><th>own key</th><th></th></tr>
 {user_rows}</table>
 <h2>Publishing</h2>
 <p class=note>Directories holding a <code>.thetis-private</code> marker never leave this
