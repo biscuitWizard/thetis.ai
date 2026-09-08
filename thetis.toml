@@ -146,25 +146,47 @@ max_retries = 3
 # llama-server with `--parallel N` already serves N concurrent slots on a
 # single port; use `base_urls` for separate processes or separate machines.
 
-[[providers]]
-id = "local"
-label = "llama.cpp"
-# Whatever llama-server prints as its base; the OpenAI routes hang off it.
-# `--jinja` matters when you start the server: without it llama.cpp does not
-# apply the model's chat template, and tool calling — which Thetis depends on
-# entirely — will not work.
-base_url = "http://127.0.0.1:8080/v1"
+# The DeepSeek server on 8080, retired 2026-09-07: 120 GB across the three
+# RTX 8000s bought decode too slow to narrate a turn with. Its unit is stopped
+# and disabled; uncomment this, the model entry below, and re-enable
+# llama-deepseek to bring it back. `--jinja` is what makes tool calling work,
+# so keep it on whatever server takes this port next.
+# [[providers]]
+# id = "local"
+# label = "llama.cpp"
+# base_url = "http://127.0.0.1:8080/v1"
 # api_key = "env:LLAMA_API_KEY"   # only if you started it with --api-key
 # headers = { "X-Org" = "acme" }  # sent on every request to this provider
 
-# A second llama-server, pinned to the A100, for short per-turn calls. Model
-# ids are prefixed by provider id, so `local-qwen/qwen3.8-27b` reaches this one
-# and `local/deepseek-v4-flash` the first. Started by the llama-qwen systemd
-# unit (scripts/local-models/).
+# The llama-server pinned to the A100. Model ids are prefixed by provider id,
+# so `local-qwen/qwen3.8-27b` reaches it. Started by the llama-qwen systemd
+# unit (scripts/local-models/), which was stopped and DISABLED on 2026-09-08
+# when Flash-Next replaced it. The A100 is otherwise idle, so
+# `systemctl start llama-qwen` brings it back and the two run side by side.
 [[providers]]
 id = "local-qwen"
 label = "llama.cpp (A100)"
 base_url = "http://127.0.0.1:8081/v1"
+
+# Qwen3.8-Flash-Next, added 2026-09-08. A ~177B/A6B MoE at Q4_K_M, so it does
+# not fit one card: it is tensor-split across the three RTX 8000s, which are
+# the only cards here that can peer with each other (the A100 has no P2P with
+# them). Measured at 117k depth that split gives ~20 tok/s against ~16.7 for a
+# layer split over all four; it is marginally slower on short prompts, where
+# giving up the A100's bandwidth is not repaid.
+#
+# Started by the llama-flash systemd unit (scripts/local-models/), which
+# replaced llama-qwen as the enabled local model on 2026-09-08. A copy of the
+# weights sits in /dev/shm so a restart loads in ~80s rather than ~4min off
+# NFS; a reboot clears that and the script falls back to /tank on its own.
+#
+# It needs a llama.cpp newer than the pinned unsloth fork, which cannot load
+# the qwen4exp architecture at all, plus an unmerged PR for the tensor split.
+# That build lives in /home/bitmuse/llama.cpp-perf2.
+[[providers]]
+id = "local-flash"
+label = "llama.cpp (3x RTX 8000)"
+base_url = "http://127.0.0.1:8082/v1"
 
 # [[providers]]
 # id = "vllm"
@@ -279,18 +301,33 @@ id = "z-ai/glm-5.3"
 label = "GLM 5.3"
 context_window = 200000
 
-# The local llama.cpp server, offered in the picker beside the hosted models.
-[[models]]
-id = "local/deepseek-v4-flash"
-label = "DeepSeek V4 Flash (local)"
-provider = "local"
-wire_model = "deepseek-v4-flash"
+# The local llama.cpp servers, offered in the picker beside the hosted models.
+# DeepSeek retired with its provider above.
+# [[models]]
+# id = "local/deepseek-v4-flash"
+# label = "DeepSeek V4 Flash (local)"
+# provider = "local"
+# wire_model = "deepseek-v4-flash"
 
 [[models]]
 id = "local-qwen/qwen3.8-27b"
 label = "Qwen3.8 27B (local, A100)"
 provider = "local-qwen"
 wire_model = "qwen3.8-27b"
+
+# Uncensored conversion of Flash-Next. 262144 is the model's trained context
+# and the ceiling llama-server enforces anyway, so asking for more just gets
+# this back with a warning in the log. Speculative decoding is deliberately
+# off: the model is hybrid, 36 of its 48 blocks are recurrent, and unwinding
+# that state on a rejected token costs more than the accepted tokens save --
+# a 2B draft measured 5x SLOWER, and the model's own MTP head silently
+# corrupted output. Do not turn it on without re-measuring.
+[[models]]
+id = "local-flash/qwen3.8-flash-next"
+label = "Qwen3.8 Flash Next (local, 3x RTX 8000)"
+provider = "local-flash"
+wire_model = "qwen3.8-flash-next"
+context_window = 262144
 
 # Ways of working, offered per conversation. `read_only` is carried through to
 # the agent, which withholds every tool that changes something — so adding a
@@ -476,7 +513,9 @@ enabled = true
 # one, because an unknown model has to be assumed small enough to be safe.
 #
 # It was 200000, one number for every model, and the local llama-server here
-# runs at 65536: compaction could not fire before that server refused, and
+# ran at 65536 (it runs at 262144 now, unified across both slots — see
+# scripts/local-models/llama-qwen.sh): compaction could not fire before that
+# server refused, and
 # every context failure of 2026-09-07 -- a build refused at 67960 tokens, a hub
 # turn at 71048, a fight whose tool call was cut off mid-argument with 490
 # tokens of room -- was that one gap.

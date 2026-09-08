@@ -50,3 +50,4 @@ github-app.pem
 # Scanned PDFs kept beside the checkout for reference. Large, and not ours to
 # redistribute — the point of the rule is that no `git add -A` can sweep one in.
 /manuals/
+/docs/
