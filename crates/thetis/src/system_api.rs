@@ -84,10 +84,19 @@ async fn status(
         "wit": crate::pipeline::kernel_wit_fingerprint(),
         "uptime_s": STARTED.get().map(|t| t.elapsed().as_secs()),
         // The asker's own conversations, or everyone's when this connection
-        // is showing everyone's: the count should match the sidebar.
+        // is showing everyone's: the count should match the sidebar. A
+        // private surface's sidebar is always the asker's own.
         "sessions": grip
             .persist
-            .list_sessions_owned(principal.list_owner(), scope.as_ref(), false)
+            .list_sessions_owned(
+                if scope.as_ref().is_some_and(|s| s.private) {
+                    Some(principal.user_id.as_str())
+                } else {
+                    principal.list_owner()
+                },
+                scope.as_ref(),
+                false,
+            )
             .await
             .map(|s| s.len())
             .unwrap_or(0),

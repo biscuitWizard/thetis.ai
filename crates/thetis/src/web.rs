@@ -1251,16 +1251,21 @@ async fn connection(
         {
             Ok(actions) => actions,
             Err(e) => {
-                // Show the whole chain: the outer context alone ("gateway
-                // on-client-message") says nothing about what went wrong.
-                let detail = format!("{e:#}");
-                tracing::warn!(error = %detail, "gateway rejected a client message");
+                // The log gets the whole chain: the outer context alone
+                // ("gateway on-client-message") says nothing about what went
+                // wrong. The browser gets the cause: a host import that
+                // refused ("this campaign belongs to another user") arrives
+                // here as a trap, and the chain around it is a wasm backtrace
+                // nobody should read in a banner.
+                tracing::warn!(error = %format!("{e:#}"), "gateway rejected a client message");
                 // Naming the frame this answers lets the client tell an
                 // incidental error from the refusal of the thing it is
                 // waiting on — a `send` whose worker would not start arrives
                 // here, and the composer stays locked behind an optimistic
                 // message until it knows.
-                let _ = out_tx.send(error_frame(&detail, inbound_type(&text))).await;
+                let _ = out_tx
+                    .send(error_frame(&user_facing(&e), inbound_type(&text)))
+                    .await;
                 continue;
             }
         };
@@ -1490,6 +1495,13 @@ fn frame_for_socket(frame_gateway: Option<&str>, socket_gateway: &str) -> bool {
     frame_gateway.map_or(true, |gateway| gateway == socket_gateway)
 }
 
+/// What a browser is told when a guest call fails: the innermost cause, which
+/// for a host refusal is the host's own sentence. The contexts wrapped around
+/// it are for the log.
+fn user_facing(e: &anyhow::Error) -> String {
+    e.root_cause().to_string()
+}
+
 fn error_frame(detail: &str, replying_to: Option<String>) -> String {
     serde_json::json!({
         "type": "error",
@@ -1527,6 +1539,17 @@ mod preview_tests {
 
     fn rewrite(html: &str) -> String {
         String::from_utf8(rewrite_preview_html(html.as_bytes(), "abc123")).unwrap()
+    }
+
+    /// A host import that refuses reaches the socket as a trap wrapped in a
+    /// wasm backtrace; the banner shows the refusal, not the backtrace.
+    #[test]
+    fn a_refusal_reaches_the_browser_as_its_own_sentence() {
+        let e = anyhow::anyhow!("this campaign belongs to another user")
+            .context("error while executing at wasm backtrace:\n    0: 0x5aaf24 - <unknown>")
+            .context("gateway on-client-message");
+        assert_eq!(super::user_facing(&e), "this campaign belongs to another user");
+        assert!(format!("{e:#}").contains("wasm backtrace"), "the log keeps the chain");
     }
 
     #[test]
