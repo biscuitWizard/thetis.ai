@@ -148,6 +148,15 @@ pub struct SurfaceScope {
     /// disappears from the chat sidebar, or it shows up in every surface at
     /// once — and the first of those is the unacceptable one.
     pub inherits_unrecorded: bool,
+    /// Whether this surface's sessions are their owner's alone.
+    ///
+    /// Sharing — invitations, an administrator's see-all — is a chat feature:
+    /// a conversation has an audience. A mounted surface's sessions are a
+    /// different kind of thing (the campaign gateway's are one player's game
+    /// saves), so they are listed only for their owner and refused to everyone
+    /// else, administrators included; `/admin` reads the store directly and is
+    /// where seeing everything belongs. Every surface but the primary one.
+    pub private: bool,
 }
 
 impl SurfaceScope {
@@ -156,7 +165,15 @@ impl SurfaceScope {
         Self {
             name: name.to_owned(),
             inherits_unrecorded: name == primary,
+            private: Self::is_private(Some(name), primary),
         }
+    }
+
+    /// Whether a session recorded with `surface` is private to its owner: the
+    /// rule behind [`Self::private`], for a caller holding a session's own
+    /// row rather than a scope. Unrecorded sessions are chat history.
+    pub fn is_private(surface: Option<&str>, primary: &str) -> bool {
+        surface.is_some_and(|recorded| recorded != primary)
     }
 
     /// Whether a session recorded with `surface` belongs to this scope.
@@ -357,12 +374,28 @@ impl Store {
         Ok(table.get(id)?.map(|v| v.value().to_owned()))
     }
 
-    pub fn owner_of_root(&self, id: &str) -> Result<Option<String>> {
+    /// The conversation a session answers to: itself, or the top of its
+    /// sub-agent chain.
+    fn root_of(&self, id: &str) -> Result<String> {
         let mut root = id.to_owned();
         while let Some(row) = self.get_subagent(&root)? {
             root = row.parent_id;
         }
+        Ok(root)
+    }
+
+    pub fn owner_of_root(&self, id: &str) -> Result<Option<String>> {
+        let root = self.root_of(id)?;
         self.owner_of(&root)
+    }
+
+    /// The surface that created a session's root conversation, or `None` for
+    /// one written before the field existed or made by no surface at all.
+    /// Read beside the owner when deciding access, because a private
+    /// surface's sessions answer to their owner alone.
+    pub fn surface_of_root(&self, id: &str) -> Result<Option<String>> {
+        let root = self.root_of(id)?;
+        Ok(self.get_session(&root)?.and_then(|meta| meta.surface))
     }
 
     /// Whether an account may speak in a conversation it does not own.
@@ -572,15 +605,18 @@ impl Store {
             if children.get(id.value())?.is_some() {
                 continue;
             }
-            if let Some(want) = owner {
-                let owned = owners.get(id.value())?.as_ref().map(|v| v.value()) == Some(want);
-                if !owned && invited.get((id.value(), want))?.is_none() {
-                    continue;
-                }
-            }
             let meta: SessionMeta = serde_json::from_slice(v.value())?;
             if let Some(scope) = surface {
                 if !scope.claims(meta.surface.as_deref()) {
+                    continue;
+                }
+            }
+            if let Some(want) = owner {
+                let owned = owners.get(id.value())?.as_ref().map(|v| v.value()) == Some(want);
+                // An invitation opens a chat conversation to its guest; a
+                // private surface's sessions have no guests.
+                let shared = surface.is_none_or(|scope| !scope.private);
+                if !owned && (!shared || invited.get((id.value(), want))?.is_none()) {
                     continue;
                 }
             }
@@ -2813,5 +2849,71 @@ mod tests {
             listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             vec![mine.id.as_str()]
         );
+    }
+
+    /// Every surface but the primary one keeps its sessions to their owner.
+    #[test]
+    fn a_mounted_surface_is_private_and_the_chat_surface_is_not() {
+        assert!(!chat().private);
+        assert!(play().private);
+        assert!(!SurfaceScope::is_private(None, "web"));
+        assert!(!SurfaceScope::is_private(Some("web"), "web"));
+        assert!(SurfaceScope::is_private(Some("campaign"), "web"));
+    }
+
+    /// An invitation is a chat thing. A guest list on a campaign — however it
+    /// got there — must not put somebody else's game in a player's library.
+    #[test]
+    fn an_invitation_does_not_list_a_private_surface_session() {
+        let (store, _d) = temp_store();
+        let game = store
+            .create_session(Some("game".into()), "agent", "alice", Some("campaign"))
+            .unwrap();
+        let chat_convo = store
+            .create_session(Some("chat".into()), "agent", "alice", Some("web"))
+            .unwrap();
+        store.add_participant(&game.id, "bob", "alice").unwrap();
+        store.add_participant(&chat_convo.id, "bob", "alice").unwrap();
+
+        let ids = |scope: Option<&SurfaceScope>| {
+            store
+                .list_sessions_owned(Some("bob"), scope, true)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(Some(&chat())), vec![chat_convo.id.clone()]);
+        assert!(ids(Some(&play())).is_empty());
+        // Unscoped (`/admin`, an agent turn) still lists what the tables say.
+        assert_eq!(ids(None).len(), 2);
+        // The owner's own library is untouched by the guest row.
+        assert_eq!(
+            store
+                .list_sessions_owned(Some("alice"), Some(&play()), true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Access reads the surface at the root, so a campaign's sub-agent
+    /// answers as the campaign does.
+    #[test]
+    fn the_surface_is_read_at_the_root_of_a_sub_agent_chain() {
+        let (store, _d) = temp_store();
+        let game = store
+            .create_session(Some("game".into()), "agent", "alice", Some("campaign"))
+            .unwrap();
+        let child = store.create_session(None, "agent", "alice", None).unwrap();
+        crate::subagents::Subagents::new(&store)
+            .register(&game.id, &child.id, "k", "helper", "", "", "agent", 8)
+            .unwrap();
+        assert_eq!(
+            store.surface_of_root(&child.id).unwrap().as_deref(),
+            Some("campaign")
+        );
+        assert_eq!(store.surface_of_root(&game.id).unwrap().as_deref(), Some("campaign"));
+        assert_eq!(store.surface_of_root("nothing").unwrap(), None);
     }
 }

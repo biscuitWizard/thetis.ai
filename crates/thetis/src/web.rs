@@ -306,7 +306,15 @@ async fn login_submit(
     )
         .into_response()
 }
-async fn logout(State(g): State<Arc<Grip>>, headers: HeaderMap) -> Response {
+/// Ends the login and goes to the door. A surface that lives somewhere other
+/// than `/` — the campaign gateway at `/play/` — posts with `?next=` so the
+/// sign-in that follows comes back to it; the chat UI posts without, and
+/// lands on the plain door as before.
+async fn logout(
+    State(g): State<Arc<Grip>>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
     if !g.cfg().auth.users_mode {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -315,9 +323,18 @@ async fn logout(State(g): State<Arc<Grip>>, headers: HeaderMap) -> Response {
     }
     (
         [(header::SET_COOKIE, crate::auth::clear_cookie())],
-        Redirect::to("/login"),
+        Redirect::to(&door_after_logout(&q.next)),
     )
         .into_response()
+}
+
+/// Where a sign-out lands: the sign-in page, remembering where to return to
+/// when there is somewhere other than the root to return to.
+fn door_after_logout(next: &str) -> String {
+    match crate::auth::safe_next(next).as_str() {
+        "/" => "/login".to_string(),
+        safe => format!("/login?next={}", percent_encode(safe)),
+    }
 }
 /// Who the caller is. The same summary the socket sends as its first frame;
 /// this is what the UI asks when the socket keeps being refused, to tell an
@@ -1506,10 +1523,20 @@ mod mount_tests {
 
 #[cfg(test)]
 mod preview_tests {
-    use super::{rewrite_prefixed_html, rewrite_preview_html};
+    use super::{door_after_logout, rewrite_prefixed_html, rewrite_preview_html};
 
     fn rewrite(html: &str) -> String {
         String::from_utf8(rewrite_preview_html(html.as_bytes(), "abc123")).unwrap()
+    }
+
+    #[test]
+    fn a_sign_out_returns_to_where_it_was_asked_from() {
+        assert_eq!(door_after_logout(""), "/login");
+        assert_eq!(door_after_logout("/"), "/login");
+        assert_eq!(door_after_logout("/play/"), "/login?next=%2Fplay%2F");
+        // An off-site `next` is not a place a sign-out may send anyone.
+        assert_eq!(door_after_logout("https://evil.example/"), "/login");
+        assert_eq!(door_after_logout("//evil.example/"), "/login");
     }
 
     #[test]

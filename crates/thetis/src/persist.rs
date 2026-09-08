@@ -95,6 +95,7 @@ impl Persist {
                         "surface": surface.map(|s| &s.name),
                         "surface_inherits_unrecorded":
                             surface.is_some_and(|s| s.inherits_unrecorded),
+                        "surface_private": surface.is_some_and(|s| s.private),
                     }),
                 )
                 .await
@@ -649,6 +650,10 @@ fn serve_store_call_inner(
                 name: name.to_owned(),
                 inherits_unrecorded: params
                     .get("surface_inherits_unrecorded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                private: params
+                    .get("surface_private")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             })

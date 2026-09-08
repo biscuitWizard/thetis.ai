@@ -273,7 +273,46 @@ pub async fn resolve(g: &Arc<Grip>, h: &HeaderMap) -> Option<Arc<Principal>> {
 /// turn may do is `policy(speaker) ∩ ceiling(session)`, resolved separately in
 /// `store::session_policy`. That is what makes an invitation safe to hand out —
 /// it cannot lend the invitee any of the owner's capabilities.
+///
+/// A session made by a private surface (`SurfaceScope::private` — every
+/// mounted gateway, so a campaign) has one way in: ownership. No invitation
+/// reaches it and the blanket grant stops at its door, so an administrator
+/// plays their own campaigns at `/play` like anyone else and sees everyone's
+/// only from `/admin`.
 pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
+    let st = g.local_store().context("ownership is gateway-only")?;
+    let surface = st.surface_of_root(id)?;
+    let private = crate::store::SurfaceScope::is_private(
+        surface.as_deref(),
+        &g.cfg().primary_gateway,
+    )
+    .then_some(surface.as_deref().unwrap_or_default());
+    // The surface is read before the blanket grant, and the owner before the
+    // guest list, so the common case — one's own conversation — costs one
+    // table read and a private session never reaches the participant table.
+    decide(p, private, || st.owner_of_root(id), || {
+        st.is_participant(id, &p.user_id)
+    })
+}
+
+/// The access rule itself, apart from the store it reads.
+///
+/// `private` names the surface when the session is private to its owner, and
+/// is `None` for a chat conversation. The owner is read only when the answer
+/// depends on it, and the invitation only after ownership has failed.
+fn decide(
+    p: &Principal,
+    private: Option<&str>,
+    owner: impl FnOnce() -> Result<Option<String>>,
+    invited: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    if let Some(surface) = private {
+        return match owner()? {
+            Some(o) if o == p.user_id => Ok(()),
+            Some(_) => bail!("this {surface} belongs to another user"),
+            None => bail!("no such {surface}"),
+        };
+    }
     // Administrators have the blanket grant intrinsically. Checking the raw
     // see-all bit here disagreed with `Principal::may_see_all`: a custom admin
     // role could list foreign conversations, then be refused when opening or
@@ -281,11 +320,10 @@ pub fn may_access(g: &Grip, p: &Principal, id: &str) -> Result<()> {
     if p.may_see_all() {
         return Ok(());
     }
-    let st = g.local_store().context("ownership is gateway-only")?;
-    match st.owner_of_root(id)? {
+    match owner()? {
         Some(o) if o == p.user_id => Ok(()),
         Some(_) => {
-            if st.is_participant(id, &p.user_id)? {
+            if invited()? {
                 Ok(())
             } else {
                 // The same message either way: distinguishing "not yours" from
@@ -575,5 +613,52 @@ mod tests {
         p.set_view_all(true);
         assert!(!p.viewing_all());
         assert_eq!(p.list_owner(), Some("eve"));
+    }
+    /// A campaign is one player's: the blanket grant that lets an
+    /// administrator open any chat conversation stops at a private surface,
+    /// and so does an invitation. Only the owner gets in.
+    #[test]
+    fn a_private_surface_admits_its_owner_and_nobody_else() {
+        use crate::policy::EffectivePolicy;
+        let admin = Principal::new(
+            "ada".into(),
+            "Ada".into(),
+            "admin".into(),
+            Arc::new(EffectivePolicy::unrestricted(&[], "m", &[], "agent", 2)),
+        );
+        let mut plain = EffectivePolicy::unrestricted(&[], "m", &[], "agent", 2);
+        plain.admin = false;
+        plain.see_all_sessions = false;
+        let bob = Principal::new("bob".into(), "Bob".into(), "dev".into(), Arc::new(plain));
+        let owned_by = |who: &'static str| move || Ok(Some(who.to_string()));
+        let invited = || Ok(true);
+        let not_invited = || Ok(false);
+        let never = || -> Result<bool> { panic!("a private session never reads the guest list") };
+
+        assert!(decide(&bob, Some("campaign"), owned_by("bob"), never).is_ok());
+        let refused = decide(&bob, Some("campaign"), owned_by("ada"), never).unwrap_err();
+        assert_eq!(refused.to_string(), "this campaign belongs to another user");
+        // Being invited, or being an administrator, changes nothing here.
+        assert!(decide(&bob, Some("campaign"), owned_by("ada"), invited).is_err());
+        let refused = decide(&admin, Some("campaign"), owned_by("bob"), never).unwrap_err();
+        assert_eq!(refused.to_string(), "this campaign belongs to another user");
+        assert!(decide(&admin, Some("campaign"), owned_by("ada"), never).is_ok());
+        assert_eq!(
+            decide(&bob, Some("campaign"), || Ok(None), never)
+                .unwrap_err()
+                .to_string(),
+            "no such campaign"
+        );
+
+        // A chat conversation keeps its three ways in.
+        assert!(decide(&admin, None, owned_by("bob"), never).is_ok());
+        assert!(decide(&bob, None, owned_by("bob"), never).is_ok());
+        assert!(decide(&bob, None, owned_by("ada"), invited).is_ok());
+        assert_eq!(
+            decide(&bob, None, owned_by("ada"), not_invited)
+                .unwrap_err()
+                .to_string(),
+            "conversation belongs to another user"
+        );
     }
 }

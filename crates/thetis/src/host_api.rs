@@ -106,6 +106,21 @@ impl HostState {
         }
     }
 
+    /// The surface a session was made by, when that surface keeps its
+    /// sessions private to their owner (`SurfaceScope::private`); `None` for a
+    /// chat conversation, which can be shared.
+    async fn private_surface_of(&mut self, session_id: &str) -> Result<Option<String>> {
+        let surface = self
+            .grip()
+            .persist
+            .get_session(session_id)
+            .await
+            .wt()?
+            .and_then(|meta| meta.surface);
+        let primary = self.grip().cfg().primary_gateway.clone();
+        Ok(surface.filter(|s| crate::store::SurfaceScope::is_private(Some(s), &primary)))
+    }
+
     /// Whether `account` owns this conversation (resolved to its root, so a
     /// sub-agent answers for its parent).
     ///
@@ -583,17 +598,6 @@ impl session::Host for HostState {
         // silently swapping an unlisted one for the default made a deliberate
         // choice look like it had been ignored.
         //
-        // Whose conversations: the principal's own, unless this connection has
-        // asked for everyone's and the policy lets it (`Principal::list_owner`).
-        // An agent store lists its owner's; a store with neither — a
-        // local-mode probe — lists all.
-        let owned = if let Some(p) = &self.principal {
-            p.list_owner().map(str::to_string)
-        } else if let Some(id) = &self.session_id {
-            self.grip().persist.owner_of_root(id).await.wt()?
-        } else {
-            None
-        };
         // Which surface's conversations. Sessions belong to the surface that
         // created them, so each gateway lists its own: Thetis serves the chat
         // UI and the campaign gateway over one store, and a campaign is a
@@ -609,6 +613,26 @@ impl session::Host for HostState {
         // A caller that is not a surface — an agent turn, a local probe — gets
         // no filter, exactly as before.
         let surface = self.surface_scope();
+        // Whose conversations: the principal's own, unless this connection has
+        // asked for everyone's and the policy lets it (`Principal::list_owner`).
+        // An agent store lists its owner's; a store with neither — a
+        // local-mode probe — lists all.
+        //
+        // A private surface (a mounted gateway: the campaign) has no
+        // "everyone's": its sessions are their owner's alone, so the see-all
+        // switch is inert there and an administrator's library holds their
+        // own campaigns like anybody's.
+        let owned = if let Some(p) = &self.principal {
+            if surface.as_ref().is_some_and(|scope| scope.private) {
+                Some(p.user_id.clone())
+            } else {
+                p.list_owner().map(str::to_string)
+            }
+        } else if let Some(id) = &self.session_id {
+            self.grip().persist.owner_of_root(id).await.wt()?
+        } else {
+            None
+        };
         self.grip()
             .persist
             .list_sessions_owned(owned.as_deref(), surface.as_ref(), include_archived)
@@ -878,6 +902,14 @@ impl session::Host for HostState {
             return Ok(Err(
                 "only the owner of a conversation can invite people to it".into(),
             ));
+        }
+        // A private surface's sessions have no guest list to add to: an
+        // invitation would be a row `may_access` never reads and the
+        // listing never honours, a share that shares nothing.
+        if let Some(surface) = self.private_surface_of(&session_id).await? {
+            return Ok(Err(format!(
+                "a {surface} cannot be shared: it belongs to its owner alone"
+            )));
         }
         // Resolve through `user()` so the invitation stores the canonical id
         // and an account typed in the wrong case still works.
